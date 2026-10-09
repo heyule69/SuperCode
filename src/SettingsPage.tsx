@@ -28,7 +28,7 @@ const groups = [
     { id: 'usage', label: '用量', icon: ChartNoAxesColumn, terms: 'Token 统计' },
     { id: 'quota', label: '额度', icon: Gauge, terms: '套餐 余额 重置 平台 连接 Coding Plan' },
     { id: 'resources', label: '资源', icon: Cpu, terms: '内存 进程 释放' },
-    { id: 'about', label: '关于', icon: Info, terms: '版本 SuperCode' },
+    { id: 'about', label: '关于', icon: Info, terms: '版本 SuperCode 更新 GitHub' },
   ] },
 ] as const;
 

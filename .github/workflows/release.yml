@@ -1,0 +1,31 @@
+name: Publish signed Windows release
+on:
+  push:
+    tags: ['v*']
+permissions:
+  contents: write
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  publish:
+    if: github.repository == 'heyule69/SuperCode'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout release source
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Checkout tested local release assets
+        uses: actions/checkout@v4
+        with:
+          ref: release-assets/${{ github.ref_name }}
+          path: release-assets
+          persist-credentials: false
+      - name: Verify and publish
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          export RELEASE_SOURCE_COMMIT="$(git rev-parse HEAD)"
+          node --test scripts/test-release-contract.mjs
+          node scripts/github-release.mjs release-assets

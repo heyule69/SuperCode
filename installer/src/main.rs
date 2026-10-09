@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 mod engine;
+mod update;
 #[cfg(windows)]
 mod windows_install;
 use engine::{Installed, Manifest, Progress};
@@ -20,6 +21,7 @@ struct Installer {
     running: AtomicBool,
     completed: Mutex<Option<Installed>>,
     probe_report: Option<PathBuf>,
+    update_request: Option<update::Request>,
 }
 
 fn default_path() -> PathBuf {
@@ -30,13 +32,21 @@ fn default_path() -> PathBuf {
     PathBuf::from(std::env::var_os("LOCALAPPDATA").unwrap_or_else(|| ".".into())).join("SuperCode")
 }
 #[tauri::command]
-fn installation_path() -> String {
-    default_path().to_string_lossy().into()
+fn installation_path(app: tauri::AppHandle) -> String {
+    app.state::<Installer>()
+        .update_request
+        .as_ref()
+        .map(|r| r.path.clone())
+        .unwrap_or_else(default_path)
+        .to_string_lossy()
+        .into()
 }
 
 #[tauri::command]
 async fn choose_directory(app: tauri::AppHandle) -> std::result::Result<Option<String>, String> {
-    if app.state::<Installer>().running.load(Ordering::SeqCst) {
+    if app.state::<Installer>().running.load(Ordering::SeqCst)
+        || app.state::<Installer>().update_request.is_some()
+    {
         return Err("安装期间不能更换目录。".into());
     }
     tauri::async_runtime::spawn_blocking(move || {
@@ -57,13 +67,22 @@ async fn begin_install(
     path: String,
 ) -> std::result::Result<Installed, String> {
     let state = app.state::<Installer>();
+    if let Some(request) = &state.update_request {
+        if request.path != PathBuf::from(&path) {
+            return Err("更新期间不能更改安装目录。".into());
+        }
+    }
     if state.running.swap(true, Ordering::SeqCst) {
         return Err("安装正在进行。".into());
     }
     *state.completed.lock().map_err(|_| "无法读取安装状态")? = None;
     let task_app = app.clone();
+    let updating = state.update_request.is_some();
     let result = tauri::async_runtime::spawn_blocking(move || {
         let manifest: Manifest = serde_json::from_str(MANIFEST).map_err(|e| e.to_string())?;
+        if updating {
+            update::wait_for_release(&PathBuf::from(&path))?;
+        }
         #[cfg(windows)]
         {
             engine::install(
@@ -127,16 +146,17 @@ fn show_installer(
     app: tauri::AppHandle,
     window: tauri::WebviewWindow,
     piece_count: u32,
-) -> std::result::Result<(), String> {
+) -> std::result::Result<bool, String> {
     if let Some(path) = &app.state::<Installer>().probe_report {
         engine::write_json(
             path,
             &serde_json::json!({"nativeIpcReady": true, "logoFragments": piece_count, "version": app.package_info().version.to_string()}),
         )?;
         app.exit(if piece_count == 40 { 0 } else { 1 });
-        return Ok(());
+        return Ok(false);
     }
-    window.show().map_err(|e| e.to_string())
+    window.show().map_err(|e| e.to_string())?;
+    Ok(app.state::<Installer>().update_request.is_some())
 }
 #[tauri::command]
 fn close_installer(app: tauri::AppHandle) -> std::result::Result<(), String> {
@@ -150,17 +170,32 @@ fn main() {
     #[cfg(windows)]
     {
         let args: Vec<_> = std::env::args_os().collect();
-        if args.get(1).is_some_and(|a| a == "--verify-install") {
+        if args
+            .get(1)
+            .is_some_and(|a| a == "--verify-install" || a == "--verify-update")
+        {
             let result = (|| {
-                let target = PathBuf::from(args.get(2).ok_or("缺少测试目录")?);
+                let manifest: Manifest =
+                    serde_json::from_str(MANIFEST).map_err(|e| e.to_string())?;
+                let automatic = args.get(1).is_some_and(|a| a == "--verify-update");
+                let target = if automatic {
+                    update::read_request(
+                        &PathBuf::from(args.get(2).ok_or("缺少更新请求")?),
+                        &manifest.version,
+                    )?
+                    .path
+                } else {
+                    PathBuf::from(args.get(2).ok_or("缺少测试目录")?)
+                };
                 // Verification may never target a registered production installation.
                 if windows_install::previous_install()
                     .is_some_and(|p| windows_install::same_path(&p, &target))
                 {
                     return Err("不能在正式安装目录运行隔离验证。".to_string());
                 }
-                let manifest: Manifest =
-                    serde_json::from_str(MANIFEST).map_err(|e| e.to_string())?;
+                if automatic {
+                    update::wait_for_release(&target)?;
+                }
                 let mut events: Vec<Progress> = vec![];
                 let installed = engine::install(
                     &target,
@@ -171,12 +206,15 @@ fn main() {
                 )?;
                 engine::write_json(
                     &target.join("verification.json"),
-                    &serde_json::json!({ "installed": installed, "events": events, "isolated": true }),
+                    &serde_json::json!({ "installed": installed, "events": events, "isolated": true, "automaticUpdate": automatic }),
                 )?;
                 Ok::<_, String>(())
             })();
             if let Err(error) = result {
-                if let Some(path) = args.get(2) {
+                if let Some(path) = args
+                    .get(2)
+                    .filter(|_| args.get(1).is_some_and(|a| a == "--verify-install"))
+                {
                     let dest = PathBuf::from(path);
                     if engine::validate_target(&dest).is_ok() {
                         let _ = std::fs::create_dir_all(&dest);
@@ -189,6 +227,19 @@ fn main() {
         }
     }
     let args: Vec<_> = std::env::args_os().collect();
+    let update_request = if args.get(1).is_some_and(|a| a == "--update-request") {
+        let manifest: Manifest =
+            serde_json::from_str(MANIFEST).expect("Invalid installer manifest");
+        match args.get(2).ok_or("缺少更新请求").and_then(|path| {
+            update::read_request(&PathBuf::from(path), &manifest.version)
+                .map_err(|_| "更新请求无效")
+        }) {
+            Ok(request) => Some(request),
+            Err(_) => std::process::exit(2),
+        }
+    } else {
+        None
+    };
     let probe_report = if args.get(1).is_some_and(|a| a == "--verify-ui") {
         args.get(2).map(PathBuf::from).filter(|p| {
             p.is_absolute()
@@ -202,6 +253,7 @@ fn main() {
     tauri::Builder::default()
         .manage(Installer {
             probe_report,
+            update_request,
             ..Installer::default()
         })
         .plugin(tauri_plugin_dialog::init())

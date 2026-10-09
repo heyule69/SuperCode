@@ -409,6 +409,31 @@ pub fn request_app_exit(app: AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+pub fn reserve_update_exit(app: &AppHandle) -> Result<(), String> {
+    let state = app.state::<DesktopLifecycle>();
+    if state.quitting.swap(true, Ordering::AcqRel) {
+        return Err("SuperCode 正在退出。".into());
+    }
+    match app.state::<AppState>().store.running() {
+        Ok(0) => Ok(()),
+        result => {
+            state.quitting.store(false, Ordering::Release);
+            match result {
+                Err(error) => Err(error),
+                _ => Err("还有任务正在运行或等待确认，请完成任务后再更新。".into()),
+            }
+        }
+    }
+}
+pub fn cancel_update_exit(app: &AppHandle) {
+    app.state::<DesktopLifecycle>()
+        .quitting
+        .store(false, Ordering::Release);
+}
+pub fn finish_update_exit(app: AppHandle) {
+    exit_reserved(app);
+}
+
 fn begin_exit(app: AppHandle) {
     if app
         .state::<DesktopLifecycle>()
@@ -417,6 +442,9 @@ fn begin_exit(app: AppHandle) {
     {
         return;
     }
+    exit_reserved(app);
+}
+fn exit_reserved(app: AppHandle) {
     window_state::flush(&app);
     let _ = app.emit("desktop-before-exit", ());
     tauri::async_runtime::spawn(async move {

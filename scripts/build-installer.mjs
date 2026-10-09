@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, writeFileSync, statSync } from 'node:fs';
 import { join, resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { verifyRelease } from './release-contract.mjs';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const generated = join(root, 'installer', 'generated');
@@ -56,5 +57,17 @@ if (!prepareOnly) {
   const metadata = { version, setup: setup.slice(root.length + 1), bytes: statSync(setup).size, sha256: hash(readFileSync(setup)), appSha256: entries[0].sha256, iconName, builtAt: new Date().toISOString() };
   writeFileSync(join(output, 'installer-build.json'), `${JSON.stringify(metadata, null, 2)}\n`, 'utf8');
   writeFileSync(`${setup}.sha256`, `${metadata.sha256}  SuperCode_${version}_x64-setup.exe\n`, 'utf8');
+  const signingKey = process.env.TAURI_SIGNING_PRIVATE_KEY_PATH || join(process.env.USERPROFILE, '.supercode-signing', 'update.key');
+  if (existsSync(signingKey)) {
+    run(process.execPath, [join(root, 'node_modules', '@tauri-apps', 'cli', 'tauri.js'), 'signer', 'sign', '-f', signingKey, '-p', process.env.TAURI_SIGNING_PRIVATE_KEY_PASSWORD || '', '--app-version', version, setup]);
+    const notesPath = join(root, 'docs', 'releases', `${version}.md`);
+    const latest = { version, notes: existsSync(notesPath) ? readText(notesPath).trim() : `SuperCode ${version}`, pub_date: new Date().toISOString(), platforms: {
+      'windows-x86_64': { url: `https://github.com/heyule69/SuperCode/releases/download/v${version}/SuperCode_${version}_x64-setup.exe`, signature: readText(`${setup}.sig`).trim(), sha256: metadata.sha256, size: metadata.bytes },
+    } };
+    writeFileSync(join(output, 'latest.json'), `${JSON.stringify(latest, null, 2)}\n`, 'utf8');
+    verifyRelease(output, root, version);
+  } else {
+    console.log('未配置更新签名私钥，仅生成本地安装包；发布前需要设置 TAURI_SIGNING_PRIVATE_KEY_PATH。');
+  }
   console.log(`\n安装包：${setup}\nSHA256：${metadata.sha256}`);
 }

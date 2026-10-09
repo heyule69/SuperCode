@@ -6,6 +6,8 @@
 
 当前版本 **0.1.0**，主要支持 **Windows**。基于 Tauri 2、Rust、React + TypeScript 和 SQLite。
 
+[下载 Windows 安装包](https://github.com/heyule69/SuperCode/releases/latest) · [版本记录](https://github.com/heyule69/SuperCode/releases)
+
 ![SuperCode 工作台](docs/screenshots/workbench.jpg)
 
 ## 功能
@@ -16,10 +18,13 @@
 - **图片与媒体**：上传、粘贴图片，在对话中查看图片、播放视频和音频。
 - **技能、插件与 MCP**：发现本机技能，管理 Codex / Claude 插件和 MCP；浏览器、电脑自动化可一键安装并测试。
 - **桌面体验**：深浅主题、系统通知、托盘和多窗口。聊天保存在本机，Agent 按需启动，空闲后释放。
+- **软件更新**：自动检查 GitHub Releases，在「设置 → 关于」下载更新并重启安装，保留聊天与配置。
 
 各 Agent 的权限和引导能力按原生协议提供；目前同一时间运行一个 Agent 任务。[接入说明](docs/agent-integration.md) · [排队与引导](docs/agent-input-capabilities.md)
 
 ## 开始使用
+
+先下载安装包，选择安装目录。之后可直接在软件中更新。
 
 1. 在「设置 → Agent」检测已有安装，缺少时点击「安装」。
 2. 在「模型供应商」选择官方账号登录，或添加 API 连接。

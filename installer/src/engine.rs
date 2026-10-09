@@ -187,7 +187,7 @@ fn lock(target: &Path) -> Result<Lock> {
         path,
     })
 }
-fn ensure_not_running(target: &Path) -> Result<()> {
+pub(crate) fn ensure_not_running(target: &Path) -> Result<()> {
     let path = target.join("supercode.exe");
     if path.exists() {
         let mut options = OpenOptions::new();

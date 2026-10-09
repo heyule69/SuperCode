@@ -17,8 +17,12 @@ VIAddVersionKey "FileVersion" "${VERSION}"
 VIAddVersionKey "LegalCopyright" "SuperCode"
 Var VerifyPath
 Var ExitStatus
+Var UpdateRequest
+Var VerifyUpdate
 Function .onInit
   ${GetOptions} $CMDLINE "/VERIFY=" $VerifyPath
+  ${GetOptions} $CMDLINE "/UPDATE_REQUEST=" $UpdateRequest
+  ${GetOptions} $CMDLINE "/VERIFY_UPDATE=" $VerifyUpdate
 FunctionEnd
 Section
   ${IfNot} ${RunningX64}
@@ -29,6 +33,11 @@ Section
   InitPluginsDir
   SetOutPath "$PLUGINSDIR"
   File /oname=installer.exe "${GUI_SOURCE}"
+  ${If} $VerifyUpdate != ""
+    ExecWait '$\"$PLUGINSDIR\installer.exe$\" --verify-update $\"$VerifyUpdate$\"' $ExitStatus
+    SetErrorLevel $ExitStatus
+    Quit
+  ${EndIf}
   ${If} $VerifyPath != ""
     ExecWait '$\"$PLUGINSDIR\installer.exe$\" --verify-install $\"$VerifyPath$\"' $ExitStatus
     SetErrorLevel $ExitStatus
@@ -56,6 +65,10 @@ Section
       Quit
     ${EndIf}
   ${EndIf}
-  ExecWait '$\"$PLUGINSDIR\installer.exe$\"' $ExitStatus
+  ${If} $UpdateRequest != ""
+    ExecWait '$\"$PLUGINSDIR\installer.exe$\" --update-request $\"$UpdateRequest$\"' $ExitStatus
+  ${Else}
+    ExecWait '$\"$PLUGINSDIR\installer.exe$\"' $ExitStatus
+  ${EndIf}
   SetErrorLevel $ExitStatus
 SectionEnd

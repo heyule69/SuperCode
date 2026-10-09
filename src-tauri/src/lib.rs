@@ -3,6 +3,7 @@ mod agent_commands;
 mod agent_smoke;
 mod agent_versions;
 mod agents;
+mod app_updates;
 mod automation;
 mod bridge;
 mod ccswitch;
@@ -57,6 +58,7 @@ pub fn run() {
     let followup_test = std::env::args().any(|arg| arg == "--followups-smoke-test");
     let smoke_test = std::env::args().any(|arg| arg == "--smoke-test");
     let automation_test = std::env::args().any(|arg| arg == "--automation-smoke-test");
+    let update_test = std::env::args().any(|arg| arg == "--app-updates-test");
     let agents_test = std::env::args().any(|arg| {
         matches!(
             arg.as_str(),
@@ -66,16 +68,17 @@ pub fn run() {
                 | "--provider-accounts-test"
         )
     });
-    let smoke_dir = (smoke_test || agents_test || desktop_test || followup_test).then(|| {
-        std::env::current_dir()
-            .unwrap_or_default()
-            .join(".supercode/smoke")
-            .join(if agents_test {
-                format!("Agent test 测试 {}", uuid::Uuid::new_v4())
-            } else {
-                uuid::Uuid::new_v4().to_string()
-            })
-    });
+    let smoke_dir = (smoke_test || agents_test || desktop_test || followup_test || update_test)
+        .then(|| {
+            std::env::current_dir()
+                .unwrap_or_default()
+                .join(".supercode/smoke")
+                .join(if agents_test {
+                    format!("Agent test 测试 {}", uuid::Uuid::new_v4())
+                } else {
+                    uuid::Uuid::new_v4().to_string()
+                })
+        });
     let mut context = tauri::generate_context!();
     if let Some(dir) = &smoke_dir {
         for window in &mut context.config_mut().app.windows {
@@ -115,6 +118,7 @@ pub fn run() {
         .manage(automation::Automation::default())
         .manage(agents::Agents::default())
         .manage(agent_versions::Versions::default())
+        .manage(app_updates::AppUpdates::default())
         .manage(accounts::Accounts::default())
         .manage(notifications::Notifications::default())
         .manage(platform_usage::UsageCache::default())
@@ -156,7 +160,12 @@ pub fn run() {
             let outbox_handle = app.handle().clone();
             tauri::async_runtime::spawn(async move { outbox::watch(outbox_handle).await });
             let handle = app.handle().clone();
-            if followup_test {
+            if update_test {
+                if let Some(window) = app.get_webview_window("main") {
+                    window.hide()?;
+                }
+                tauri::async_runtime::spawn(async move { app_updates::smoke(handle).await });
+            } else if followup_test {
                 tauri::async_runtime::spawn(async move { followup_smoke::run(handle).await });
             } else if desktop_test {
                 window_state::restore(app, &dir)?;
@@ -183,11 +192,18 @@ pub fn run() {
                     // Keep ordinary close available if the OS has no tray.
                     eprintln!("系统托盘不可用：{error}");
                 }
+                let update_handle = handle.clone();
+                tauri::async_runtime::spawn(async move { app_updates::watch(update_handle).await });
                 tauri::async_runtime::spawn(async move { runtime::idle_watch(handle).await });
             }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            app_updates::app_update_status,
+            app_updates::check_app_update,
+            app_updates::download_app_update,
+            app_updates::install_app_update,
+            app_updates::set_automatic_app_updates,
             notifications::update_notification_preferences,
             notifications::update_notification_context,
             notifications::notification_status,

@@ -68,7 +68,8 @@ try {
     el('action').click(); await flush(); assert.equal(calls.filter(c => c.command === 'launch_installed').length, 1);
   });
   await check('The native UI includes no simulation timer and releases its subscription', async () => {
-    assert.doesNotMatch(script, /duration\s*=|startPreview|launchPreview|setInterval|setTimeout/);
+    assert.doesNotMatch(script, /duration\s*=|startPreview|launchPreview|setInterval/);
+    assert.equal((script.match(/if \(automaticUpdate\) setTimeout\(launch, 500\)/g) ?? []).length, 2);
     assert.equal(window.document.querySelectorAll('iframe,script[src]').length, 0);
     window.dispatchEvent(new window.Event('pagehide')); assert.equal(unlistened, true); assert.equal(callbacks.size, 0);
   });

@@ -9,6 +9,8 @@ installer/gen/
 release/
 *.tsbuildinfo
 .supercode/
+.supercode-signing/
+*.key
 memory/
 MEMORY.md
 *.log

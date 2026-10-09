@@ -15,8 +15,13 @@ $uninstallerHash = if (Test-Path -LiteralPath $formalUninstaller) { (Get-FileHas
 $registration = Get-ItemProperty -LiteralPath 'HKCU:/Software/Microsoft/Windows/CurrentVersion/Uninstall/SuperCode' -ErrorAction SilentlyContinue
 $oldLocation = $registration.InstallLocation
 $manifest = Get-Content -LiteralPath (Join-Path $projectRoot 'installer/generated/manifest.json') -Encoding utf8 -Raw | ConvertFrom-Json
-function Install-TestTarget {
-    $process = Start-Process -FilePath $setup -ArgumentList ('/VERIFY="' + $testTarget + '"') -WindowStyle Hidden -PassThru
+function Install-TestTarget([bool]$AutomaticUpdate = $false) {
+    if ($AutomaticUpdate) {
+        $requestPath = Join-Path $testRoot '自动更新请求 with spaces.json'
+        [System.IO.File]::WriteAllText($requestPath, ([ordered]@{ path = $testTarget; version = $manifest.version } | ConvertTo-Json), [System.Text.UTF8Encoding]::new($false))
+        $arguments = '/VERIFY_UPDATE="' + $requestPath + '"'
+    } else { $arguments = '/VERIFY="' + $testTarget + '"' }
+    $process = Start-Process -FilePath $setup -ArgumentList $arguments -WindowStyle Hidden -PassThru
     if (-not $process.WaitForExit(45000)) { throw '安装器隔离验证超时。' }
     if ($process.ExitCode -ne 0) {
         $errorPath = Join-Path $testTarget 'verification-error.json'
@@ -30,11 +35,16 @@ function Install-TestTarget {
     }
     $verification = Get-Content -LiteralPath (Join-Path $testTarget 'verification.json') -Encoding utf8 -Raw | ConvertFrom-Json
     if (-not $verification.isolated -or $verification.events[-1].percent -ne 100) { throw '没有收到真实安装完成事件。' }
+    if ($AutomaticUpdate -and -not $verification.automaticUpdate) { throw '自动更新请求没有进入更新流程。' }
     return $verification
 }
 $fresh = Install-TestTarget
 # Reinstall uses the same production engine and retains the previous program in a backup.
 $upgrade = Install-TestTarget
+$dataSentinel = Join-Path $testTarget 'user-data-verification.txt'
+[System.IO.File]::WriteAllText($dataSentinel, '保留用户数据', [System.Text.UTF8Encoding]::new($false))
+$automaticUpgrade = Install-TestTarget -AutomaticUpdate $true
+if ((Get-Content -LiteralPath $dataSentinel -Encoding utf8 -Raw) -ne '保留用户数据') { throw '自动更新改变了用户文件。' }
 $previousExe = Join-Path $upgrade.installed.backup 'supercode.exe'
 if ((Get-FileHash -LiteralPath $previousExe -Algorithm SHA256).Hash.ToLowerInvariant() -ne $manifest.entries[0].sha256) { throw '更新没有保留原程序备份。' }
 $uninstaller = Join-Path $testTarget 'uninstall.exe'
@@ -53,7 +63,7 @@ if ($formalHash -and (Get-FileHash -LiteralPath $formal -Algorithm SHA256).Hash 
 if ($uninstallerHash -and (Get-FileHash -LiteralPath $formalUninstaller -Algorithm SHA256).Hash -ne $uninstallerHash) { throw '隔离测试改变了正式卸载器。' }
 $currentRegistration = Get-ItemProperty -LiteralPath 'HKCU:/Software/Microsoft/Windows/CurrentVersion/Uninstall/SuperCode' -ErrorAction SilentlyContinue
 if ($currentRegistration.InstallLocation -ne $oldLocation) { throw '隔离测试改变了正式注册信息。' }
-$report = [ordered]@{ setup = $setup; isolatedDirectory = $testTarget; freshInstall = $true; upgrade = $true; oldBinaryBackedUp = $true; uninstall = $true; productionUnchanged = $true; progressEvents = $fresh.events.Count; appSha256 = $manifest.entries[0].sha256 }
+$report = [ordered]@{ setup = $setup; isolatedDirectory = $testTarget; freshInstall = $true; upgrade = $true; automaticUpdate = $true; userFilesPreserved = $true; oldBinaryBackedUp = $true; uninstall = $true; productionUnchanged = $true; progressEvents = $fresh.events.Count; appSha256 = $manifest.entries[0].sha256 }
 $json = $report | ConvertTo-Json -Depth 8
 [System.IO.File]::WriteAllText((Join-Path $testRoot 'report.json'), $json + [Environment]::NewLine, [System.Text.UTF8Encoding]::new($false))
 Write-Output $json

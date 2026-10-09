@@ -136,7 +136,7 @@
       const pointer = { x: 0, y: 0 };
       let progress = 0, visualProgress = 0, lastTime = 0, frame = null;
       let phase = 'welcome', state = 'loading', ready = false, destroyed = false, connected = false, finished = false;
-      let unlisten = null, shown = false;
+      let unlisten = null, shown = false, automaticUpdate = false, autoStarted = false;
       let installationPath = '';
       let reducedMotion = preference.matches;
       element('fallback').src = logoData;
@@ -153,15 +153,15 @@
         const label = phase === 'welcome' ? '开始安装' : phase === 'complete' ? '打开 SuperCode' : '正在安装';
         element('action').setAttribute('aria-label', label); element('action').title = label;
         element('action').disabled = !ready || !connected || busy || destroyed;
-        element('replay').disabled = busy; element('folder').disabled = busy || phase === 'complete' || !connected;
+        element('replay').disabled = busy; element('folder').disabled = busy || phase === 'complete' || !connected || automaticUpdate;
         element('action-icon').innerHTML = phase === 'complete'
           ? '<path d="M13 4h7v7m0-7-9 9M10 4H5a1 1 0 0 0-1 1v14a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>'
           : '<path d="M12 4v11m-4-4 4 4 4-4M5 18v2h14v-2" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/>';
         element('install-path').disabled = busy || !connected;
-        element('install-path').readOnly = phase === 'complete';
+        element('install-path').readOnly = phase === 'complete' || automaticUpdate;
         element('progress-readout').hidden = phase === 'welcome'; element('progress').hidden = phase === 'welcome';
         root.dataset.phase = phase; root.dataset.state = state;
-        if (ready && connected && !shown) { shown = true; invoke('show_installer', { pieceCount: pieces.length }).catch(showError); }
+        if (ready && connected && !shown) { shown = true; invoke('show_installer', { pieceCount: pieces.length }).then(updating => { automaticUpdate = updating === true; if (automaticUpdate && !autoStarted) { autoStarted = true; begin(); } }).catch(showError); }
       };
       const showError = error => {
         element('error').textContent = String(error); element('error').hidden = false;
@@ -275,12 +275,12 @@
         const dt = Math.min(64, Math.max(0, time - lastTime)); lastTime = time;
         visualProgress += (progress - visualProgress) * (1 - Math.exp(-dt / 220));
         if (Math.abs(progress - visualProgress) < .002) visualProgress = progress;
-        if (finished && visualProgress === 1) { phase = 'complete'; state = 'complete'; updateControls(); }
+        if (finished && visualProgress === 1) { phase = 'complete'; state = 'complete'; updateControls(); if (automaticUpdate) setTimeout(launch, 500); }
         draw();
         if (visualProgress !== progress) frame = requestAnimationFrame(tick);
       };
       const schedule = () => {
-        if (reducedMotion) { visualProgress = progress; if (finished) { phase = 'complete'; state = 'complete'; updateControls(); } draw(); return; }
+        if (reducedMotion) { visualProgress = progress; if (finished) { phase = 'complete'; state = 'complete'; updateControls(); if (automaticUpdate) setTimeout(launch, 500); } draw(); return; }
         if (frame === null && !document.hidden) { lastTime = performance.now(); frame = requestAnimationFrame(tick); }
       };
       const receive = event => {
