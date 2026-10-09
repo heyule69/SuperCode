@@ -1,8 +1,9 @@
-import { defineConfig } from 'vite';
+import { defineConfig } from 'vitest/config';
 import react from '@vitejs/plugin-react';
 
 export default defineConfig({
   plugins: [react()],
+  test: { include:['src/**/*.test.{ts,tsx,mjs}'] },
   clearScreen: false,
   server: { port: 1420, strictPort: true },
   build: { target: 'es2022', chunkSizeWarningLimit: 400, rollupOptions: { input: { main: 'index.html', tray: 'tray.html' } } },

@@ -1,7 +1,10 @@
 param([string]$SetupPath)
 $ErrorActionPreference = 'Stop'
 $projectRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
-if (-not $SetupPath) { $SetupPath = Join-Path $projectRoot 'release/SuperCode_0.1.0_x64-setup.exe' }
+if (-not $SetupPath) {
+  $appVersion = (Get-Content -LiteralPath (Join-Path $projectRoot 'package.json') -Encoding utf8 -Raw | ConvertFrom-Json).version
+  $SetupPath = Join-Path $projectRoot "release/SuperCode_${appVersion}_x64-setup.exe"
+}
 $setup = [System.IO.Path]::GetFullPath($SetupPath)
 if (-not (Test-Path -LiteralPath $setup)) { throw '请先生成安装包。' }
 $testRoot = Join-Path $projectRoot ('.supercode/installer-verification-' + (Get-Date -Format 'yyyyMMdd-HHmmss'))
@@ -48,6 +51,8 @@ if ((Get-Content -LiteralPath $dataSentinel -Encoding utf8 -Raw) -ne '保留用�
 $previousExe = Join-Path $upgrade.installed.backup 'supercode.exe'
 if ((Get-FileHash -LiteralPath $previousExe -Algorithm SHA256).Hash.ToLowerInvariant() -ne $manifest.entries[0].sha256) { throw '更新没有保留原程序备份。' }
 $uninstaller = Join-Path $testTarget 'uninstall.exe'
+$uninstallerInspection = Join-Path $testRoot 'verified-uninstaller.exe'
+Copy-Item -LiteralPath $uninstaller -Destination $uninstallerInspection
 $uninstall = Start-Process -FilePath $uninstaller -ArgumentList '/S' -WindowStyle Hidden -PassThru
 if (-not $uninstall.WaitForExit(45000)) { throw '卸载验证超时。' }
 if ($uninstall.ExitCode -ne 0) { throw ('卸载退出码：' + $uninstall.ExitCode) }
@@ -63,7 +68,7 @@ if ($formalHash -and (Get-FileHash -LiteralPath $formal -Algorithm SHA256).Hash 
 if ($uninstallerHash -and (Get-FileHash -LiteralPath $formalUninstaller -Algorithm SHA256).Hash -ne $uninstallerHash) { throw '隔离测试改变了正式卸载器。' }
 $currentRegistration = Get-ItemProperty -LiteralPath 'HKCU:/Software/Microsoft/Windows/CurrentVersion/Uninstall/SuperCode' -ErrorAction SilentlyContinue
 if ($currentRegistration.InstallLocation -ne $oldLocation) { throw '隔离测试改变了正式注册信息。' }
-$report = [ordered]@{ setup = $setup; isolatedDirectory = $testTarget; freshInstall = $true; upgrade = $true; automaticUpdate = $true; userFilesPreserved = $true; oldBinaryBackedUp = $true; uninstall = $true; productionUnchanged = $true; progressEvents = $fresh.events.Count; appSha256 = $manifest.entries[0].sha256 }
+$report = [ordered]@{ setup = $setup; version = $manifest.version; isolatedDirectory = $testTarget; uninstallerInspection = $uninstallerInspection; freshInstall = $true; upgrade = $true; automaticUpdate = $true; userFilesPreserved = $true; oldBinaryBackedUp = $true; uninstall = $true; productionUnchanged = $true; progressEvents = $fresh.events.Count; appSha256 = $manifest.entries[0].sha256 }
 $json = $report | ConvertTo-Json -Depth 8
 [System.IO.File]::WriteAllText((Join-Path $testRoot 'report.json'), $json + [Environment]::NewLine, [System.Text.UTF8Encoding]::new($false))
 Write-Output $json

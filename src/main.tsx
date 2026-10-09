@@ -14,5 +14,6 @@ import './model-menu.css';
 import './extensions.css';
 import './permission-menu.css';
 import './followups.css';
+import './new-chat.css';
 
 ReactDOM.createRoot(document.getElementById('root')!).render(<React.StrictMode><AppBoundary><App /></AppBoundary></React.StrictMode>);

@@ -6,6 +6,8 @@ SilentInstall silent
 SetCompressor /SOLID lzma
 !include LogicLib.nsh
 !include FileFunc.nsh
+!define MUI_ICON "${ICON_SOURCE}"
+!define MUI_UNICON "${ICON_SOURCE}"
 !include MUI2.nsh
 !define PRODUCT "SuperCode"
 !define KEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\SuperCode"

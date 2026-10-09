@@ -1,0 +1,32 @@
+.workspace { --conversation-width:840px; }
+.workspace > .chat-scroll > .messages,
+.workspace > .composer-area { max-width:var(--conversation-width); }
+.workspace .conversation-turn + .conversation-turn { border-top:0; margin-top:32px; padding-top:12px; }
+
+.workspace.new-chat-page { overflow:auto; }
+.new-chat-page > .chat-scroll { flex:0 0 auto; min-height:auto; margin-top:auto; overflow:visible; }
+.new-chat-page > .composer-area { margin-bottom:auto; padding-top:0; padding-bottom:32px; }
+.new-chat-welcome { width:100%; max-width:960px; margin:0 auto; padding:32px 28px 42px; text-align:center; }
+.new-chat-logo { display:block; width:64px; height:64px; margin:0 auto 30px; object-fit:contain; }
+.new-chat-welcome h1 { margin:0; font-size:clamp(24px,2.3vw,32px); font-weight:500; line-height:1.6; letter-spacing:-.6px; text-wrap:balance; }
+.new-chat-project-anchor { position:relative; display:inline-block; max-width:100%; vertical-align:bottom; }
+.new-chat-project { display:block; max-width:100%; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; border:0; border-radius:0; border-bottom:1px dotted var(--muted); padding:0; background:transparent; color:inherit; font:inherit; letter-spacing:inherit; line-height:inherit; }
+.new-chat-project:hover { border-bottom-color:var(--text); }
+.new-chat-project:focus-visible { outline:2px solid var(--accent); outline-offset:5px; border-radius:3px; }
+.new-chat-projects { display:block; width:260px; max-width:calc(100vw - 32px); left:50%; right:auto; transform:translateX(calc(-50% + var(--layer-shift,0px))); font-size:var(--ui-size); font-weight:400; letter-spacing:0; line-height:1.5; text-align:left; }
+.new-chat-projects > button { display:flex; align-items:center; width:100%; gap:10px; padding:10px 12px; border:0; border-radius:8px; background:transparent; color:var(--text); font:inherit; text-align:left; }
+.new-chat-projects > button:hover,
+.new-chat-projects > button:focus-visible { background:var(--hover); outline:none; }
+.new-chat-projects > button > span { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.new-chat-projects > button > svg { flex:none; color:var(--muted); }
+.new-chat-projects > .new-chat-add-project { border-top:1px solid var(--line); border-radius:0 0 8px 8px; margin-top:5px; }
+
+@media(max-width:800px) {
+  .new-chat-welcome { padding:24px 22px 30px; }
+  .new-chat-logo { width:56px; height:56px; margin-bottom:24px; }
+}
+@media(max-height:600px) {
+  .new-chat-welcome { padding-top:16px; padding-bottom:24px; }
+  .new-chat-logo { width:48px; height:48px; margin-bottom:18px; }
+  .new-chat-page > .composer-area { padding-bottom:16px; }
+}

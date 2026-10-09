@@ -1,7 +1,7 @@
 import { useEffect, useId, useLayoutEffect, useRef, type KeyboardEvent } from 'react';
 
-export function useFloatingLayer(open: boolean, close: () => void, { focusFirst = false, position = true } = {}) {
-  const root = useRef<HTMLDivElement>(null);
+export function useFloatingLayer<T extends HTMLElement = HTMLDivElement>(open: boolean, close: () => void, { focusFirst = false, position = true } = {}) {
+  const root = useRef<T>(null);
   const id = useId();
   const latestClose = useRef(close); latestClose.current = close;
   const dismiss = (restoreFocus = false) => {

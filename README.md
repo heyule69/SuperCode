@@ -4,7 +4,7 @@
 
 把 Codex、Claude Code、OpenCode 和 Pi 放进一个桌面工作台，管理项目、模型连接和工具，直接用对话完成开发任务。
 
-当前版本 **0.1.0**，主要支持 **Windows**。基于 Tauri 2、Rust、React + TypeScript 和 SQLite。
+当前版本 **0.1.1**，主要支持 **Windows**。基于 Tauri 2、Rust、React + TypeScript 和 SQLite。
 
 [下载 Windows 安装包](https://github.com/heyule69/SuperCode/releases/latest) · [版本记录](https://github.com/heyule69/SuperCode/releases)
 
