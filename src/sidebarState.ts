@@ -22,6 +22,16 @@ export function sidebarGroups(projects: Project[], sessions: Session[], state: S
   }
   return [pinned, main, recent, ...groups].filter(group => group.projects.length || group.sessions.length || byId.has(group.id));
 }
+export function sidebarAreas(projects: Project[], sessions: Session[], state: SidebarState) {
+  const groups = sidebarGroups(projects, sessions, state);
+  const sections = new Set(state.sections.map(section => section.id));
+  return {
+    projects: groups.map(group => ({ ...group, sessions: group.sessions.filter(session => !!session.projectId) }))
+      .filter(group => group.projects.length || group.sessions.length || sections.has(group.id)),
+    direct: groups.map(group => ({ ...group, projects: [], sessions: group.sessions.filter(session => !session.projectId) }))
+      .filter(group => group.sessions.length),
+  };
+}
 export function projectSessions(projectId: string, sessions: Session[], state: SidebarState) {
   const sections = new Set(state.sections.map(s => s.id));
   return sessions.filter(s => s.projectId === projectId && !state.sessions[s.id]?.pinned && !sections.has(state.sessions[s.id]?.sectionId ?? ''));

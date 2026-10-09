@@ -47,6 +47,7 @@ pub async fn execute_agent_command(
     if session.agent != "codex" {
         return Err("此原生命令只适用于 Codex，Claude 的界面命令请使用 /help 查看".into());
     }
+    crate::chat_connection::check(&app, &session.agent, Some(&session_id), None).await?;
     let project = state.store.session_workspace(&session)?;
     let client = state
         .runtime

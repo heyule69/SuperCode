@@ -18,7 +18,7 @@ beforeEach(()=>{
   sessionStorage.clear();
   node=document.createElement('div');document.body.append(node);root=createRoot(node);
   accounts=Promise.resolve([{agent:'codex',loggedIn:true,method:'chatgpt'},{agent:'claude',loggedIn:false}]);
-  mocks.call.mockReset();mocks.call.mockImplementation(async(command:string)=>command==='list_provider_accounts'?accounts:undefined);
+  mocks.call.mockReset();mocks.call.mockImplementation(async(command:string)=>command==='list_provider_accounts'?accounts:command==='list_official_accounts'?[{id:'@official',agent:'claude',name:'本机账号',loggedIn:false,current:false}]:undefined);
 });
 afterEach(async()=>{await act(async()=>root.unmount());node.remove();});
 async function render(){await act(async()=>root.render(<ProviderSettings profiles={profiles} officialAgents={['codex','claude']} order={order} busy={false} updated={async()=>{}}/>));}
@@ -44,38 +44,37 @@ it('hides an unavailable official account, retains API connections, and supports
   expect(mocks.call).toHaveBeenCalledWith('list_provider_accounts',{force:true});expect(tab('codex').textContent).toContain('1');
 });
 it('keeps official login setup inside Add without listing an unconfigured connection',async()=>{
-  await render();await act(async()=>button('添加').click());expect(providerCard('Claude 官方账号')).toBeDefined();expect(providerCard('ChatGPT 官方账号')).toBeDefined();expect(node.querySelector('#provider-key')).toBeNull();
+  await render();await act(async()=>button('添加').click());expect(providerCard('Claude 官方登录')).toBeDefined();expect(providerCard('ChatGPT 官方登录')).toBeUndefined();expect(node.querySelector('#provider-key')).toBeNull();expect(button('使用 API Key')).toBeUndefined();
 });
-it('starts native browser login from the official card without opening an API form',async()=>{
-  mocks.call.mockImplementation(async(command:string)=>command==='list_provider_accounts'?accounts:command==='start_official_login'?{message:'请在浏览器完成登录'}:undefined);
-  await render();await act(async()=>button('添加').click());await act(async()=>providerCard('Claude 官方账号').click());
-  expect(mocks.call).toHaveBeenCalledWith('start_official_login',{agent:'claude'});expect(node.querySelector('#provider-key')).toBeNull();expect(node.querySelector('#provider-url')).toBeNull();
-  expect(node.textContent).toContain('等待浏览器登录');expect(providerCard('ChatGPT 官方账号').disabled).toBe(true);
-  mocks.call.mockImplementation(async(command:string)=>command==='official_account_status'?{loggedIn:true}:undefined);
-  await act(async()=>button('检查登录').click());await act(async()=>tab('claude').click());
-  expect(tab('claude').textContent).toContain('3');expect(node.querySelector('.saved-provider-list')?.textContent).toContain('Claude 官方账号');expect(node.textContent).not.toContain('等待浏览器登录');
+it('opens account management first and only starts login after naming the additional account',async()=>{
+  const original=mocks.call.getMockImplementation()!;
+  mocks.call.mockImplementation(async(command:string,args:unknown)=>command==='start_official_account_login'?{accountId:'new-account',message:'请在浏览器完成登录'}:original(command,args));
+  await render();await act(async()=>button('添加').click());await act(async()=>providerCard('Claude 官方登录').click());
+  expect(mocks.call).toHaveBeenCalledWith('list_official_accounts',{agent:'claude',force:false});expect(node.querySelector('#provider-key')).toBeNull();expect(node.querySelector('#provider-url')).toBeNull();
+  expect(mocks.call.mock.calls.some(([command])=>command==='start_official_account_login')).toBe(false);
+  await act(async()=>button('添加账号').click());await act(async()=>{const input=node.querySelector<HTMLInputElement>('#official-account-name')!;Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value')!.set!.call(input,'工作账号');input.dispatchEvent(new Event('input',{bubbles:true}));});
+  await act(async()=>node.querySelector('.official-account-add')!.dispatchEvent(new Event('submit',{bubbles:true,cancelable:true})));
+  expect(mocks.call).toHaveBeenCalledWith('start_official_account_login',{agent:'claude',name:'工作账号'});expect(node.textContent).toContain('等待浏览器登录');
 });
-it('reuses a confirmed local ChatGPT login instead of requesting another sign-in',async()=>{
-  await render();await act(async()=>button('添加').click());await act(async()=>providerCard('ChatGPT 官方账号').click());
-  expect(mocks.call).toHaveBeenCalledWith('use_official_account',{agent:'codex'});expect(mocks.call.mock.calls.some(([command])=>command==='start_official_login')).toBe(false);
-  expect(node.querySelector('.provider-native-heading')?.textContent).toContain('ChatGPT 官方账号');expect(node.querySelector('#provider-key')).toBeNull();
+it('keeps the selected Agent while adding and exposes only its official login',async()=>{
+  await render();await act(async()=>button('添加').click());await act(async()=>tab('codex').click());
+  expect(providerCard('ChatGPT 官方登录')).toBeDefined();expect(providerCard('Claude 官方登录')).toBeUndefined();expect(providerCard('Anthropic API')).toBeUndefined();
+  await act(async()=>providerCard('自定义 / 兼容 API').click());expect(node.querySelector('.provider-engine-note')?.textContent).toContain('Codex');expect(node.querySelector('#provider-protocol')?.textContent).toBe('OpenAI Responses');
 });
-it('only opens a key form when an explicit API connection is selected',async()=>{
-  await render();await act(async()=>button('添加').click());await act(async()=>button('使用 API Key').click());
-  expect(providerCard('ChatGPT 官方账号')).toBeUndefined();await act(async()=>providerCard('OpenAI API').click());
-  expect(node.querySelector('#provider-key')).not.toBeNull();expect(node.querySelector<HTMLInputElement>('#provider-url')?.value).toBe('https://api.openai.com/v1');
+it('uses fixed Anthropic Messages for Claude third-party connections',async()=>{
+  await render();await act(async()=>button('添加').click());expect(providerCard('OpenAI API')).toBeUndefined();expect(providerCard('Groq')).toBeUndefined();await act(async()=>providerCard('Kimi / Moonshot').click());
+  expect(node.querySelector('#provider-key')).not.toBeNull();expect(node.querySelector('#provider-protocol')?.textContent).toBe('Anthropic Messages');expect(node.querySelector('.provider-engine-note')?.textContent).toContain('Claude Code');
   expect(mocks.call.mock.calls.some(([command])=>command==='start_official_login')).toBe(false);
 });
 it('keeps OpenCode and Pi API connections with their own engine rather than using another agent login',async()=>{
   await render();await act(async()=>tab('opencode').click());await act(async()=>button('添加').click());
-  expect(providerCard('ChatGPT 官方账号')).toBeUndefined();await act(async()=>providerCard('OpenAI API').click());
+  expect(providerCard('ChatGPT 官方登录')).toBeUndefined();await act(async()=>providerCard('OpenAI API').click());
   expect(node.querySelector('.provider-engine-note')?.textContent).toContain('OpenCode');expect(node.querySelector('#provider-key')).not.toBeNull();
   await act(async()=>button('所有连接').click());await act(async()=>tab('pi').click());await act(async()=>button('添加').click());await act(async()=>providerCard('Anthropic API').click());
   expect(node.querySelector('.provider-engine-note')?.textContent).toContain('Pi');expect(mocks.call.mock.calls.some(([command])=>command==='start_official_login')).toBe(false);
 });
-it('reports native login failure without creating a key form or a connected account',async()=>{
-  mocks.call.mockImplementation(async(command:string)=>{if(command==='list_provider_accounts')return accounts;if(command==='start_official_login')throw new Error('无法打开浏览器');});
-  await render();await act(async()=>button('添加').click());await act(async()=>providerCard('Claude 官方账号').click());
-  expect(node.querySelector('[role="alert"]')?.textContent).toContain('无法打开浏览器');expect(node.querySelector('#provider-key')).toBeNull();expect(sessionStorage.getItem('supercode.pendingLogin')).toBeNull();
-  await act(async()=>button('返回').click());expect(tab('claude').textContent).toContain('2');
+it('does not authorize managed accounts from a different logged-in native account',async()=>{
+  const managed:AgentProfile={id:'account:one',accountId:'one',agent:'codex',name:'工作账号',officialAccount:true,model:'test-model',current:false,hasCredential:false};
+  await act(async()=>root.render(<ProviderSettings profiles={[...profiles,managed]} officialAgents={['codex']} order={order} busy={false} updated={async()=>{}}/>));
+  expect(tab('codex').textContent).toContain('1');await act(async()=>tab('codex').click());expect(node.querySelector('.saved-provider-list')?.textContent).not.toContain('工作账号');
 });

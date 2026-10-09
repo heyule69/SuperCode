@@ -22,6 +22,7 @@ pub struct Summary {
     pub model: Option<String>,
     pub has_credential: bool,
     pub official_account: bool,
+    pub account_id: Option<String>,
     pub current: bool,
     pub provider_id: Option<String>,
     pub protocol: String,
@@ -31,9 +32,15 @@ pub struct Summary {
     pub model_source: Value,
 }
 impl Profile {
+    pub fn account_id(&self) -> Option<&str> {
+        self.config["accountId"].as_str()
+    }
     pub fn is_official(&self) -> bool {
         if crate::providers::key(&self.config).is_some() {
             return false;
+        }
+        if self.config["official"] == true {
+            return matches!(self.agent.as_str(), "claude" | "codex");
         }
         if self.agent == "claude" {
             return self.config["env"]["ANTHROPIC_BASE_URL"]
@@ -50,6 +57,7 @@ impl Profile {
     pub fn summary(&self, current: bool) -> Summary {
         Summary {
             official_account: self.is_official(),
+            account_id: self.account_id().map(str::to_owned),
             id: self.id.clone(),
             agent: self.agent.clone(),
             name: self.name.clone(),

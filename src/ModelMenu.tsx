@@ -1,7 +1,7 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'react';
-import { Check, ChevronDown, LoaderCircle, MessageSquare, RefreshCw, Search, SlidersHorizontal, X } from 'lucide-react';
-import { desktop } from './api';
-import { filterModelGroups, isKimiSource, modelGroups, modelName, sourceLabel, type ModelOption } from './modelPicker';
+import { Check, ChevronDown, LoaderCircle, MessageSquare, Plus, RefreshCw, Search, SlidersHorizontal, X } from 'lucide-react';
+import { call, desktop } from './api';
+import { filterModelGroups, isKimiSource, modelGroups, sourceLabel, type ModelOption } from './modelPicker';
 import type { AgentProfile, Model, ModelSource } from './types';
 import { useFloatingLayer } from './useFloatingLayer';
 import { ProviderIcon } from './AgentIcon';
@@ -69,6 +69,7 @@ export function ModelMenu({ value, models, profiles, activeProfile, source, busy
   const [left, setLeft] = useState(0);
   const [listHeight, setListHeight] = useState<number>();
   const [showNote, setShowNote] = useState(false);
+  const [loggedInAgents, setLoggedInAgents] = useState<string[]>([]);
   const layer = useFloatingLayer(open, () => setOpen(false), { position: false });
   const anchor = layer.root;
   const trigger = useRef<HTMLButtonElement>(null);
@@ -76,20 +77,30 @@ export function ModelMenu({ value, models, profiles, activeProfile, source, busy
   const searchInput = useRef<HTMLInputElement>(null);
   const popover = useRef<HTMLDivElement>(null);
   const note = useRef<HTMLDivElement>(null);
-  const groups = modelGroups({ value, models, profiles, activeProfile, source, agent, connectionId, order });
+  const groups = modelGroups({ value, models, profiles, activeProfile, source, agent, connectionId, order, loggedInAgents });
   const currentId = connectionId ?? activeProfile?.id ?? '';
   const currentGroup = groups.find(g => g.id === currentId || g.options.some(option => option.connectionId === currentId));
   const selected = currentGroup?.options.find(m => m.selected);
-  const selectedSource = currentGroup?.source;
-  const selectedName = selected?.displayName ?? modelName({ id: value, model: value, displayName: value || '选择模型', isDefault: false }, selectedSource);
+  const selectedSource = selected?.source;
+  const needsProvider = !groups.length && !loading;
+  const selectedName = selected?.displayName ?? (needsProvider ? '添加模型供应商' : loading && !currentGroup ? '正在检查连接…' : '选择模型');
   const visible = filterModelGroups(groups, search, filter);
   const available = groups.filter(g => g.options.length > 0);
-  const efforts = selected?.supportedReasoningEfforts?.map(e => e.reasoningEffort) ?? (agent === 'claude' ? ['low', 'medium', 'high', 'max'] : []);
+  const efforts = selected?.supportedReasoningEfforts?.map(e => e.reasoningEffort) ?? (selected && agent === 'claude' ? ['low', 'medium', 'high', 'max'] : []);
   const contextVariants = selected && isKimiSource(selected.source) && agent === 'claude' && selected.rawIds.some(id => /^k3\[1m\]$/i.test(id)) && selected.rawIds.includes('k3') ? selected.rawIds : [];
 
   function close(focus = false) { setOpen(false); setShowNote(false); if (focus) trigger.current?.focus(); }
   useEffect(() => { if (busy) setOpen(false); }, [busy]);
   useEffect(() => { if (!open) setShowNote(false); }, [open]);
+  useEffect(() => { setLoggedInAgents([]); }, [agent, profiles]);
+  useEffect(() => {
+    if (!open || !desktop || !['claude', 'codex'].includes(agent)) return;
+    let disposed = false;
+    void call<{ agent: string; connectionId?: string; loggedIn: boolean }[]>('list_provider_accounts', { force: false }).then(rows => {
+      if (!disposed) setLoggedInAgents(rows.filter(row => row.loggedIn).map(row => row.connectionId ?? row.agent));
+    }).catch(() => { if (!disposed) setLoggedInAgents([]); });
+    return () => { disposed = true; };
+  }, [open, agent, profiles]);
   useEffect(() => {
     if (!showNote) return;
     const outside = (event: Event) => { if (!note.current?.contains(event.target as Node)) setShowNote(false); };
@@ -130,13 +141,13 @@ export function ModelMenu({ value, models, profiles, activeProfile, source, busy
     options[next].focus();
   }
   return <div className="composer-menu-anchor" ref={anchor}>
-    <button ref={trigger} type="button" className="composer-chip model-chip" aria-label="选择模型" aria-haspopup="dialog" aria-expanded={open} disabled={busy}
-      title={[selectedName, selectedSource && sourceLabel(selectedSource), value && `模型 ID：${value}`].filter(Boolean).join('\n')}
-      onClick={() => { setOpen(v => !v); setSearch(''); setFilter(null); if (!open && !models.length && desktop && !loading) reload(); }}>
+    <button ref={trigger} type="button" className="composer-chip model-chip" aria-label={needsProvider ? '添加模型供应商' : '选择模型'} aria-haspopup={needsProvider ? undefined : 'dialog'} aria-expanded={open} disabled={busy}
+      title={[selectedName, selectedSource && sourceLabel(selectedSource), selected && `模型 ID：${selected.model}`].filter(Boolean).join('\n')}
+      onClick={() => { if (needsProvider) { manage(); return; } setOpen(v => !v); setSearch(''); setFilter(null); if (!open && !models.length && desktop && !loading) reload(); }}>
       {selectedSource?.mark ? <span className="model-provider-mark" aria-hidden="true"><ProviderIcon provider={selectedSource.providerId} name={selectedSource.connectionName || selectedSource.providerName} mark={selectedSource.mark}/></span> : null}
       <span className="model-chip-name">{selectedName}</span>
       {selectedSource?.providerName ? <span className="model-chip-provider">{selectedSource.providerName}</span> : null}
-      <ChevronDown size={11} />
+      {needsProvider ? <Plus size={12}/> : <ChevronDown size={11} />}
     </button>
     {open ? <div ref={popover} className="composer-popover model-popover" style={{ left }} role="dialog" aria-label="模型选择" onKeyDown={move}>
       <div className="model-menu-heading"><h2>选择模型</h2><span title={selectedName}>{selectedName}</span><button type="button" className="icon-button" aria-label="关闭模型选择" onClick={() => close(true)}><X size={15}/></button></div>

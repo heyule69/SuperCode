@@ -194,64 +194,43 @@ pub fn list_messages(
 pub async fn list_models(
     agent: Option<String>,
     session_id: Option<String>,
+    connection_id: Option<String>,
     app: AppHandle,
 ) -> Result<Value, String> {
-    if let Some(agent @ ("opencode" | "pi")) = agent.as_deref() {
-        return crate::native_agents::models(&app, agent, session_id.as_deref()).await;
+    let agent = agent.as_deref().unwrap_or("codex");
+    let route = crate::chat_connection::available_route(
+        &app, agent, session_id.as_deref(), connection_id.as_deref(),
+    ).await?;
+    let source = crate::chat_connection::model_source(route.as_ref(), agent);
+    let Some(route) = route else {
+        return Ok(json!({"data":[],"source":source}));
+    };
+    if matches!(agent, "opencode" | "pi") {
+        let mut catalog = crate::providers::catalog_models(&route.config);
+        catalog["source"] = source;
+        return Ok(catalog);
     }
-    if agent.as_deref() == Some("claude") {
-        let route = app
-            .state::<AppState>()
-            .store
-            .route("claude", session_id.as_deref())?;
+    if agent == "claude" {
+        let official = route.config["official"] == true
+            || route.profile.as_ref().is_some_and(crate::ccswitch::Profile::is_official);
         let config = route.config;
-        let profile = route.profile;
-        let mut source = crate::providers::model_source(
-            &config,
-            "claude",
-            profile.as_ref().map(|p| p.name.as_str()),
-        );
-        if needs_official_login(
-            "claude",
-            &route.id,
-            &config,
-            profile
-                .as_ref()
-                .is_some_and(crate::ccswitch::Profile::is_official),
-        ) && !app
-            .state::<crate::accounts::Accounts>()
-            .get("claude", false, &app)
-            .await
-            .is_ok_and(|status| status["loggedIn"] == true)
-        {
-            source["available"] = false.into();
-            return Ok(json!({"data":[],"source":source}));
-        }
         let mut catalog = crate::providers::catalog_models(&config);
         catalog["source"] = source.clone();
         if catalog["data"].as_array().is_some_and(|a| !a.is_empty()) {
             return Ok(catalog);
         }
-        if config["env"]["ANTHROPIC_BASE_URL"]
-            .as_str()
-            .is_some_and(|s| !s.contains("api.anthropic.com"))
-        {
+        if !official {
             return Ok(json!({"data":[],"needsModel":true,"source":source}));
         }
         return Ok(
             json!({"data":[{"id":"sonnet","model":"sonnet","displayName":"Claude Sonnet","isDefault":true},{"id":"opus","model":"opus","displayName":"Claude Opus","isDefault":false},{"id":"haiku","model":"haiku","displayName":"Claude Haiku","isDefault":false}],"source":source}),
         );
     }
-    let route = app
-        .state::<AppState>()
-        .store
-        .route("codex", session_id.as_deref())?;
     let profile = route.profile;
     if let Some(profile) = &profile {
         if !profile.is_official() {
             let mut catalog = crate::providers::catalog_models(&profile.config);
-            catalog["source"] =
-                crate::providers::model_source(&profile.config, "codex", Some(&profile.name));
+            catalog["source"] = source;
             return Ok(catalog);
         }
     }
@@ -266,47 +245,15 @@ pub async fn list_models(
     {
         return Err("Claude 正在运行，请先完成任务后加载 Codex 模型".into());
     }
-    let config = route.config;
-    let mut source =
-        crate::providers::model_source(&config, "codex", profile.as_ref().map(|p| p.name.as_str()));
-    if needs_official_login(
-        "codex",
-        &route.id,
-        &config,
-        profile
-            .as_ref()
-            .is_some_and(crate::ccswitch::Profile::is_official),
-    ) && !app
-        .state::<crate::accounts::Accounts>()
-        .get("codex", false, &app)
-        .await
-        .is_ok_and(|status| status["loggedIn"] == true)
-    {
-        source["available"] = false.into();
-        return Ok(json!({"data":[],"source":source}));
-    }
     let mut catalog = app
         .state::<AppState>()
         .runtime
-        .get_for_session(&app, session_id.as_deref())
+        .get_for_connection(&app, session_id.as_deref(), connection_id.as_deref())
         .await?
         .request("model/list", json!({"limit":100}))
         .await?;
     catalog["source"] = source;
     Ok(catalog)
-}
-
-fn needs_official_login(agent: &str, id: &str, config: &Value, official_profile: bool) -> bool {
-    id == crate::session_config::OFFICIAL
-        || official_profile
-        || id == crate::session_config::LOCAL
-            && crate::providers::key(config).is_none()
-            && crate::providers::model_source(config, agent, None)["providerId"]
-                == if agent == "claude" {
-                    "anthropic"
-                } else {
-                    "openai"
-                }
 }
 
 #[tauri::command]
@@ -381,6 +328,7 @@ pub(crate) async fn send_chat_message_inner(
     }
     let state = app.state::<AppState>();
     let session = state.store.session(&session_id)?;
+    crate::chat_connection::check(&app, &session.agent, Some(&session_id), None).await?;
     if session.native_id.is_some()
         && model
             .as_deref()
@@ -1050,45 +998,6 @@ pub async fn release_runtime(app: AppHandle) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn model_catalog_login_guard_keeps_explicit_api_and_custom_cli_connections() {
-        assert!(needs_official_login(
-            "claude",
-            "@official",
-            &json!({}),
-            false
-        ));
-        assert!(needs_official_login(
-            "claude",
-            "@local",
-            &json!({"env":{}}),
-            false
-        ));
-        assert!(needs_official_login(
-            "codex",
-            "@local",
-            &json!({"config":"model_provider='openai'"}),
-            false
-        ));
-        assert!(!needs_official_login(
-            "claude",
-            "api",
-            &json!({"apiKey":"fixture"}),
-            false
-        ));
-        assert!(!needs_official_login(
-            "claude",
-            "@local",
-            &json!({"env":{"ANTHROPIC_BASE_URL":"https://custom.example/anthropic"}}),
-            false
-        ));
-        assert!(!needs_official_login(
-            "codex",
-            "@local",
-            &json!({"config":"model_provider='gateway'\n[model_providers.gateway]\nbase_url='https://custom.example/v1'"}),
-            false
-        ));
-    }
     #[test]
     fn system_open_accepts_documents_without_running_code_or_executables() {
         for name in [

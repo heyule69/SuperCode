@@ -323,11 +323,14 @@ async fn query(agent: &str, route: &Route, app: &AppHandle) -> Option<Usage> {
         && (route.config["official"] == true
             || route.profile.as_ref().is_some_and(|p| p.is_official()))
     {
-        let limits = app
+        let limits = if let Some(id) = route.config["accountId"].as_str() {
+            if let Some(value) = app.state::<AppState>().runtime.existing_account_limits(route.fingerprint()).await { value }
+            else { crate::accounts::read_codex_limits_for(app, Some(id)).await.ok()? }
+        } else { app
             .state::<AppState>()
             .runtime
             .account_limits(app, route.fingerprint())
-            .await?;
+            .await? };
         plan_name = limits["rateLimits"]["planType"]
             .as_str()
             .or_else(|| limits["rateLimitsByLimitId"]["codex"]["planType"].as_str())
@@ -424,19 +427,29 @@ fn connection(route: &Route, agent: &str) -> QuotaConnection {
         source,
     }
 }
-// Return display metadata without requesting allowances or starting an Agent.
+// Return safe display metadata; only official candidates need a cached login check.
 #[tauri::command]
 pub async fn get_quota_connections(app: AppHandle) -> Result<Vec<QuotaConnection>, String> {
-    tauri::async_runtime::spawn_blocking(move || quota_connections(&app.state::<AppState>().store))
+    let handle = app.clone();
+    let candidates = tauri::async_runtime::spawn_blocking(move || quota_connections(&handle.state::<AppState>().store))
         .await
-        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())??;
+    let mut visible = Vec::new();
+    for item in candidates {
+        let official = item.connection_id == crate::session_config::OFFICIAL
+            || app.state::<AppState>().store.profile(&item.agent, &item.connection_id)?
+                .is_some_and(|p| p.is_official());
+        if !official || crate::chat_connection::check(&app, &item.agent, None, Some(&item.connection_id)).await.is_ok() {
+            visible.push(item);
+        }
+    }
+    Ok(visible)
 }
 fn quota_connections(store: &crate::storage::Store) -> Result<Vec<QuotaConnection>, String> {
     let profiles = store.profiles()?;
-    let sessions = store.sessions()?;
     let mut connections = Vec::new();
     for profile in &profiles {
-        if profile.agent == "codex" && profile.is_official() {
+        if profile.agent == "codex" && profile.is_official() && profile.account_id().is_none() {
             continue;
         }
         connections.push(connection(
@@ -451,7 +464,7 @@ fn quota_connections(store: &crate::storage::Store) -> Result<Vec<QuotaConnectio
     for agent in ["codex", "claude"] {
         if agent == "codex"
             && (store.official(agent)?
-                || profiles.iter().any(|p| p.agent == agent && p.is_official()))
+                || profiles.iter().any(|p| p.agent == agent && p.is_official() && p.account_id().is_none()))
             || agent != "codex"
                 && store.official(agent)?
                 && !profiles.iter().any(|p| p.agent == agent && p.is_official())
@@ -460,22 +473,6 @@ fn quota_connections(store: &crate::storage::Store) -> Result<Vec<QuotaConnectio
                 &store.route_for(agent, crate::session_config::OFFICIAL)?,
                 agent,
             ));
-        }
-        if agent != "codex"
-            && (store.default_connection(agent)? == crate::session_config::LOCAL
-                || sessions.iter().any(|s| {
-                    s.agent == agent
-                        && s.connection_id.as_deref() == Some(crate::session_config::LOCAL)
-                }))
-        {
-            if let Ok(route) = store.route_for(agent, crate::session_config::LOCAL) {
-                let source = route.source(agent);
-                if providers::key(&route.config).is_some()
-                    || !matches!(source["providerId"].as_str(), Some("openai" | "anthropic"))
-                {
-                    connections.push(connection(&route, agent));
-                }
-            }
         }
     }
     Ok(connections)
@@ -487,10 +484,9 @@ pub async fn get_platform_usage(
     refresh: bool,
     app: AppHandle,
 ) -> Result<Option<Usage>, String> {
-    let route = app
-        .state::<AppState>()
-        .store
-        .route_for(&agent, &connection_id)?;
+    let Some(route) = crate::chat_connection::available_route(&app, &agent, None, Some(&connection_id)).await? else {
+        return Ok(None);
+    };
     let cache_key = (agent.clone(), route.fingerprint());
     if !refresh {
         if let Some(value) = app.state::<UsageCache>().get(&cache_key) {
@@ -506,6 +502,18 @@ pub async fn get_platform_usage(
 mod tests {
     use super::*;
     use serde_json::json;
+    #[test]
+    fn quota_candidates_exclude_hidden_native_routes_even_with_old_chat_history() {
+        let store = crate::storage::Store::from_connection(rusqlite::Connection::open_in_memory().unwrap()).unwrap();
+        let project = store.add_project(std::path::Path::new("D:/quota-empty-test")).unwrap();
+        for agent in ["claude", "codex", "opencode", "pi"] {
+            store.create_agent_session(&project.id, None, agent).unwrap();
+        }
+        assert!(store.profiles().unwrap().is_empty());
+        assert!(quota_connections(&store).unwrap().iter().all(|item| {
+            item.connection_id == crate::session_config::OFFICIAL && item.agent == "codex"
+        }));
+    }
     #[test]
     fn connection_list_keeps_unsupported_platforms_without_disclosing_credentials() {
         let route = Route {

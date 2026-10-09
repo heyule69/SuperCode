@@ -443,6 +443,11 @@ pub async fn send(
             "ANTHROPIC_DEFAULT_SONNET_MODEL",
             "ANTHROPIC_DEFAULT_HAIKU_MODEL",
             "CLAUDE_CODE_SUBAGENT_MODEL",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR",
+            "CLAUDE_CODE_USE_BEDROCK",
+            "CLAUDE_CODE_USE_VERTEX",
+            "CLAUDE_CODE_USE_FOUNDRY",
         ] {
             command.env_remove(key);
         }
@@ -454,6 +459,7 @@ pub async fn send(
             }
         }
     }
+    crate::official_accounts::configure(&mut command, app, "claude", &config)?;
     let mut child = command
         .current_dir(cwd)
         .stdin(std::process::Stdio::piped())

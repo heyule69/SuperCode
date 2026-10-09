@@ -4,7 +4,7 @@ export interface Message { seq: number; id: string; sessionId: string; role: str
 export interface Agent { id: string; name: string; installed: boolean; path: string | null; connected: boolean }
 export interface ModelSource { providerId: string; providerName: string; mark: string; planName?: string | null; connectionName?: string | null; modelFamily?: string | null; available?: boolean }
 export interface ModelCatalog { data: Model[]; source?: ModelSource }
-export interface AgentProfile { id: string; agent: string; name: string; model: string | null; hasCredential: boolean; current: boolean; officialAccount?: boolean; providerId?: string | null; protocol?: string; plan?: string | null; source?: string; models?: string[]; modelSource?: ModelSource }
+export interface AgentProfile { id: string; agent: string; name: string; model: string | null; hasCredential: boolean; current: boolean; officialAccount?: boolean; accountId?: string | null; providerId?: string | null; protocol?: string; plan?: string | null; source?: string; models?: string[]; modelSource?: ModelSource }
 export interface SidebarItem { pinned: boolean; unread: boolean; sectionId: string | null }
 export interface SidebarSection { id: string; name: string }
 export interface SidebarState { projects: Record<string, SidebarItem>; sessions: Record<string, SidebarItem>; sections: SidebarSection[] }

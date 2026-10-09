@@ -195,16 +195,16 @@ fn configured_base_url(config: &Value) -> Option<String> {
 }
 
 #[tauri::command]
-pub fn get_model_source(
+pub async fn get_model_source(
     agent: String,
     session_id: Option<String>,
+    connection_id: Option<String>,
     app: AppHandle,
 ) -> Result<Value, String> {
-    Ok(app
-        .state::<AppState>()
-        .store
-        .route(&agent, session_id.as_deref())?
-        .source(&agent))
+    let route = crate::chat_connection::available_route(
+        &app, &agent, session_id.as_deref(), connection_id.as_deref(),
+    ).await?;
+    Ok(crate::chat_connection::model_source(route.as_ref(), &agent))
 }
 
 pub fn real_claude_model(config: &Value, requested: Option<&str>) -> Option<String> {
@@ -405,13 +405,14 @@ fn make_profile(mut s: Settings, previous: Option<&Profile>) -> Result<Profile, 
         return Err("API 协议无效".into());
     }
     if (s.agent == "codex" && s.protocol != "responses")
-        || (s.agent == "claude" && s.protocol == "responses")
+        || (s.agent == "claude" && s.protocol != "anthropic" && !(s.protocol == "chat" && previous.is_some_and(|p| p.agent == "claude" && p.config["protocol"] == s.protocol)))
         || !matches!(s.agent.as_str(), "claude" | "codex" | "opencode" | "pi")
     {
         return Err(
-            "Claude Code 支持 Anthropic / Chat Completions；Codex 需要 Responses 协议".into(),
+            "Claude Code 新连接需要 Anthropic Messages；Codex 需要 OpenAI Responses".into(),
         );
     }
+    if s.official && previous.is_none() { return Err("官方账号请通过官方登录添加".into()); }
     if previous.is_some_and(|p| p.agent != s.agent) {
         return Err("编辑连接时不能更换 Agent，请新增连接".into());
     }
@@ -545,7 +546,7 @@ pub async fn delete_provider_profile(id: String, app: AppHandle) -> Result<(), S
 pub async fn fetch_provider_models(id: String, app: AppHandle) -> Result<Vec<String>, String> {
     let p = find(&app, &id)?;
     if p.is_official() {
-        let value = crate::commands::list_models(Some(p.agent), None, app).await?;
+        let value = crate::commands::list_models(Some(p.agent), None, Some(p.id), app).await?;
         return Ok(value["data"]
             .as_array()
             .map(|a| {
@@ -607,7 +608,7 @@ pub async fn test_provider_connection(id: String, app: AppHandle) -> Result<Valu
     let p = find(&app, &id)?;
     let s = settings(&p);
     if s.official {
-        let status = crate::accounts::official_account_status(p.agent, app).await?;
+        let status = app.state::<crate::accounts::Accounts>().get_for(&p.agent, p.account_id(), true, &app).await?;
         if status["loggedIn"] != true {
             return Err("尚未检测到官方登录，请在供应商页登录官方账号".into());
         }
@@ -881,5 +882,22 @@ mod tests {
         assert!(validate_url("http://remote.example/v1").is_err());
         assert!(validate_url("http://127.0.0.1:8888/v1").is_ok());
         assert!(validate_url("https://example.com/v1?key=secret").is_err());
+    }
+    #[test]
+    fn new_provider_protocols_are_agent_specific_and_native_accounts_cannot_be_forged() {
+        let settings = |agent: &str, protocol: &str| serde_json::from_value::<Settings>(json!({
+            "name":"连接","agent":agent,"providerId":"custom","plan":protocol,"protocol":protocol,
+            "baseUrl":"https://example.test/v1","model":"test-model","models":["test-model"],"apiKey":"test-key"
+        })).unwrap();
+        for agent in ["claude", "codex", "opencode", "pi"] {
+            for protocol in ["anthropic", "responses", "chat"] {
+                let allowed = match agent { "claude" => protocol == "anthropic", "codex" => protocol == "responses", _ => true };
+                assert_eq!(make_profile(settings(agent, protocol), None).is_ok(), allowed, "{agent}/{protocol}");
+            }
+        }
+        let mut fake_official = settings("claude", "anthropic"); fake_official.official = true;
+        assert!(make_profile(fake_official, None).is_err());
+        let legacy = Profile { id: "legacy-chat".into(), agent: "claude".into(), name: "旧连接".into(), config: json!({"protocol":"chat","baseUrl":"https://example.test/v1","apiKey":"test-key"}) };
+        assert!(make_profile(settings("claude", "chat"), Some(&legacy)).is_ok());
     }
 }

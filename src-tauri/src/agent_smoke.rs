@@ -63,7 +63,7 @@ async fn verify(app: &AppHandle) -> Result<Value, String> {
             let agent = account["agent"].as_str().ok_or("账号 Agent 缺失")?;
             if account["loggedIn"] == false {
                 state.store.use_official(agent)?;
-                let catalog = commands::list_models(Some(agent.into()), None, app.clone()).await?;
+                let catalog = commands::list_models(Some(agent.into()), None, None, app.clone()).await?;
                 if catalog["data"]
                     .as_array()
                     .is_none_or(|models| !models.is_empty())

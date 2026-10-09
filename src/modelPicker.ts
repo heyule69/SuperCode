@@ -1,6 +1,6 @@
 import catalog from '../resources/providers.json';
 import type { AgentProfile, Model, ModelSource } from './types';
-import { connectionIds, nativeConnectionSource, type ConnectionOrder } from './providerOrder';
+import { nativeConnectionSource, visibleProviderIds, type ConnectionOrder } from './providerOrder';
 
 export interface ModelOption extends Model {
   key: string;
@@ -13,6 +13,7 @@ export interface ModelOption extends Model {
 export interface ModelGroup { id: string; source: ModelSource; options: ModelOption[] }
 
 export function sourceForProfile(profile: AgentProfile): ModelSource {
+  if (profile.officialAccount && profile.accountId) return { ...nativeConnectionSource(profile.agent, '@official'), connectionName: profile.name };
   if (profile.agent === 'codex' && profile.officialAccount) return nativeConnectionSource('codex', '@official');
   if (profile.modelSource) return profile.modelSource;
   const provider = catalog.find(p => p.id === profile.providerId);
@@ -77,22 +78,28 @@ function optionsFor(models: Model[], source: ModelSource, connectionId: string, 
   });
 }
 
-export function modelGroups({ models, profiles, activeProfile, source, agent, value, connectionId, order }: { models: Model[]; profiles: AgentProfile[]; activeProfile?: AgentProfile; source?: ModelSource; agent: string; value: string; connectionId?: string; order?: ConnectionOrder }): ModelGroup[] {
+export function modelGroups({ models, profiles, activeProfile, source, agent, value, connectionId, order, loggedInAgents = [] }: { models: Model[]; profiles: AgentProfile[]; activeProfile?: AgentProfile; source?: ModelSource; agent: string; value: string; connectionId?: string; order?: ConnectionOrder; loggedInAgents?: string[] }): ModelGroup[] {
   const currentId = connectionId ?? activeProfile?.id ?? '';
-  const officialCurrent = agent === 'codex' && (currentId === '@official' || activeProfile?.officialAccount || currentId === '@local' && source?.connectionName === 'ChatGPT 官方账号');
-  const currentSource = officialCurrent ? { ...nativeConnectionSource(agent, '@official'), available: source?.available } : source ?? (activeProfile ? sourceForProfile(activeProfile) : { providerId: 'unknown', providerName: '', mark: '' });
+  const currentProfile = profiles.find(p => p.agent === agent && p.id === currentId);
+  const legacyOfficial = agent === 'codex' && currentId === '@local' && source?.available === true && source.connectionName === 'ChatGPT 官方账号';
+  const officialRoute = ['claude', 'codex'].includes(agent) && (currentId === '@official' || !!currentProfile?.officialAccount || legacyOfficial);
+  const officialCurrent = agent === 'codex' && officialRoute && !currentProfile?.accountId;
+  const accountKey = currentProfile?.accountId ? currentId : agent;
+  const verifiedAgents = officialRoute && source?.available === false ? loggedInAgents.filter(id => id !== accountKey) : officialRoute && source?.available === true ? [...new Set([...loggedInAgents, accountKey])] : loggedInAgents;
+  const currentAvailable = source?.available !== false && (officialRoute ? verifiedAgents.includes(accountKey) : !!currentProfile && !currentProfile.officialAccount);
+  const currentSource = officialCurrent ? { ...nativeConnectionSource(agent, '@official'), available: source?.available } : source ?? (currentProfile ? sourceForProfile(currentProfile) : nativeConnectionSource(agent, currentId));
   const currentGroupId = officialCurrent ? '@official' : currentId;
   const profileModels = (profile: AgentProfile): Model[] => [...new Set([profile.model, ...profile.models ?? []].filter((m): m is string => !!m))].map(id => ({ id, model: id, displayName: id, isDefault: id === profile.model }));
-  const officialModels = profiles.filter(p => p.agent === agent && p.officialAccount).flatMap(profileModels);
-  const currentModels = currentSource.available === false ? [] : models.length ? models : activeProfile ? profileModels(activeProfile) : officialCurrent ? officialModels : [];
-  const current = { id: currentGroupId, source: currentSource, options: optionsFor(currentModels, currentSource, currentId, true, value || activeProfile?.model || '') };
-  const ids = order?.[agent] || agent === 'codex' ? connectionIds(agent, profiles, [], order) : profiles.filter(p => p.agent === agent).map(p => p.id);
-  // Legacy/current native routes remain selectable even if absent from the new defaults.
-  if (!ids.includes(currentGroupId)) { if (order?.[agent]) ids.push(currentGroupId); else ids.unshift(currentGroupId); }
+  const officialModels = profiles.filter(p => p.agent === agent && p.officialAccount && !p.accountId).flatMap(profileModels);
+  const currentModels = !currentAvailable ? [] : models.length ? models : currentProfile ? profileModels(currentProfile) : officialCurrent ? officialModels : [];
+  const current = { id: currentGroupId, source: currentSource, options: optionsFor(currentModels, currentSource, currentId, true, value || currentProfile?.model || '') };
+  const ids = visibleProviderIds(agent, profiles, verifiedAgents, order).filter(id => id !== currentGroupId || currentAvailable);
+  if (currentAvailable && !ids.includes(currentGroupId)) ids.push(currentGroupId);
+  if (!order?.[agent] && currentAvailable) { const index = ids.indexOf(currentGroupId); ids.splice(index, 1); ids.unshift(currentGroupId); }
   return ids.map(id => {
     if (id === currentGroupId) return current;
     const profile = profiles.find(p => p.agent === agent && p.id === id);
-    const officialProfile = id === '@official' ? profiles.find(p => p.agent === agent && p.officialAccount && (p.model || p.models?.length)) : undefined;
+    const officialProfile = id === '@official' ? profiles.find(p => p.agent === agent && p.officialAccount && !p.accountId && (p.model || p.models?.length)) : undefined;
     const groupSource = profile ? sourceForProfile(profile) : nativeConnectionSource(agent, id);
     const groupModels = profile ? profileModels(profile) : id === '@official' && agent === 'codex' ? officialModels : officialProfile ? profileModels(officialProfile) : [];
     return { id, source: groupSource, options: optionsFor(groupModels, groupSource, id, false, '') };

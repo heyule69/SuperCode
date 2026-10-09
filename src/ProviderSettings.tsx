@@ -1,26 +1,27 @@
 import { lazy, Suspense, useEffect, useRef, useState, type PointerEvent, type SelectHTMLAttributes } from 'react';
-import { ArrowLeft, ArrowUp, ArrowDown, Check, ChevronDown, ChevronRight, Download, ExternalLink, GripVertical, LoaderCircle, Plus, RefreshCw, Search, Trash2, X } from 'lucide-react';
+import { ArrowLeft, ArrowUp, ArrowDown, Check, ChevronDown, ChevronRight, Download, GripVertical, LoaderCircle, Plus, RefreshCw, Search, Trash2, X } from 'lucide-react';
 import catalog from '../resources/providers.json';
 import { CredentialInput } from './CredentialInput';
 import { AgentIcon, ProviderIcon } from './AgentIcon';
 import { call, desktop } from './api';
 import type { AgentProfile, Provider, ProviderSettings as Config } from './types';
 import { connectionIds, mergeVisibleOrder, moveConnection, nativeConnectionSource, providerAgents, visibleProviderIds, type ConnectionOrder } from './providerOrder';
+import { agentProtocols, officialProvider, protocolLabels, providersForAgent } from './providerCapabilities';
+import OfficialAccounts from './OfficialAccounts';
 const providers = catalog as Provider[];
 const CCSwitchSettings = lazy(() => import('./CCSwitchSettings'));
-const protocolLabels: Record<string, string> = { anthropic: 'Anthropic Messages', chat: 'OpenAI Chat Completions', responses: 'OpenAI Responses' };
 const blank: Config = { id: null, name: '', agent: 'claude', providerId: 'custom', plan: 'anthropic', protocol: 'anthropic', baseUrl: '', model: '', models: [], hasCredential: false };
-type AccountStatus = { agent: string; loggedIn: boolean; method?: string; plan?: string; error?: string | null };
+type AccountStatus = { agent: string; connectionId?: string; loggedIn: boolean; method?: string; plan?: string; error?: string | null };
 
 function SelectControl({ children, ...props }: SelectHTMLAttributes<HTMLSelectElement>) {
   return <div className="select-control"><select {...props}>{children}</select><ChevronDown size={14} aria-hidden="true" /></div>;
 }
 
-export default function ProviderSettings({ profiles, officialAgents, order, busy, updated }: { profiles: AgentProfile[]; officialAgents: string[]; order?: ConnectionOrder; busy: boolean; updated: (resetAgent?: string) => Promise<void> }) {
+export default function ProviderSettings({ profiles, officialAgents, order, busy, updated, initialAgent = 'claude' }: { profiles: AgentProfile[]; officialAgents: string[]; order?: ConnectionOrder; busy: boolean; updated: (resetAgent?: string) => Promise<void>; initialAgent?: string }) {
   const [adding, setAdding] = useState(false);
-  const [apiConnections, setApiConnections] = useState(false);
+  const [managingAccounts, setManagingAccounts] = useState(false);
   const [importing, setImporting] = useState(false);
-  const [agentTab, setAgentTab] = useState('claude');
+  const [agentTab, setAgentTab] = useState(initialAgent);
   const [nativeId, setNativeId] = useState<string | null>(null);
   const [dragId, setDragId] = useState('');
   const [dropTarget, setDropTarget] = useState<{ id: string; edge: 'before' | 'after' } | null>(null);
@@ -38,13 +39,11 @@ export default function ProviderSettings({ profiles, officialAgents, order, busy
   const [deleteId, setDeleteId] = useState('');
   const [account, setAccount] = useState<Record<string, { loggedIn: boolean; method?: string; plan?: string }>>({});
   const [accountsChecking, setAccountsChecking] = useState(desktop);
-  const [login, setLogin] = useState<{ agent: string; id?: string } | null>(() => { try { return JSON.parse(sessionStorage.getItem('supercode.pendingLogin') ?? 'null'); } catch { return null; } });
-  useEffect(() => { if (login) sessionStorage.setItem('supercode.pendingLogin', JSON.stringify(login)); else sessionStorage.removeItem('supercode.pendingLogin'); }, [login]);
   useEffect(() => {
     if (!desktop) return;
     let disposed = false;
     void call<AccountStatus[]>('list_provider_accounts', { force: false }).then(rows => {
-      if (!disposed) { setAccount(previous => ({ ...Object.fromEntries(rows.map(row => [row.agent, row])), ...previous })); const errors = rows.filter(row => row.error).map(row => row.error); if (errors.length) setError(errors.join('；')); }
+      if (!disposed) { setAccount(previous => ({ ...Object.fromEntries(rows.map(row => [row.connectionId ?? row.agent, row])), ...previous })); const errors = rows.filter(row => row.error).map(row => row.error); if (errors.length) setError(errors.join('；')); }
     }).catch(e => { if (!disposed) setError(String(e)); }).finally(() => { if (!disposed) setAccountsChecking(false); });
     return () => { disposed = true; };
   }, []);
@@ -52,30 +51,29 @@ export default function ProviderSettings({ profiles, officialAgents, order, busy
     setAccountsChecking(true);
     try {
       const rows = await call<AccountStatus[]>('list_provider_accounts', { force: true });
-      setAccount(Object.fromEntries(rows.map(row => [row.agent, row])));
+      setAccount(Object.fromEntries(rows.map(row => [row.connectionId ?? row.agent, row])));
       const failed = rows.filter(row => row.error);
       if (failed.length) throw new Error(failed.map(row => row.error).join('；'));
     } finally { setAccountsChecking(false); }
   }
   const active = config ? profiles.find(p => p.id === config.id)?.current : false;
-  const provider = providers.find(p => p.id === config?.providerId);
+  const provider = providersForAgent(providers, config?.agent ?? agentTab).find(p => p.id === config?.providerId);
   const completeIds = connectionIds(agentTab, profiles, officialAgents, order);
-  const loggedInAgents = Object.keys(account).filter(agent => account[agent].loggedIn);
+  const loggedInAgents = Object.keys(account).filter(id => account[id].loggedIn);
   const ids = visibleProviderIds(agentTab, profiles, loggedInAgents, order);
   const visibleConnections = ids.map((id, index) => {
     const p = profiles.find(p => p.agent === agentTab && p.id === id);
     const native = nativeConnectionSource(agentTab, id);
     const name = p?.name ?? native.connectionName!;
-    const subtitle = p ? `${p.model ?? '沿用 CLI 模型'}${p.source === 'ccswitch' ? ' · CC Switch 导入' : ''}` : id === '@official' ? '使用本机官方登录' : '沿用本机模型与供应商';
+    const subtitle = p?.officialAccount ? p.accountId ? '官方账号 · 独立登录' : '使用本机官方登录' : p ? `${p.model ?? '沿用 CLI 模型'}${p.source === 'ccswitch' ? ' · CC Switch 导入' : ''}` : id === '@official' ? '使用本机官方登录' : '沿用本机模型与供应商';
     return { id, index, p, native, name, subtitle, isDefault: completeIds[0] === id };
   }).filter(c => `${c.name} ${c.subtitle} ${c.p?.modelSource?.providerName ?? ''}`.toLowerCase().includes(connectionSearch.trim().toLowerCase()));
   const sortingDisabled = !desktop || working || !!connectionSearch.trim();
-  const nativeAccountPicker = ['codex', 'claude'].includes(agentTab) && !apiConnections;
-  const pickerProviders = providers.map(p => {
-    const officialAgent = nativeAccountPicker ? p.id === 'openai' ? 'codex' : p.id === 'anthropic' ? 'claude' : null : null;
-    const name = officialAgent ? nativeConnectionSource(officialAgent, '@official').connectionName! : p.id === 'openai' ? 'OpenAI API' : p.id === 'anthropic' ? 'Anthropic API' : p.name;
-    const subtitle = officialAgent ? account[officialAgent]?.loggedIn ? '已登录 · 使用本机账号' : '浏览器登录 · 无需 API Key' : `${p.category} · ${p.presets.some(v => /coding|token/.test(v.id)) ? 'Coding Plan / API' : p.category === '自定义' ? '兼容 API' : '标准 API'}`;
-    return { p, officialAgent, name, subtitle };
+  const official = officialProvider(agentTab);
+  const pickerProviders = providersForAgent(providers, agentTab).map(p => {
+    const name = p.id === 'openai' ? 'OpenAI API' : p.id === 'anthropic' ? 'Anthropic API' : p.name;
+    const subtitle = `${p.category} · ${p.presets.some(v => /coding|token/.test(v.id)) ? 'Coding Plan / API' : p.category === '自定义' ? '兼容 API' : '标准 API'}`;
+    return { p, name, subtitle };
   }).filter(({ p, name, subtitle }) => `${p.name} ${name} ${subtitle}`.toLowerCase().includes(search.trim().toLowerCase()));
   function clearDrag() { pointerDrag.current = null; setDragId(''); setDropTarget(null); }
   function dragMove(e: PointerEvent<HTMLButtonElement>) {
@@ -114,10 +112,7 @@ export default function ProviderSettings({ profiles, officialAgents, order, busy
     if (target) void reorder(moveConnection(ids, id, target, direction === -1 ? 'before' : 'after'));
   }
   function accountControls(agent: string) {
-    return <div className="provider-account-controls"><p className="muted">{account[agent]?.loggedIn ? `已登录 · ${account[agent].plan ?? account[agent].method ?? '官方账号'}` : account[agent] ? '本机官方账号未登录' : '使用本机官方登录，凭据由 CLI 管理。'}</p><div className="account-actions">
-      <button className="quiet-button" disabled={!desktop || working || busy} onClick={() => void run(async () => { const result = await call<{ loggedIn: boolean }>('official_account_status', { agent }); setAccount(a => ({ ...a, [agent]: result })); setMessage(result.loggedIn ? '本机账号已登录' : '本机账号未登录'); })}>检查登录</button>
-      <button className="quiet-button" disabled={!desktop || working || busy || !!login} onClick={() => void run(async () => { const result = await call<{ loginId?: string; message: string }>('start_official_login', { agent }); setLogin({ agent, id: result.loginId }); await updated(); setMessage(result.message); })}><ExternalLink size={13} />登录</button>
-    </div></div>;
+    return <button className="quiet-button" disabled={working || busy} onClick={() => { setAgentTab(agent); setManagingAccounts(true); setConfig(null); setNativeId(null); }}>管理官方账号</button>;
   }
   async function run(action: () => Promise<void>) {
     setWorking(true); setMessage(''); setError('');
@@ -125,20 +120,8 @@ export default function ProviderSettings({ profiles, officialAgents, order, busy
   }
   function choose(p: Provider, presetId = p.presets[0].id) {
     const preset = p.presets.find(p => p.id === presetId)!;
-    setConfig({ ...blank, providerId: p.id, plan: preset.id, name: p.id === 'custom' ? '自定义连接' : `${p.name} · ${preset.name}`, protocol: preset.protocol, agent: ['opencode', 'pi'].includes(agentTab) ? agentTab : preset.protocol === 'responses' ? 'codex' : 'claude', baseUrl: preset.baseUrl, model: preset.models[0] ?? '', models: preset.models });
+    setConfig({ ...blank, providerId: p.id, plan: preset.id, name: p.id === 'custom' ? '自定义连接' : `${p.name} · ${preset.name}`, protocol: preset.protocol, agent: agentTab, baseUrl: preset.baseUrl, model: preset.models[0] ?? '', models: preset.models });
     setAdding(false); setNativeId(null); setModelSearch(''); setNewModel(''); setError(''); setMessage('');
-  }
-  async function chooseOfficial(agent: string) {
-    setAgentTab(agent); setConfig(null); setNativeId(null);
-    const status = account[agent] ?? await call<AccountStatus>('official_account_status', { agent });
-    setAccount(previous => ({ ...previous, [agent]: status }));
-    if (status.loggedIn) {
-      await call('use_official_account', { agent });
-      await updated(agent); setAdding(false); setNativeId('@official'); setMessage('已使用本机官方账号');
-    } else {
-      const result = await call<{ loginId?: string; message: string }>('start_official_login', { agent });
-      setLogin({ agent, id: result.loginId }); setMessage(result.message);
-    }
   }
   async function save(activate = false) {
     if (!config) return;
@@ -149,13 +132,16 @@ export default function ProviderSettings({ profiles, officialAgents, order, busy
     return saved.id;
   }
   return <div className="provider-settings">
-    <div className="settings-page-heading"><h2>模型供应商</h2><div>{!desktop ? <span className="preview-label" title="预览模式不保存密钥，不调用模型">预览</span> : null}<button className="quiet-button" disabled={!desktop || working || accountsChecking} onClick={() => void run(async () => { await refreshAccounts(); await updated(); })}><RefreshCw size={15} className={accountsChecking ? 'spin' : ''}/>{accountsChecking ? '检查中…' : '刷新连接'}</button><button className="quiet-button" disabled={working || busy} onClick={() => { setImporting(true); setConfig(null); setNativeId(null); setAdding(false); setError(''); setMessage(''); }}><Download size={15} />CC Switch 导入</button><button className="primary-button" disabled={working || busy} onClick={() => { setAdding(true); setApiConnections(false); setImporting(false); setConfig(null); setNativeId(null); setSearch(''); setError(''); setMessage(''); }}><Plus size={15} />添加</button></div></div>
+    <div className="settings-page-heading"><h2>模型供应商</h2><div>{!desktop ? <span className="preview-label" title="预览模式不保存密钥，不调用模型">预览</span> : null}<button className="quiet-button" disabled={!desktop || working || accountsChecking} onClick={() => void run(async () => { await refreshAccounts(); await updated(); })}><RefreshCw size={15} className={accountsChecking ? 'spin' : ''}/>{accountsChecking ? '检查中…' : '刷新连接'}</button><button className="quiet-button" disabled={working || busy} onClick={() => { setImporting(true); setManagingAccounts(false); setConfig(null); setNativeId(null); setAdding(false); setError(''); setMessage(''); }}><Download size={15} />CC Switch 导入</button><button className="primary-button" disabled={working || busy} onClick={() => { setAdding(true); setManagingAccounts(false); setImporting(false); setConfig(null); setNativeId(null); setSearch(''); setError(''); setMessage(''); }}><Plus size={15} />添加</button></div></div>
+    <div className="provider-tabs" role="tablist" aria-label="按 Agent 分类">{providerAgents.map(a => <button key={a.id} role="tab" id={`providers-${a.id}-tab`} aria-controls="provider-connections" aria-selected={agentTab === a.id} className={agentTab === a.id ? 'selected' : ''} disabled={working || managingAccounts} onClick={() => { setAgentTab(a.id); setConfig(null); setNativeId(null); setConnectionSearch(''); setSearch(''); setMessage(''); clearDrag(); }}><AgentIcon agent={a.id}/>{a.name}<span>{visibleProviderIds(a.id, profiles, loggedInAgents, order).length}</span></button>)}</div>
     {error ? <p className="cc-error" role="alert">{error}</p> : null}
     {message ? <p className="provider-feedback" role="status"><Check size={15} />{message}</p> : null}
-    <div className="provider-view">{importing ? <Suspense fallback={<p className="muted">加载中…</p>}><CCSwitchSettings busy={busy || working} updated={updated} back={() => setImporting(false)} /></Suspense> : adding ? <div className="provider-picker">
-      <div className="provider-picker-heading"><h3>添加连接</h3>{['codex', 'claude'].includes(agentTab) ? <button className="quiet-button" disabled={working || busy} onClick={() => setApiConnections(value => !value)}>{apiConnections ? '使用官方账号' : '使用 API Key'}</button> : null}<button className="quiet-button" disabled={working} onClick={() => setAdding(false)}><ArrowLeft size={15} />返回</button></div>
+    <div className="provider-view">{importing ? <Suspense fallback={<p className="muted">加载中…</p>}><CCSwitchSettings busy={busy || working} updated={updated} back={() => setImporting(false)} /></Suspense> : managingAccounts ? <OfficialAccounts agent={agentTab} busy={busy} back={() => { setManagingAccounts(false); setAdding(false); }} updated={async resetAgent => { await refreshAccounts(); await updated(resetAgent); }}/> : adding ? <div className="provider-picker">
+      <div className="provider-picker-heading"><h3>添加 {providerAgents.find(a => a.id === agentTab)?.name} 连接</h3><button className="quiet-button" disabled={working} onClick={() => setAdding(false)}><ArrowLeft size={15} />返回</button></div>
+      {official ? <div className="provider-official-section"><h4>官方账号</h4><button className="provider-preset official-login-card" disabled={working || busy || !desktop} onClick={() => { setManagingAccounts(true); setAdding(false); setError(''); setMessage(''); }}><span className={`provider-mark mark-${official.id}`}><ProviderIcon provider={official.id}/></span><span><strong>{official.name}</strong><small>浏览器登录 · 支持多个账号</small></span><ChevronRight size={16}/></button></div> : null}
+      <div className="provider-api-heading"><h4>{official ? '第三方 / API 连接' : 'API 连接'}</h4><span>{agentProtocols[agentTab].map(id => protocolLabels[id]).join(' / ')}</span></div>
       <div className="search-field"><Search size={16} /><input autoFocus value={search} onChange={e => setSearch(e.target.value)} placeholder="搜索供应商" aria-label="搜索供应商" /></div>
-      <div className="provider-preset-grid">{pickerProviders.map(({ p, officialAgent, name, subtitle }) => <button key={p.id} className="provider-preset" disabled={working || busy || !!officialAgent && (!desktop || !!login)} onClick={() => officialAgent ? void run(() => chooseOfficial(officialAgent)) : choose(p)}><span className={`provider-mark mark-${p.id}`}><ProviderIcon provider={p.id} name={name} mark={p.mark}/></span><span><strong>{name}</strong><small>{subtitle}</small></span>{officialAgent ? <ExternalLink size={15} /> : <ChevronRight size={15} />}</button>)}</div>
+      <div className="provider-preset-grid">{pickerProviders.map(({ p, name, subtitle }) => <button key={p.id} className="provider-preset" disabled={working || busy} onClick={() => choose(p)}><span className={`provider-mark mark-${p.id}`}><ProviderIcon provider={p.id} name={name} mark={p.mark}/></span><span><strong>{name}</strong><small>{subtitle}</small></span><ChevronRight size={15} /></button>)}</div>
       {!pickerProviders.length ? <p className="muted">无匹配供应商</p> : null}
     </div> : nativeId ? <div className="provider-native-editor">
       <button className="quiet-button" disabled={working} onClick={() => setNativeId(null)}><ArrowLeft size={15} />{providerAgents.find(a => a.id === agentTab)?.name}</button>
@@ -168,8 +154,8 @@ export default function ProviderSettings({ profiles, officialAgents, order, busy
         <h3>连接</h3>
         <label htmlFor="provider-name">连接名称</label><input id="provider-name" value={config.name} disabled={working || busy} onChange={e => setConfig({ ...config, name: e.target.value })} autoComplete="off" />
         {config.official ? accountControls(config.agent) : <>
-        {config.providerId !== 'custom' ? <><label htmlFor="provider-plan" title="切换套餐将新建连接，需要对应的 API Key">套餐 / 接入方式</label><SelectControl id="provider-plan" value={config.plan} disabled={working || busy} onChange={e => { if (provider) { const p = provider.presets.find(p => p.id === e.target.value)!; setConfig({ ...config, name: provider.presets.some(v => config.name === `${provider.name} · ${v.name}`) ? `${provider.name} · ${p.name}` : config.name, plan: p.id, protocol: p.protocol, baseUrl: p.baseUrl, agent: ['opencode', 'pi'].includes(config.agent) ? config.agent : p.protocol === 'responses' ? 'codex' : 'claude', model: p.models[0] ?? '', models: p.models, apiKey: '', hasCredential: false, id: null }); } }}>{provider?.presets.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}{!provider?.presets.some(p => p.id === config.plan) ? <option value={config.plan}>导入的配置</option> : null}</SelectControl></> : null}
-        <label htmlFor="provider-protocol">API 协议</label><SelectControl id="provider-protocol" value={config.protocol} disabled={working || busy || !!config.id} onChange={e => setConfig({ ...config, protocol: e.target.value, plan: config.providerId === 'custom' ? e.target.value : config.plan, agent: ['opencode', 'pi'].includes(config.agent) ? config.agent : e.target.value === 'responses' ? 'codex' : 'claude' })}>{Object.entries(protocolLabels).map(([id, name]) => <option key={id} value={id}>{name}</option>)}</SelectControl>
+        {config.providerId !== 'custom' ? <><label htmlFor="provider-plan" title="切换套餐将新建连接，需要对应的 API Key">套餐 / 接入方式</label><SelectControl id="provider-plan" value={config.plan} disabled={working || busy} onChange={e => { if (provider) { const p = provider.presets.find(p => p.id === e.target.value)!; setConfig({ ...config, name: provider.presets.some(v => config.name === `${provider.name} · ${v.name}`) ? `${provider.name} · ${p.name}` : config.name, plan: p.id, protocol: p.protocol, baseUrl: p.baseUrl, model: p.models[0] ?? '', models: p.models, apiKey: '', hasCredential: false, id: null }); } }}>{provider?.presets.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}{!provider?.presets.some(p => p.id === config.plan) ? <option value={config.plan}>导入的配置</option> : null}</SelectControl></> : null}
+        <label htmlFor="provider-protocol">API 协议</label>{agentProtocols[config.agent].length === 1 && agentProtocols[config.agent].includes(config.protocol) ? <div className="provider-fixed-protocol" id="provider-protocol">{protocolLabels[config.protocol]}</div> : <SelectControl id="provider-protocol" value={config.protocol} disabled={working || busy || !!config.id} onChange={e => setConfig({ ...config, protocol: e.target.value, plan: config.providerId === 'custom' ? e.target.value : config.plan })}>{agentProtocols[config.agent].map(id => <option key={id} value={id}>{protocolLabels[id]}</option>)}{!agentProtocols[config.agent].includes(config.protocol) ? <option value={config.protocol}>{protocolLabels[config.protocol]}（已有连接）</option> : null}</SelectControl>}
         <label htmlFor="provider-url">Base URL</label><input id="provider-url" className="code-input" value={config.baseUrl} disabled={working || busy} onChange={e => setConfig({ ...config, baseUrl: e.target.value })} placeholder="https://api.example.com/v1" spellCheck={false} autoComplete="off" />
         <label htmlFor="provider-key" title="Windows 使用本机用户加密保存密钥">API Key {config.hasCredential ? <span className="credential-saved"><Check size={12} />已保存</span> : null}</label><CredentialInput key={config.id ?? 'new'} id="provider-key" saved={config.hasCredential} revision={credentialRevision} value={config.apiKey ?? ''} disabled={working || busy} onChange={apiKey => setConfig({ ...config, apiKey })} />
         </>}
@@ -186,7 +172,6 @@ export default function ProviderSettings({ profiles, officialAgents, order, busy
       {config.id ? <div className="provider-delete">{deleteId === config.id ? <><span>删除连接？</span><button className="quiet-button" onClick={() => setDeleteId('')}>取消</button><button className="danger-button" disabled={working || busy} onClick={() => void run(async () => { await call('delete_provider_profile', { id: config.id }); setConfig(null); setDeleteId(''); await updated(); setMessage('已删除'); })}>删除</button></> : <button className="quiet-button" disabled={working || busy} onClick={() => setDeleteId(config.id!)}><Trash2 size={14} />删除</button>}</div> : <span />}
       <div className="provider-save-actions">{working ? <LoaderCircle size={15} className="spin" /> : null}<button className="quiet-button" disabled={!desktop || working || busy || !config.model.trim() || (!config.official && !config.baseUrl.trim())} title="先保存，再发送测试请求；按供应商规则计费" onClick={() => void run(async () => { const id = await save(); if (!id) return; const result = await call<{ model: string }>('test_provider_connection', { id }); setMessage(config.official ? '官方账号可用' : `连接成功 · ${result.model}`); })}>{config.official ? '检查账号' : '测试'}</button><button className="quiet-button" disabled={!desktop || working || busy || !config.model.trim()} onClick={() => void run(async () => { await save(); })}>保存</button><button className="primary-button" disabled={!desktop || working || busy || !config.model.trim()} onClick={() => void run(async () => { await save(true); })}>保存为默认</button></div></div>
     </div> : <div className="provider-overview">
-      <div className="provider-tabs" role="tablist" aria-label="按 Agent 分类">{providerAgents.map(a => <button key={a.id} role="tab" id={`providers-${a.id}-tab`} aria-controls="provider-connections" aria-selected={agentTab === a.id} className={agentTab === a.id ? 'selected' : ''} disabled={working} onClick={() => { setAgentTab(a.id); setConnectionSearch(''); setMessage(''); clearDrag(); }}><AgentIcon agent={a.id}/>{a.name}<span>{visibleProviderIds(a.id, profiles, loggedInAgents, order).length}</span></button>)}</div>
       <div className="search-field"><Search size={15} /><input aria-label="搜索模型连接" placeholder="搜索连接或模型" value={connectionSearch} onChange={e => { setConnectionSearch(e.target.value); clearDrag(); }} /></div>
       <p className="provider-order-hint">{connectionSearch.trim() ? '清空搜索后可调整顺序' : !ids.length ? accountsChecking && ['codex', 'claude'].includes(agentTab) ? '正在检查本机官方登录…' : '添加连接或从 CC Switch 导入' : `拖动调整顺序并设置 ${providerAgents.find(a => a.id === agentTab)?.name} 新聊天默认`}</p>
       <div ref={providerList} className="provider-scroll" id="provider-connections" role="tabpanel" aria-labelledby={`providers-${agentTab}-tab`}>
@@ -197,9 +182,9 @@ export default function ProviderSettings({ profiles, officialAgents, order, busy
               onPointerDown={e => { if (sortingDisabled || e.button !== 0) return; e.currentTarget.setPointerCapture(e.pointerId); pointerDrag.current = { id, y: e.clientY, pointerId: e.pointerId, active: false }; }}
               onPointerMove={dragMove} onPointerUp={dragEnd} onPointerCancel={clearDrag} onLostPointerCapture={clearDrag}
               onKeyDown={e => { if (e.altKey && ['ArrowUp', 'ArrowDown'].includes(e.key)) { e.preventDefault(); move(id, e.key === 'ArrowUp' ? -1 : 1); } }}><GripVertical size={16}/></button>
-            <button type="button" className="saved-provider" disabled={working || busy || !desktop} onClick={() => void run(async () => { if (p) setConfig(await call<Config>('get_provider_profile', { id })); else setNativeId(id); setMessage(''); })}>
+            <button type="button" className="saved-provider" disabled={working || busy || !desktop} onClick={() => void run(async () => { if (id === '@official' || p?.officialAccount) setManagingAccounts(true); else if (p) setConfig(await call<Config>('get_provider_profile', { id })); else setNativeId(id); setMessage(''); })}>
               <span className={`provider-mark mark-${p?.providerId ?? native.providerId}`}>{id === '@local' ? <AgentIcon agent={agentTab}/> : <ProviderIcon provider={p?.officialAccount ? (agentTab === 'claude' ? 'anthropic' : 'openai') : p?.modelSource?.providerId ?? p?.providerId ?? native.providerId} name={name} mark={p?.modelSource?.mark ?? p?.name.slice(0, 1).toUpperCase() ?? native.mark}/>}</span>
-              <span><strong>{name}</strong><small>{subtitle}</small></span><span className={`connection-state ${isDefault ? 'enabled' : ''}`}>{isDefault ? '新聊天默认' : p ? p.officialAccount ? '本机登录' : p.hasCredential ? '已配置' : '未保存密钥' : '本机登录'}</span><ChevronRight size={16}/>
+              <span><strong>{name}</strong><small>{subtitle}</small></span><span className={`connection-state ${isDefault ? 'enabled' : ''}`}>{isDefault ? '新聊天默认' : p ? p.officialAccount ? '官方登录' : p.hasCredential ? '已配置' : '未保存密钥' : '本机登录'}</span><ChevronRight size={16}/>
             </button>
             <div className="provider-order-actions"><button type="button" className="icon-button" aria-label={`上移 ${name}`} title="上移" disabled={sortingDisabled || index === 0} onClick={() => move(id, -1)}><ArrowUp size={14}/></button><button type="button" className="icon-button" aria-label={`下移 ${name}`} title="下移" disabled={sortingDisabled || index === ids.length - 1} onClick={() => move(id, 1)}><ArrowDown size={14}/></button></div>
           </div>;
@@ -207,7 +192,6 @@ export default function ProviderSettings({ profiles, officialAgents, order, busy
         {!visibleConnections.length ? <p className="empty-filter">{connectionSearch.trim() ? '没有匹配的连接' : '暂无已配置连接'}</p> : null}
       </div>
     </div>}
-    {login ? <div className="login-progress"><span>等待浏览器登录</span><button className="quiet-button" disabled={working} onClick={() => void run(async () => { const status = await call<{ loggedIn: boolean }>('official_account_status', { agent: login.agent }); setAccount(a => ({ ...a, [login.agent]: status })); if (status.loggedIn) { setLogin(null); setAdding(false); await updated(); setMessage('已登录'); } else setMessage('未完成登录'); })}>检查登录</button><button className="quiet-button" disabled={working} onClick={() => void run(async () => { await call('cancel_official_login', { agent: login.agent, loginId: login.id ?? null }); setLogin(null); setMessage('已取消'); })}>取消</button></div> : null}
     </div>
   </div>;
 }

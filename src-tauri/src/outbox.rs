@@ -176,7 +176,9 @@ pub async fn enqueue_followup(
     // Inserts are serialized by SQLite. Do not wait for a slow agent startup
     // just to save another follow-up in the input box.
     let store = &app.state::<AppState>().store;
-    validate(&payload, &store.session(&session_id)?)?;
+    let session = store.session(&session_id)?;
+    validate(&payload, &session)?;
+    crate::chat_connection::check(&app, &session.agent, Some(&session_id), None).await?;
     let id = store.put_followup(&session_id, &payload)?;
     changed(&app);
     Ok(id)
@@ -216,6 +218,8 @@ pub async fn change_followup(
         }
         "pause" => store.update_followup(&id, "paused", None)?,
         "resume" => {
+            let session = store.session(&row.session_id)?;
+            crate::chat_connection::check(&app, &session.agent, Some(&session.id), None).await?;
             store.0.lock().map_err(|e|e.to_string())?.execute("UPDATE followups SET status='queued',error=NULL WHERE session_id=?1 AND status IN ('paused','failed')",[row.session_id]).map_err(|e|e.to_string())?;
         }
         _ => return Err("未知的排队操作".into()),
@@ -259,6 +263,7 @@ pub async fn steer_followup(
         return Err("当前任务已结束或变化，请继续排队发送".into());
     }
     validate(&row.payload, &session)?;
+    crate::chat_connection::check(&app, &session.agent, Some(&session.id), None).await?;
     store.update_followup(&id, "steering", None)?;
     let native_mode = session.agent == "claude"
         || session.agent == "pi"

@@ -7,7 +7,7 @@ export function connectionIds(agent: string, profiles: AgentProfile[], officialA
   const saved = order?.[agent];
   const own = profiles.filter(p => p.agent === agent);
   const defaultId = own.find(p => p.current)?.id ?? (officialAgents.includes(agent) ? '@official' : '@local');
-  const canonical = (id: string) => agent === 'codex' && (id === '@local' || own.some(p => p.id === id && p.officialAccount)) ? '@official' : id;
+  const canonical = (id: string) => agent === 'codex' && (id === '@local' || own.some(p => p.id === id && p.officialAccount && !p.accountId)) ? '@official' : id;
   const nativeIds = ['opencode', 'pi'].includes(agent) ? ['@local'] : ['@official'];
   const available = new Set([...own.map(p => canonical(p.id)), ...nativeIds]);
   if (agent !== 'codex' && (saved?.includes('@local') || !saved && defaultId === '@local')) available.add('@local');
@@ -28,7 +28,7 @@ export function visibleProviderIds(agent: string, profiles: AgentProfile[], logg
     if (id === '@local') return false;
     if (id === '@official') return loggedIn;
     const profile = profiles.find(p => p.agent === agent && p.id === id);
-    return !!profile && (!profile.officialAccount || loggedIn);
+    return !!profile && (!profile.officialAccount || (profile.accountId ? loggedInAgents.includes(id) : loggedIn));
   });
 }
 

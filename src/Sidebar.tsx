@@ -2,7 +2,7 @@ import { useEffect, useId, useLayoutEffect, useRef, useState, type Dispatch, typ
 import { createPortal } from 'react-dom';
 import { Archive, Check, ChevronRight, Copy, Download, ExternalLink, Eye, EyeOff, Folder, FolderClosed, FolderOpen, FolderInput, GitFork, List, LoaderCircle, MoreHorizontal, PanelTop, Pencil, Pin, PinOff, Plus, Settings2, Share2, SquarePen, Terminal, Trash2, X, type LucideIcon } from 'lucide-react';
 import { call, desktop } from './api';
-import { exportFilename, projectSessions, sidebarGroups } from './sidebarState';
+import { exportFilename, projectSessions, sidebarAreas, type SidebarGroup } from './sidebarState';
 import { isActive, type ArchivedSession, type Project, type Session, type SidebarSection, type SidebarState } from './types';
 import { SessionIndicator } from './SessionIndicator';
 
@@ -15,7 +15,7 @@ export interface SidebarProps {
   projects: Project[]; sessions: Session[]; state: SidebarState; projectId: string; sessionId: string; ready: boolean; blocked: boolean;
   collapsed: Set<string>; setCollapsed: Dispatch<SetStateAction<Set<string>>>;
   selectProject: (project: Project) => void; selectSession: (session: Session) => void | Promise<void>;
-  addProject: () => void; createSession: (project: Project) => Promise<void>; updated: () => Promise<void>; dialogChanged: (open: boolean) => void;
+  addProject: () => void; createSession: (project?: Project) => Promise<void>; updated: () => Promise<void>; dialogChanged: (open: boolean) => void;
 }
 
 export function Sidebar(props: SidebarProps) {
@@ -217,7 +217,7 @@ export function Sidebar(props: SidebarProps) {
     const meta = state.sessions[session.id];
     return <div className={`sidebar-chat-row ${session.id === sessionId ? 'selected' : ''} ${meta?.unread && !isActive(session.status) ? 'unread' : ''}`} key={session.id} onContextMenu={e => show(e, { kind: 'session', item: session })}>
       <button className={`session-row ${session.id === sessionId ? 'selected' : ''}`} aria-current={session.id === sessionId ? 'page' : undefined} onClick={() => void selectSession(session)} title={session.title}>
-        <span className="session-title">{session.title}{standalone ? <small>{projects.find(p => p.id === session.projectId)?.name}</small> : null}</span><SessionIndicator status={session.status} unread={meta?.unread}/>{session.status === 'waiting' ? <span className="waiting-badge" aria-label="需要确认">!</span> : null}
+        <span className="session-title">{session.title}{standalone && session.projectId ? <small>{projects.find(p => p.id === session.projectId)?.name}</small> : null}</span><SessionIndicator status={session.status} unread={meta?.unread}/>{session.status === 'waiting' ? <span className="waiting-badge" aria-label="需要确认">!</span> : null}
       </button>
       <button className="sidebar-row-menu" aria-label={`${session.title} 的菜单`} onClick={e => show(e, { kind: 'session', item: session }, true)}><MoreHorizontal size={15}/></button>
     </div>;
@@ -242,15 +242,26 @@ export function Sidebar(props: SidebarProps) {
       {expanded ? <div className="session-list">{projectSessions(project.id, sessions, state).map(s => chatRow(s))}</div> : null}
     </div>;
   }
-  const groups = sidebarGroups(projects, sessions, state);
+  function renderGroup(group: SidebarGroup, direct = false) {
+    return <section className="sidebar-group" key={group.id} aria-label={group.name}>
+      {group.id !== 'default' && !(direct && group.id === 'recent') ? <div className="sidebar-group-heading" onContextMenu={e => { const section = state.sections.find(s => s.id === group.id); if (section) show(e, { kind: 'section', item: section }); }}>{group.id === 'pinned' ? <Pin size={12}/> : <List size={12}/>}<span>{group.name}</span>{state.sections.some(s => s.id === group.id) ? <button className="sidebar-row-menu" aria-label={`${group.name} 的分区菜单`} onClick={e => show(e, { kind: 'section', item: state.sections.find(s => s.id === group.id)! }, true)}><MoreHorizontal size={14}/></button> : null}</div> : null}
+      {group.projects.map(projectRow)}{group.sessions.map(s => chatRow(s, true))}{!group.projects.length && !group.sessions.length ? <span className="sidebar-group-empty">暂无内容</span> : null}
+    </section>;
+  }
+  const areas = sidebarAreas(projects, sessions, state);
   const dialogTitle = dialog?.kind === 'rename' ? '重命名聊天' : dialog?.kind === 'edit' ? '编辑项目' : dialog?.kind === 'section' ? dialog.section ? '重命名分区' : '新建分区' : dialog?.kind === 'delete' ? '永久删除聊天' : dialog?.kind === 'remove' ? '移除项目' : dialog?.kind === 'archiveProject' ? '归档项目聊天' : dialog?.kind === 'share' ? '分享聊天' : '已归档聊天';
   const shownArchives = archives.filter(row => `${row.session.title} ${row.projectName}`.toLowerCase().includes(archiveSearch.toLowerCase()));
   return <>
-    <div className="sidebar-section-label"><span>项目</span><div><button className="icon-button" aria-label="侧栏管理" onClick={e => show(e, { kind: 'root' }, true)}><MoreHorizontal size={15}/></button><button className="icon-button" title="添加项目" onClick={addProject}><Plus size={15}/></button></div></div>
-    <div className="project-list sidebar-items">{!ready ? <div className="sidebar-loading" role="status">正在加载项目…</div> : groups.map(group => <section className="sidebar-group" key={group.id} aria-label={group.name}>
-      {group.id !== 'default' ? <div className="sidebar-group-heading" onContextMenu={e => { const section = state.sections.find(s => s.id === group.id); if (section) show(e, { kind: 'section', item: section }); }}>{group.id === 'pinned' ? <Pin size={12}/> : <List size={12}/>}<span>{group.name}</span>{state.sections.some(s => s.id === group.id) ? <button className="sidebar-row-menu" aria-label={`${group.name} 的分区菜单`} onClick={e => show(e, { kind: 'section', item: state.sections.find(s => s.id === group.id)! }, true)}><MoreHorizontal size={14}/></button> : null}</div> : null}
-      {group.projects.map(projectRow)}{group.sessions.map(s => chatRow(s, true))}{!group.projects.length && !group.sessions.length ? <span className="sidebar-group-empty">暂无内容</span> : null}
-    </section>)}{ready && !projects.length ? <button className="empty-project" onClick={addProject}><FolderOpen size={22}/><span>添加项目</span></button> : null}</div>
+    <div className="sidebar-navigation">
+      <section className="sidebar-projects sidebar-region" aria-label="项目列表">
+        <div className="sidebar-section-label"><span>项目</span><div><button className="icon-button" aria-label="侧栏管理" onClick={e => show(e, { kind: 'root' }, true)}><MoreHorizontal size={15}/></button><button className="icon-button" title="添加项目" onClick={addProject}><Plus size={15}/></button></div></div>
+        <div className="project-list sidebar-items">{!ready ? <div className="sidebar-loading" role="status">正在加载项目…</div> : areas.projects.map(group => renderGroup(group))}{ready && !projects.length ? <button className="empty-project" onClick={addProject}><FolderOpen size={22}/><span>添加项目</span></button> : null}</div>
+      </section>
+      <section className="sidebar-direct sidebar-region" aria-label="直接对话">
+        <div className="sidebar-section-label"><span>直接对话</span><div><button className="icon-button" aria-label="新建直接对话" title="新建直接对话" disabled={!ready || blocked} onClick={() => void createSession()}><Plus size={15}/></button></div></div>
+        <div className="project-list sidebar-items">{!ready ? <div className="sidebar-loading" role="status">正在加载对话…</div> : areas.direct.length ? areas.direct.map(group => renderGroup(group, true)) : <span className="sidebar-direct-empty">暂无对话</span>}</div>
+      </section>
+    </div>
     {error && !menu && !dialog ? <div className="sidebar-action-error" role="alert"><span>{error}</span><button className="icon-button" title="关闭提示" onClick={() => setError('')}><X size={13}/></button></div> : null}
     {menu ? createPortal(<div ref={popup} className="sidebar-context-menu" role="menu" aria-label={menu.target.kind === 'project' ? '项目操作' : menu.target.kind === 'session' ? '聊天操作' : '分区操作'} style={{ left: menu.x, top: menu.y }} onKeyDown={navigate}>
       {renderItems(menuItems(menu.target))}{feedback ? <div className="sidebar-menu-feedback" role="status">{feedback}</div> : null}{error ? <div className="resource-menu-error" role="alert">{error}</div> : null}

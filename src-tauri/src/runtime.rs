@@ -171,8 +171,16 @@ impl Runtime {
         app: &AppHandle,
         session_id: Option<&str>,
     ) -> Result<Arc<Client>, String> {
+        self.get_for_connection(app, session_id, None).await
+    }
+    pub async fn get_for_connection(
+        &self,
+        app: &AppHandle,
+        session_id: Option<&str>,
+        connection_id: Option<&str>,
+    ) -> Result<Arc<Client>, String> {
         crate::desktop_lifecycle::ensure_running(app)?;
-        let route = app.state::<AppState>().store.route("codex", session_id)?;
+        let route = app.state::<AppState>().store.route_with_connection("codex", session_id, connection_id)?;
         let routing = route.fingerprint();
         let project = session_id
             .map(|id| {
@@ -261,6 +269,10 @@ impl Client {
             args.extend(["-c", override_value.as_str()]);
         }
         let mut command = process::command(&executable, &args);
+        crate::official_accounts::configure(&mut command, &app, "codex", &route.config)?;
+        if route.config["official"] == true || route.profile.as_ref().is_some_and(|p| p.is_official()) {
+            for name in ["OPENAI_API_KEY", "OPENAI_BASE_URL", "SUPERCODE_PROVIDER_API_KEY"] { command.env_remove(name); }
+        }
         if let Some(project) = project {
             command.current_dir(project);
         }

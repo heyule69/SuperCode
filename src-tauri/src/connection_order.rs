@@ -36,7 +36,7 @@ fn official_aliases(conn: &Connection, agent: &str) -> Result<HashSet<String>> {
             config: serde_json::from_str(&crate::credentials::open(&raw)?)
                 .map_err(|_| "本地配置 JSON 无效")?,
         };
-        if profile.is_official() {
+        if profile.is_official() && profile.account_id().is_none() {
             aliases.insert(id);
         }
     }

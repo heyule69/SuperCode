@@ -754,56 +754,6 @@ async fn start_for(
     let (client, events) = Client::start(&launch, &args, cwd, &env, agent == "pi").await?;
     Ok((client, events, config))
 }
-pub async fn models(
-    app: &AppHandle,
-    agent: &str,
-    session_id: Option<&str>,
-) -> Result<Value, String> {
-    let s = session_id
-        .map(|s| app.state::<AppState>().store.session(s))
-        .transpose()?;
-    let route = app.state::<AppState>().store.route(agent, session_id)?;
-    if route.profile.is_some() {
-        let mut catalog = crate::providers::catalog_models(&route.config);
-        catalog["source"] = route.source(agent);
-        return Ok(catalog);
-    }
-    if app.state::<AppState>().store.running()? > 0 {
-        return Err("请在当前任务结束后刷新本机模型".into());
-    }
-    let cwd = s
-        .as_ref()
-        .map(|s| {
-            app.state::<AppState>()
-                .store
-                .session_workspace(s)
-                .map(|p| p.path)
-        })
-        .transpose()?
-        .unwrap_or_else(|| app.state::<AppState>().data_dir.to_string_lossy().into());
-    let (client, mut rx, _) = start_for(app, agent, Path::new(&cwd), s.as_ref(), "ask").await?;
-    let drain = tokio::spawn(async move {
-        while let Some(v) = rx.recv().await {
-            if v["type"] == "supercode_disconnected" {
-                break;
-            }
-        }
-    });
-    let result=async{if agent=="pi"{
-        let state=client.request("get_state",json!({}),60).await?;
-        let levels=client.request("get_available_thinking_levels",json!({}),30).await?;
-        let v=client.request("get_available_models",json!({}),60).await?;
-        let data=v["models"].as_array().ok_or("Pi 模型列表格式无效")?.iter().map(|m| {
-            let selected=m["provider"]==state["model"]["provider"]&&m["id"]==state["model"]["id"];
-            let mut row=json!({"id":format!("{}/{}",m["provider"].as_str().unwrap_or(""),m["id"].as_str().unwrap_or("")),"model":format!("{}/{}",m["provider"].as_str().unwrap_or(""),m["id"].as_str().unwrap_or("")),"displayName":m["name"],"contextWindow":m["contextWindow"],"isDefault":selected});
-            if selected { row["defaultReasoningEffort"]=state["thinkingLevel"].clone(); row["supportedReasoningEfforts"]=json!(levels["levels"].as_array().into_iter().flatten().filter_map(|v|v.as_str()).map(|level|json!({"reasoningEffort":level})).collect::<Vec<_>>()); }
-            row
-        }).collect::<Vec<_>>();Ok(json!({"data":data,"source":route.source(agent)}))}else{
-        client.request("initialize",init(),60).await?;let v=client.request("session/new",json!({"cwd":cwd,"mcpServers":[]}),90).await?;let data=v["models"]["availableModels"].as_array().ok_or("OpenCode 未返回模型列表，请先配置本机供应商")?.iter().map(|m|json!({"id":m["modelId"],"model":m["modelId"],"displayName":m["name"],"isDefault":m["modelId"]==v["models"]["currentModelId"]})).collect::<Vec<_>>();Ok(json!({"data":data,"source":route.source(agent)}))}}.await;
-    client.close().await;
-    drain.abort();
-    result
-}
 pub async fn send(
     app: &AppHandle,
     s: &Session,

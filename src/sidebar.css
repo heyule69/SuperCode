@@ -1,4 +1,10 @@
 .sidebar-section-label > div { display:flex; align-items:center; gap:2px; }
+.sidebar-navigation { display:grid; grid-template-rows:minmax(0,1.15fr) minmax(0,1fr); gap:24px; flex:1; min-height:0; }
+.sidebar-region { display:flex; flex-direction:column; min-height:0; min-width:0; }
+.sidebar-region > .sidebar-section-label { flex:none; }
+.sidebar-region > .project-list { overscroll-behavior:contain; }
+.sidebar-direct-empty { display:block; padding:6px 12px; color:var(--muted); font-size:var(--ui-size); }
+@media(max-height:680px) { .sidebar-navigation { gap:16px; } }
 .sidebar-items .project-heading { border-radius:8px; gap:0; min-height:36px; }
 .sidebar-items .project-heading:hover, .sidebar-items .project-heading:focus-within { background:var(--hover); }
 .sidebar-items .project-row:hover { background:transparent; }

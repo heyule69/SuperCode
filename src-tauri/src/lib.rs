@@ -1,4 +1,5 @@
 mod accounts;
+mod official_accounts;
 mod agent_commands;
 mod agent_smoke;
 mod agent_versions;
@@ -7,6 +8,7 @@ mod app_updates;
 mod automation;
 mod bridge;
 mod ccswitch;
+mod chat_connection;
 mod claude;
 mod client_features;
 mod commands;
@@ -49,7 +51,6 @@ pub struct AppState {
     pub claude: claude::Runtime,
     pub native: native_agents::Runtime,
     pub activity: std::sync::Mutex<protocol::ActivityBuffer>,
-    pub claude_login: tokio::sync::Mutex<Option<tokio::process::Child>>,
     pub change_snapshots:
         std::sync::Mutex<std::collections::HashMap<String, (String, Option<String>)>>,
 }
@@ -139,6 +140,7 @@ pub fn run() {
         .manage(agent_versions::Versions::default())
         .manage(app_updates::AppUpdates::default())
         .manage(accounts::Accounts::default())
+        .manage(official_accounts::Logins::default())
         .manage(notifications::Notifications::default())
         .manage(platform_usage::UsageCache::default())
         .manage(ui_recovery::UiRecovery::default())
@@ -173,7 +175,6 @@ pub fn run() {
                 claude: claude::Runtime::default(),
                 native: native_agents::Runtime::default(),
                 activity: std::sync::Mutex::new(protocol::ActivityBuffer::default()),
-                claude_login: tokio::sync::Mutex::new(None),
                 change_snapshots: std::sync::Mutex::new(std::collections::HashMap::new()),
             });
             if !std::env::args().any(|arg| arg == "--legacy-installation-exit-test") {
@@ -278,6 +279,7 @@ pub fn run() {
             commands::configure_codex,
             commands::add_project,
             commands::create_session,
+            chat_connection::check_chat_connection,
             commands::list_messages,
             commands::send_message,
             commands::send_chat_message,
@@ -312,8 +314,12 @@ pub fn run() {
             accounts::official_account_status,
             accounts::list_provider_accounts,
             accounts::use_official_account,
-            accounts::start_official_login,
-            accounts::cancel_official_login,
+            official_accounts::list_official_accounts,
+            official_accounts::start_official_account_login,
+            official_accounts::finish_official_account_login,
+            official_accounts::cancel_official_account_login,
+            official_accounts::rename_official_account,
+            official_accounts::remove_official_account,
             agent_commands::execute_agent_command,
             client_features::get_client_preferences,
             client_features::save_client_preferences,

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { emptySidebar, exportFilename, projectSessions, sidebarGroups } from './sidebarState';
+import { emptySidebar, exportFilename, projectSessions, sidebarAreas, sidebarGroups } from './sidebarState';
 import type { Project, Session, SidebarState } from './types';
 const projects: Project[] = [{ id:'p1',name:'项目一',path:'D:/one' }, { id:'p2',name:'项目二',path:'D:/two' }];
 const session = (id:string,projectId='p1'):Session => ({ id, projectId,title:id,agent:'claude',model:null,nativeId:null,status:'idle',updatedAt:0,turnId:null });
@@ -41,4 +41,32 @@ it('shows projectless chats in recents, pins and custom sections without hiding 
   expect(groups.find(g=>g.id==='pinned')?.sessions.map(s=>s.id)).toEqual(['pin']);
   expect(groups.find(g=>g.id==='custom')?.sessions.map(s=>s.id)).toEqual(['work']);
   expect(groups.flatMap(g=>g.sessions).length).toBe(3);
+});
+
+it('separates direct chats from projects while keeping pins and custom sections in their own area', () => {
+  const rows = [session('project-pin'), session('project-section'), session('project-normal'), session('direct-pin', ''), session('direct-section', ''), session('direct-recent', '')];
+  const state: SidebarState = {
+    projects: { p1:{pinned:true,unread:false,sectionId:null} },
+    sessions: {
+      'project-pin':{pinned:true,unread:false,sectionId:null},
+      'project-section':{pinned:false,unread:false,sectionId:'work'},
+      'direct-pin':{pinned:true,unread:true,sectionId:null},
+      'direct-section':{pinned:false,unread:false,sectionId:'work'},
+    },
+    sections:[{id:'work',name:'工作'},{id:'empty',name:'空分区'}],
+  };
+  const areas = sidebarAreas(projects, rows, state);
+  expect(areas.projects.flatMap(group=>group.sessions).map(row=>row.id)).toEqual(['project-pin','project-section']);
+  expect(areas.projects.flatMap(group=>group.projects).map(row=>row.id)).toEqual(['p1','p2']);
+  expect(projectSessions('p1', rows, state).map(row=>row.id)).toEqual(['project-normal']);
+  expect(areas.direct.flatMap(group=>group.sessions).map(row=>row.id)).toEqual(['direct-pin','direct-recent','direct-section']);
+  expect(areas.direct.every(group=>!group.projects.length)).toBe(true);
+  expect(areas.projects.some(group=>group.id==='empty')).toBe(true);
+  expect(areas.direct.some(group=>group.id==='empty')).toBe(false);
+});
+
+it('keeps direct chats accessible with no projects and hides chats belonging to removed projects', () => {
+  const areas = sidebarAreas([], [session('direct', ''), session('missing-project')], emptySidebar);
+  expect(areas.projects).toEqual([]);
+  expect(areas.direct.flatMap(group=>group.sessions).map(row=>row.id)).toEqual(['direct']);
 });

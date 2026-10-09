@@ -6,7 +6,6 @@ use std::{
     time::{Duration, Instant},
 };
 use tauri::{AppHandle, Emitter, Manager};
-use tauri_plugin_opener::OpenerExt;
 use tokio::sync::Mutex;
 
 #[derive(Default)]
@@ -21,24 +20,34 @@ impl Accounts {
         force: bool,
         app: &AppHandle,
     ) -> Result<Value, String> {
+        self.get_for(agent, None, force, app).await
+    }
+    pub(crate) async fn get_for(
+        &self,
+        agent: &str,
+        account_id: Option<&str>,
+        force: bool,
+        app: &AppHandle,
+    ) -> Result<Value, String> {
         let index = match agent {
             "codex" => 0,
             "claude" => 1,
             _ => return Err("不支持此 Agent 的官方账号".into()),
         };
         let _check = self.checks[index].lock().await;
+        let cache_key = format!("{agent}:{}", account_id.unwrap_or("native"));
         if !force {
-            if let Some((at, value)) = self.cache.lock().await.get(agent) {
+            if let Some((at, value)) = self.cache.lock().await.get(&cache_key) {
                 if at.elapsed() < Duration::from_secs(60) {
                     return Ok(value.clone());
                 }
             }
         }
-        let value = read_official_status(agent, app).await?;
+        let value = read_official_status(agent, account_id, app).await?;
         self.cache
             .lock()
             .await
-            .insert(agent.into(), (Instant::now(), value.clone()));
+            .insert(cache_key, (Instant::now(), value.clone()));
         Ok(value)
     }
 }
@@ -64,21 +73,58 @@ pub async fn list_provider_accounts(
         one("codex", force.unwrap_or(false), &app),
         one("claude", force.unwrap_or(false), &app)
     );
-    Ok(vec![codex, claude])
+    let mut rows = vec![codex, claude];
+    for profile in app
+        .state::<AppState>()
+        .store
+        .profiles()?
+        .into_iter()
+        .filter(|p| p.is_official() && p.account_id().is_some())
+    {
+        let mut status = app
+            .state::<Accounts>()
+            .get_for(
+                &profile.agent,
+                profile.account_id(),
+                force.unwrap_or(false),
+                &app,
+            )
+            .await
+            .unwrap_or_else(|error| json!({"loggedIn":false,"error":error}));
+        status["agent"] = profile.agent.into();
+        status["connectionId"] = profile.id.into();
+        rows.push(status);
+    }
+    Ok(rows)
 }
 
 /// A short-lived account-only connection. It never starts/resumes a thread, loads
 /// SuperCode tools, or changes the main runtime's route, epoch or session state.
 pub(crate) async fn read_codex_limits(app: &AppHandle) -> Result<Value, String> {
-    read_codex_value(app, "account/rateLimits/read", json!({})).await
+    read_codex_limits_for(app, None).await
 }
-async fn read_codex_value(app: &AppHandle, method: &str, params: Value) -> Result<Value, String> {
+pub(crate) async fn read_codex_limits_for(
+    app: &AppHandle,
+    account_id: Option<&str>,
+) -> Result<Value, String> {
+    read_codex_value(app, account_id, "account/rateLimits/read", json!({})).await
+}
+pub(crate) fn codex_command(
+    app: &AppHandle,
+    account_id: Option<&str>,
+) -> Result<tokio::process::Command, String> {
     let launch = crate::agents::resolve(app, "codex")?;
     let mut command = launch.command(&["app-server", "--listen", "stdio://"]);
     for setting in process::codex_config_overrides(false)? {
         command.arg("-c").arg(setting);
     }
     command.args(["-c", "model_provider=\"openai\""]);
+    crate::official_accounts::configure(
+        &mut command,
+        app,
+        "codex",
+        &json!({"official":true,"accountId":account_id}),
+    )?;
     // Official allowance belongs to the CLI's saved ChatGPT login, not an API key.
     for variable in [
         "OPENAI_API_KEY",
@@ -87,6 +133,15 @@ async fn read_codex_value(app: &AppHandle, method: &str, params: Value) -> Resul
     ] {
         command.env_remove(variable);
     }
+    Ok(command)
+}
+pub(crate) async fn read_codex_value(
+    app: &AppHandle,
+    account_id: Option<&str>,
+    method: &str,
+    params: Value,
+) -> Result<Value, String> {
+    let mut command = codex_command(app, account_id)?;
     let mut child = command
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -122,7 +177,7 @@ where
     )
     .await
 }
-async fn read_account_method<W, R>(
+pub(crate) async fn read_account_method<W, R>(
     mut input: W,
     mut output: R,
     method: &str,
@@ -196,7 +251,10 @@ where
         }
     }
 }
-fn claude_command(app: &AppHandle, args: &[&str]) -> Result<tokio::process::Command, String> {
+pub(crate) fn claude_command(
+    app: &AppHandle,
+    args: &[&str],
+) -> Result<tokio::process::Command, String> {
     let launch = crate::agents::resolve(app, "claude")?;
     let mut c = launch.command(&["--setting-sources", ""]);
     c.args(args);
@@ -204,6 +262,11 @@ fn claude_command(app: &AppHandle, args: &[&str]) -> Result<tokio::process::Comm
         "ANTHROPIC_AUTH_TOKEN",
         "ANTHROPIC_API_KEY",
         "ANTHROPIC_BASE_URL",
+        "CLAUDE_CODE_OAUTH_TOKEN",
+        "CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR",
+        "CLAUDE_CODE_USE_BEDROCK",
+        "CLAUDE_CODE_USE_VERTEX",
+        "CLAUDE_CODE_USE_FOUNDRY",
     ] {
         c.env_remove(name);
     }
@@ -220,16 +283,33 @@ fn codex_status(value: &Value) -> Value {
 fn claude_status(value: &Value) -> Value {
     json!({"loggedIn":value["loggedIn"] == true && matches!(value["authMethod"].as_str(), Some("claude.ai" | "oauth_token")),"method":value["authMethod"],"plan":value["subscriptionType"]})
 }
-async fn read_official_status(agent: &str, app: &AppHandle) -> Result<Value, String> {
+async fn read_official_status(
+    agent: &str,
+    account_id: Option<&str>,
+    app: &AppHandle,
+) -> Result<Value, String> {
     if agent == "codex" {
-        let value = read_codex_value(app, "account/read", json!({"refreshToken":false})).await?;
+        let value = read_codex_value(
+            app,
+            account_id,
+            "account/read",
+            json!({"refreshToken":false}),
+        )
+        .await?;
         return Ok(codex_status(&value));
     }
     if agent != "claude" {
         return Err("不支持此 Agent 的账号".into());
     }
     use tokio::io::AsyncReadExt;
-    let mut child = claude_command(app, &["auth", "status", "--json"])?
+    let mut command = claude_command(app, &["auth", "status", "--json"])?;
+    crate::official_accounts::configure(
+        &mut command,
+        app,
+        agent,
+        &json!({"official":true,"accountId":account_id}),
+    )?;
+    let mut child = command
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
@@ -258,88 +338,33 @@ async fn read_official_status(agent: &str, app: &AppHandle) -> Result<Value, Str
     Ok(claude_status(&value))
 }
 #[tauri::command]
-pub async fn use_official_account(agent: String, app: AppHandle) -> Result<(), String> {
+pub async fn use_official_account(
+    agent: String,
+    account_id: Option<String>,
+    app: AppHandle,
+) -> Result<(), String> {
     let state = app.state::<AppState>();
+    let status = app
+        .state::<Accounts>()
+        .get_for(&agent, account_id.as_deref(), true, &app)
+        .await?;
+    if status["loggedIn"] != true {
+        return Err("请先完成此账号的官方登录".into());
+    }
     state.runtime.release(&app).await?;
-    state.store.use_official(&agent)?;
+    if let Some(id) = account_id {
+        let connection = format!("account:{id}");
+        state
+            .store
+            .profile(&agent, &connection)?
+            .ok_or("账号不存在")?;
+        state.store.select_profile(&agent, Some(&connection))?;
+    } else {
+        state.store.use_official(&agent)?;
+    }
     let _ = app.emit("workspace-updated", ());
     Ok(())
 }
-#[tauri::command]
-pub async fn start_official_login(agent: String, app: AppHandle) -> Result<Value, String> {
-    use_official_account(agent.clone(), app.clone()).await?;
-    if agent == "codex" {
-        let value = app
-            .state::<AppState>()
-            .runtime
-            .get(&app)
-            .await?
-            .request("account/login/start", json!({"type":"chatgpt"}))
-            .await?;
-        let url = value["authUrl"]
-            .as_str()
-            .ok_or("Codex 未返回官方登录地址")?;
-        let parsed = reqwest::Url::parse(url).map_err(|_| "官方登录地址无效")?;
-        if parsed.scheme() != "https"
-            || !matches!(
-                parsed.host_str(),
-                Some("auth.openai.com" | "auth0.openai.com" | "chatgpt.com")
-            )
-        {
-            return Err("Codex 返回了未知登录域名，未打开浏览器".into());
-        }
-        app.opener()
-            .open_url(url, None::<&str>)
-            .map_err(|_| "无法打开浏览器")?;
-        return Ok(
-            json!({"started":true,"loginId":value["loginId"],"message":"请在浏览器完成 ChatGPT 官方登录，完成后点击检查状态。"}),
-        );
-    }
-    let state = app.state::<AppState>();
-    let mut slot = state.claude_login.lock().await;
-    if slot
-        .as_mut()
-        .is_some_and(|c| c.try_wait().ok().flatten().is_none())
-    {
-        return Err("Claude 登录已经开始，请完成浏览器登录或取消后重试".into());
-    }
-    let child = claude_command(&app, &["auth", "login", "--claudeai"])?
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .map_err(|_| "无法启动 Claude 官方登录")?;
-    *slot = Some(child);
-    Ok(
-        json!({"started":true,"message":"已启动本机 Claude 官方登录。请在浏览器完成登录，再点击检查状态。"}),
-    )
-}
-#[tauri::command]
-pub async fn cancel_official_login(
-    agent: String,
-    login_id: Option<String>,
-    app: AppHandle,
-) -> Result<(), String> {
-    if agent == "claude" {
-        if let Some(mut c) = app.state::<AppState>().claude_login.lock().await.take() {
-            let _ = c.kill().await;
-        }
-        return Ok(());
-    }
-    if agent == "codex" {
-        if let Some(id) = login_id {
-            app.state::<AppState>()
-                .runtime
-                .get(&app)
-                .await?
-                .request("account/login/cancel", json!({"loginId":id}))
-                .await?;
-        }
-        return Ok(());
-    }
-    Err("Agent 无效".into())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

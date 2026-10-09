@@ -53,7 +53,7 @@ pub fn routing_identity(profile: &Profile) -> Value {
         .or_else(|| config["env"]["ANTHROPIC_BASE_URL"].as_str())
         .or(endpoint)
         .unwrap_or("");
-    json!({"agent":profile.agent,"base":base.trim_end_matches('/'),"protocol":config["protocol"].as_str().unwrap_or(if profile.agent=="claude" {"anthropic"} else {"responses"}),"official":profile.is_official()})
+    json!({"agent":profile.agent,"base":base.trim_end_matches('/'),"protocol":config["protocol"].as_str().unwrap_or(if profile.agent=="claude" {"anthropic"} else {"responses"}),"official":profile.is_official(),"accountId":profile.account_id()})
 }
 
 pub struct Route {
@@ -75,7 +75,7 @@ impl Route {
                     && source["providerId"] == "openai"
                     && crate::providers::key(&self.config).is_none())
         {
-            source["connectionName"] = "ChatGPT 官方账号".into();
+            source["connectionName"] = self.profile.as_ref().filter(|p| p.account_id().is_some()).map(|p| p.name.as_str()).unwrap_or("ChatGPT 官方账号").into();
         }
         source
     }
@@ -168,6 +168,20 @@ impl Store {
             self.default_connection(agent)?
         };
         self.route_for(agent, &id)
+    }
+    pub fn route_with_connection(
+        &self,
+        agent: &str,
+        session_id: Option<&str>,
+        connection_id: Option<&str>,
+    ) -> Result<Route, String> {
+        // A picker draft can inspect a non-default supplier. Existing chats
+        // always inspect their own binding, regardless of the picker argument.
+        if session_id.is_some() || connection_id.is_none() {
+            self.route(agent, session_id)
+        } else {
+            self.route_for(agent, connection_id.unwrap())
+        }
     }
     pub fn route_for(&self, agent: &str, id: &str) -> Result<Route, String> {
         let profile = if matches!(id, LOCAL | OFFICIAL) {
@@ -372,6 +386,9 @@ async fn change_session_model(
         .map_err(|_| "Agent 正在安装、更新或测试，请稍后切换模型")?;
     let state = app.state::<AppState>();
     let session = state.store.session(&session_id)?;
+    if force_compact {
+        crate::chat_connection::check(&app, &session.agent, Some(&session_id), None).await?;
+    }
     let connection = if connection_id.is_empty() {
         LOCAL
     } else {
@@ -420,6 +437,23 @@ mod tests {
             Profile { id:"kimi".into(),agent:"claude".into(),name:"Kimi".into(),config:json!({"model":"k3","env":{"ANTHROPIC_BASE_URL":"https://api.kimi.com/coding/","ANTHROPIC_MODEL":"k3","ANTHROPIC_AUTH_TOKEN":"test-kimi-key"}}) },
             Profile { id:"glm".into(),agent:"claude".into(),name:"智谱".into(),config:json!({"model":"glm-test","env":{"ANTHROPIC_BASE_URL":"https://open.bigmodel.cn/api/anthropic","ANTHROPIC_MODEL":"glm-test","ANTHROPIC_AUTH_TOKEN":"test-glm-key"}}) },
         ]).unwrap();
+    }
+    #[test]
+    fn model_discovery_uses_the_draft_connection_and_preserves_a_pinned_chat() {
+        let store = store();
+        profiles(&store);
+        store.select_profile("claude", Some("kimi")).unwrap();
+        let project = store.add_project(Path::new("D:/model-route-test")).unwrap();
+        let session = store.create_configured_session(&project.id, None, "claude", Some("glm")).unwrap();
+        assert_eq!(store.route_with_connection("claude", None, None).unwrap().id, "kimi");
+        assert_eq!(store.route_with_connection("claude", None, Some("glm")).unwrap().id, "glm");
+        assert_eq!(store.route_with_connection("claude", Some(&session.id), Some("kimi")).unwrap().id, "glm");
+        assert!(store.route_with_connection("claude", None, Some("deleted")).is_err());
+        let official = store.route_with_connection("codex", None, Some(OFFICIAL)).unwrap();
+        assert_eq!(official.id, OFFICIAL);
+        assert_eq!(official.config["official"], true);
+        assert_eq!(store.default_connection("claude").unwrap(), "kimi");
+        assert!(store.transcript(&session.id).unwrap().is_empty());
     }
     #[test]
     fn switches_only_summarize_when_portable_history_requires_it() {

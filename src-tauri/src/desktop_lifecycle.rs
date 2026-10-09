@@ -458,15 +458,12 @@ fn exit_reserved(app: AppHandle) {
         tokio::time::sleep(Duration::from_millis(350)).await;
         let state = app.state::<AppState>();
         let shutdown = async {
+            let logins = app.state::<crate::official_accounts::Logins>();
             tokio::join!(
                 state.runtime.shutdown(),
                 state.claude.shutdown(),
                 state.native.shutdown(),
-                async {
-                    if let Some(mut child) = state.claude_login.lock().await.take() {
-                        let _ = child.start_kill();
-                    }
-                }
+                logins.shutdown(&app)
             );
         };
         let _ = tokio::time::timeout(Duration::from_secs(3), shutdown).await;

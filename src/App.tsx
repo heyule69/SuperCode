@@ -30,11 +30,11 @@ import { DesktopTitleBar, type DesktopMenu } from './DesktopTitleBar';
 import { emptyNavigation, travel, visit } from './navigation';
 import type { SettingsTab } from './SettingsPage';
 import { createChatSession } from './chatSession';
+import { isProviderRequired, requireChatConnection } from './chatConnection';
 import { FollowupQueue, useFollowups, type Followup, type FollowupPayload } from './Followups';
 import { SelectionActions } from './SelectionActions';
 import type { SideDraft } from './SideChat';
 const SideChat=lazy(()=>import('./SideChat'));
-import { sourceForProfile } from './modelPicker';
 import { ActivityRail } from './ActivityRail';
 import { AgentMenu } from './AgentMenu';
 import { NewChat } from './NewChat';
@@ -98,6 +98,8 @@ export default function App() {
   const [model, setModel] = useState('');
   const [models, setModels] = useState<Model[]>([]);
   const [modelSource, setModelSource] = useState<ModelSource>();
+  const [modelSourceRevision, setModelSourceRevision] = useState('');
+  const [connectionRevision, setConnectionRevision] = useState(0);
   const modelRequest = useRef(0);
   const [permissionChoices, setPermissionChoices] = useState(() => loadPermissionChoices(agentId, agentId === prefs.defaultAgent ? prefs.defaultPermission : 'ask'));
   const permissionMode = permissionChoices[agentId] ?? compatiblePermission(agentId === prefs.defaultAgent ? prefs.defaultPermission : 'ask', agentId);
@@ -135,7 +137,9 @@ export default function App() {
   const [changesLoading, setChangesLoading] = useState(false);
   const [preview, setPreview] = useState<{ name: string; text: string; diff?: boolean; line?: number } | null>(null);
   const [error, setError] = useState('');
-  const [modal, setModal] = useState<'search' | 'project' | 'rename' | null>(null);
+  const [modal, setModal] = useState<'search' | 'project' | 'rename' | 'provider' | null>(null);
+  const [providerRequiredAgent, setProviderRequiredAgent] = useState('');
+  const [providerSettingsAgent, setProviderSettingsAgent] = useState<string>();
   const modalRef = useRef(modal); modalRef.current = modal;
   const [modalError, setModalError] = useState('');
   const [modalWorking, setModalWorking] = useState(false);
@@ -173,7 +177,8 @@ export default function App() {
   const connectionId = session?.connectionId ?? draftConnectionId ?? profiles.find(p => p.agent === agentId && p.current)?.id ?? (officialAgents.includes(agentId) ? '@official' : '@local');
   const activeProfile = profiles.find(p => p.agent === agentId && p.id === connectionId);
   const [handoffTarget, setHandoffTarget] = useState('');
-  const profileRevision = `${agentId}:${sessionId}:${connectionId}:${activeProfile?.id ?? ''}:${activeProfile?.name ?? ''}:${activeProfile?.model ?? ''}:${activeProfile?.models?.join(',') ?? ''}:${officialAgents.join(',')}`;
+  const profileRevision = `${agentId}:${sessionId}:${connectionId}:${JSON.stringify(activeProfile ?? null)}:${officialAgents.join(',')}:${connectionRevision}`;
+  const currentModelSource = modelSourceRevision === profileRevision ? modelSource : undefined;
   const skillQuery = input.startsWith('/');
   const slashOptions = commandsDismissed || !composerFocused ? [] : commandMatches(input, agentId, nativeCommands, skillCatalog.skills);
   const slashIndex = Math.min(commandSelection, Math.max(0, slashOptions.length - 1));
@@ -197,24 +202,25 @@ export default function App() {
   useEffect(() => {
     let disposed = false;
     const request = ++modelRequest.current;
-    setModelSource(activeProfile?.modelSource);
-    if (!sessionId && draftConnectionId) {
-      setModels([]); setLoadingModels(false);
-      if (activeProfile) setModelSource(sourceForProfile(activeProfile));
-      return;
-    }
-    const automatic = desktop && (agentId === 'claude' || !!activeProfile && !activeProfile.officialAccount || ['opencode', 'pi'].includes(agentId) && agents.some(a => a.id === agentId && a.installed) && !sessions.some(s => isActive(s.status)));
-    setLoadingModels(automatic);
-    if (automatic) void call<ModelCatalog>('list_models', { agent: agentId, sessionId: sessionId || null }).then(result => {
+    setModels([]); setModelSource(undefined); setModelSourceRevision(profileRevision);
+    if (!ready || !desktop) { setLoadingModels(false); return; }
+    setLoadingModels(true);
+    const args = { agent: agentId, sessionId: sessionId || null, connectionId };
+    void (async () => {
+      const source = await call<ModelSource>('get_model_source', args);
+      if (disposed || request !== modelRequest.current) return;
+      setModelSource(source);
+      if (source.available !== true) return;
+      // API catalogs are stored locally. Official Codex discovery stays on demand.
+      const automatic = agentId === 'claude' || !!activeProfile && !activeProfile.officialAccount || ['opencode', 'pi'].includes(agentId);
+      if (!automatic) return;
+      const result = await call<ModelCatalog>('list_models', args);
       if (disposed || request !== modelRequest.current) return;
       setModels(result.data); setModelSource(result.source);
       setModel(previous => session?.model ? session.model : result.data.some(m => m.model === previous) ? previous : result.data.find(m => m.isDefault)?.model ?? '');
-    }).catch(e => { if (!disposed && request === modelRequest.current) report(e); }).finally(() => { if (!disposed && request === modelRequest.current) setLoadingModels(false); });
-    else if (desktop && agentId === 'codex') void call<ModelSource>('get_model_source', { agent: agentId, sessionId: sessionId || null }).then(source => {
-      if (!disposed && request === modelRequest.current) setModelSource(source);
-    }).catch(e => { if (!disposed && request === modelRequest.current) report(e); });
+    })().catch(e => { if (!disposed && request === modelRequest.current) report(e); }).finally(() => { if (!disposed && request === modelRequest.current) setLoadingModels(false); });
     return () => { disposed = true; };
-  }, [profileRevision]);
+  }, [profileRevision, ready]);
   const currentRequests = requests.filter(r => !r.params.threadId || r.params.threadId === session?.nativeId || r.params.threadId === current.current.nativeId);
   const newChat = ready && !messages.length && !busy && !messagesLoading && !currentRequests.length;
   const activeElsewhere = sessions.find(s => isActive(s.status) && s.id !== sessionId);
@@ -223,7 +229,11 @@ export default function App() {
   const agentName = agents.find(a => a.id === agentId)?.name ?? agentId;
   newSessionRef.current = () => { void newSession(); };
 
-  function report(e: unknown) { const text = e instanceof Error ? e.message : String(e); if (modalRef.current || settingsOpenRef.current) setModalError(text); else setError(text); }
+  function showProviderRequired(agent = agentId) {
+    if (agent === agentId) { modelRequest.current++; setModels([]); setModelSource({ providerId: 'unknown', providerName: '', mark: '', available: false }); setModelSourceRevision(profileRevision); setLoadingModels(false); }
+    setProviderRequiredAgent(agent); setError(''); setModal('provider');
+  }
+  function report(e: unknown) { if (isProviderRequired(e)) { showProviderRequired(); return; } const text = e instanceof Error ? e.message : String(e); if (modalRef.current || settingsOpenRef.current) setModalError(text); else setError(text); }
   const showDiff = useCallback((name: string, text: string) => { setPreview({ name, text, diff: true }); if (narrow) setContextOverlay(true); else setContext(true); }, [narrow]);
   const refresh = useCallback(async () => {
     const data = await call<Bootstrap>('bootstrap');
@@ -526,6 +536,7 @@ export default function App() {
     const originDraft = draftKey.current;
     setSending(true);
     try {
+      await requireChatConnection(agentId, connectionId, id);
       if (!id) { const s = await createChatSession({ projectId, model, agent: agentId, connectionId }); id = s.id; setSessions(old => [s, ...old]); if(current.current.projectId===projectId && draftKey.current===originDraft){setSessionId(id);current.current.sessionId=id;draftKey.current=id;} }
       if (anyBusy || followups.rows.length) {
         await call('enqueue_followup',{sessionId:id,payload:followupPayload(text,taskAttachments)});
@@ -570,6 +581,7 @@ export default function App() {
       if (!desktop) { setError('原生命令需要在桌面版运行。'); return; }
         setSending(true);
       try {
+        await requireChatConnection(agentId, connectionId, sessionId);
         let id = sessionId;
         if (!id) { const s = await createChatSession({ projectId, model, agent: agentId, connectionId }); id = s.id; setSessionId(id); current.current.sessionId = id; }
         pendingSession.current = id;
@@ -588,6 +600,7 @@ export default function App() {
     if (!desktop) { setError('原生命令需要在桌面版运行。'); return; }
     setSending(true);
     try {
+      await requireChatConnection(agentId, connectionId, sessionId);
       let id = sessionId;
       if (!id) { const s = await createChatSession({ projectId, model, agent: agentId, connectionId }); id = s.id; setSessionId(id); current.current.sessionId = id; }
       pendingSession.current = id;
@@ -597,8 +610,21 @@ export default function App() {
   }
   async function connectionUpdated(_resetAgent?: string) {
     const data = await refresh();
-    const nextDefault = data.profiles.find(p => p.agent === agentId && p.current)?.id ?? (data.officialAgents.includes(agentId) ? '@official' : '@local');
-    if (!sessionId && !draftConnectionId && nextDefault !== connectionId) { modelRequest.current++; setModels([]); setModelSource(undefined); setModel(''); }
+    setConnectionRevision(value => value + 1);
+    const defaultFor = (agent: string) => data.profiles.find(p => p.agent === agent && p.current)?.id ?? (data.officialAgents.includes(agent) ? '@official' : '@local');
+    const nextDefault = defaultFor(agentId);
+    if (!sessionId && nextDefault !== connectionId && (!draftConnectionId || draftConnectionId === '@local' || _resetAgent === agentId && providerRequiredAgent === agentId)) {
+      setDraftConnectionId(undefined); draftModels.current.delete(draftKey.current);
+      modelRequest.current++; setModels([]); setModelSource(undefined); setModel('');
+    }
+    // A blocked side draft has no conversation binding yet. Let an explicitly
+    // added default replace its hidden fallback while preserving the saved text.
+    setSideDraft(old => {
+      if (!old) return old;
+      const agent = old.agent ?? agentId, next = defaultFor(agent);
+      if (next === '@local' || next === old.connectionId || !(old.connectionId === '@local' || _resetAgent === agent && providerRequiredAgent === agent)) return old;
+      return { ...old, connectionId: next, payload: old.payload ? { ...old.payload, model: data.profiles.find(p=>p.id===next)?.model ?? null } : old.payload };
+    });
   }
   async function chooseModel(option: ModelOption) {
     if (anyBusy || configuring) return;
@@ -627,14 +653,10 @@ export default function App() {
     finally { setConfiguring(false); setHandoffTarget(''); }
   }
   async function loadModels() {
-    if (!sessionId && draftConnectionId) {
-      if (activeProfile) { setModels([...new Set([activeProfile.model, ...activeProfile.models ?? []].filter((id): id is string => !!id))].map(id => ({ id, model: id, displayName: id, isDefault: id === activeProfile.model }))); setModelSource(sourceForProfile(activeProfile)); }
-      return;
-    }
     setLoadingModels(true);
     const requestedAgent = agentId;
     const request = ++modelRequest.current;
-    try { const result = await call<ModelCatalog>('list_models', { agent: requestedAgent, sessionId: sessionId || null }); if (request === modelRequest.current) { setModels(result.data.filter(m => !('hidden' in m) || !m.hidden)); setModelSource(result.source); setModel(previous => previous || result.data.find(m => m.isDefault)?.model || ''); } }
+    try { const result = await call<ModelCatalog>('list_models', { agent: requestedAgent, sessionId: sessionId || null, connectionId }); if (request === modelRequest.current) { setModels(result.data.filter(m => !('hidden' in m) || !m.hidden)); setModelSource(result.source); setModelSourceRevision(profileRevision); setModel(previous => previous || result.data.find(m => m.isDefault)?.model || ''); } }
     catch (e) { if (request === modelRequest.current) report(e); } finally { if (request === modelRequest.current) setLoadingModels(false); }
   }
   async function stop() { setStopping(true); try { await call('interrupt_turn', { sessionId }); } catch (e) { report(e); } finally { setStopping(false); } }
@@ -823,22 +845,22 @@ export default function App() {
             <PermissionMenu value={permissionMode} agent={agentId} busy={anyBusy} onChange={mode => {setPermissionMode(mode);}} />
           </div><div className="composer-right">
             <AgentMenu value={agentId} agents={agents} busy={anyBusy} choose={switchAgent}/>
-            <ModelMenu value={model} models={models} profiles={profiles} activeProfile={activeProfile} connectionId={connectionId} order={connectionOrder} source={modelSource} busy={anyBusy || configuring} loading={loadingModels} agent={agentId} choose={chooseModel} reload={() => void loadModels()} manage={() => {setSettingsTab('providers');openSettings();}} effort={effort} setEffort={setEffort} hasConversation={!!session?.nativeId} />
+            <ModelMenu value={model} models={modelSourceRevision === profileRevision ? models : []} profiles={profiles} activeProfile={activeProfile} connectionId={connectionId} order={connectionOrder} source={currentModelSource} busy={anyBusy || configuring} loading={loadingModels} agent={agentId} choose={chooseModel} reload={() => void loadModels()} manage={() => {setProviderSettingsAgent(agentId);setSettingsTab('providers');openSettings();}} effort={effort} setEffort={setEffort} hasConversation={!!session?.nativeId} />
             {busy ? <button className="send-button stop-button" type="button" disabled={!session?.turnId || stopping} onClick={() => void stop()} aria-label="停止生成"><Square size={14} fill="currentColor" /></button> : null}<button className="send-button" type="submit" disabled={(!input.trim() && !attachments.length) || sending || importingImages} aria-label={anyBusy ? '加入队列' : '发送消息'} title={anyBusy ? '加入队列，当前任务完成后发送' : '发送消息'}><ArrowUp size={18} /></button></div></div>
-        </form><div className="composer-footnote"><span /><div><PlatformUsageIndicator agent={agentId} connectionId={connectionId} revision={profileRevision} openStats={() => {setSettingsTab('quota');openSettings();}} /><UsageIndicator usage={usage} busy={anyBusy || !session?.nativeId} compact={() => void handleCommand('/compact','')} openStats={() => {setSettingsTab('usage');openSettings();}} /><span>{prefs.enterSend ? 'Enter 发送' : 'Ctrl Enter 发送'} · Shift Enter 换行</span></div></div>
+        </form><div className="composer-footnote"><span /><div>{currentModelSource?.available === true ? <PlatformUsageIndicator key={`${agentId}:${connectionId}`} agent={agentId} connectionId={agentId === 'codex' && connectionId === '@local' ? '@official' : connectionId} revision={profileRevision} openStats={() => {setSettingsTab('quota');openSettings();}} /> : null}<UsageIndicator usage={usage} busy={anyBusy || !session?.nativeId} compact={() => void handleCommand('/compact','')} openStats={() => {setSettingsTab('usage');openSettings();}} /><span>{prefs.enterSend ? 'Enter 发送' : 'Ctrl Enter 发送'} · Shift Enter 换行</span></div></div>
       </div>
       {logsOpen ? <section className="logs-panel"><div><span><Terminal size={14} />运行日志</span><button className="quiet-button" onClick={() => setLogs([])}>清空</button><button className="icon-button" title="关闭日志" onClick={() => setLogsOpen(false)}><X size={15} /></button></div><pre>{logs.length ? logs.join('\n') : '暂无运行日志。Agent 会在发送消息时启动。'}</pre></section> : null}
     </main>
 
     <SelectionActions key={sessionId} area={scrollArea} add={text=>{setInput(old=>[old,text.split('\n').map(line=>`> ${line}`).join('\n')].filter(Boolean).join('\n\n'));requestAnimationFrame(()=>textarea.current?.focus());}} details={setSelectionDetail} ask={text=>void openSide(undefined,`关于下面这段内容：\n\n${text}\n\n请帮我进一步解释。`)}/>
-    {sideDraft && !settingsOpen ? <Suspense fallback={<aside className="side-chat">正在打开侧边聊天…</aside>}><SideChat key={sideDraft.key} draft={sideDraft} projectId={sideDraft.projectId??projectId} agent={sideDraft.agent??agentId} connectionId={sideDraft.connectionId??connectionId} defaults={followupPayload('')} close={()=>setSideDraft(null)} opened={()=>void refresh()} openFile={showFile} showDiff={showDiff} resizeHandle={<div {...panels.handle('right')}/>}/></Suspense> : null}
+    {sideDraft && !settingsOpen ? <Suspense fallback={<aside className="side-chat">正在打开侧边聊天…</aside>}><SideChat key={sideDraft.key} draft={sideDraft} projectId={sideDraft.projectId??projectId} agent={sideDraft.agent??agentId} connectionId={sideDraft.connectionId??connectionId} defaults={followupPayload('')} close={()=>setSideDraft(null)} opened={()=>void refresh()} openFile={showFile} showDiff={showDiff} providerRequired={(agent,draft)=>{setSideDraft(draft);showProviderRequired(agent);}} resizeHandle={<div {...panels.handle('right')}/>}/></Suspense> : null}
     {selectionDetail?<div className="modal-backdrop" onClick={()=>setSelectionDetail('')}><section className="modal" role="dialog" aria-modal="true" aria-label="选中内容" onClick={e=>e.stopPropagation()}><div className="modal-heading"><h2>选中内容</h2><button className="icon-button" aria-label="关闭选中内容" onClick={()=>setSelectionDetail('')}><X size={16}/></button></div><pre className="selection-detail">{selectionDetail}</pre><CopyButton text={selectionDetail} label="复制选中内容"/></section></div>:null}
     {showContext && !sideDraft ? <aside className="context-panel" hidden={settingsOpen} inert={!!modal || sidebarDialog}>{!settingsOpen ? <div {...panels.handle('right')}/> : null}<div className="context-header"><span title={workspacePath}>工作区</span>{workspacePath && !project ? <button className="icon-button" title="定位聊天目录" onClick={() => void openPath('.', 'reveal').catch(report)}><Folder size={15}/></button> : null}{narrow ? <button className="icon-button" title="关闭变更面板" onClick={() => setContextOverlay(false)}><X size={16} /></button> : null}<button className={`icon-button ${changesLoading ? 'spin' : ''}`} title="刷新变更" disabled={changesLoading || !workspacePath} onClick={() => void refreshChanges(projectId)}><RefreshCw size={15} /></button></div><div className="context-tabs"><span className="active">文件变更<small>{changes.files.length}</small></span>{changes.branch ? <span className="branch"><GitBranch size={12} />{changes.branch}</span> : null}</div>{changesLoading && !changes.files.length && !preview ? <div className="context-empty"><LoaderCircle size={22} className="spin" /><strong>正在检查文件变更…</strong></div> : preview ? <div className="file-preview"><div className="file-preview-header"><FileCode2 size={14} /><span title={preview.name}>{preview.name}</span><CopyButton text={preview.text} label="复制文件内容" iconOnly /><button className="icon-button" title="关闭文件" onClick={() => setPreview(null)}><X size={14} /></button></div><Suspense fallback={<pre>{preview.text}</pre>}>{preview.diff ? <DiffView text={preview.text} /> : <SourceView text={preview.text} line={preview.line} />}</Suspense></div> : changes.files.length ? <><div className="changed-files">{changes.files.map(f => <button key={f.path} disabled={f.path.endsWith("/")} onClick={() => reviewFile(f.path)} title={f.path.endsWith("/") ? `${f.path} · 未跟踪文件夹` : f.path}><FileCode2 size={15} /><span>{f.path}</span><small className={f.status === '??' ? 'untracked' : ''}>{f.status === '??' ? 'U' : f.status}</small></button>)}</div>{changes.diff ? <button className="workspace-diff-button" onClick={() => showDiff('工作区变更', changes.diff)}>查看全部差异</button> : null}</> : <div className="context-empty"><span><FileCode2 size={24} /></span><strong>{!workspacePath ? '聊天文件' : !project ? '聊天工作目录'  : changes.isGit ? '暂无文件变更' : '未启用 Git'}</strong><p>{!workspacePath ? '发送消息后自动创建独立目录，也可以选择项目' : !project ? workspacePath  : changes.isGit ? '文件修改后会显示在这里' : '初始化 Git 后可查看文件差异'}</p></div>}</aside> : null}
 
     {settingsOpen ? <Suspense fallback={<div className="startup-loading" role="status">正在加载设置…</div>}><SettingsPage tab={settingsTab} select={setSettingsTab} blocked={!!modal || sidebarDialog}>
       {modalError ? <div className="error-banner modal-error" role="alert"><span>{modalError}</span><button className="icon-button" aria-label="关闭错误提示" onClick={() => setModalError('')}><X size={14} /></button></div> : null}
       {settingsTab === 'agents' ? <AgentSettings agents={agents} busy={anyBusy || configuring} loadMcp={loadMcp} setLoadMcp={setLoadMcp} saveMcp={saveCodex}/> : null}
-      {settingsTab === 'providers' ? <Suspense fallback={<p className="muted">正在加载模型连接…</p>}><ProviderSettings profiles={profiles} officialAgents={officialAgents} order={connectionOrder} busy={anyBusy} updated={connectionUpdated} /></Suspense> : null}
+      {settingsTab === 'providers' ? <Suspense fallback={<p className="muted">正在加载模型连接…</p>}><ProviderSettings profiles={profiles} officialAgents={officialAgents} order={connectionOrder} busy={anyBusy} updated={connectionUpdated} initialAgent={providerSettingsAgent} /></Suspense> : null}
       {settingsTab === 'general' ? <GeneralSettings prefs={prefs} setPrefs={setPrefs} busy={anyBusy} autoExpand={autoExpand} setAutoExpand={setAutoExpand} agents={agents} /> : null}
       {settingsTab === 'usage' ? <Suspense fallback={<p className="muted">加载中…</p>}><UsagePanel /></Suspense> : null}
       {settingsTab === 'quota' ? <Suspense fallback={<p className="muted">加载中…</p>}><QuotaPanel profiles={profiles} officialAgents={officialAgents} /></Suspense> : null}
@@ -847,7 +869,8 @@ export default function App() {
 {settingsTab === 'resources' ? <><div className="settings-page-heading"><h2>资源</h2><button className="icon-button" title="刷新内存" onClick={() => void inspectRuntime()}><RefreshCw size={14} /></button></div><div className="settings-section">{runtime && desktop ? <><div className="memory-grid"><div><span>应用与 WebView</span><strong>{(runtime.shellBytes / 1024 / 1024).toFixed(0)}<small> MiB</small></strong></div><div><span>Agent 与工具</span><strong>{(runtime.agentBytes / 1024 / 1024).toFixed(0)}<small> MiB</small></strong></div></div><p className="muted">{runtime.running ? 'Agent 运行中' : 'Agent 未运行'}</p></> : <p className="muted">{desktop ? '正在读取内存…' : '桌面版可查看内存'}</p>}<dl className="resource-info">{runtime && desktop ? <div><dt>空闲释放</dt><dd>{runtime.idleReleaseSeconds % 60 === 0 ? `${runtime.idleReleaseSeconds / 60} 分钟` : `${runtime.idleReleaseSeconds} 秒`}</dd></div> : null}<div><dt>会话保存</dt><dd>本机</dd></div></dl>{desktop ? <button className="quiet-button" disabled={anyBusy} onClick={() => { void call('release_runtime').then(inspectRuntime).catch(report); }}>释放空闲进程</button> : null}</div></> : null}
     </SettingsPage></Suspense> : null}
 
-    {modal ? <div className="modal-backdrop" onMouseDown={e => { if (e.target === e.currentTarget && !modalWorking) setModal(null); }}><section className="modal" ref={modalElement} role="dialog" aria-modal="true" aria-label={modal === 'search' ? '搜索会话' : modal === 'rename' ? '会话设置' : '添加项目'}><div className="modal-header"><h2>{modal === 'search' ? '搜索会话' : modal === 'rename' ? '会话设置' : '添加项目'}</h2><button className="icon-button" title="关闭" disabled={modalWorking} onClick={() => setModal(null)}><X size={18}/></button></div>
+    {modal ? <div className="modal-backdrop" onMouseDown={e => { if (e.target === e.currentTarget && !modalWorking) setModal(null); }}><section className="modal" ref={modalElement} role="dialog" aria-modal="true" aria-label={modal === 'search' ? '搜索会话' : modal === 'rename' ? '会话设置' : modal === 'provider' ? '添加模型供应商' : '添加项目'}><div className="modal-header"><h2>{modal === 'search' ? '搜索会话' : modal === 'rename' ? '会话设置' : modal === 'provider' ? '添加模型供应商' : '添加项目'}</h2><button className="icon-button" title="关闭" disabled={modalWorking} onClick={() => setModal(null)}><X size={18}/></button></div>
+      {modal === 'provider' ? <><p>{agents.find(a=>a.id===providerRequiredAgent)?.name ?? (({claude:'Claude Code',codex:'Codex',opencode:'OpenCode',pi:'Pi'} as Record<string,string>)[providerRequiredAgent] ?? providerRequiredAgent)} 当前对话没有可用的连接。请先添加模型供应商，再发送消息。</p><div className="modal-actions"><button type="button" className="quiet-button" onClick={()=>setModal(null)}>取消</button><button type="button" className="primary-button" onClick={()=>{setProviderSettingsAgent(providerRequiredAgent);setSettingsTab('providers');openSettings();}}>去添加</button></div></> : null}
       {modalError ? <div className="error-banner modal-error" role="alert">{modalError}</div> : null}
       {modal === 'project' ? <form onSubmit={e => { e.preventDefault(); void addProject(pathInput.trim()); }}><label htmlFor="project-path">项目文件夹路径</label><input id="project-path" autoFocus value={pathInput} onChange={e => setPathInput(e.target.value)} placeholder="D:\Projects\my-project" /><p className="muted">{desktop ? '输入已有项目的完整路径，也可以通过系统对话框选择文件夹。' : '这是界面预览。路径仅用于展示，不会读取本地文件。'}</p><div className="modal-actions">{desktop ? <button type="button" className="quiet-button" onClick={() => void addProject(undefined, true)}>选择文件夹</button> : null}<button className="primary-button" disabled={!pathInput.trim()}>添加项目</button></div></form> : null}
       {modal === 'search' ? <><div className="search-field"><Search size={17} /><input autoFocus value={search} onChange={e => setSearch(e.target.value)} placeholder="搜索项目或会话…" aria-label="搜索项目或会话" /></div><div className="search-results">{shownProjects.map(p => <div key={p.id}><button onClick={() => { selectProject(p); setModal(null); }}><Folder size={16} /><strong>{p.name}</strong></button>{sessions.filter(s => s.projectId === p.id && s.title.toLowerCase().includes(search.toLowerCase())).map(s => <button key={s.id} onClick={() => void selectSession(s)}><MessageSquare size={15} /><span>{s.title}</span></button>)}</div>)}{sessions.filter(s => !s.projectId && s.title.toLowerCase().includes(search.toLowerCase())).map(s => <button key={s.id} onClick={() => void selectSession(s)}><MessageSquare size={15}/><span>{s.title}</span></button>)}{!shownProjects.length && !sessions.some(s => !s.projectId && s.title.toLowerCase().includes(search.toLowerCase())) ? <p className="muted">没有找到匹配的会话。</p> : null}</div></> : null}
