@@ -10,7 +10,15 @@ SetCompressor /SOLID lzma
 !define MUI_UNICON "${ICON_SOURCE}"
 !include MUI2.nsh
 !define PRODUCT "SuperCode"
-!define KEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\SuperCode"
+!ifndef KEY
+  !define KEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\SuperCode"
+!endif
+!ifndef DESKTOP_LINK
+  !define DESKTOP_LINK "$DESKTOP\SuperCode.lnk"
+!endif
+!ifndef PROGRAMS_LINK
+  !define PROGRAMS_LINK "$SMPROGRAMS\SuperCode.lnk"
+!endif
 Name "SuperCode"
 OutFile "${OUTPUT}"
 Icon "${ICON_SOURCE}"
@@ -84,8 +92,8 @@ Section
   WriteRegDWORD HKCU "${KEY}" "NoModify" 1
   WriteRegDWORD HKCU "${KEY}" "NoRepair" 1
   WriteRegDWORD HKCU "${KEY}" "EstimatedSize" ${SIZE_KB}
-  CreateShortcut "$SMPROGRAMS\SuperCode.lnk" "$INSTDIR\supercode.exe" "" "$INSTDIR\${ICON_NAME}" 0
-  CreateShortcut "$DESKTOP\SuperCode.lnk" "$INSTDIR\supercode.exe" "" "$INSTDIR\${ICON_NAME}" 0
+  CreateShortcut "${PROGRAMS_LINK}" "$INSTDIR\supercode.exe" "" "$INSTDIR\${ICON_NAME}" 0
+  CreateShortcut "${DESKTOP_LINK}" "$INSTDIR\supercode.exe" "" "$INSTDIR\${ICON_NAME}" 0
   ${If} ${Errors}
     SetErrorLevel 4
     Quit
@@ -117,8 +125,8 @@ Section "Uninstall"
     StrCpy $0 $0 -1 1
   ${EndIf}
   ${If} $0 == $INSTDIR
-    Delete "$DESKTOP\SuperCode.lnk"
-    Delete "$SMPROGRAMS\SuperCode.lnk"
+    Delete "${DESKTOP_LINK}"
+    Delete "${PROGRAMS_LINK}"
     DeleteRegKey HKCU "${KEY}"
     System::Call 'shell32::SHChangeNotify(i 0x08000000, i 0, p 0, p 0)'
   ${EndIf}

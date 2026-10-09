@@ -409,6 +409,12 @@ pub fn request_app_exit(app: AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+pub fn is_quitting(app: &AppHandle) -> bool {
+    app.state::<DesktopLifecycle>()
+        .quitting
+        .load(Ordering::Acquire)
+}
+
 pub fn reserve_update_exit(app: &AppHandle) -> Result<(), String> {
     let state = app.state::<DesktopLifecycle>();
     if state.quitting.swap(true, Ordering::AcqRel) {

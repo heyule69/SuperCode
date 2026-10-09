@@ -3,6 +3,8 @@ mod engine;
 mod update;
 #[cfg(windows)]
 mod windows_install;
+#[cfg(windows)]
+mod windows_shutdown;
 use engine::{Installed, Manifest, Progress};
 use std::{
     path::PathBuf,
@@ -85,6 +87,10 @@ async fn begin_install(
         }
         #[cfg(windows)]
         {
+            windows_shutdown::prepare_upgrade(
+                &PathBuf::from(&path),
+                &windows_shutdown::user_data()?,
+            )?;
             engine::install(
                 &PathBuf::from(path),
                 PAYLOAD,
@@ -196,6 +202,17 @@ fn main() {
                 if automatic {
                     update::wait_for_release(&target)?;
                 }
+                let data = args
+                    .get(3)
+                    .map(PathBuf::from)
+                    .map(Ok)
+                    .unwrap_or_else(windows_shutdown::user_data)?;
+                // This is a read-only task-state check, not an installation
+                // destination; the real application data directory is valid here.
+                if !data.is_absolute() {
+                    return Err("用户数据目录必须为完整路径。".into());
+                }
+                windows_shutdown::prepare_upgrade(&target, &data)?;
                 let mut events: Vec<Progress> = vec![];
                 let installed = engine::install(
                     &target,

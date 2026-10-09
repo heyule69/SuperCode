@@ -18,6 +18,8 @@ mod extensions;
 mod followup_smoke;
 mod handoff;
 mod image_attachments;
+mod installation_exit;
+mod installation_exit_protocol;
 mod links;
 mod media;
 mod native_agents;
@@ -55,6 +57,12 @@ pub struct AppState {
 pub fn run() {
     let desktop_test = std::env::args()
         .any(|arg| matches!(arg.as_str(), "--desktop-smoke-test" | "--tray-hover-test"));
+    let installation_test = std::env::args().any(|arg| {
+        matches!(
+            arg.as_str(),
+            "--installation-exit-test" | "--legacy-installation-exit-test"
+        )
+    });
     let followup_test = std::env::args().any(|arg| arg == "--followups-smoke-test");
     let smoke_test = std::env::args().any(|arg| arg == "--smoke-test");
     let automation_test = std::env::args().any(|arg| arg == "--automation-smoke-test");
@@ -68,7 +76,12 @@ pub fn run() {
                 | "--provider-accounts-test"
         )
     });
-    let smoke_dir = (smoke_test || agents_test || desktop_test || followup_test || update_test)
+    let smoke_dir = (smoke_test
+        || agents_test
+        || desktop_test
+        || followup_test
+        || update_test
+        || installation_test)
         .then(|| {
             std::env::current_dir()
                 .unwrap_or_default()
@@ -92,7 +105,13 @@ pub fn run() {
         }
     }
     let builder = tauri::Builder::default();
-    let builder = if smoke_test || automation_test || agents_test || desktop_test || followup_test {
+    let builder = if smoke_test
+        || automation_test
+        || agents_test
+        || desktop_test
+        || followup_test
+        || installation_test
+    {
         builder
     } else {
         builder.plugin(tauri_plugin_single_instance::init(|app, _, _| {
@@ -157,10 +176,15 @@ pub fn run() {
                 claude_login: tokio::sync::Mutex::new(None),
                 change_snapshots: std::sync::Mutex::new(std::collections::HashMap::new()),
             });
+            if !std::env::args().any(|arg| arg == "--legacy-installation-exit-test") {
+                installation_exit::attach(app.handle())?;
+            }
             let outbox_handle = app.handle().clone();
             tauri::async_runtime::spawn(async move { outbox::watch(outbox_handle).await });
             let handle = app.handle().clone();
-            if update_test {
+            if installation_test {
+                installation_exit::smoke(app.handle().clone())?;
+            } else if update_test {
                 if let Some(window) = app.get_webview_window("main") {
                     window.hide()?;
                 }

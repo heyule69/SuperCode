@@ -30,16 +30,69 @@ pub fn hidden_command(path: impl AsRef<std::ffi::OsStr>) -> Command {
     command
 }
 pub fn previous_install() -> Option<PathBuf> {
+    registered_path(KEY)
+}
+fn registered_path(key: &str) -> Option<PathBuf> {
     CURRENT_USER
-        .open(KEY)
+        .options()
+        .read()
+        .access(0x100)
+        .open(key)
         .ok()
         .and_then(|key| {
-            key.get_string("InstallLocation")
-                .or_else(|_| key.get_string(""))
-                .ok()
+            ["InstallLocation", ""]
+                .into_iter()
+                .filter_map(|name| key.get_string(name).ok())
+                .find_map(|s| {
+                    let s = s.trim().trim_matches('"').trim();
+                    (!s.is_empty()).then(|| PathBuf::from(s))
+                })
         })
-        .filter(|s| !s.is_empty())
-        .map(|s| PathBuf::from(s.trim_matches('"')))
+}
+fn shortcut_target(path: &Path) -> Result<PathBuf> {
+    use windows::{
+        core::{Interface, HSTRING},
+        Win32::{
+            Foundation::RPC_E_CHANGED_MODE,
+            System::Com::{
+                CoCreateInstance, CoInitializeEx, CoUninitialize, IPersistFile,
+                CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, STGM_READ,
+            },
+            UI::Shell::{IShellLinkW, ShellLink},
+        },
+    };
+    struct Com(bool);
+    impl Drop for Com {
+        fn drop(&mut self) {
+            if self.0 {
+                unsafe {
+                    CoUninitialize();
+                }
+            }
+        }
+    }
+    let initialized = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
+    if initialized.is_err() && initialized != RPC_E_CHANGED_MODE {
+        return Err(initialized.to_string());
+    }
+    let _com = Com(initialized.is_ok());
+    unsafe {
+        let link: IShellLinkW =
+            CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER).map_err(|e| e.to_string())?;
+        let file: IPersistFile = link.cast().map_err(|e| e.to_string())?;
+        file.Load(&HSTRING::from(path.as_os_str()), STGM_READ)
+            .map_err(|e| e.to_string())?;
+        let mut buffer = vec![0u16; 32768];
+        link.GetPath(&mut buffer, std::ptr::null_mut(), 4)
+            .map_err(|e| e.to_string())?;
+        let end = buffer
+            .iter()
+            .position(|c| *c == 0)
+            .ok_or("快捷方式路径无效")?;
+        Ok(PathBuf::from(
+            String::from_utf16(&buffer[..end]).map_err(|e| e.to_string())?,
+        ))
+    }
 }
 pub(crate) fn same_path(a: &Path, b: &Path) -> bool {
     let a = fs::canonicalize(a).unwrap_or_else(|_| a.to_path_buf());
@@ -66,45 +119,11 @@ impl Registration for WindowsRegistration {
         if self.isolated {
             return Ok(());
         }
-        if let Some(previous) = previous_install() {
-            if !same_path(&previous, target) {
-                return Err(format!(
-                    "已安装在 {}。请使用原目录更新，或先卸载旧版再更换目录。",
-                    previous.display()
-                ));
-            }
-        }
-        let values = match CURRENT_USER.open(KEY) {
-            Ok(key) => Some(
-                key.values()
-                    .map_err(|e| e.to_string())?
-                    .map(|(name, value)| Value {
-                        name,
-                        kind: value.ty().into(),
-                        bytes: value.to_vec(),
-                    })
-                    .collect(),
-            ),
-            Err(e) if e.code().0 as u32 == 0x80070002 => None,
-            Err(e) => return Err(format!("无法备份卸载信息：{e}")),
-        };
-        let desktop = shortcut("Desktop")?;
-        let programs = shortcut("Programs")?;
-        for (path, name) in [(&desktop, "desktop.lnk"), (&programs, "programs.lnk")] {
-            if path.exists() {
-                if previous_install().is_none() {
-                    return Err("发现同名快捷方式，请先移开再安装，以免覆盖。".into());
-                }
-                fs::copy(path, backup.join(name)).map_err(|e| e.to_string())?;
-            }
-        }
-        write_json(
-            &backup.join("registration.json"),
-            &Snapshot {
-                values,
-                desktop: desktop.exists(),
-                programs: programs.exists(),
-            },
+        snapshot_registration(
+            target,
+            backup,
+            KEY,
+            [&shortcut("Desktop")?, &shortcut("Programs")?],
         )
     }
     fn apply(&self, target: &Path, worker: &Path) -> Result<()> {
@@ -142,38 +161,200 @@ impl Registration for WindowsRegistration {
         if self.isolated {
             return Ok(());
         }
-        let snapshot: Snapshot = serde_json::from_slice(
-            &fs::read(backup.join("registration.json")).map_err(|e| e.to_string())?,
-        )
-        .map_err(|e| e.to_string())?;
-        if CURRENT_USER.open(KEY).is_ok() {
-            CURRENT_USER.remove_tree(KEY).map_err(|e| e.to_string())?;
-        }
-        if let Some(values) = snapshot.values {
-            let key = CURRENT_USER.create(KEY).map_err(|e| e.to_string())?;
-            for value in values {
-                key.set_bytes(value.name, Type::from(value.kind), &value.bytes)
-                    .map_err(|e| e.to_string())?;
-            }
-        }
-        for (name, saved, existed) in [
-            ("Desktop", "desktop.lnk", snapshot.desktop),
-            ("Programs", "programs.lnk", snapshot.programs),
-        ] {
-            let path = shortcut(name)?;
-            if existed {
-                fs::copy(backup.join(saved), path).map_err(|e| e.to_string())?;
-            } else if path.exists() {
-                fs::remove_file(path).map_err(|e| e.to_string())?;
-            }
-        }
-        Ok(())
+        restore_registration(backup, KEY, [&shortcut("Desktop")?, &shortcut("Programs")?])
     }
+}
+
+fn snapshot_registration(
+    target: &Path,
+    backup: &Path,
+    registry: &str,
+    links: [&Path; 2],
+) -> Result<()> {
+    if let Some(previous) = registered_path(registry) {
+        if !same_path(&previous, target) {
+            return Err(format!(
+                "已安装在 {}。请使用原目录更新，或先卸载旧版再更换目录。",
+                previous.display()
+            ));
+        }
+    }
+    let values = match CURRENT_USER.options().read().access(0x100).open(registry) {
+        Ok(key) => Some(
+            key.values()
+                .map_err(|e| e.to_string())?
+                .map(|(name, value)| Value {
+                    name,
+                    kind: value.ty().into(),
+                    bytes: value.to_vec(),
+                })
+                .collect(),
+        ),
+        Err(e) if e.code().0 as u32 == 0x80070002 => None,
+        Err(e) => return Err(format!("无法备份卸载信息：{e}")),
+    };
+    let [desktop, programs] = links;
+    for (path, name) in [(desktop, "desktop.lnk"), (programs, "programs.lnk")] {
+        if path.exists() {
+            // Legacy installations may have no usable uninstall entry. Verify
+            // the actual link target instead of treating our own link as a conflict.
+            if !same_path(
+                &shortcut_target(path)
+                    .map_err(|e| format!("无法检查快捷方式 {}：{e}", path.display()))?,
+                &target.join("supercode.exe"),
+            ) {
+                return Err(format!(
+                    "同名快捷方式 {} 指向其他程序，无法覆盖。",
+                    path.display()
+                ));
+            }
+            fs::copy(path, backup.join(name)).map_err(|e| e.to_string())?;
+        }
+    }
+    write_json(
+        &backup.join("registration.json"),
+        &Snapshot {
+            values,
+            desktop: desktop.exists(),
+            programs: programs.exists(),
+        },
+    )
+}
+fn restore_registration(backup: &Path, registry: &str, links: [&Path; 2]) -> Result<()> {
+    let snapshot: Snapshot = serde_json::from_slice(
+        &fs::read(backup.join("registration.json")).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
+    if CURRENT_USER
+        .options()
+        .read()
+        .access(0x100)
+        .open(registry)
+        .is_ok()
+    {
+        CURRENT_USER
+            .remove_tree(registry)
+            .map_err(|e| e.to_string())?;
+    }
+    if let Some(values) = snapshot.values {
+        let key = CURRENT_USER
+            .options()
+            .read()
+            .write()
+            .create()
+            .access(0x100)
+            .open(registry)
+            .map_err(|e| e.to_string())?;
+        for value in values {
+            key.set_bytes(value.name, Type::from(value.kind), &value.bytes)
+                .map_err(|e| e.to_string())?;
+        }
+    }
+    for (path, saved, existed) in [
+        (links[0], "desktop.lnk", snapshot.desktop),
+        (links[1], "programs.lnk", snapshot.programs),
+    ] {
+        if existed {
+            fs::copy(backup.join(saved), path).map_err(|e| e.to_string())?;
+        } else if path.exists() {
+            fs::remove_file(path).map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn create_link(path: &Path, target: &Path) {
+        use windows::{
+            core::{Interface, HSTRING},
+            Win32::{
+                System::Com::{
+                    CoCreateInstance, CoInitializeEx, CoUninitialize, IPersistFile,
+                    CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED,
+                },
+                UI::Shell::{IShellLinkW, ShellLink},
+            },
+        };
+        unsafe {
+            CoInitializeEx(None, COINIT_MULTITHREADED).ok().unwrap();
+            {
+                let link: IShellLinkW =
+                    CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER).unwrap();
+                link.SetPath(&HSTRING::from(target.as_os_str())).unwrap();
+                let file: IPersistFile = link.cast().unwrap();
+                file.Save(&HSTRING::from(path.as_os_str()), true).unwrap();
+            }
+            CoUninitialize();
+        }
+    }
+    #[test]
+    fn legacy_shortcuts_without_registration_upgrade_and_roll_back() {
+        let root =
+            std::env::temp_dir().join(format!("supercode-link-test-{}", uuid::Uuid::new_v4()));
+        let target = root.join("旧版目录 with spaces");
+        let backup = root.join("backup");
+        fs::create_dir_all(&target).unwrap();
+        fs::create_dir(&backup).unwrap();
+        fs::write(target.join("supercode.exe"), b"old exe").unwrap();
+        let links = [root.join("desktop.lnk"), root.join("programs.lnk")];
+        for path in &links {
+            create_link(path, &target.join("supercode.exe"));
+        }
+        let original = fs::read(&links[0]).unwrap();
+        let registry = format!(
+            r"Software\SuperCode\InstallerTests\{}",
+            uuid::Uuid::new_v4()
+        );
+        snapshot_registration(&target, &backup, &registry, [&links[0], &links[1]]).unwrap();
+        assert_eq!(original, fs::read(backup.join("desktop.lnk")).unwrap());
+        let key = CURRENT_USER.create(&registry).unwrap();
+        key.set_string("InstallLocation", target.to_string_lossy())
+            .unwrap();
+        drop(key);
+        fs::write(&links[0], b"new shortcut").unwrap();
+        restore_registration(&backup, &registry, [&links[0], &links[1]]).unwrap();
+        assert_eq!(original, fs::read(&links[0]).unwrap());
+        assert!(CURRENT_USER.open(&registry).is_err());
+        create_link(&links[1], &root.join("other.exe"));
+        let unrelated = fs::read(&links[1]).unwrap();
+        assert!(
+            snapshot_registration(&target, &backup, &registry, [&links[0], &links[1]]).is_err()
+        );
+        assert_eq!(unrelated, fs::read(&links[1]).unwrap());
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn quoted_legacy_registry_paths_and_raw_values_survive_rollback() {
+        let root =
+            std::env::temp_dir().join(format!("supercode-registry-test-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&root).unwrap();
+        let registry = format!(
+            r"Software\SuperCode\InstallerTests\{}",
+            uuid::Uuid::new_v4()
+        );
+        let key = CURRENT_USER.create(&registry).unwrap();
+        let location = format!("\"{}\"", root.display());
+        key.set_string("InstallLocation", &location).unwrap();
+        key.set_u32("EstimatedSize", 123).unwrap();
+        assert!(same_path(&registered_path(&registry).unwrap(), &root));
+        key.set_string("", &location).unwrap();
+        key.set_string("InstallLocation", "  \"\"  ").unwrap();
+        assert!(same_path(&registered_path(&registry).unwrap(), &root));
+        key.set_string("InstallLocation", &location).unwrap();
+        let links = [root.join("desktop.lnk"), root.join("programs.lnk")];
+        snapshot_registration(&root, &root, &registry, [&links[0], &links[1]]).unwrap();
+        key.set_string("InstallLocation", "C:\\Wrong").unwrap();
+        drop(key);
+        restore_registration(&root, &registry, [&links[0], &links[1]]).unwrap();
+        let restored = CURRENT_USER.open(&registry).unwrap();
+        assert_eq!(restored.get_string("InstallLocation").unwrap(), location);
+        assert_eq!(restored.get_u32("EstimatedSize").unwrap(), 123);
+        drop(restored);
+        CURRENT_USER.remove_tree(&registry).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
     #[test]
     fn installation_identity_handles_windows_path_aliases() {
         assert!(same_path(
