@@ -23,7 +23,7 @@ let published;
 const previous = await fetch(`${api}/releases/tags/${tag}`, { headers: { Authorization: `Bearer ${token}`, Accept: 'application/vnd.github+json' } });
 if (previous.ok) { published = await previous.json(); if (!published.draft) throw new Error('This release is already published'); }
 else if (previous.status === 404) {
-  published = await request(`${api}/releases`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ tag_name: tag, target_commitish: sourceCommit, name: `SuperCode ${version}`, body: readFileSync(join(root, 'docs', 'releases', `${version}.md`), 'utf8'), draft: true, prerelease: false }) });
+  published = await request(`${api}/releases`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ tag_name: tag, target_commitish: sourceCommit, name: `SuperCode ${version}`, body: readFileSync(join(root, '.github', 'release-notes', `${version}.md`), 'utf8'), draft: true, prerelease: false }) });
 } else throw new Error(`Cannot inspect release: ${previous.status}`);
 for (const name of release.assets) {
   const old = published.assets.find(asset => asset.name === name);

@@ -8,7 +8,7 @@
 
 [下载 Windows 安装包](https://github.com/heyule69/SuperCode/releases/latest) · [版本记录](https://github.com/heyule69/SuperCode/releases)
 
-![SuperCode 工作台](docs/screenshots/workbench.jpg)
+![SuperCode 工作台](.github/assets/workbench.jpg)
 
 ## 功能
 
@@ -20,7 +20,7 @@
 - **桌面体验**：深浅主题、系统通知、托盘和多窗口。聊天保存在本机，Agent 按需启动，空闲后释放。
 - **软件更新**：自动检查 GitHub Releases，在「设置 → 关于」下载更新并重启安装，保留聊天与配置。
 
-各 Agent 的权限和引导能力按原生协议提供；目前同一时间运行一个 Agent 任务。[接入说明](docs/agent-integration.md) · [排队与引导](docs/agent-input-capabilities.md)
+各 Agent 的权限和引导能力按原生协议提供；目前同一时间运行一个 Agent 任务。
 
 ## 开始使用
 
@@ -36,11 +36,11 @@
 
 **Agent 管理**
 
-![Agent 管理：版本检查、安装、更新与测试](docs/screenshots/agents.jpg)
+![Agent 管理：版本检查、安装、更新与测试](.github/assets/agents.jpg)
 
 **自动化工具**
 
-![浏览器与电脑自动化工具](docs/screenshots/automation.jpg)
+![浏览器与电脑自动化工具](.github/assets/automation.jpg)
 
 ## 从源码运行
 
@@ -61,4 +61,4 @@ npm run desktop:build                              # 打包桌面端
 npm run installer:build                            # 构建 Logo 动画安装器
 ```
 
-安装器构建还需要 Python 与 NSIS，详见 [安装器说明](installer/README.md)。更多配置见 [插件与 MCP](docs/plugins-and-mcp.md)、[自动化工具](docs/automation-installation.md)。
+安装器构建还需要 Python 与 NSIS，详见 [安装器说明](installer/README.md)。

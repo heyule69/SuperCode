@@ -47,7 +47,7 @@ writeFileSync(join(generated, 'payload-sources.json'), JSON.stringify(entries, n
 run('python', ['-X', 'utf8', '-c', 'import json,pathlib,sys,zipfile; p=pathlib.Path(sys.argv[1]); entries=json.loads((p/"payload-sources.json").read_text(encoding="utf-8")); z=zipfile.ZipFile(p/"payload.zip","w",compression=zipfile.ZIP_DEFLATED,compresslevel=9); [z.write(e["source"],e["name"]) for e in entries]; z.close()', generated]);
 const template = readText(join(root, 'installer', 'ui-template.html'));
 if (template.split('__LOGO_DATA__').length !== 2) throw new Error('Logo 模板占位符不匹配。');
-const logo = `data:image/png;base64,${readFileSync(join(root, 'resources', 'branding', 'supercode-mark-transparent-v1.png')).toString('base64')}`;
+const logo = `data:image/png;base64,${readFileSync(join(root, 'resources', 'branding', 'logo.png')).toString('base64')}`;
 mkdirSync(join(root, 'installer', 'ui'), { recursive: true });
 writeFileSync(join(root, 'installer', 'ui', 'index.html'), template.replace('__LOGO_DATA__', logo), 'utf8');
 if (!prepareOnly) {
@@ -60,7 +60,7 @@ if (!prepareOnly) {
   const signingKey = process.env.TAURI_SIGNING_PRIVATE_KEY_PATH || join(process.env.USERPROFILE, '.supercode-signing', 'update.key');
   if (existsSync(signingKey)) {
     run(process.execPath, [join(root, 'node_modules', '@tauri-apps', 'cli', 'tauri.js'), 'signer', 'sign', '-f', signingKey, '-p', process.env.TAURI_SIGNING_PRIVATE_KEY_PASSWORD || '', '--app-version', version, setup]);
-    const notesPath = join(root, 'docs', 'releases', `${version}.md`);
+    const notesPath = join(root, '.github', 'release-notes', `${version}.md`);
     const latest = { version, notes: existsSync(notesPath) ? readText(notesPath).trim() : `SuperCode ${version}`, pub_date: new Date().toISOString(), platforms: {
       'windows-x86_64': { url: `https://github.com/heyule69/SuperCode/releases/download/v${version}/SuperCode_${version}_x64-setup.exe`, signature: readText(`${setup}.sig`).trim(), sha256: metadata.sha256, size: metadata.bytes },
     } };
