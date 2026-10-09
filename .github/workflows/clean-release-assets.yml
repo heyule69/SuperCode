@@ -1,0 +1,33 @@
+name: Remove redundant release attachments
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/clean-release-assets.yml
+      - scripts/clean-release-assets.mjs
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Published release tag to clean
+        required: true
+        default: v0.1.0
+        type: string
+permissions:
+  contents: write
+concurrency:
+  group: release-${{ inputs.tag || 'v0.1.0' }}
+  cancel-in-progress: false
+jobs:
+  cleanup:
+    if: github.repository == 'heyule69/SuperCode'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout release maintenance scripts
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Verify retained assets and remove redundant attachments
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ inputs.tag || 'v0.1.0' }}
+        run: node scripts/clean-release-assets.mjs

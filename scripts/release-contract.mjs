@@ -26,12 +26,11 @@ export function verifyRelease(directory, root, version) {
   const manifest = JSON.parse(readFileSync(join(directory, 'latest.json'), 'utf8'));
   const packageInfo = manifest.platforms?.['windows-x86_64'];
   const digest = createHash('sha256').update(bytes).digest('hex');
-  const signature = readFileSync(join(directory, `${name}.sig`), 'utf8').trim();
-  const checksum = readFileSync(join(directory, `${name}.sha256`), 'utf8').trim();
+  const signature = packageInfo?.signature;
   if (manifest.version !== version || bytes.subarray(0, 2).toString() !== 'MZ' || bytes.length > 256 * 1024 * 1024
-    || packageInfo?.size !== bytes.length || packageInfo?.sha256 !== digest || packageInfo?.signature !== signature
+    || packageInfo?.size !== bytes.length || packageInfo?.sha256 !== digest || typeof signature !== 'string' || !signature.trim()
     || packageInfo?.url !== `https://github.com/heyule69/SuperCode/releases/download/v${version}/${name}`
-    || checksum !== `${digest}  ${name}`) throw new Error('Release assets do not match their manifest');
+  ) throw new Error('Release assets do not match their manifest');
   verifySignedBytes(bytes, signature, readFileSync(join(root, 'src-tauri/update-public-key.txt'), 'utf8'), version);
-  return { name, digest, bytes: bytes.length, manifest, assets: [name, `${name}.sha256`, `${name}.sig`, 'latest.json'] };
+  return { name, digest, bytes: bytes.length, manifest, assets: [name, 'latest.json'] };
 }

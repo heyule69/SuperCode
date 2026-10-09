@@ -13,6 +13,6 @@ Windows x64 安装版启动 15 秒后自动检查一次，此后每 6 小时检�
 3. 设置 `TAURI_SIGNING_PRIVATE_KEY_PATH`，然后运行 `npm run installer:build`。
 4. 提交测试通过的源码，运行 `npm run release:publish`。
 
-发布脚本先核对签名和包清单，只把 EXE、校验文件、签名、`latest.json` 和源提交信息放入临时发布分支；版本标签指向源码提交。GitHub Actions 验证后创建 Release、上传四个资产并发布，最后删除临时分支。主分支不存放安装包、私钥、记忆或本机数据。
+发布脚本先核对签名和包清单，只把 EXE、`latest.json` 和源提交信息放入临时发布分支；版本标签指向源码提交。GitHub Actions 验证后创建 Release、上传安装包与更新清单并发布，最后删除临时分支。签名和 SHA-256 校验值已包含在 `latest.json` 中，无需单独上传。用户只需下载 EXE。主分支不存放安装包、私钥、记忆或本机数据。
 
 首次发布的私钥保存在维护者电脑的 `%USERPROFILE%\.supercode-signing\update.key`，公钥已编入程序。私钥必须单独备份，不上传 Git。以后需要使用同一密钥签名；更换公钥会使已有安装无法验证更新。构建本地未签名安装包仍可运行，但不能通过发布脚本发布为自动更新。

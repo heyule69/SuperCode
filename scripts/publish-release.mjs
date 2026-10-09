@@ -1,5 +1,5 @@
 // Publish tested local assets through GitHub Actions using the existing Git SSH login.
-// Only these four assets and source.json enter a temporary, parentless Git branch.
+// Only the installer, update manifest and source.json enter a temporary, parentless Git branch.
 import { spawnSync } from 'node:child_process';
 import { mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { resolve, join, dirname } from 'node:path';
