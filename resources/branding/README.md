@@ -1,5 +1,19 @@
 # SuperCode 应用图标
 
+当前图标（2026-10-09）：使用 `supercode-mark-transparent-v1.png` 的独立橙色徽记，移除浅色底板。软件、托盘、通知和安装器使用同一图标。原始素材保留，处理过程与完整提示词见 `supercode-mark-transparent-v1.notes.md`。
+
+当前资源重新生成命令：
+
+```powershell
+npm exec tauri icon -- 'resources/branding/supercode-mark-transparent-v1.png' --output 'src-tauri/icons'
+Copy-Item -LiteralPath 'src-tauri/icons/128x128.png' -Destination 'public/app-icon.png'
+Copy-Item -LiteralPath 'src-tauri/icons/32x32.png' -Destination 'public/favicon.png'
+```
+
+`public/favicon.svg` 嵌入同一张 32 × 32 透明 PNG。设计演示位于 `docs/designs/installer.html`；已确认的正式安装器源码位于 `installer/`，安装包输出到 `release/`。正式界面使用同一透明徽记和真实安装进度，软件、原生安装器 EXE 的六个内嵌图标尺寸均与源 ICO 一致。
+
+以下记录保留图标的历史选择与验证过程。
+
 2026-10-08：用户选择方案 2，浅色圆角方块与橙色放射徽记，作为软件图标。
 
 - 原始素材：`supercode-icon-ai-v3-radial.png`，1254 × 1254，RGBA，来自内置 ImageGen。保留用户选定的原始生成图。

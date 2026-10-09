@@ -1,0 +1,348 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="dark" data-phase="welcome">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark light">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; connect-src ipc: http://ipc.localhost; img-src 'self' data:; style-src 'unsafe-inline'; script-src 'unsafe-inline'; base-uri 'none'; form-action 'none'">
+  <title>SuperCode</title>
+  <link id="favicon" rel="icon" type="image/png">
+  <style>
+    :root {
+      color-scheme: dark;
+      --page: #111214; --surface: #1b1c1f; --text: #d5d4d2;
+      --muted: #88898d; --line: #ffffff10; --hover: #ffffff09;
+      --field: #17181a; --accent: #fb8b51; --focus: #fb8b5180;
+      --bloom: 0; --surface-shadow: 0 28px 90px #00000032;
+      font-family: "Segoe UI Variable", "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+      -webkit-font-smoothing: antialiased;
+    }
+    :root[data-theme="light"] {
+      color-scheme: light;
+      --page: #eeede9; --surface: #f9f8f4; --text: #34332f;
+      --muted: #77756f; --line: #31271912; --hover: #31271908;
+      --field: #f0eee9; --accent: #dc6930; --focus: #dc693080;
+      --surface-shadow: 0 28px 90px #52452713;
+    }
+    * { box-sizing: border-box; }
+    html, body { height: 100%; overflow: hidden; }
+    body { margin: 0; background: var(--surface); color: var(--text); }
+    button, input { font: inherit; }
+    button { cursor: pointer; -webkit-tap-highlight-color: transparent; }
+    button:focus-visible, canvas:focus-visible { outline: 2px solid var(--focus); outline-offset: 5px; }
+    [hidden] { display: none !important; }
+    .installer {
+      position: relative; display: flex; flex-direction: column;
+      width: 100%; height: 100dvh; overflow: hidden;
+      background: var(--surface); isolation: isolate;
+    }
+    .installer::before {
+      content: ""; position: absolute; inset: 7% 7% 18%; z-index: -1; pointer-events: none;
+      background: radial-gradient(ellipse at 50% 58%, #e56b2410 0%, transparent 63%);
+      opacity: var(--bloom);
+    }
+    .top-controls { position: absolute; top: 15px; right: 16px; z-index: 2; display: flex; gap: 2px; }
+    .quiet-button { display: grid; place-items: center; width: 44px; height: 44px; border: 0; border-radius: 50%; background: transparent; color: var(--muted); transition: color 180ms, background 180ms; }
+    .quiet-button:hover { background: var(--hover); color: var(--text); }
+    .quiet-button svg { width: 16px; height: 16px; }
+    .stage { position: relative; flex: 1; min-height: 0; width: 100%; margin-top: 28px; }
+    canvas { display: block; width: 100%; height: 100%; cursor: default; touch-action: manipulation; outline: none; }
+    [data-phase="welcome"] #mark { animation: standby 5s ease-in-out infinite; }
+    [data-phase="complete"] #mark { animation: settled 700ms cubic-bezier(.2,.75,.25,1) both; }
+    .progress-readout { position: absolute; top: calc(50% + 8px); left: 50%; transform: translate(-50%, -50%); pointer-events: none; color: var(--muted); font: 500 11px/1 Consolas, monospace; font-variant-numeric: tabular-nums; letter-spacing: -.3px; }
+    .directory { flex-shrink: 0; margin: 5px 40px 30px; }
+    .directory > label { display: block; margin: 0 0 10px 2px; font-size: 11px; font-weight: 400; color: var(--muted); letter-spacing: .1px; }
+    .directory-row { display: flex; align-items: center; gap: 14px; }
+    .directory-field { display: flex; align-items: center; gap: 12px; min-width: 0; flex: 1; height: 48px; border: 1px solid var(--line); border-radius: 9px; background: var(--field); padding: 0 14px; transition: border-color 180ms, box-shadow 180ms; }
+    .directory-field:focus-within { border-color: var(--focus); box-shadow: 0 0 0 2px #eb7b3110; }
+    .directory-field:has(input[aria-invalid="true"]) { border-color: #e66d45; }
+    .directory-field > svg { width: 17px; height: 17px; color: var(--muted); flex-shrink: 0; }
+    input { min-width: 0; width: 100%; border: 0; outline: 0; padding: 0; color: var(--text); background: transparent; font-family: Consolas, "Segoe UI", monospace; font-size: 12px; }
+    input:disabled { opacity: .6; -webkit-text-fill-color: var(--text); cursor: default; }
+    .action { display: grid; place-items: center; width: 48px; height: 48px; flex-shrink: 0; border: 0; border-radius: 50%; color: #281a12; background: var(--accent); transition: transform 180ms, box-shadow 180ms; }
+    .action:hover { transform: translateY(-1px); box-shadow: 0 5px 18px #dd682326; }
+    .action:active { transform: scale(.94); }
+    .action svg { width: 19px; height: 19px; }
+    .action:disabled { cursor: default; opacity: .5; }
+    .drag { position: absolute; inset: 0 68px auto 0; height: 52px; z-index: 2; }
+    .folder-button { display: grid; place-items: center; width: 24px; height: 30px; padding: 0; border: 0; color: var(--muted); background: transparent; flex-shrink: 0; }
+    .folder-button svg { width: 17px; height: 17px; }
+    .folder-button:hover { color: var(--accent); }
+    .error { flex-shrink: 0; margin: -16px 40px 20px; font-size: 12px; line-height: 1.5; color: #ec926d; white-space: pre-wrap; overflow-wrap: anywhere; max-height: 65px; overflow: auto; }
+    .sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; }
+    @media (max-width: 520px) {
+      .top-controls { top: 8px; right: 8px; }
+      .stage { margin-top: 30px; }
+      .directory { margin: 0 22px 24px; }
+      .directory-row { gap: 10px; }
+      .directory-field { padding: 0 11px; gap: 8px; }
+      input { font-size: 11px; }
+      .action { width: 46px; height: 46px; }
+    }
+    @keyframes standby { 0%,100% { transform: translateY(1px) scale(1); } 50% { transform: translateY(-3px) scale(1.012); } }
+    @keyframes settled { 0% { transform: scale(.985); } 45% { transform: scale(1.025); } 100% { transform: scale(1); } }
+    @media (prefers-reduced-motion: reduce) {
+      button, .directory-field { transition: none !important; }
+      .action:hover, .action:active { transform: none; }
+      #mark { animation: none !important; }
+    }
+  </style>
+</head>
+<body>
+  <main class="installer" aria-label="SuperCode 安装器">
+    <div class="drag" id="drag" aria-hidden="true"></div>
+    <div class="top-controls">
+      <button class="quiet-button" id="replay" aria-label="关闭安装器" title="关闭">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      </button>
+    </div>
+    <div class="stage" id="stage">
+      <canvas id="mark" role="img" aria-label="SuperCode 透明徽记"><img id="fallback" alt="SuperCode 透明徽记"></canvas>
+      <span class="progress-readout" id="progress-readout" aria-hidden="true" hidden>0%</span>
+    </div>
+    <div class="directory">
+      <label for="install-path">安装目录</label>
+      <div class="directory-row">
+        <div class="directory-field">
+          <button class="folder-button" id="folder" title="选择安装目录" aria-label="选择安装目录"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7a2 2 0 0 1 2-2h5l2 3h7a2 2 0 0 1 2 2v9H3V7Z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/></svg></button>
+          <input id="install-path" value="%LOCALAPPDATA%\SuperCode" aria-label="安装目录" autocomplete="off" spellcheck="false">
+        </div>
+        <button class="action" id="action" aria-label="开始安装" title="开始安装" disabled>
+          <svg id="action-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4v11m-4-4 4 4 4-4M5 18v2h14v-2" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </button>
+      </div>
+    </div>
+    <div class="error" id="error" role="alert" hidden></div>
+    <span class="sr-only" id="status" role="status" aria-live="polite"></span>
+    <span class="sr-only" id="progress" role="progressbar" aria-label="安装进度" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" hidden></span>
+  </main>
+  <script>
+    (() => {
+      'use strict';
+      const logoData = '__LOGO_DATA__';
+      const element = id => document.getElementById(id);
+      const root = document.documentElement;
+      const canvas = element('mark');
+      const context = canvas.getContext('2d', { alpha: true });
+      const stage = element('stage');
+      const preference = matchMedia('(prefers-reduced-motion: reduce)');
+      const image = new Image();
+      const native = window.__TAURI__;
+      const invoke = (...args) => native.core.invoke(...args);
+      const pieces = [];
+      const sourceScale = .378;
+      const center = { x: 625, y: 630 };
+      const size = { width: 0, height: 0, pixelRatio: 1 };
+      const pointer = { x: 0, y: 0 };
+      let progress = 0, visualProgress = 0, lastTime = 0, frame = null;
+      let phase = 'welcome', state = 'loading', ready = false, destroyed = false, connected = false, finished = false;
+      let unlisten = null, shown = false;
+      let installationPath = '';
+      let reducedMotion = preference.matches;
+      element('fallback').src = logoData;
+      element('favicon').href = logoData;
+      const clamp = (value, min = 0, max = 1) => Math.max(min, Math.min(max, value));
+      const mix = (from, to, amount) => from + (to - from) * amount;
+      const smooth = value => value * value * (3 - 2 * value);
+      const ease = value => 1 - Math.pow(1 - value, 3);
+      const percentage = () => progress >= 1 ? 100 : Math.min(99, Math.floor(progress * 100));
+      const random = index => { const value = Math.sin(index * 78.233 + 19.19) * 43758.5453; return value - Math.floor(value); };
+
+      const updateControls = () => {
+        const busy = phase === 'installing' || state === 'launching';
+        const label = phase === 'welcome' ? '开始安装' : phase === 'complete' ? '打开 SuperCode' : '正在安装';
+        element('action').setAttribute('aria-label', label); element('action').title = label;
+        element('action').disabled = !ready || !connected || busy || destroyed;
+        element('replay').disabled = busy; element('folder').disabled = busy || phase === 'complete' || !connected;
+        element('action-icon').innerHTML = phase === 'complete'
+          ? '<path d="M13 4h7v7m0-7-9 9M10 4H5a1 1 0 0 0-1 1v14a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>'
+          : '<path d="M12 4v11m-4-4 4 4 4-4M5 18v2h14v-2" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/>';
+        element('install-path').disabled = busy || !connected;
+        element('install-path').readOnly = phase === 'complete';
+        element('progress-readout').hidden = phase === 'welcome'; element('progress').hidden = phase === 'welcome';
+        root.dataset.phase = phase; root.dataset.state = state;
+        if (ready && connected && !shown) { shown = true; invoke('show_installer', { pieceCount: pieces.length }).catch(showError); }
+      };
+      const showError = error => {
+        element('error').textContent = String(error); element('error').hidden = false;
+      };
+      const buildPieces = () => {
+        const radii = [0, 59, 93, 127, 159, 252];
+        for (let petal = 0; petal < 8; petal++) {
+          const angle = -Math.PI / 2 + petal * Math.PI / 4;
+          const low = angle - Math.PI / 8, high = angle + Math.PI / 8;
+          for (let band = 0; band < 5; band++) {
+            const inner = Math.max(0, radii[band] - .45), outer = radii[band + 1] + .45;
+            const points = [];
+            for (const radius of [inner, outer]) for (let j = 0; j <= 16; j++) {
+              const theta = low + (high - low) * j / 16;
+              points.push({ x: radius * Math.cos(theta), y: radius * Math.sin(theta) });
+            }
+            const x = Math.floor(Math.min(...points.map(point => point.x))) - 2;
+            const y = Math.floor(Math.min(...points.map(point => point.y))) - 2;
+            const width = Math.ceil(Math.max(...points.map(point => point.x))) - x + 2;
+            const height = Math.ceil(Math.max(...points.map(point => point.y))) - y + 2;
+            const texture = document.createElement('canvas');
+            const density = 1.8;
+            texture.width = Math.ceil(width * density); texture.height = Math.ceil(height * density);
+            const painter = texture.getContext('2d', { alpha: true });
+            painter.scale(density, density); painter.translate(-x, -y);
+            painter.beginPath();
+            painter.arc(0, 0, outer, low, high);
+            if (inner) painter.arc(0, 0, inner, high, low, true);
+            else painter.lineTo(0, 0);
+            painter.closePath(); painter.clip();
+            painter.drawImage(image, -center.x * sourceScale, -center.y * sourceScale, image.naturalWidth * sourceScale, image.naturalHeight * sourceScale);
+            const index = petal * 5 + band;
+            pieces.push({ texture, x: x + width / 2, y: y + height / 2, width, height, angle,
+              arrival: .02 + petal * .084 + band * .017,
+              distance: 105 + band * 10 + random(index + 1) * 85,
+              tangent: (random(index + 2) - .5) * 145,
+              turn: (random(index + 3) - .5) * 6.4,
+              fold: 1.0 + random(index + 4) * .75,
+              seed: random(index + 5),
+            });
+          }
+        }
+      };
+
+      const draw = () => {
+        if (!ready || !size.width || !size.height || destroyed) return;
+        const { width, height, pixelRatio } = size;
+        context.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0);
+        context.clearRect(0, 0, width, height);
+        const scale = Math.min(width / 700, height / 454);
+        const readout = element('progress-readout');
+        readout.textContent = `${percentage()}%`;
+        readout.style.fontSize = `${Math.max(8, Math.min(11, 11 * scale))}px`;
+        readout.style.transform = `translate(-50%, -50%) translate(${reducedMotion ? 0 : pointer.x * 6}px, ${reducedMotion ? 0 : pointer.y * 5}px)`;
+        context.save();
+        context.translate(width / 2 + (reducedMotion ? 0 : pointer.x * 6), height / 2 + 8 + (reducedMotion ? 0 : pointer.y * 5));
+        context.scale(scale, scale);
+        const finish = clamp((visualProgress - .88) / .12);
+        const bloom = reducedMotion ? 0 : Math.sin(finish * Math.PI) * (1 - finish) * 23;
+        root.style.setProperty('--bloom', String(phase === 'welcome' ? .2 : phase === 'complete' ? .7 : .3 + Math.sin(progress * Math.PI) * .7));
+        if (phase !== 'installing' || visualProgress >= 1) {
+          context.drawImage(image, -center.x * sourceScale, -center.y * sourceScale, image.naturalWidth * sourceScale, image.naturalHeight * sourceScale);
+        } else {
+          for (const piece of pieces) {
+            const local = clamp((visualProgress - piece.arrival) / .19);
+            if (local <= 0) continue;
+            const landed = ease(local), remaining = 1 - landed;
+            const tangent = piece.tangent * remaining + Math.sin(local * Math.PI) * 20;
+            const radial = piece.distance * remaining + bloom;
+            const wobble = local > .76 ? Math.sin((local - .76) / .24 * Math.PI) * 2.2 * (1 - local) : 0;
+            const x = piece.x + (reducedMotion ? 0 : Math.cos(piece.angle) * (radial + wobble) - Math.sin(piece.angle) * tangent);
+            const y = piece.y + (reducedMotion ? 0 : Math.sin(piece.angle) * (radial + wobble) + Math.cos(piece.angle) * tangent);
+            const opacity = reducedMotion ? smooth(clamp(local * 2)) : smooth(clamp(local * 4.5));
+            if (!reducedMotion && local < .74) {
+              const sparks = Math.sin(local / .74 * Math.PI) * .28;
+              for (let tail = 1; tail <= 3; tail++) {
+                const offset = tail * 8 * remaining;
+                context.globalAlpha = sparks / tail;
+                context.fillStyle = '#ff9b58';
+                context.beginPath();
+                context.arc(x + Math.cos(piece.angle) * offset, y + Math.sin(piece.angle) * offset, 1.05 + piece.seed, 0, Math.PI * 2);
+                context.fill();
+              }
+            }
+            context.save();
+            context.globalAlpha = opacity;
+            context.translate(x, y);
+            if (!reducedMotion) {
+              context.rotate(piece.turn * remaining + Math.sin(finish * Math.PI) * .08);
+              const fold = .16 + .84 * Math.abs(Math.cos((1 - local) * Math.PI * piece.fold));
+              context.scale(.65 + .35 * landed, mix(fold, 1, smooth(local)));
+            }
+            context.drawImage(piece.texture, -piece.width / 2, -piece.height / 2, piece.width, piece.height);
+            context.restore();
+          }
+        }
+        context.restore(); context.globalAlpha = 1;
+        element('progress').setAttribute('aria-valuenow', String(percentage()));
+      };
+
+      const resize = () => {
+        const rectangle = stage.getBoundingClientRect();
+        size.width = rectangle.width; size.height = rectangle.height; size.pixelRatio = Math.min(window.devicePixelRatio || 1, 2);
+        canvas.width = Math.round(size.width * size.pixelRatio); canvas.height = Math.round(size.height * size.pixelRatio);
+        draw();
+      };
+      const stopFrame = () => { if (frame !== null) cancelAnimationFrame(frame); frame = null; };
+      const tick = time => {
+        frame = null;
+        if (destroyed || document.hidden) return;
+        const dt = Math.min(64, Math.max(0, time - lastTime)); lastTime = time;
+        visualProgress += (progress - visualProgress) * (1 - Math.exp(-dt / 220));
+        if (Math.abs(progress - visualProgress) < .002) visualProgress = progress;
+        if (finished && visualProgress === 1) { phase = 'complete'; state = 'complete'; updateControls(); }
+        draw();
+        if (visualProgress !== progress) frame = requestAnimationFrame(tick);
+      };
+      const schedule = () => {
+        if (reducedMotion) { visualProgress = progress; if (finished) { phase = 'complete'; state = 'complete'; updateControls(); } draw(); return; }
+        if (frame === null && !document.hidden) { lastTime = performance.now(); frame = requestAnimationFrame(tick); }
+      };
+      const receive = event => {
+        if (phase !== 'installing' || destroyed || !Number.isFinite(event.percent)) return;
+        // 100 is accepted only after the native command returns a successful installation.
+        progress = Math.max(progress, clamp(Math.min(99, event.percent) / 100));
+        element('status').textContent = `安装进度 ${percentage()}%`; draw(); schedule();
+      };
+      const begin = async () => {
+        if (!ready || !connected || phase !== 'welcome' || destroyed) return;
+        const path = element('install-path').value.trim(); if (!path) return;
+        phase = 'installing'; state = 'installing'; progress = visualProgress = 0; finished = false;
+        element('error').hidden = true; installationPath = path; pointer.x = pointer.y = 0; updateControls(); draw();
+        try {
+          const installed = await invoke('begin_install', { path });
+          installationPath = installed.path; element('install-path').value = installed.path;
+          finished = true; progress = 1; element('status').textContent = '安装完成。'; draw(); schedule();
+        } catch (error) {
+          stopFrame(); phase = 'welcome'; state = 'idle'; progress = visualProgress = 0; updateControls(); draw(); showError(error);
+        }
+      };
+      const launch = async () => {
+        if (phase !== 'complete' || state !== 'complete') return;
+        state = 'launching'; updateControls(); element('error').hidden = true;
+        try { await invoke('launch_installed'); } catch (error) { state = 'complete'; updateControls(); showError(error); }
+      };
+      element('action').addEventListener('click', () => { if (phase === 'welcome') begin(); else if (phase === 'complete') launch(); });
+      element('replay').addEventListener('click', async () => { try { await invoke('close_installer'); } catch (error) { showError(error); } });
+      element('folder').addEventListener('click', async () => {
+        if (phase !== 'welcome') return;
+        try { const path = await invoke('choose_directory'); if (path) { element('install-path').value = path; element('error').hidden = true; } } catch (error) { showError(error); }
+      });
+      element('install-path').addEventListener('input', () => { element('error').hidden = true; });
+      element('install-path').addEventListener('keydown', event => { if (event.key === 'Enter' && phase === 'welcome') { event.preventDefault(); begin(); } });
+      element('drag').addEventListener('pointerdown', event => { if (event.button === 0) native.window.getCurrentWindow().startDragging().catch(showError); });
+      canvas.addEventListener('pointermove', event => {
+        if (reducedMotion || phase === 'installing') return;
+        const rectangle = canvas.getBoundingClientRect();
+        pointer.x = clamp((event.clientX - rectangle.left) / rectangle.width * 2 - 1, -1, 1);
+        pointer.y = clamp((event.clientY - rectangle.top) / rectangle.height * 2 - 1, -1, 1); draw();
+      });
+      canvas.addEventListener('pointerleave', () => { pointer.x = pointer.y = 0; draw(); });
+      preference.addEventListener('change', event => { reducedMotion = event.matches; pointer.x = 0; pointer.y = 0; draw(); });
+      document.addEventListener('visibilitychange', () => { if (document.hidden) stopFrame(); else schedule(); });
+      const observer = new ResizeObserver(resize); observer.observe(stage);
+      window.addEventListener('pagehide', () => { destroyed = true; stopFrame(); observer.disconnect(); pieces.length = 0; unlisten?.(); });
+      window.supercodeInstaller = Object.freeze({
+        getState: () => ({ phase, state, progress: percentage(), visualProgress, reducedMotion, pieceCount: pieces.length, pendingFrames: frame === null ? 0 : 1 }),
+      });
+      image.onload = () => { if (destroyed) return; ready = true; state = 'idle'; buildPieces(); resize(); updateControls(); };
+      const connect = async () => {
+        if (!native) { showError('请通过安装程序打开此界面。'); return; }
+        try {
+          // Subscribe before enabling the install button, including the first progress event.
+          unlisten = await native.event.listen('installation-progress', event => receive(event.payload));
+          element('install-path').value = await invoke('installation_path'); connected = true; updateControls();
+        } catch (error) { showError(error); invoke('show_installer', { pieceCount: pieces.length }).catch(() => {}); }
+      };
+      connect();
+      image.onerror = () => { state = 'failed'; updateControls(); element('action').disabled = true; showError('图标加载失败，请重新下载安装包。'); if (native) invoke('show_installer', { pieceCount: 0 }).catch(() => {}); };
+      image.src = logoData;
+    })();
+  </script>
+</body>
+</html>

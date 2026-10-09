@@ -2,6 +2,11 @@ node_modules/
 dist/
 src-tauri/target/
 src-tauri/gen/schemas/
+installer/target/
+installer/generated/
+installer/ui/
+installer/gen/
+release/
 *.tsbuildinfo
 .supercode/
 memory/
