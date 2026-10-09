@@ -1,0 +1,21 @@
+.notification-settings .settings-page-heading { margin-bottom:24px; }
+.notification-subtitle { margin:9px 0 0; color:var(--muted); font-size:var(--ui-size); }
+.notification-system-card { display:flex; align-items:center; gap:13px; padding:16px 18px; margin-bottom:28px; border:1px solid var(--line); border-radius:14px; background:var(--surface); }
+.notification-system-icon { display:grid; place-items:center; width:38px; height:38px; border-radius:11px; background:var(--hover); color:var(--text); flex:none; }
+.notification-system-copy { display:flex; flex-direction:column; gap:5px; min-width:0; flex:1; }
+.notification-system-copy strong { font-size:var(--ui-size); font-weight:500; }
+.notification-system-copy > span { color:var(--muted); font-size:calc(var(--ui-size) - 1px); }
+.notification-status-badge { padding:4px 9px; border-radius:6px; white-space:nowrap; font-size:11px; color:var(--muted); background:var(--hover); }
+.notification-status-badge.available { color:var(--accent); background:color-mix(in srgb, var(--accent) 10%, transparent); }
+.notification-options { min-width:0; }
+.notification-options .settings-group { margin-bottom:24px; }
+.notification-options .settings-card { padding:0 16px; }
+.notification-options .setting-row { gap:16px; padding:15px 0; }
+.notification-options .setting-control select { min-width:144px; font-size:calc(var(--ui-size) - 1px); }
+.notification-type-row { display:flex; align-items:center; gap:12px; }
+.notification-type-row + .notification-type-row { border-top:1px solid var(--line); }
+.notification-type-row > svg { color:var(--muted); flex:none; }
+.notification-type-row > .setting-row { flex:1; min-width:0; }
+.settings-switch:disabled { cursor:default; opacity:.4; }
+.notification-options select:disabled { opacity:.5; }
+@media(max-width:720px) { .notification-system-card { gap:8px; padding:12px; }.notification-system-icon { display:none; }.notification-status-badge { display:none; }.notification-type-row { align-items:flex-start; }.notification-type-row > svg { margin-top:17px; }.notification-options .setting-description { min-width:0; }.notification-options .setting-row { flex-wrap:nowrap; }.notification-options .setting-control { max-width:none; }.notification-options .setting-control select { min-width:0; width:125px; } }

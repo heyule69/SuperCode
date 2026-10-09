@@ -1,0 +1,29 @@
+.automation-intro { color:var(--muted); margin:-12px 0 32px; line-height:1.6; }
+.automation-cards { display:grid; gap:20px; }
+.automation-card { background:var(--surface); border:1px solid var(--line); border-radius:16px; padding:24px; }
+.automation-card header { display:flex; align-items:center; gap:14px; }
+.automation-icon { display:grid; place-items:center; width:44px; height:44px; flex:none; color:var(--text); background:var(--hover); border-radius:12px; }
+.automation-title { min-width:0; flex:1; }
+.automation-card h3 { margin:0; font-size:15px; font-weight:600; }
+.automation-title p { margin:5px 0 0; font-size:12px; color:var(--muted); }
+.automation-description { color:var(--muted); line-height:1.7; margin:20px 0; }
+.automation-enable { display:flex; align-items:center; gap:10px; color:var(--muted); font-size:12px; }
+.automation-result { display:flex; align-items:center; gap:8px; min-height:24px; flex-wrap:wrap; }
+.automation-result small { color:var(--muted); margin-left:auto; font-size:12px; }
+.automation-result.failed { color:var(--danger); white-space:pre-wrap; overflow-wrap:anywhere; }
+.automation-card progress { display:block; width:100%; margin:12px 0; height:4px; accent-color:#3385f5; }
+.automation-test-summary { margin-top:12px; color:var(--muted); font-size:12px; line-height:1.6; }
+.automation-test-summary p { margin:0 0 3px; }
+.automation-test-summary span { font-size:11px; }
+.automation-card footer { display:flex; align-items:center; gap:16px; border-top:1px solid var(--line); padding-top:18px; margin-top:20px; min-height:32px; }
+.automation-card footer button { display:inline-flex; align-items:center; justify-content:center; gap:7px; }
+.automation-text-button { border:0; background:transparent; color:var(--muted); padding:7px 0; cursor:pointer; }
+.automation-text-button:hover { color:var(--text); }
+.automation-footnote { display:flex; align-items:flex-start; gap:9px; color:var(--muted); margin-top:24px; font-size:12px; line-height:1.8; }
+.automation-footnote svg { flex:none; margin-top:3px; }
+.automation-footnote p { margin:0; }
+.automation-notice { padding:12px 16px; background:var(--hover); border-radius:10px; color:var(--muted); }
+.automation-spin { animation:automation-spin 1s linear infinite; }
+@keyframes automation-spin { to { transform:rotate(360deg); } }
+@media (prefers-reduced-motion:reduce) { .automation-spin { animation-duration:3s; } }
+@media (max-width:850px) { .automation-card { padding:18px; }.automation-card header { flex-wrap:wrap; }.automation-enable { margin-left:auto; }.automation-result small { width:100%; margin-left:23px; } }

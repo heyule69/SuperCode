@@ -1,0 +1,57 @@
+/* Approved compact model picker; shares the app's appearance and font settings. */
+.composer-popover.model-popover {
+  --model-selected:color-mix(in srgb,var(--hover) 75%,var(--text) 5%);
+  --model-menu-size:max(12px,calc(var(--ui-size) - 1px));
+  width:400px;
+  max-width:calc(100vw - 24px);
+  padding:0;
+  border-radius:12px;
+  border-color:var(--line);
+  background:var(--surface);
+  box-shadow:0 12px 40px #0003;
+  font-size:var(--model-menu-size);
+}
+.model-menu-heading { display:flex; align-items:center; gap:8px; padding:10px 13px 0; }
+.model-menu-heading h2 { margin:0; font-size:calc(var(--model-menu-size) + 2px); font-weight:600; }
+.model-menu-heading > span { margin-left:auto; min-width:0; max-width:160px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:calc(var(--ui-size) - 1px); color:var(--muted); }
+.model-popover .icon-button { width:26px; height:26px; padding:0; justify-content:center; flex:none; color:var(--muted); }
+.model-popover .model-picker-search { height:32px; gap:8px; padding:5px 9px; margin:8px 12px; background:var(--bg); border:1px solid var(--line); border-radius:8px; color:var(--muted); }
+.model-popover .model-picker-search:focus-within { border-color:var(--muted); box-shadow:none; }
+.model-popover .model-picker-search input { width:100%; height:20px; min-height:20px; padding:0; min-width:0; border:0; background:transparent; font:inherit; font-size:var(--model-menu-size); color:var(--text); }
+.model-popover .model-picker-search input::placeholder { color:var(--muted); }
+.model-popover .model-picker-search .icon-button { width:22px; height:22px; }
+.model-popover .model-provider-filters { display:flex; flex-wrap:nowrap; gap:4px; padding:0 12px 8px; overflow-x:auto; overscroll-behavior-x:contain; }
+.model-popover .model-provider-filters::-webkit-scrollbar { height:3px; }
+.model-popover .model-provider-filters > button { flex-shrink:0; gap:5px; min-height:26px; padding:4px 8px; font-size:var(--model-menu-size); color:var(--muted); border-radius:6px; }
+.model-provider-filters > button > span:not(.agent-logo):not(.provider-initial) { max-width:165px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.model-popover .model-provider-filters > button[aria-pressed=true] { color:var(--text); background:var(--model-selected); }
+.model-provider-filters .provider-logo, .model-provider-filters .agent-logo, .model-provider-filters .agent-logo img { width:14px; height:14px; object-fit:contain; flex:none; }
+.model-popover .model-menu-scroll { max-height:264px; min-height:65px; overflow-y:auto; overscroll-behavior:contain; margin:0; padding:0 6px 6px; }
+.model-popover .model-group-heading { display:flex; gap:7px; padding:9px 8px 4px; color:var(--muted); font-size:var(--model-menu-size); }
+.model-group-heading > span { display:flex; align-items:center; gap:8px; min-width:0; flex:1; }
+.model-group-heading > span > span:last-child { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.model-popover .model-group-heading > small { flex:none; max-width:48%; margin-left:auto; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:calc(var(--ui-size) - 2px); opacity:1; }
+.model-group-mark { display:inline-flex; width:17px; height:17px; align-items:center; justify-content:center; flex:none; }
+.model-group-mark .provider-logo, .model-group-mark .agent-logo, .model-group-mark .agent-logo img { width:17px; height:17px; object-fit:contain; }
+.composer-popover.model-popover .model-option { min-height:36px; width:100%; gap:8px; padding:6px 9px; margin:1px 0; border-radius:6px; font-size:var(--model-menu-size); }
+.model-popover .model-option.selected, .model-popover .model-option.selected:hover { background:var(--model-selected); }
+.model-popover .model-option-copy { display:flex; align-items:center; gap:7px; flex:1; min-width:0; }
+.model-popover .model-option strong { font-size:var(--model-menu-size); font-weight:500; min-width:0; }
+.model-popover .model-context-badge { color:var(--muted); font-size:calc(var(--ui-size) - 2px); border:1px solid var(--line); border-radius:5px; padding:1px 5px; flex:none; }
+.model-popover .model-option-check { display:inline-flex; justify-content:center; flex:none; width:17px; min-width:17px; min-height:16px; }
+.model-popover .model-menu-empty { padding:32px 16px; text-align:center; color:var(--muted); font-size:var(--ui-size); }
+.model-popover .model-menu-footer { display:block; border-top:1px solid var(--line); padding:6px 13px 8px; }
+.model-setting-row { display:flex; align-items:center; justify-content:space-between; gap:10px; min-height:28px; font-size:var(--model-menu-size); }
+.model-setting-row > span { color:var(--muted); }
+.model-setting-control { position:relative; }
+.model-popover .model-setting-trigger { justify-content:space-between; min-width:76px; gap:8px; padding:4px 6px; font-size:var(--model-menu-size); }
+.model-setting-menu { position:absolute; z-index:2; bottom:calc(100% + 7px); right:0; min-width:128px; max-height:240px; overflow-y:auto; padding:5px; border:1px solid var(--line); border-radius:10px; background:var(--surface); box-shadow:0 8px 24px #0003; }
+.model-popover .model-setting-menu > button { justify-content:space-between; width:100%; gap:16px; padding:7px 10px; min-height:30px; font-size:calc(var(--ui-size) - 1px); }
+.model-setting-menu > button[aria-checked=true] { background:var(--model-selected); }
+.model-menu-actions { display:flex; align-items:center; justify-content:space-between; gap:10px; margin-top:5px; }
+.model-popover .model-menu-actions button { gap:5px; padding:4px 0; color:var(--muted); font-size:var(--model-menu-size); }
+.model-popover .model-menu-actions button:hover { background:transparent; color:var(--text); }
+.model-context-note { position:relative; }
+.model-popover .model-context-note > button { font-size:calc(var(--ui-size) - 2px); }
+.model-popover .model-switch-note { position:absolute; right:0; bottom:calc(100% + 7px); z-index:2; width:min(228px,calc(100vw - 60px)); padding:12px; margin:0; background:var(--surface); border:1px solid var(--line); border-radius:10px; box-shadow:0 6px 20px #0003; color:var(--muted); font-size:calc(var(--ui-size) - 1px); line-height:1.6; }
+@media (max-width:540px) { .model-popover .model-provider-filters { padding-inline:12px; }.model-popover .model-group-heading > small { max-width:38%; }.model-popover .model-menu-heading { padding-inline:13px; } }

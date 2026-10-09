@@ -1,0 +1,23 @@
+{
+  "kimi": "/brands/kimi.png",
+  "glm": "/brands/glm.png",
+  "minimax": "/brands/minimax.png",
+  "zai": "/brands/zai.svg",
+  "qwen": "/brands/qwen.png",
+  "volc": "/brands/volc.png",
+  "tencent": "/brands/tencent.png",
+  "baidu": "/brands/baidu.png",
+  "deepseek": "/brands/deepseek.png",
+  "siliconflow": "/brands/siliconflow.svg",
+  "openrouter": "/brands/openrouter.png",
+  "google": "/brands/google.png",
+  "xai": "/brands/xai.png",
+  "groq": "/brands/groq.png",
+  "together": "/brands/together.png",
+  "mistral": "/brands/mistral.png",
+  "fireworks": "/brands/fireworks.png",
+  "cerebras": "/brands/cerebras.png",
+  "nvidia": "/brands/nvidia.png",
+  "ollama": "/brands/ollama.png",
+  "lmstudio": "/brands/lmstudio.png"
+}

@@ -1,0 +1,29 @@
+* { box-sizing:border-box; }
+html,body,#root { margin:0; background:var(--surface); color:var(--text); }
+body { font:12px/1.5 var(--ui-font); overflow:hidden; }
+.tray-panel { padding:6px; border:1px solid var(--line); border-radius:8px; max-height:100vh; display:flex; flex-direction:column; overflow-y:auto; }
+.tray-heading { color:var(--muted); font-size:11px; padding:5px 10px 6px; flex-shrink:0; user-select:none; }
+.tray-panel button { appearance:none; border:0; background:transparent; color:inherit; font:inherit; width:100%; min-height:30px; padding:6px 10px; text-align:left; border-radius:5px; display:flex; align-items:center; gap:8px; cursor:pointer; flex-shrink:0; transition:background-color 120ms ease; }
+.tray-panel button:hover, .tray-panel button:focus-visible { background:var(--hover); outline:none; }
+.tray-panel button:disabled { opacity:.55; cursor:default; }
+.tray-recent-list { overflow-y:auto; max-height:210px; min-height:0; flex-shrink:1; }
+.tray-title { flex:1; min-width:0; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.tray-project { max-width:65px; flex-shrink:0; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; color:var(--muted); font-size:11px; }
+.tray-status { display:flex; align-items:center; justify-content:center; width:14px; flex-shrink:0; color:var(--muted); }
+.tray-status.running svg { animation:tray-spin .9s linear infinite; }
+.tray-unread { width:6px; height:6px; border-radius:50%; background:#78aaff; }
+.tray-waiting { color:var(--full-access); font-weight:650; font-size:12px; }
+.tray-more { justify-content:space-between; padding-left:32px!important; }
+.tray-more svg,.tray-action svg { flex-shrink:0; color:var(--muted); }
+.tray-window-toggle { padding-left:10px!important; }
+.tray-window-toggle small { color:var(--muted); font:inherit; margin-left:5px; }
+.tray-window-list { max-height:120px; overflow-y:auto; min-height:0; }
+.tray-action { gap:12px!important; }
+.tray-divider { height:1px; background:var(--line); margin:5px 3px; flex-shrink:0; }
+.tray-empty,.tray-error { padding:8px 12px; margin:0; color:var(--muted); font-size:12px; }
+.tray-error { color:var(--danger); }
+::-webkit-scrollbar { width:5px; }
+::-webkit-scrollbar-thumb { background:var(--line); border-radius:8px; }
+@keyframes tray-spin { to { transform:rotate(360deg); } }
+@media (prefers-reduced-motion:reduce) { .tray-panel button { transition:none; } }
+html[data-motion=off] .tray-panel button { transition:none; }

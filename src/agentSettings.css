@@ -1,0 +1,15 @@
+.agent-settings-intro,.agent-settings-footnote{color:var(--muted);line-height:1.7;margin:0 0 24px}
+.agent-install-list{border:1px solid var(--border);border-radius:16px;background:var(--surface);overflow:hidden}
+.agent-install-row{padding:22px 24px}.agent-install-row+.agent-install-row{border-top:1px solid var(--border)}
+.agent-install-main{display:flex;align-items:center;gap:16px}.agent-install-main>div:nth-child(2){flex:1;min-width:0}
+.agent-install-main h3{margin:0 0 5px;font-size:15px;font-weight:600}.agent-install-main p{margin:0;color:var(--muted);font-size:12px}
+.agent-install-logo{width:40px;height:40px;display:flex;align-items:center;justify-content:center;flex:none}.agent-install-logo .agent-logo{width:27px;height:27px;font-size:28px}
+.agent-install-actions{display:flex;align-items:center;gap:16px}.agent-install-ready{display:flex;align-items:center;gap:5px;color:var(--muted);font-size:12px}
+.agent-heading-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap}.agent-release-info{display:flex;align-items:center;gap:9px;flex-wrap:wrap;margin-top:7px;color:var(--muted);font-size:11px}.agent-release-info strong{color:var(--text);font-weight:500}.agent-update-badge{padding:2px 6px;border-radius:5px;background:var(--hover);color:var(--text)}.agent-release-error{display:flex;align-items:center;gap:6px}.agent-release-error button{border:0;padding:0;background:none;color:var(--text);font:inherit;text-decoration:underline;cursor:pointer}.agent-install-actions button{white-space:nowrap}.agent-checking{animation:agent-check-spin 1s linear infinite}@keyframes agent-check-spin{to{transform:rotate(360deg)}}
+.agent-install-row progress{display:block;width:calc(100% - 56px);margin:18px 0 0 56px;height:3px;accent-color:var(--text)}
+.agent-install-message{color:var(--muted);font-size:12px;margin:12px 0 0 56px;overflow-wrap:anywhere}.agent-install-message.failed{color:var(--danger,#e87777)}
+.agent-settings-footnote{font-size:12px;margin:16px 0 28px}.agent-advanced-toggle{display:flex;align-items:center;gap:7px;padding:0;color:var(--muted);background:none;border:0;cursor:pointer}.agent-advanced-toggle .expanded{transform:rotate(180deg)}
+.agent-advanced{margin-top:16px}.agent-path-option{display:flex;align-items:center;gap:8px;padding:12px 0}.agent-path-option+.agent-path-option{border-top:1px solid var(--border)}.agent-path-option>span{flex:1;min-width:0}.agent-path-option small{display:block;color:var(--muted);font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-top:5px}.agent-advanced>.quiet-button{margin-top:12px}
+@media(max-width:800px){.agent-install-row{padding:16px}.agent-install-actions{gap:8px}.agent-install-ready{display:none}.agent-path-option{flex-wrap:wrap}.agent-path-option>span{flex-basis:100%}}
+@media(max-width:650px){.agent-install-main{flex-wrap:wrap;gap:12px}.agent-install-actions{margin-left:52px;flex-basis:calc(100% - 52px);justify-content:flex-end}.agent-settings-page .settings-page-heading{gap:10px;flex-wrap:wrap}}
+@media(prefers-reduced-motion:reduce){.agent-checking{animation:none}}

@@ -1,0 +1,53 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "SuperCode",
+  "version": "0.1.0",
+  "identifier": "dev.supercode.desktop",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "beforeBuildCommand": "npm run build",
+    "devUrl": "http://127.0.0.1:1420",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "SuperCode",
+        "width": 1320,
+        "height": 800,
+        "minWidth": 760,
+        "minHeight": 580,
+        "backgroundColor": "#f3f4f5",
+        "decorations": false,
+        "center": true,
+        "visible": false
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; connect-src ipc: http://ipc.localhost; img-src 'self' supercode-media: http://supercode-media.localhost https://supercode-media.localhost https: http: data:; media-src 'self' supercode-media: http://supercode-media.localhost https://supercode-media.localhost https: http:; style-src 'self' 'unsafe-inline'; script-src 'self'"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "targets": [
+      "nsis"
+    ],
+    "shortDescription": "轻量多 Agent 编程工作台",
+    "windows": {
+      "nsis": {
+        "languages": [
+          "SimpChinese",
+          "English"
+        ],
+        "displayLanguageSelector": true
+      }
+    }
+  }
+}

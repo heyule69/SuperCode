@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "tray-menu-capability",
+  "description": "Local, on-demand SuperCode tray menu",
+  "windows": ["tray-menu"],
+  "permissions": ["core:default", "core:window:allow-set-theme"]
+}

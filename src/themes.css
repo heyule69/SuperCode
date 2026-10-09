@@ -1,0 +1,84 @@
+/* Shared palettes for the desktop shell and its appearance previews. */
+:root {
+  --ui-font:-apple-system-body,ui-sans-serif,-apple-system,system-ui,"Segoe UI",Helvetica,"Microsoft YaHei",Arial,sans-serif,"Apple Color Emoji","Segoe UI Emoji";
+  --code-font:ui-monospace,"SFMono-Regular","SF Mono",Menlo,Consolas,"Liberation Mono",monospace;
+  --ui-size:13px;
+  --chat-size:14px;
+  --composer-bg:var(--surface);
+  --window-bg:var(--bg);
+  --shadow:0 4px 24px #0000000a;
+  --border:var(--line);
+  --frame-line:color-mix(in srgb,var(--line) 65%,transparent);
+  --composer-line:color-mix(in srgb,var(--text) 8%,transparent);
+}
+:root, :root[data-theme=light], .theme-preview.theme-light {
+  color-scheme:light;
+  --bg:#f3f4f5;
+  --sidebar:#eceff2;
+  --surface:#f7f8f9;
+  --surface2:#eaedf0;
+  --composer-bg:#eaedf0;
+  --window-bg:#e9eef3;
+  --line:#d8dce0;
+  --text:#292b2e;
+  --muted:#646a71;
+  --accent:#424a54;
+  --accent-bg:#dce2e8;
+  --hover:#e0e4e8;
+  --danger:#b43f36;
+  --chat-user-bg:#e3e6e9;
+  --chat-link:#2868be;
+  --diff-added:#168344;
+  --full-access:#b64e0b;
+}
+:root[data-theme=dark], .theme-preview.theme-dark {
+  color-scheme:dark;
+  --bg:#181818;
+  --sidebar:#191c1f;
+  --surface:#222222;
+  --surface2:#252525;
+  --composer-bg:#363636;
+  --window-bg:#1a2129;
+  --line:#333639;
+  --text:#e3e3e3;
+  --muted:#9c9fa3;
+  --accent:#c3c8ce;
+  --accent-bg:#30363c;
+  --hover:#2b2e31;
+  --danger:#f07670;
+  --chat-user-bg:#303030;
+  --chat-link:#7daaff;
+  --diff-added:#3ecf7a;
+  --full-access:#ed8a46;
+}
+:root[data-theme=graphite], .theme-preview.theme-graphite {
+  color-scheme:dark;
+  --composer-bg:#252d38; --window-bg:#20262f;
+  --bg:#20262f; --sidebar:#191f28; --surface:#252d38; --surface2:#202630;
+  --line:#394453; --text:#e1e8f1; --muted:#9caabb; --accent:#a4c1ef;
+  --accent-bg:#303f57; --hover:#303b49; --danger:#f5ada9;
+  --chat-user-bg:#323d4a; --chat-link:#7daaff; --diff-added:#3ecf7a;
+  --full-access:#ed9c61;
+}
+:root[data-theme=sand], .theme-preview.theme-sand {
+  color-scheme:light;
+  --composer-bg:#fffdf8; --window-bg:#fcfaf5;
+  --bg:#fcfaf5; --sidebar:#f1ede4; --surface:#fffdf8; --surface2:#f6f2e9;
+  --line:#e4dccd; --text:#39362f; --muted:#716958; --accent:#88613f;
+  --accent-bg:#f0e5d6; --hover:#ede6d9; --danger:#a54439;
+  --chat-user-bg:#eee9df; --chat-link:#376bae; --diff-added:#287c42;
+  --full-access:#a35020;
+}
+:root { color:var(--text); background:var(--bg); font-family:var(--ui-font); }
+body, #root { background:var(--bg); }
+.composer { background:var(--composer-bg); box-shadow:none; }
+.context-panel { background:var(--sidebar); }
+:root .welcome-logo { background:var(--surface2); border-color:var(--line); color:var(--text); }
+.message-content { line-height:1.75; font-weight:400; }
+.message-content strong { font-weight:600; }
+.permission-chip.full-access { color:var(--full-access); }
+.theme-preview { background:var(--bg); color:var(--text); }
+.theme-preview > span { background:var(--sidebar); border-color:var(--line); }
+.theme-preview b { background:var(--composer-bg); border-color:var(--line); opacity:1; }
+.theme-preview.theme-system { background:linear-gradient(90deg,#f3f4f5 50%,#181818 50%); color:#8b9095; }
+.theme-preview.theme-system > span { background:#eceff2; border-color:#d8dce0; }

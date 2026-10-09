@@ -1,0 +1,16 @@
+// @vitest-environment happy-dom
+import { act, createElement } from 'react';
+import { createRoot } from 'react-dom/client';
+import { afterEach, beforeEach, expect, it, vi } from 'vitest';
+import { FollowupQueue, type Followup } from './Followups';
+const roots:ReturnType<typeof createRoot>[]=[];
+beforeEach(()=>{(globalThis as typeof globalThis & {IS_REACT_ACT_ENVIRONMENT:boolean}).IS_REACT_ACT_ENVIRONMENT=true;});
+afterEach(()=>{act(()=>roots.splice(0).forEach(r=>r.unmount()));document.body.innerHTML='';});
+const row:Followup={id:'q1',sessionId:'s1',status:'queued',error:null,payload:{text:'原始排队消息',model:'test-model',readOnly:false,permissionMode:'ask',attachments:[{kind:'skill',name:'Recall',path:'skill.md'}],effort:null}};
+function mount(status='queued',agent='codex',steeringMode?:string) {const node=document.createElement('div');document.body.append(node);const root=createRoot(node);roots.push(root);const change=vi.fn(async()=>{}),steer=vi.fn(async()=>{}),openSide=vi.fn();act(()=>root.render(createElement(FollowupQueue,{rows:[{...row,status}],agent,turnId:'t1',steeringMode,change,steer,openSide})));return{node,change,steer,openSide};}
+it('keeps the queued text and attachments and routes steering to its ID',async()=>{const{node,steer}=mount();expect(node.textContent).toContain(row.payload.text);expect(node.textContent).toContain('1 个附件');const button=[...node.querySelectorAll('button')].find(b=>b.textContent==='引导')!;await act(async()=>button.click());expect(steer).toHaveBeenCalledWith('q1');});
+it('edits a queued message without losing its attachments or sending it',async()=>{const{node,change,steer}=mount();const edit=[...node.querySelectorAll('button')].find(b=>b.textContent==='编辑消息')!;act(()=>edit.click());const area=node.querySelector('textarea')!;expect(area.value).toBe(row.payload.text);await act(async()=>node.querySelector('form')!.dispatchEvent(new Event('submit',{bubbles:true,cancelable:true})));expect(change).toHaveBeenCalledWith('q1','edit',row.payload.text);expect(steer).not.toHaveBeenCalled();});
+it('opens the original payload in the side chat and exposes explicit resume after pause',async()=>{const{node,change,openSide}=mount('paused');const side=[...node.querySelectorAll('button')].find(b=>b.textContent==='在侧边聊天中打开')!;act(()=>side.click());expect(openSide).toHaveBeenCalledWith({...row,status:'paused'});await act(async()=>[...node.querySelectorAll('button')].find(b=>b.textContent==='继续排队')!.click());expect(change).toHaveBeenCalledWith('q1','resume');});
+it('describes Claude supplements without promising an immediate interruption',()=>{const{node}=mount('queued','claude');expect(node.textContent).not.toContain('停止并引导');expect([...node.querySelectorAll('button')].find(b=>b.textContent==='引导')?.title).toContain('下一可接收');});
+it('uses the runtime capability for OpenCode and preserves an explicit fallback',()=>{const{node}=mount('queued','opencode','native');expect(node.textContent).not.toContain('停止并引导');const fallback=mount('queued','opencode','interrupt');expect(fallback.node.textContent).toContain('停止并引导');});
+it('locks actions once a message is actually being dispatched',()=>{const{node}=mount('sending');expect([...node.querySelectorAll('button')].every(b=>b.disabled)).toBe(true);});
