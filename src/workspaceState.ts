@@ -2,12 +2,11 @@ import type { Attachment } from './ComposerMenus';
 import type { Bootstrap } from './types';
 
 export function restoreWorkspace(data: Pick<Bootstrap, 'projects' | 'sessions'>, saved: { sessionId: string; projectId: string; fresh?: boolean }) {
-  if (saved.fresh) return { project: data.projects.find(p => p.id === saved.projectId) ?? data.projects[0], session: undefined };
+  if (saved.fresh) return { project: undefined, session: undefined };
   const session = data.sessions.find(s => s.id === saved.sessionId);
+  if (session && !session.projectId) return { project: undefined, session };
   const project = data.projects.find(p => p.id === session?.projectId) ?? data.projects.find(p => p.id === saved.projectId);
-  if (project) return { project, session };
-  const first = data.sessions.find(s => data.projects.some(p => p.id === s.projectId));
-  return { project: data.projects.find(p => p.id === first?.projectId) ?? data.projects[0], session: first };
+  return { project, session: project ? session : undefined };
 }
 
 export interface DraftModel { connectionId: string; model: string; effort?: string }

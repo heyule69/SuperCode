@@ -31,3 +31,14 @@ describe('sidebar grouping',()=>{
     expect(exportFilename('...','md')).toBe('聊天.md');expect(exportFilename('x'.repeat(200),'md').length).toBe(83);
   });
 });
+
+
+it('shows projectless chats in recents, pins and custom sections without hiding or duplicating them', () => {
+  const standalone = [session('recent', ''), session('pin', ''), session('work', '')];
+  const state: SidebarState = { projects: {}, sessions: { pin: { pinned:true, unread:false, sectionId:null }, work: { pinned:false, unread:false, sectionId:'custom' } }, sections:[{id:'custom',name:'工作'}] };
+  const groups = sidebarGroups([], standalone, state);
+  expect(groups.find(g=>g.id==='recent')?.sessions.map(s=>s.id)).toEqual(['recent']);
+  expect(groups.find(g=>g.id==='pinned')?.sessions.map(s=>s.id)).toEqual(['pin']);
+  expect(groups.find(g=>g.id==='custom')?.sessions.map(s=>s.id)).toEqual(['work']);
+  expect(groups.flatMap(g=>g.sessions).length).toBe(3);
+});

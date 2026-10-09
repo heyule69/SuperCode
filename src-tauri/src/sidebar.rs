@@ -254,7 +254,7 @@ impl Store {
         require_idle(&tx, "session", id)?;
         require_item(&tx, "project", project)?;
         tx.execute(
-            "UPDATE sessions SET native_id=NULL,project_id=?2 WHERE id=?1 AND project_id<>?2",
+            "UPDATE sessions SET native_id=NULL,project_id=?2 WHERE id=?1 AND project_id IS NOT ?2",
             params![id, project],
         )
         .map_err(|e| e.to_string())?;
@@ -269,15 +269,20 @@ impl Store {
         let mut conn = self.0.lock().map_err(|e| e.to_string())?;
         let tx = conn.transaction().map_err(|e| e.to_string())?;
         require_idle(&tx, "session", id)?;
-        let source=tx.query_row("SELECT id,project_id,title,agent,model,native_id,status,updated_at,turn_id,connection_id FROM sessions WHERE id=?1",[id],Self::session_row).map_err(|e|e.to_string())?;
+        let source=tx.query_row("SELECT id,project_id,title,agent,model,native_id,status,updated_at,turn_id,connection_id,(SELECT path FROM session_workspaces WHERE session_id=sessions.id) FROM sessions WHERE id=?1",[id],Self::session_row).map_err(|e|e.to_string())?;
         let project = project.unwrap_or(&source.project_id);
-        require_item(&tx, "project", project)?;
+        if !project.is_empty() {
+            require_item(&tx, "project", project)?;
+        }
         let next = uuid::Uuid::new_v4().to_string();
         let title = format!(
             "{} · 分叉",
             source.title.chars().take(90).collect::<String>()
         );
-        tx.execute("INSERT INTO sessions(id,project_id,title,agent,model,status,updated_at,connection_id) VALUES(?1,?2,?3,?4,?5,'idle',?6,?7)",params![next,project,title,source.agent,source.model,crate::storage::now(),source.connection_id]).map_err(|e|e.to_string())?;
+        tx.execute("INSERT INTO sessions(id,project_id,title,agent,model,status,updated_at,connection_id) VALUES(?1,?2,?3,?4,?5,'idle',?6,?7)",params![next,(!project.is_empty()).then_some(project),title,source.agent,source.model,crate::storage::now(),source.connection_id]).map_err(|e|e.to_string())?;
+        if project.is_empty() {
+            tx.execute("INSERT INTO session_workspaces(session_id,path) SELECT ?2,path FROM session_workspaces WHERE session_id=?1", params![id,next]).map_err(|e| e.to_string())?;
+        }
         tx.execute("INSERT INTO messages(id,session_id,role,text,kind,data) SELECT id,?2,role,text,kind,data FROM messages WHERE session_id=?1 ORDER BY seq",params![id,next]).map_err(|e|e.to_string())?;
         tx.execute("INSERT INTO session_context(session_id,summary,through_seq) SELECT ?2,summary,(SELECT coalesce(max(seq),0) FROM messages WHERE session_id=?2 AND id IN (SELECT id FROM messages WHERE session_id=?1 AND seq<=session_context.through_seq)) FROM session_context WHERE session_id=?1",params![id,next]).map_err(|e|e.to_string())?;
         tx.commit().map_err(|e| e.to_string())?;
@@ -286,13 +291,13 @@ impl Store {
     }
     pub fn archived_sessions(&self) -> Result<Vec<ArchivedSession>, String> {
         let conn = self.0.lock().map_err(|e| e.to_string())?;
-        let mut stmt=conn.prepare("SELECT s.id,s.project_id,s.title,s.agent,s.model,s.native_id,s.status,s.updated_at,s.turn_id,s.connection_id,p.name,p.path FROM sessions s JOIN projects p ON p.id=s.project_id WHERE s.archived=1 OR p.id IN (SELECT id FROM sidebar_items WHERE kind='project' AND removed=1) ORDER BY s.updated_at DESC LIMIT 500").map_err(|e|e.to_string())?;
+        let mut stmt=conn.prepare("SELECT s.id,s.project_id,s.title,s.agent,s.model,s.native_id,s.status,s.updated_at,s.turn_id,s.connection_id,w.path,coalesce(p.name,'无项目聊天'),coalesce(p.path,w.path,'') FROM sessions s LEFT JOIN session_workspaces w ON w.session_id=s.id LEFT JOIN projects p ON p.id=s.project_id WHERE s.archived=1 OR p.id IN (SELECT id FROM sidebar_items WHERE kind='project' AND removed=1) ORDER BY s.updated_at DESC LIMIT 500").map_err(|e|e.to_string())?;
         let rows = stmt
             .query_map([], |r| {
                 Ok(ArchivedSession {
                     session: Self::session_row(r)?,
-                    project_name: r.get(10)?,
-                    project_path: r.get(11)?,
+                    project_name: r.get(11)?,
+                    project_path: r.get(12)?,
                 })
             })
             .map_err(|e| e.to_string())?

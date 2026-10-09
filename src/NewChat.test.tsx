@@ -25,7 +25,7 @@ async function open() { await act(async () => trigger().click()); }
 
 it('switches projects through the existing callback and leaves the current project untouched when reselected', async () => {
   await render(); await open();
-  const options = () => [...container.querySelectorAll<HTMLButtonElement>('[role="menuitemradio"]')];
+  const options = () => [...container.querySelectorAll<HTMLButtonElement>('[role="menuitemradio"]')].slice(1);
   expect(options()[0].getAttribute('aria-checked')).toBe('true');
   await act(async () => options()[0].click());
   expect(selectProject).not.toHaveBeenCalled();
@@ -51,8 +51,15 @@ it('supports keyboard selection, Escape and outside dismissal without switching 
 
 it('opens the folder picker for an empty workspace without inventing a project', async () => {
   await render([]); await open();
-  expect(container.querySelector('[role="menuitemradio"]')).toBeNull();
+  expect(container.querySelector('[role="menuitemradio"]')?.textContent).toBe('不选择项目');
   await act(async () => container.querySelector<HTMLButtonElement>('[role="menuitem"]')!.click());
   expect(addProject).toHaveBeenCalledOnce(); expect(selectProject).not.toHaveBeenCalled();
   expect(container.querySelector('[role="menu"]')).toBeNull();
+});
+
+
+it('can return to a projectless draft', async () => {
+  await render(); await open();
+  await act(async () => container.querySelector<HTMLButtonElement>('[role="menuitemradio"]')!.click());
+  expect(selectProject).toHaveBeenCalledExactlyOnceWith();
 });

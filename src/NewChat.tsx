@@ -1,10 +1,10 @@
 import { useState } from 'react';
-import { Check, Folder, Plus } from 'lucide-react';
+import { Check, Folder, MessageSquare, Plus } from 'lucide-react';
 import type { Project } from './types';
 import { useFloatingLayer } from './useFloatingLayer';
 
 export function NewChat({ project, projects, selectProject, addProject }: {
-  project?: Project; projects: Project[]; selectProject: (project: Project) => void; addProject: () => void;
+  project?: Project; projects: Project[]; selectProject: (project?: Project) => void; addProject: () => void;
 }) {
   const [open, setOpen] = useState(false);
   const layer = useFloatingLayer<HTMLSpanElement>(open, () => setOpen(false), { focusFirst: true });
@@ -19,6 +19,7 @@ export function NewChat({ project, projects, selectProject, addProject }: {
             if (event.key === 'ArrowDown') { event.preventDefault(); setOpen(true); }
           }}>{project?.name ?? 'SuperCode'}</button>
         {open ? <span id={`${layer.id}-projects`} className="composer-popover new-chat-projects" role="menu" aria-label="项目">
+          <button type="button" role="menuitemradio" aria-checked={!project} onClick={() => { layer.dismiss(true); if (project) selectProject(); }}><MessageSquare size={16}/><span>不选择项目</span>{!project ? <Check size={15}/> : null}</button>
           {projects.map(item => <button type="button" key={item.id} role="menuitemradio" aria-checked={item.id === project?.id}
             title={item.path} onClick={() => { layer.dismiss(true); if (item.id !== project?.id) selectProject(item); }}>
             <Folder size={16}/><span>{item.name}</span>{item.id === project?.id ? <Check size={15}/> : null}

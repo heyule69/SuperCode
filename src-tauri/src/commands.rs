@@ -138,12 +138,29 @@ pub fn create_session(
     state: State<'_, AppState>,
     app: AppHandle,
 ) -> Result<Session, String> {
-    let session = state.store.create_configured_session(
-        &project_id,
-        model,
-        agent.as_deref().unwrap_or("codex"),
-        connection_id.as_deref(),
-    )?;
+    let session = if project_id.is_empty() {
+        let root = if std::env::args().any(|a| a == "--smoke-test") {
+            state.data_dir.join("workspaces")
+        } else {
+            app.path()
+                .document_dir()
+                .map_err(|e| e.to_string())?
+                .join("SuperCode")
+        };
+        state.store.create_projectless_session(
+            &root,
+            model,
+            agent.as_deref().unwrap_or("codex"),
+            connection_id.as_deref(),
+        )?
+    } else {
+        state.store.create_configured_session(
+            &project_id,
+            model,
+            agent.as_deref().unwrap_or("codex"),
+            connection_id.as_deref(),
+        )?
+    };
     let _ = app.emit("workspace-updated", ());
     Ok(session)
 }
@@ -447,7 +464,7 @@ async fn send_inner(
             prepared.claude.insert(0, context);
         }
     }
-    let project = state.store.project(&session.project_id)?;
+    let project = state.store.session_workspace(&session)?;
     if !Path::new(&project.path).is_dir() {
         return Err("项目文件夹已不存在，请重新添加项目".into());
     }
@@ -662,6 +679,53 @@ pub struct ChangedFile {
     status: String,
 }
 
+fn chat_files(root: &Path) -> Vec<ChangedFile> {
+    fn collect(
+        root: &Path,
+        directory: &Path,
+        depth: usize,
+        files: &mut Vec<ChangedFile>,
+        visited: &mut usize,
+    ) {
+        if depth > 4 || files.len() >= 200 || *visited >= 1000 {
+            return;
+        }
+        let Ok(entries) = std::fs::read_dir(directory) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            if files.len() >= 200 || *visited >= 1000 {
+                break;
+            }
+            *visited += 1;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            if name.starts_with('.') || matches!(name, "node_modules" | "target" | "__pycache__") {
+                continue;
+            }
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            if kind.is_dir() {
+                collect(root, &entry.path(), depth + 1, files, visited);
+            } else if kind.is_file() {
+                if let Ok(path) = entry.path().strip_prefix(root) {
+                    files.push(ChangedFile {
+                        path: path.to_string_lossy().replace('\\', "/"),
+                        status: "??".into(),
+                    });
+                }
+            }
+        }
+    }
+    let mut files = Vec::new();
+    collect(root, root, 0, &mut files, &mut 0);
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+    files
+}
+
 async fn git(root: &str, args: &[&str]) -> Result<Vec<u8>, String> {
     let executable = process::find_program("git").ok_or("未安装 Git")?;
     tokio::time::timeout(std::time::Duration::from_secs(15), async {
@@ -717,8 +781,16 @@ async fn read_limited<R: tokio::io::AsyncRead + Unpin>(
 }
 
 #[tauri::command]
-pub async fn workspace_changes(project_id: String, app: AppHandle) -> Result<Changes, String> {
-    let root = app.state::<AppState>().store.project(&project_id)?.path;
+pub async fn workspace_changes(
+    project_id: String,
+    session_id: Option<String>,
+    app: AppHandle,
+) -> Result<Changes, String> {
+    let root = app
+        .state::<AppState>()
+        .store
+        .workspace(&project_id, session_id.as_deref())?
+        .path;
     if git(&root, &["rev-parse", "--is-inside-work-tree"])
         .await
         .is_err()
@@ -726,7 +798,11 @@ pub async fn workspace_changes(project_id: String, app: AppHandle) -> Result<Cha
         return Ok(Changes {
             is_git: false,
             branch: String::new(),
-            files: vec![],
+            files: if project_id.is_empty() {
+                chat_files(Path::new(&root))
+            } else {
+                vec![]
+            },
             diff: String::new(),
         });
     }
@@ -776,10 +852,14 @@ pub async fn workspace_changes(project_id: String, app: AppHandle) -> Result<Cha
 }
 
 fn contained_file(root: &Path, path: &str) -> Result<PathBuf, String> {
+    contained_workspace_path(root, path, false)
+}
+
+fn contained_workspace_path(root: &Path, path: &str, directory: bool) -> Result<PathBuf, String> {
     let root = std::fs::canonicalize(root).map_err(|e| e.to_string())?;
     let candidate = std::fs::canonicalize(root.join(path)).map_err(|e| e.to_string())?;
-    if !candidate.starts_with(&root) || !candidate.is_file() {
-        return Err("只能预览当前项目内的文件".into());
+    if !candidate.starts_with(&root) || !(candidate.is_file() || directory && candidate.is_dir()) {
+        return Err("只能查看当前工作目录内的文件".into());
     }
     Ok(candidate)
 }
@@ -831,12 +911,17 @@ fn system_document(path: &Path) -> bool {
 #[tauri::command]
 pub fn open_project_path(
     project_id: String,
+    session_id: Option<String>,
     path: String,
     action: String,
     app: AppHandle,
 ) -> Result<(), String> {
-    let root = app.state::<AppState>().store.project(&project_id)?.path;
-    let file = contained_file(Path::new(&root), &path)?;
+    let root = app
+        .state::<AppState>()
+        .store
+        .workspace(&project_id, session_id.as_deref())?
+        .path;
+    let file = contained_workspace_path(Path::new(&root), &path, action == "reveal")?;
     match action.as_str() {
         "reveal" => app
             .opener()
@@ -854,10 +939,14 @@ pub fn open_project_path(
 #[tauri::command]
 pub fn read_project_file(
     project_id: String,
+    session_id: Option<String>,
     path: String,
     state: State<'_, AppState>,
 ) -> Result<String, String> {
-    let root = state.store.project(&project_id)?.path;
+    let root = state
+        .store
+        .workspace(&project_id, session_id.as_deref())?
+        .path;
     let path = contained_file(Path::new(&root), &path)?;
     if std::fs::metadata(&path).map_err(|e| e.to_string())?.len() > 1024 * 1024 {
         return Err("文件超过 1 MB，请在外部编辑器中查看".into());
@@ -1032,6 +1121,20 @@ mod tests {
         std::fs::write(base.join("outside.txt"), "private").unwrap();
         assert!(contained_file(&base.join("project"), "中文.txt").is_ok());
         assert!(contained_file(&base.join("project"), "../outside.txt").is_err());
+        assert!(contained_workspace_path(&base.join("project"), ".", true).is_ok());
+        assert!(contained_workspace_path(&base.join("project"), "..", true).is_err());
+        assert!(contained_file(&base.join("project"), ".").is_err());
+        std::fs::create_dir_all(base.join("project/nested")).unwrap();
+        std::fs::create_dir_all(base.join("project/node_modules")).unwrap();
+        std::fs::write(base.join("project/nested/result.html"), "<p>result</p>").unwrap();
+        std::fs::write(base.join("project/node_modules/hidden.js"), "x").unwrap();
+        assert_eq!(
+            chat_files(&base.join("project"))
+                .iter()
+                .map(|f| f.path.as_str())
+                .collect::<Vec<_>>(),
+            ["nested/result.html", "中文.txt"]
+        );
         // The exact temporary directory is owned by this test.
         std::fs::remove_dir_all(base).unwrap();
     }

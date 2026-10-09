@@ -180,7 +180,7 @@ impl Runtime {
                 let session = state.store.session(id)?;
                 state
                     .store
-                    .project(&session.project_id)
+                    .session_workspace(&session)
                     .map(|project| std::path::PathBuf::from(project.path))
             })
             .transpose()?;

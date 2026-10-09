@@ -6,7 +6,7 @@ import { call, desktop } from './api';
 import { mediaReference, type MediaReference } from './mediaSources';
 import './media.css';
 
-export const MediaContext = createContext<{ projectId?: string; openFile?: (path: string, line?: number) => void }>({});
+export const MediaContext = createContext<{ projectId?: string; sessionId?: string; openFile?: (path: string, line?: number) => void }>({});
 interface PreparedMedia { token: string; previewToken: string; path: string; kind: MediaReference['kind']; name: string }
 
 export const MediaCard = memo(function MediaCard({ media }: { media: MediaReference }) {
@@ -31,16 +31,16 @@ export const MediaCard = memo(function MediaCard({ media }: { media: MediaRefere
     let cancelled = false;
     if (/^https?:/i.test(media.path)) { setSource(media.path); setFullSource(media.path); return; }
     if (!desktop) { setError('本地媒体请在桌面版中查看'); return; }
-    void call<PreparedMedia>('prepare_media', { path: media.path, projectId: context.projectId ?? null }).then(result => {
+    void call<PreparedMedia>('prepare_media', { path: media.path, projectId: context.projectId ?? null, sessionId: context.sessionId || null }).then(result => {
       if (cancelled) return;
       setSource(convertFileSrc(result.previewToken, 'supercode-media')); setFullSource(convertFileSrc(result.token, 'supercode-media'));
     }).catch(e => { if (!cancelled) setError(String(e)); });
     return () => { cancelled = true; };
-  }, [media.path, context.projectId, visible]);
+  }, [media.path, context.projectId, context.sessionId, visible]);
   const Icon = media.kind === 'image' ? Image : media.kind === 'video' ? Play : Music2;
   const label = media.kind === 'image' ? '图片' : media.kind === 'video' ? '视频' : '音频';
   function openInSystem() {
-    if (desktop) void call('open_media', { path: media.path, projectId: context.projectId ?? null }).catch(e => setError(String(e)));
+    if (desktop) void call('open_media', { path: media.path, projectId: context.projectId ?? null, sessionId: context.sessionId || null }).catch(e => setError(String(e)));
     else context.openFile?.(media.path);
   }
   function activatePlayer(event: React.SyntheticEvent<HTMLMediaElement>) {

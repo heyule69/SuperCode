@@ -1,0 +1,10 @@
+.desktop-workarea .sidebar,.context-panel,.side-chat{position:relative;min-width:0}
+.panel-resize-handle{position:absolute;top:0;bottom:0;width:7px;z-index:12;cursor:col-resize;touch-action:none;background:transparent;outline:none}
+.panel-resize-handle.left{right:-3px}
+.panel-resize-handle.right{left:-3px}
+.panel-resize-handle::after{content:'';position:absolute;inset:0 2px;background:transparent;transition:background 120ms}
+.panel-resize-handle:hover::after,.panel-resize-handle:focus-visible::after,.panel-resizing .panel-resize-handle::after{background:var(--accent)}
+.panel-resizing,.panel-resizing *{cursor:col-resize!important;user-select:none!important}
+@media(max-width:1100px){.desktop-workarea .app:not(.context-hidden) .context-panel,.desktop-workarea .side-chat{width:var(--context-width,284px)}.desktop-workarea .side-chat{position:absolute;right:0;top:0;bottom:0;z-index:60;box-shadow:-8px 0 30px #0002}}
+
+.context-empty p{overflow-wrap:anywhere}

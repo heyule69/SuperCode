@@ -279,7 +279,7 @@ pub async fn steer_followup(
                 let (_,_,signature)=settings.as_ref().filter(|(native,turn,_)|Some(native.as_str())==session.native_id.as_deref()&&turn==&expected_turn_id).ok_or("当前任务配置尚未就绪或已变化，请保留排队发送")?;
                 crate::client_features::validate_steering_settings(signature,permission,row.payload.effort.as_deref())?;
             }
-            let input=if p.codex.iter().any(|v|v["type"]=="skill") {let catalog=client.request("skills/list",json!({"cwds":[store.project(&session.project_id)?.path],"forceReload":false})).await?;crate::client_features::resolve_codex_skills(&p,&catalog)}else{p.codex};
+            let input=if p.codex.iter().any(|v|v["type"]=="skill") {let catalog=client.request("skills/list",json!({"cwds":[store.session_workspace(&session)?.path],"forceReload":false})).await?;crate::client_features::resolve_codex_skills(&p,&catalog)}else{p.codex};
             client.request("turn/steer",json!({"threadId":session.native_id,"expectedTurnId":expected_turn_id,"input":input})).await?;
         } else if session.agent=="claude" {
             app.state::<AppState>().claude.steer(&session.id,&expected_turn_id,&id,p.claude,permission,row.payload.effort.as_deref()).await?;

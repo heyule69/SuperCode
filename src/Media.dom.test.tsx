@@ -20,9 +20,9 @@ it('loads thumbnails, opens the original on one click, and closes with Escape', 
   await act(async () => root.render(<MediaContext.Provider value={{ projectId: 'p' }}><Markdown text={'![截图](<D:/output/截图.png>)'}/></MediaContext.Provider>));
   const img = container.querySelector('img')!;
   expect(img.src).toContain('/small'); expect(img.loading).toBe('lazy');
-  expect(call).toHaveBeenCalledWith('prepare_media', { path: 'D:/output/截图.png', projectId: 'p' });
+  expect(call).toHaveBeenCalledWith('prepare_media', { path: 'D:/output/截图.png', projectId: 'p', sessionId: null });
   await act(async () => container.querySelector<HTMLButtonElement>('[aria-label="在系统中打开 截图"]')!.click());
-  expect(call).toHaveBeenCalledWith('open_media', { path: 'D:/output/截图.png', projectId: 'p' });
+  expect(call).toHaveBeenCalledWith('open_media', { path: 'D:/output/截图.png', projectId: 'p', sessionId: null });
   const button = container.querySelector<HTMLButtonElement>('.chat-image-button')!;
   await act(async () => button.click());
   expect(document.querySelector('.image-preview img')?.getAttribute('src')).toContain('/full');
@@ -46,4 +46,10 @@ it('does not preload audio or automatically play it', async () => {
   await act(async () => root.render(<Markdown text={'![音频](<D:/output/demo.wav>)'}/>));
   const audio = container.querySelector('audio')!;
   expect(audio.controls).toBe(true); expect(audio.preload).toBe('none'); expect(audio.autoplay).toBe(false);
+});
+
+
+it('resolves relative generated images against a projectless chat workspace', async () => {
+  await act(async () => root.render(<MediaContext.Provider value={{ sessionId: 'chat-files' }}><Markdown text="![生成图片](result.png)"/></MediaContext.Provider>));
+  expect(call).toHaveBeenCalledWith('prepare_media', { path:'result.png', projectId:null, sessionId:'chat-files' });
 });

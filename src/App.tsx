@@ -38,6 +38,7 @@ import { sourceForProfile } from './modelPicker';
 import { ActivityRail } from './ActivityRail';
 import { AgentMenu } from './AgentMenu';
 import { NewChat } from './NewChat';
+import { usePanelResize } from './PanelResize';
 import { useChatReadReceipt } from './useChatReadReceipt';
 import { clipboardImages, imageBase64, imageBytes, MAX_ATTACHMENTS, MAX_TOTAL_IMAGE_BYTES, mergeAttachments, readClipboardImages, validateImageFile } from './attachments';
 const SettingsPage = lazy(() => import('./SettingsPage').then(module => ({ default: module.SettingsPage })));
@@ -163,6 +164,8 @@ export default function App() {
   const textarea = useRef<HTMLTextAreaElement>(null);
   const project = projects.find(p => p.id === projectId);
   const session = sessions.find(s => s.id === sessionId);
+  const workspacePath = project?.path ?? session?.workspacePath ?? undefined;
+  const panels = usePanelResize(sidebar, !!(showContext || sideDraft), settingsOpen);
   useChatReadReceipt({ sessionId, status: session?.status, unread: !!sidebarState.sessions[sessionId]?.unread, throughSeq: messages.reduce((seq, message) => Math.max(seq, message.seq), 0), loading: messagesLoading, settingsOpen,
     onRead: id => setSidebarState(old => ({ ...old, sessions: { ...old.sessions, [id]: { ...old.sessions[id], unread: false } } })), onError: report });
   const busy = (sending && pendingSession.current === sessionId) || isActive(session?.status);
@@ -250,10 +253,11 @@ export default function App() {
     if(current.current.sessionId===id)setUsage(result.records[0]?.data);
   }, []);
   const refreshChanges = useCallback(async (id: string) => {
-    if (!id) return;
+    if (!id && !current.current.sessionId) return;
+    const selectedSession = current.current.sessionId;
     const revision = ++changesRevision.current;
     setChangesLoading(true);
-    try { const data = await call<Changes>('workspace_changes', { projectId: id }); if (current.current.projectId === id && revision === changesRevision.current) setChanges(data); }
+    try { const data = await call<Changes>('workspace_changes', { projectId: id, sessionId: selectedSession || null }); if (current.current.projectId === id && current.current.sessionId === selectedSession && revision === changesRevision.current) setChanges(data); }
     catch (e) { report(e); }
     finally { if (revision === changesRevision.current) setChangesLoading(false); }
   }, []);
@@ -322,7 +326,7 @@ export default function App() {
     return () => { disposed = true; off?.(); if (flushTimer.current) clearTimeout(flushTimer.current); queue.current = []; };
   }, [refresh, loadMessages, refreshChanges, refreshUsage, flush]);
 
-  useEffect(() => { if (projectId && context) void refreshChanges(projectId); }, [projectId, context, refreshChanges]);
+  useEffect(() => { if ((projectId || sessionId) && context) void refreshChanges(projectId); }, [projectId, sessionId, context, refreshChanges]);
   useLayoutEffect(() => { applyPreferences(prefs); const query = window.matchMedia('(prefers-color-scheme: dark)'); const update = () => applyPreferences(prefs); query.addEventListener('change', update); return () => query.removeEventListener('change', update); }, [prefs]);
   useEffect(() => {
     if (desktop) void call('update_notification_preferences', { preferences: notificationPreferences(prefs) }).catch(report);
@@ -367,7 +371,7 @@ export default function App() {
   useEffect(() => { localStorage.setItem('supercode.agent', agentId); }, [agentId]);
   useEffect(() => { if (ready && !detached) { localStorage.setItem('supercode.session', sessionId); localStorage.setItem('supercode.project', projectId); } }, [ready, sessionId, projectId, detached]);
   useEffect(() => {
-    if (!ready || !projectId || !draftKey.current) return;
+    if (!ready || !draftKey.current) return;
     const key = draftKey.current;
     if (!sessionId && draftConnectionId) draftModels.current.set(key, { connectionId: draftConnectionId, model, effort });
     while (draftModels.current.size > 20) draftModels.current.delete(draftModels.current.keys().next().value!);
@@ -450,20 +454,20 @@ export default function App() {
       const p = await call<Project>('add_project', { path }); await refresh(); selectProject(p); setModal(null); setPathInput('');
     } catch (e) { report(e); }
   }
-  function selectProject(p: Project, nextAgent = agentId) {
+  function selectProject(p: Project | undefined, nextAgent = agentId) {
     setSettingsOpen(false);
-    const sameProject = current.current.projectId === p.id;
+    const sameProject = current.current.projectId === (p?.id ?? '');
     drafts.current.set(draftKey.current, inputRef.current);
     attachmentDrafts.current.set(draftKey.current, attachmentsRef.current);
-    draftKey.current = `${p.id}:${nextAgent}`;
+    draftKey.current = `${(p?.id ?? '')}:${nextAgent}`;
     const selection = draftModels.current.get(draftKey.current);
     setAgentId(nextAgent); setModels([]); modelRequest.current++;
     setDraftConnectionId(selection?.connectionId); setModel(selection?.model ?? ''); setModelSource(undefined); setUsage(undefined); setEffort(selection?.effort ?? '');
     setAttachments(attachmentDrafts.current.get(draftKey.current) ?? []); setInput(drafts.current.get(draftKey.current) ?? '');
-    flush(); setProjectId(p.id); setSessionId(''); setMessages([]); setPreview(null); setChanges(emptyChanges);
+    flush(); setProjectId((p?.id ?? '')); setSessionId(''); setMessages([]); setPreview(null); setChanges(emptyChanges);
     setHasMore(false); setShowJump(false); setMessagesLoading(false); stickToBottom.current = true; changesRevision.current++;
-    current.current = { sessionId: '', projectId: p.id, nativeId: null }; setError('');
-    if (sameProject && context) void refreshChanges(p.id);
+    current.current = { sessionId: '', projectId: (p?.id ?? ''), nativeId: null }; setError('');
+    if (sameProject && context) void refreshChanges((p?.id ?? ''));
   }
   async function selectSession(s: Session) {
     setSettingsOpen(false);
@@ -487,12 +491,11 @@ export default function App() {
     else if (request.search) setModal('search');
     else if (request.newChat) await newSession();
   };
-  async function newSession(target = project) {
-    if (!target) { await addProject(); return; }
+  async function newSession(target?: Project) {
     if (anyBusy || configuring) return;
     // Repeated clicks keep the same unsent draft, including its model and attachments.
-    if (sessionId || projectId !== target.id) { selectProject(target, prefsRef.current.defaultAgent); setPermissionMode(compatiblePermission(prefsRef.current.defaultPermission, prefsRef.current.defaultAgent), prefsRef.current.defaultAgent); }
-    setCollapsedProjects(old => { const next = new Set(old); next.delete(target.id); return next; });
+    if (sessionId || projectId !== (target?.id ?? '')) { selectProject(target, prefsRef.current.defaultAgent); setPermissionMode(compatiblePermission(prefsRef.current.defaultPermission, prefsRef.current.defaultAgent), prefsRef.current.defaultAgent); }
+    if (target) setCollapsedProjects(old => { const next = new Set(old); next.delete(target.id); return next; });
     setModal(null); setError('');
     requestAnimationFrame(() => textarea.current?.focus());
   }
@@ -516,7 +519,6 @@ export default function App() {
     if (command && !commandSkill) { await handleCommand(command.command, command.argument); return; }
     if (sending) return;
     if (!desktop) { setError('当前是浏览器界面预览。运行 npm run desktop 后，可以使用真实的本地 Agent。'); return; }
-    if (!project) { await addProject(); return; }
     const taskAttachments = commandSkill && !attachments.some(a => a.path === commandSkill.path) ? [...attachments, { kind: 'skill' as const, name: commandSkill.name, path: commandSkill.path }] : attachments;
     if (taskAttachments.length > 12) { setError('最多添加 12 个附件，请先移除一个附件。'); return; }
     const originalInput = input;
@@ -566,8 +568,7 @@ export default function App() {
     if (command === '/help') { setCommandMessage(commandMatches('/', agentId, nativeCommands, skillCatalog.skills).map(c => `${c.name} — ${c.skill ? '技能 · ' : ''}${c.detail}`).join('\n')); setInput(''); return; }
     if ((agentId === 'claude' || ['opencode', 'pi'].includes(agentId) && command !== '/compact' && !slashCommands.some(c => c.name === command && (!c.agent || c.agent === agentId))) && commandMatches('/', agentId, nativeCommands).some(c => c.name === command)) {
       if (!desktop) { setError('原生命令需要在桌面版运行。'); return; }
-      if (!project) { await addProject(); return; }
-      setSending(true);
+        setSending(true);
       try {
         let id = sessionId;
         if (!id) { const s = await createChatSession({ projectId, model, agent: agentId, connectionId }); id = s.id; setSessionId(id); current.current.sessionId = id; }
@@ -585,7 +586,6 @@ export default function App() {
     }
     if (!['/goal', '/goal-status', '/compact'].includes(command) || agentId !== 'codex') { setError('当前 Agent 不支持此命令。输入 / 查看可用命令。'); return; }
     if (!desktop) { setError('原生命令需要在桌面版运行。'); return; }
-    if (!project) { await addProject(); return; }
     setSending(true);
     try {
       let id = sessionId;
@@ -609,7 +609,6 @@ export default function App() {
     setLoadingModels(false);
     try {
       if (!sessionId) {
-        if (!projectId) throw new Error('请先选择项目');
         setDraftConnectionId(option.connectionId); setModel(option.model); setModelSource(option.source); setModels([]); setUsage(undefined);
         setEffort(option.defaultReasoningEffort ?? '');
         draftModels.current.set(draftKey.current, { connectionId: option.connectionId, model: option.model, effort: option.defaultReasoningEffort ?? '' });
@@ -639,19 +638,19 @@ export default function App() {
     catch (e) { if (request === modelRequest.current) report(e); } finally { if (request === modelRequest.current) setLoadingModels(false); }
   }
   async function stop() { setStopping(true); try { await call('interrupt_turn', { sessionId }); } catch (e) { report(e); } finally { setStopping(false); } }
-  const showFile = useCallback(async (path: string, line?: number) => {
-    const id = projectId;
+  const showFile = useCallback(async (path: string, line?: number, workspaceSessionId?: string) => {
+    const id = workspaceSessionId ? '' : projectId;
+    const owner = workspaceSessionId || sessionId;
     try {
-      if (systemDocument(path) && !/\.(txt|md|csv|html?)$/i.test(path)) { await call('open_project_path', { projectId: id, path, action: 'open' }); return; }
-      const text = await call<string>('read_project_file', { projectId: id, path }); if (current.current.projectId === id) { setPreview({ name: path, text, line }); if (narrow) setContextOverlay(true); else setContext(true); }
-    } catch (e) { if (current.current.projectId === id) report(e); }
-  }, [projectId, narrow]);
-  const openPath = useCallback(async (path: string, action: 'open' | 'reveal') => { await call('open_project_path', { projectId, path, action }); }, [projectId]);
+      if (systemDocument(path) && !/\.(txt|md|csv|html?)$/i.test(path)) { await call('open_project_path', { projectId: id, sessionId: owner || null, path, action: 'open' }); return; }
+      const text = await call<string>('read_project_file', { projectId: id, sessionId: owner || null, path }); if (current.current.sessionId === sessionId) { setPreview({ name: path, text, line }); if (workspaceSessionId) setSideDraft(null); if (narrow) setContextOverlay(true); else setContext(true); }
+    } catch (e) { if (current.current.sessionId === sessionId) report(e); }
+  }, [projectId, sessionId, narrow]);
+  const openPath = useCallback(async (path: string, action: 'open' | 'reveal') => { await call('open_project_path', { projectId, sessionId: sessionId || null, path, action }); }, [projectId, sessionId]);
   function reviewFile(path: string) { const file = diffFiles(changes.diff).find(f => f.path === path); if (file) showDiff(path, file.diff); else void showFile(path); }
   function selectCommand(index: number) { const command = slashOptions[index]; if (!command) return; if (command.skill) { if (!addSkill(command.skill)) return; setInput(''); } else setInput(`${command.name}${command.arguments ? ' ' : ''}`); setCommandsDismissed(true); textarea.current?.focus(); }
   function switchAgent(value: string) {
-    if (project) selectProject(project, value);
-    else { setAgentId(value); setModel(''); setModels([]); setModelSource(undefined); setDraftConnectionId(undefined); }
+    selectProject(project, value);
     setLoadingModels(false);
   }
   async function inspectRuntime() { try { setRuntime(await call<RuntimeInfo>('runtime_info')); } catch (e) { report(e); } }
@@ -663,7 +662,7 @@ export default function App() {
   async function archive() {
     if (!session || modalWorking) return;
     setModalWorking(true);
-    try { await call('archive_session', { sessionId }); await refresh(); if (project) selectProject(project); setModal(null); } catch (e) { report(e); } finally { setModalWorking(false); }
+    try { await call('archive_session', { sessionId }); await refresh(); selectProject(project); setModal(null); } catch (e) { report(e); } finally { setModalWorking(false); }
   }
   async function saveRename() {
     if (modalWorking || !rename.trim()) return;
@@ -680,9 +679,8 @@ export default function App() {
       setProjectId(next.projectId);
       void refreshChanges(next.projectId);
     } else if (active.sessionId && !next || active.projectId && !data.projects.some(p => p.id === active.projectId)) {
-      const p = data.projects.find(p => p.id === active.projectId) ?? data.projects[0];
-      if (p) selectProject(p);
-      else { flush(); current.current = { sessionId: '', projectId: '', nativeId: null }; setProjectId(''); setSessionId(''); setMessages([]); setChanges(emptyChanges); }
+      const p = data.projects.find(p => p.id === active.projectId);
+      selectProject(p);
     }
     if(next && current.current.sessionId===next.id)await loadMessages(next.id);
   }
@@ -711,7 +709,7 @@ export default function App() {
       setNavigation(next);
       if (target.page === 'settings') { setSettingsTab(target.tab as typeof settingsTab); openSettings(); }
       else if (target.sessionId && target.sessionId !== sessionId) await selectSession(sessions.find(s => s.id === target.sessionId)!);
-      else if (target.projectId !== projectId || target.sessionId !== sessionId) { const p = projects.find(p => p.id === target.projectId); if (p) selectProject(p); }
+      else if (target.projectId !== projectId || target.sessionId !== sessionId) { const p = projects.find(p => p.id === target.projectId); selectProject(p); }
       else setSettingsOpen(false);
     } finally { navigating.current = false; }
   }
@@ -797,8 +795,9 @@ export default function App() {
     ] },
   ];
 
-  return <div className="desktop-shell"><DesktopTitleBar menus={desktopMenus} back={() => void navigate(-1)} forward={() => void navigate(1)} canBack={settingsOpen || navigation.index > 0} canForward={navigation.index < navigation.entries.length - 1} sidebar={sidebar} toggleSidebar={() => setSidebar(v => !v)} blocked={!!modal || sidebarDialog} report={report}/><div className="desktop-workarea"><ActivityRail settings={settingsOpen} blocked={!!modal || sidebarDialog} home={() => setSettingsOpen(false)} create={() => { setSettingsOpen(false); void newSession(); }} search={() => setModal('search')} projects={() => { setSettingsOpen(false); setSidebar(true); }} preferences={() => { setSettingsTab('general'); openSettings(); }}/><div className={`app ${settingsOpen ? 'settings-open' : ''} ${sidebar ? '' : 'sidebar-hidden'} ${showContext || sideDraft ? '' : 'context-hidden'} ${sideDraft?'has-side-chat':''}`}>
+  return <div className="desktop-shell"><DesktopTitleBar menus={desktopMenus} back={() => void navigate(-1)} forward={() => void navigate(1)} canBack={settingsOpen || navigation.index > 0} canForward={navigation.index < navigation.entries.length - 1} sidebar={sidebar} toggleSidebar={() => setSidebar(v => !v)} blocked={!!modal || sidebarDialog} report={report}/><div className="desktop-workarea"><ActivityRail settings={settingsOpen} blocked={!!modal || sidebarDialog} home={() => setSettingsOpen(false)} create={() => { setSettingsOpen(false); void newSession(); }} search={() => setModal('search')} projects={() => { setSettingsOpen(false); setSidebar(true); }} preferences={() => { setSettingsTab('general'); openSettings(); }}/><div ref={panels.root} className={`app ${settingsOpen ? 'settings-open' : ''} ${sidebar ? '' : 'sidebar-hidden'} ${showContext || sideDraft ? '' : 'context-hidden'} ${sideDraft?'has-side-chat':''}`}>
     {sidebar ? <aside className="sidebar" hidden={settingsOpen} inert={!!modal || sidebarDialog}>
+      {!settingsOpen ? <div {...panels.handle('left')}/> : null}
       <div className="brand"><span>SuperCode</span><button className="icon-button brand-search" aria-label="搜索会话" title="搜索会话 (Ctrl+K)" onClick={() => setModal('search')}><Search size={16}/></button></div>
       <button className="new-chat" title="新建聊天 (Ctrl+N)" onClick={() => void newSession()}><SquarePen size={15} />新聊天</button>
       <Sidebar projects={projects} sessions={sessions} state={sidebarState} projectId={projectId} sessionId={sessionId} ready={ready} blocked={!!modal || settingsOpen} collapsed={collapsedProjects} setCollapsed={setCollapsedProjects} selectProject={selectProject} selectSession={selectSession} addProject={() => void addProject()} createSession={newSession} updated={reconcileSidebar} dialogChanged={setSidebarDialog}/>
@@ -808,7 +807,7 @@ export default function App() {
       {desktop ? <AppUpdateNotice open={() => { setSettingsTab('about'); openSettings(); }}/> : null}
       <header className="workspace-header"><div className="breadcrumbs">{!sidebar ? <button className="icon-button" title="展开侧栏" onClick={() => setSidebar(true)}><PanelLeftOpen size={18} /></button> : null}<Folder size={15} /><strong title={`${project?.name ?? '工作区'} · ${session?.title ?? '新会话'}`}>{session?.title ?? project?.name ?? '新聊天'}</strong>{!desktop ? <span className="preview-badge">界面预览</span> : null}</div><div className="header-actions">{session ? <button className="icon-button" title="会话设置" onClick={() => { setRename(session.title); setModal('rename'); }}><MoreHorizontal size={18} /></button> : null}<button className={`icon-button ${logsOpen ? 'on' : ''}`} title="运行日志" onClick={() => setLogsOpen(v => !v)}><Terminal size={16} /></button><button className="icon-button" title={showContext ? '收起变更面板' : '展开变更面板'} onClick={() => narrow ? setContextOverlay(v => !v) : setContext(v => !v)}>{showContext ? <PanelRightClose size={17} /> : <PanelRightOpen size={17} />}</button></div></header>
       <div className="chat-scroll" aria-busy={!ready} ref={scrollArea} onClickCapture={e => { if ((e.target as Element).closest('.activity-row, .activity-group-summary, .activity-toggle-more')) stickToBottom.current = false; }} onScroll={() => { if (settingsOpenRef.current) return; const el = scrollArea.current; if (el) { stickToBottom.current = el.scrollHeight - el.scrollTop - el.clientHeight < 100; setShowJump(!stickToBottom.current); } }}>
-        {!ready ? <div className="startup-loading" role="status"><span className="pending-text">正在加载工作区…</span></div> : messages.length || busy || messagesLoading || currentRequests.length ? <div className="messages" aria-busy={messagesLoading}>{hasMore ? <button className="load-earlier" disabled={messagesLoading} onClick={() => void loadMessages(sessionId, messages.find(m => m.seq > 0)?.seq).catch(report)}>{messagesLoading ? '正在加载…' : '加载更早的消息'}</button> : null}{messagesLoading && !messages.length ? <div className="working-indicator"><span className="pending-text">正在加载会话…</span></div> : null}<Conversation messages={messages} agentName={agentName} autoExpand={autoExpand} showDiff={showDiff} openFile={showFile} openPath={openPath} projectId={projectId} />{handoffTarget ? <div className="working-indicator" role="status"><span className="pending-text">{handoffTarget === '@compact' ? '正在压缩上下文…' : `正在切换到 ${handoffTarget}…`}</span></div> : busy && !latest ? <div className="working-indicator"><span className="pending-text">{session?.status === 'starting' ? '正在启动 Agent…' : '正在思考…'}</span></div> : null}{currentRequests.map(request => <Suspense key={String(request.id)} fallback={<div className="working-indicator">正在加载确认请求…</div>}><RequestCard request={request} respond={async result => { try { await call('respond_request', { id: request.id, result }); setRequests(old => old.filter(r => r.id !== request.id)); } catch (e) { report(e); throw e; } }} /></Suspense>)}</div>
+        {!ready ? <div className="startup-loading" role="status"><span className="pending-text">正在加载工作区…</span></div> : messages.length || busy || messagesLoading || currentRequests.length ? <div className="messages" aria-busy={messagesLoading}>{hasMore ? <button className="load-earlier" disabled={messagesLoading} onClick={() => void loadMessages(sessionId, messages.find(m => m.seq > 0)?.seq).catch(report)}>{messagesLoading ? '正在加载…' : '加载更早的消息'}</button> : null}{messagesLoading && !messages.length ? <div className="working-indicator"><span className="pending-text">正在加载会话…</span></div> : null}<Conversation messages={messages} agentName={agentName} autoExpand={autoExpand} showDiff={showDiff} openFile={showFile} openPath={openPath} projectId={projectId} sessionId={sessionId} />{handoffTarget ? <div className="working-indicator" role="status"><span className="pending-text">{handoffTarget === '@compact' ? '正在压缩上下文…' : `正在切换到 ${handoffTarget}…`}</span></div> : busy && !latest ? <div className="working-indicator"><span className="pending-text">{session?.status === 'starting' ? '正在启动 Agent…' : '正在思考…'}</span></div> : null}{currentRequests.map(request => <Suspense key={String(request.id)} fallback={<div className="working-indicator">正在加载确认请求…</div>}><RequestCard request={request} respond={async result => { try { await call('respond_request', { id: request.id, result }); setRequests(old => old.filter(r => r.id !== request.id)); } catch (e) { report(e); throw e; } }} /></Suspense>)}</div>
           : <NewChat project={project} projects={projects} selectProject={selectProject} addProject={() => void addProject()}/>}
       </div>
       {showJump ? <JumpToLatest onClick={() => { stickToBottom.current = true; setShowJump(false); scrollToLatest(scrollArea.current, !prefs.animations || window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'instant' : 'smooth'); }} /> : null}
@@ -832,9 +831,9 @@ export default function App() {
     </main>
 
     <SelectionActions key={sessionId} area={scrollArea} add={text=>{setInput(old=>[old,text.split('\n').map(line=>`> ${line}`).join('\n')].filter(Boolean).join('\n\n'));requestAnimationFrame(()=>textarea.current?.focus());}} details={setSelectionDetail} ask={text=>void openSide(undefined,`关于下面这段内容：\n\n${text}\n\n请帮我进一步解释。`)}/>
-    {sideDraft && !settingsOpen ? <Suspense fallback={<aside className="side-chat">正在打开侧边聊天…</aside>}><SideChat key={sideDraft.key} draft={sideDraft} projectId={sideDraft.projectId??projectId} agent={sideDraft.agent??agentId} connectionId={sideDraft.connectionId??connectionId} defaults={followupPayload('')} close={()=>setSideDraft(null)} opened={()=>void refresh()} openFile={showFile} showDiff={showDiff}/></Suspense> : null}
+    {sideDraft && !settingsOpen ? <Suspense fallback={<aside className="side-chat">正在打开侧边聊天…</aside>}><SideChat key={sideDraft.key} draft={sideDraft} projectId={sideDraft.projectId??projectId} agent={sideDraft.agent??agentId} connectionId={sideDraft.connectionId??connectionId} defaults={followupPayload('')} close={()=>setSideDraft(null)} opened={()=>void refresh()} openFile={showFile} showDiff={showDiff} resizeHandle={<div {...panels.handle('right')}/>}/></Suspense> : null}
     {selectionDetail?<div className="modal-backdrop" onClick={()=>setSelectionDetail('')}><section className="modal" role="dialog" aria-modal="true" aria-label="选中内容" onClick={e=>e.stopPropagation()}><div className="modal-heading"><h2>选中内容</h2><button className="icon-button" aria-label="关闭选中内容" onClick={()=>setSelectionDetail('')}><X size={16}/></button></div><pre className="selection-detail">{selectionDetail}</pre><CopyButton text={selectionDetail} label="复制选中内容"/></section></div>:null}
-    {showContext && !sideDraft ? <aside className="context-panel" hidden={settingsOpen} inert={!!modal || sidebarDialog}><div className="context-header"><span>工作区</span>{narrow ? <button className="icon-button" title="关闭变更面板" onClick={() => setContextOverlay(false)}><X size={16} /></button> : null}<button className={`icon-button ${changesLoading ? 'spin' : ''}`} title="刷新变更" disabled={changesLoading || !projectId} onClick={() => void refreshChanges(projectId)}><RefreshCw size={15} /></button></div><div className="context-tabs"><span className="active">文件变更<small>{changes.files.length}</small></span>{changes.branch ? <span className="branch"><GitBranch size={12} />{changes.branch}</span> : null}</div>{changesLoading && !changes.files.length && !preview ? <div className="context-empty"><LoaderCircle size={22} className="spin" /><strong>正在检查文件变更…</strong></div> : preview ? <div className="file-preview"><div className="file-preview-header"><FileCode2 size={14} /><span title={preview.name}>{preview.name}</span><CopyButton text={preview.text} label="复制文件内容" iconOnly /><button className="icon-button" title="关闭文件" onClick={() => setPreview(null)}><X size={14} /></button></div><Suspense fallback={<pre>{preview.text}</pre>}>{preview.diff ? <DiffView text={preview.text} /> : <SourceView text={preview.text} line={preview.line} />}</Suspense></div> : changes.files.length ? <><div className="changed-files">{changes.files.map(f => <button key={f.path} disabled={f.path.endsWith("/")} onClick={() => reviewFile(f.path)} title={f.path.endsWith("/") ? `${f.path} · 未跟踪文件夹` : f.path}><FileCode2 size={15} /><span>{f.path}</span><small className={f.status === '??' ? 'untracked' : ''}>{f.status === '??' ? 'U' : f.status}</small></button>)}</div>{changes.diff ? <button className="workspace-diff-button" onClick={() => showDiff('工作区变更', changes.diff)}>查看全部差异</button> : null}</> : <div className="context-empty"><span><FileCode2 size={24} /></span><strong>{!project ? '等待打开项目' : changes.isGit ? '暂无文件变更' : '未启用 Git'}</strong><p>{!project ? '选择本地代码文件夹' : changes.isGit ? '文件修改后会显示在这里' : '初始化 Git 后可查看文件差异'}</p></div>}</aside> : null}
+    {showContext && !sideDraft ? <aside className="context-panel" hidden={settingsOpen} inert={!!modal || sidebarDialog}>{!settingsOpen ? <div {...panels.handle('right')}/> : null}<div className="context-header"><span title={workspacePath}>工作区</span>{workspacePath && !project ? <button className="icon-button" title="定位聊天目录" onClick={() => void openPath('.', 'reveal').catch(report)}><Folder size={15}/></button> : null}{narrow ? <button className="icon-button" title="关闭变更面板" onClick={() => setContextOverlay(false)}><X size={16} /></button> : null}<button className={`icon-button ${changesLoading ? 'spin' : ''}`} title="刷新变更" disabled={changesLoading || !workspacePath} onClick={() => void refreshChanges(projectId)}><RefreshCw size={15} /></button></div><div className="context-tabs"><span className="active">文件变更<small>{changes.files.length}</small></span>{changes.branch ? <span className="branch"><GitBranch size={12} />{changes.branch}</span> : null}</div>{changesLoading && !changes.files.length && !preview ? <div className="context-empty"><LoaderCircle size={22} className="spin" /><strong>正在检查文件变更…</strong></div> : preview ? <div className="file-preview"><div className="file-preview-header"><FileCode2 size={14} /><span title={preview.name}>{preview.name}</span><CopyButton text={preview.text} label="复制文件内容" iconOnly /><button className="icon-button" title="关闭文件" onClick={() => setPreview(null)}><X size={14} /></button></div><Suspense fallback={<pre>{preview.text}</pre>}>{preview.diff ? <DiffView text={preview.text} /> : <SourceView text={preview.text} line={preview.line} />}</Suspense></div> : changes.files.length ? <><div className="changed-files">{changes.files.map(f => <button key={f.path} disabled={f.path.endsWith("/")} onClick={() => reviewFile(f.path)} title={f.path.endsWith("/") ? `${f.path} · 未跟踪文件夹` : f.path}><FileCode2 size={15} /><span>{f.path}</span><small className={f.status === '??' ? 'untracked' : ''}>{f.status === '??' ? 'U' : f.status}</small></button>)}</div>{changes.diff ? <button className="workspace-diff-button" onClick={() => showDiff('工作区变更', changes.diff)}>查看全部差异</button> : null}</> : <div className="context-empty"><span><FileCode2 size={24} /></span><strong>{!workspacePath ? '聊天文件' : !project ? '聊天工作目录'  : changes.isGit ? '暂无文件变更' : '未启用 Git'}</strong><p>{!workspacePath ? '发送消息后自动创建独立目录，也可以选择项目' : !project ? workspacePath  : changes.isGit ? '文件修改后会显示在这里' : '初始化 Git 后可查看文件差异'}</p></div>}</aside> : null}
 
     {settingsOpen ? <Suspense fallback={<div className="startup-loading" role="status">正在加载设置…</div>}><SettingsPage tab={settingsTab} select={setSettingsTab} blocked={!!modal || sidebarDialog}>
       {modalError ? <div className="error-banner modal-error" role="alert"><span>{modalError}</span><button className="icon-button" aria-label="关闭错误提示" onClick={() => setModalError('')}><X size={14} /></button></div> : null}
@@ -851,7 +850,7 @@ export default function App() {
     {modal ? <div className="modal-backdrop" onMouseDown={e => { if (e.target === e.currentTarget && !modalWorking) setModal(null); }}><section className="modal" ref={modalElement} role="dialog" aria-modal="true" aria-label={modal === 'search' ? '搜索会话' : modal === 'rename' ? '会话设置' : '添加项目'}><div className="modal-header"><h2>{modal === 'search' ? '搜索会话' : modal === 'rename' ? '会话设置' : '添加项目'}</h2><button className="icon-button" title="关闭" disabled={modalWorking} onClick={() => setModal(null)}><X size={18}/></button></div>
       {modalError ? <div className="error-banner modal-error" role="alert">{modalError}</div> : null}
       {modal === 'project' ? <form onSubmit={e => { e.preventDefault(); void addProject(pathInput.trim()); }}><label htmlFor="project-path">项目文件夹路径</label><input id="project-path" autoFocus value={pathInput} onChange={e => setPathInput(e.target.value)} placeholder="D:\Projects\my-project" /><p className="muted">{desktop ? '输入已有项目的完整路径，也可以通过系统对话框选择文件夹。' : '这是界面预览。路径仅用于展示，不会读取本地文件。'}</p><div className="modal-actions">{desktop ? <button type="button" className="quiet-button" onClick={() => void addProject(undefined, true)}>选择文件夹</button> : null}<button className="primary-button" disabled={!pathInput.trim()}>添加项目</button></div></form> : null}
-      {modal === 'search' ? <><div className="search-field"><Search size={17} /><input autoFocus value={search} onChange={e => setSearch(e.target.value)} placeholder="搜索项目或会话…" aria-label="搜索项目或会话" /></div><div className="search-results">{shownProjects.map(p => <div key={p.id}><button onClick={() => { selectProject(p); setModal(null); }}><Folder size={16} /><strong>{p.name}</strong></button>{sessions.filter(s => s.projectId === p.id && s.title.toLowerCase().includes(search.toLowerCase())).map(s => <button key={s.id} onClick={() => void selectSession(s)}><MessageSquare size={15} /><span>{s.title}</span></button>)}</div>)}{!shownProjects.length ? <p className="muted">没有找到匹配的会话。</p> : null}</div></> : null}
+      {modal === 'search' ? <><div className="search-field"><Search size={17} /><input autoFocus value={search} onChange={e => setSearch(e.target.value)} placeholder="搜索项目或会话…" aria-label="搜索项目或会话" /></div><div className="search-results">{shownProjects.map(p => <div key={p.id}><button onClick={() => { selectProject(p); setModal(null); }}><Folder size={16} /><strong>{p.name}</strong></button>{sessions.filter(s => s.projectId === p.id && s.title.toLowerCase().includes(search.toLowerCase())).map(s => <button key={s.id} onClick={() => void selectSession(s)}><MessageSquare size={15} /><span>{s.title}</span></button>)}</div>)}{sessions.filter(s => !s.projectId && s.title.toLowerCase().includes(search.toLowerCase())).map(s => <button key={s.id} onClick={() => void selectSession(s)}><MessageSquare size={15}/><span>{s.title}</span></button>)}{!shownProjects.length && !sessions.some(s => !s.projectId && s.title.toLowerCase().includes(search.toLowerCase())) ? <p className="muted">没有找到匹配的会话。</p> : null}</div></> : null}
       {modal === 'rename' ? <><form onSubmit={e => { e.preventDefault(); void saveRename(); }}><label htmlFor="rename">会话名称</label><input id="rename" autoFocus value={rename} onChange={e => setRename(e.target.value)} maxLength={100} /><div className="modal-actions"><button type="button" className="quiet-button" disabled={busy || modalWorking} onClick={() => void archive()}>归档会话</button><button className="primary-button" disabled={!rename.trim() || modalWorking}>{modalWorking ? '保存中…' : '保存'}</button></div></form></> : null}
     </section></div> : null}
   </div></div></div>;

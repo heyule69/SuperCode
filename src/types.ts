@@ -1,5 +1,5 @@
 export interface Project { id: string; name: string; path: string }
-export interface Session { id: string; projectId: string; title: string; agent: string; model: string | null; connectionId?: string | null; nativeId: string | null; status: string; updatedAt: number; turnId: string | null }
+export interface Session { id: string; projectId: string; workspacePath?: string | null; title: string; agent: string; model: string | null; connectionId?: string | null; nativeId: string | null; status: string; updatedAt: number; turnId: string | null }
 export interface Message { seq: number; id: string; sessionId: string; role: string; text: string; kind: string; data: Record<string, unknown> | null }
 export interface Agent { id: string; name: string; installed: boolean; path: string | null; connected: boolean }
 export interface ModelSource { providerId: string; providerName: string; mark: string; planName?: string | null; connectionName?: string | null; modelFamily?: string | null; available?: boolean }

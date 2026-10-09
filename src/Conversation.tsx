@@ -155,9 +155,9 @@ function TurnView({ turn, agentName, autoExpand, showDiff, openFile }: { turn: C
   </div>;
 }
 
-export const Conversation = memo(function Conversation({ messages, agentName, autoExpand, showDiff, openFile, openPath, projectId }: { messages: Message[]; agentName: string; autoExpand: boolean; showDiff:(name:string,text:string)=>void; openFile:(path:string,line?:number)=>void; openPath?: OpenPath; projectId?: string }) {
+export const Conversation = memo(function Conversation({ messages, agentName, autoExpand, showDiff, openFile, openPath, projectId, sessionId }: { messages: Message[]; agentName: string; autoExpand: boolean; showDiff:(name:string,text:string)=>void; openFile:(path:string,line?:number)=>void; openPath?: OpenPath; projectId?: string; sessionId?: string }) {
   const turns = conversationTurns(messages);
-  const mediaContext = useMemo(() => ({ projectId, openFile }), [projectId, openFile]);
+  const mediaContext = useMemo(() => ({ projectId, sessionId, openFile }), [projectId, sessionId, openFile]);
   return <MediaContext.Provider value={mediaContext}><ResourceMenu openFile={openFile} openPath={openPath}><ConversationIndex turns={turns}/>{turns.map(turn => <TurnView key={turn.id} turn={turn} agentName={agentName} autoExpand={autoExpand} showDiff={showDiff} openFile={openFile} />)}</ResourceMenu></MediaContext.Provider>;
 });
 

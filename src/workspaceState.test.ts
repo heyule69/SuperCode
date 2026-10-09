@@ -11,9 +11,14 @@ describe('workspace restoration', () => {
     expect(restoreWorkspace({ projects, sessions }, { sessionId: 'archived', projectId: 'b' })).toEqual({ project: projects[1], session: undefined });
   });
   it('opens a new workspace without stealing the main window conversation', () => {
-    expect(restoreWorkspace({ projects, sessions }, { sessionId: 'chosen', projectId: 'a', fresh: true })).toEqual({ project: projects[0], session: undefined });
-    expect(restoreWorkspace({ projects, sessions }, { sessionId: 'chosen', projectId: 'deleted', fresh: true })).toEqual({ project: projects[0], session: undefined });
+    expect(restoreWorkspace({ projects, sessions }, { sessionId: 'chosen', projectId: 'a', fresh: true })).toEqual({ project: undefined, session: undefined });
+    expect(restoreWorkspace({ projects, sessions }, { sessionId: 'chosen', projectId: 'deleted', fresh: true })).toEqual({ project: undefined, session: undefined });
     expect(restoreWorkspace({ projects: [], sessions: [] }, { sessionId: '', projectId: '', fresh: true })).toEqual({ project: undefined, session: undefined });
+  });
+  it('starts without a project and restores projectless history independently of old project selection', () => {
+    expect(restoreWorkspace({ projects, sessions }, { sessionId: '', projectId: '' })).toEqual({ project: undefined, session: undefined });
+    const chat = { ...sessions[0], id: 'standalone', projectId: '' };
+    expect(restoreWorkspace({ projects, sessions: [chat, ...sessions] }, { sessionId: 'standalone', projectId: 'b' })).toEqual({ project: undefined, session: chat });
   });
   it('bounds persisted drafts and ignores invalid records', () => {
     const texts = new Map(Array.from({ length: 25 }, (_, i) => [String(i), '草稿'.repeat(20000)]));

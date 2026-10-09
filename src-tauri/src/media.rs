@@ -91,13 +91,20 @@ fn resolve_file(
     app: &AppHandle,
     path: &str,
     project_id: Option<String>,
+    session_id: Option<String>,
 ) -> Result<PathBuf, String> {
     let state = app.state::<crate::AppState>();
-    let project = project_id
-        .filter(|id| !id.is_empty())
-        .map(|id| state.store.project(&id).map(|p| PathBuf::from(p.path)))
-        .transpose()
-        .map_err(|_| "媒体所属项目不存在")?;
+    let project = if project_id.as_deref().is_some_and(|id| !id.is_empty()) || session_id.is_some()
+    {
+        Some(PathBuf::from(
+            state
+                .store
+                .workspace(project_id.as_deref().unwrap_or(""), session_id.as_deref())?
+                .path,
+        ))
+    } else {
+        None
+    };
     local_path(path, project.as_deref())
 }
 
@@ -105,12 +112,13 @@ fn resolve_file(
 pub async fn open_media(
     path: String,
     project_id: Option<String>,
+    session_id: Option<String>,
     app: AppHandle,
 ) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
         // Cached screenshots and user-provided absolute media may be outside the
         // project. Only known media files can reach the OS document opener.
-        let path = resolve_file(&app, &path, project_id)?;
+        let path = resolve_file(&app, &path, project_id, session_id)?;
         app.opener()
             .open_path(path.to_string_lossy().into_owned(), None::<&str>)
             .map_err(|e| e.to_string())
@@ -143,12 +151,13 @@ impl Media {
 pub async fn prepare_media(
     path: String,
     project_id: Option<String>,
+    session_id: Option<String>,
     app: AppHandle,
 ) -> Result<Value, String> {
     let _permit = PREVIEW_WORK.acquire().await.map_err(|e| e.to_string())?;
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<crate::AppState>();
-        let path = resolve_file(&app, &path, project_id)?;
+        let path = resolve_file(&app, &path, project_id, session_id)?;
         let (kind, mime) = format(&path.to_string_lossy()).ok_or("不支持预览此文件类型")?;
         if kind == "image" && fs::metadata(&path).map_err(|e| e.to_string())?.len() > BLOB_LIMIT as u64 { return Err("图片超过 10 MB，请在系统中打开".into()); }
         let registry = app.state::<Media>();

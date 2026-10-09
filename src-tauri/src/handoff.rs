@@ -92,7 +92,7 @@ async fn claude_summary(
         }
     }
     command.env("CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST", "1");
-    let project = app.state::<AppState>().store.project(&session.project_id)?;
+    let project = app.state::<AppState>().store.session_workspace(&session)?;
     let mut child = command
         .current_dir(project.path)
         .stdin(std::process::Stdio::piped())
@@ -134,7 +134,7 @@ async fn codex_summary(
         .runtime
         .get_for_session(app, Some(&session.id))
         .await?;
-    let project = app.state::<AppState>().store.project(&session.project_id)?;
+    let project = app.state::<AppState>().store.session_workspace(&session)?;
     let thread = client.request("thread/start",json!({"cwd":project.path,"model":session.model,"modelProvider":route.provider(),"sandbox":"read-only","approvalPolicy":"untrusted","ephemeral":true,"developerInstructions":INSTRUCTIONS,"config":{"features.shell_tool":false,"web_search":"disabled"}})).await?;
     let native = thread["thread"]["id"]
         .as_str()

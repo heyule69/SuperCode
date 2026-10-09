@@ -776,7 +776,7 @@ pub async fn models(
         .map(|s| {
             app.state::<AppState>()
                 .store
-                .project(&s.project_id)
+                .session_workspace(s)
                 .map(|p| p.path)
         })
         .transpose()?
@@ -1255,7 +1255,7 @@ pub async fn summary(app: &AppHandle, session: &Session, input: &str) -> Result<
     let cwd = app
         .state::<AppState>()
         .store
-        .project(&session.project_id)?
+        .session_workspace(&session)?
         .path;
     let (client, mut rx, config) = start_for(
         app,

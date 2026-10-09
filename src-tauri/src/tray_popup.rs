@@ -51,7 +51,7 @@ pub struct Snapshot {
 
 fn recent(store: &crate::storage::Store) -> Result<(Vec<RecentChat>, bool), String> {
     let conn = store.0.lock().map_err(|e| e.to_string())?;
-    let mut query = conn.prepare("SELECT s.id,s.title,p.name,s.status,coalesce(i.unread,0) FROM sessions s JOIN projects p ON p.id=s.project_id LEFT JOIN sidebar_items i ON i.kind='session' AND i.id=s.id WHERE s.archived=0 AND coalesce(i.removed,0)=0 AND NOT EXISTS (SELECT 1 FROM sidebar_items x WHERE x.kind='project' AND x.id=p.id AND x.removed=1) ORDER BY s.updated_at DESC,s.rowid DESC LIMIT 31").map_err(|e| e.to_string())?;
+    let mut query = conn.prepare("SELECT s.id,s.title,coalesce(p.name,''),s.status,coalesce(i.unread,0) FROM sessions s LEFT JOIN projects p ON p.id=s.project_id LEFT JOIN sidebar_items i ON i.kind='session' AND i.id=s.id WHERE s.archived=0 AND coalesce(i.removed,0)=0 AND NOT EXISTS (SELECT 1 FROM sidebar_items x WHERE x.kind='project' AND x.id=p.id AND x.removed=1) ORDER BY s.updated_at DESC,s.rowid DESC LIMIT 31").map_err(|e| e.to_string())?;
     let mut rows = query
         .query_map([], |row| {
             Ok(RecentChat {

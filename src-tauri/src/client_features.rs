@@ -453,7 +453,7 @@ pub fn capture_change(app: &AppHandle, session: &crate::storage::Session, params
     let Some(path) = item["arguments"]["file_path"].as_str() else {
         return;
     };
-    let Ok(project) = app.state::<AppState>().store.project(&session.project_id) else {
+    let Ok(project) = app.state::<AppState>().store.session_workspace(&session) else {
         return;
     };
     let root = Path::new(&project.path);

@@ -4,7 +4,7 @@
 
 把 Codex、Claude Code、OpenCode 和 Pi 放进一个桌面工作台，管理项目、模型连接和工具，直接用对话完成开发任务。
 
-当前版本 **0.1.2**，主要支持 **Windows**。基于 Tauri 2、Rust、React + TypeScript 和 SQLite。
+当前版本 **0.1.3**，主要支持 **Windows**。基于 Tauri 2、Rust、React + TypeScript 和 SQLite。
 
 [下载 Windows 安装包](https://github.com/heyule69/SuperCode/releases/latest) · [版本记录](https://github.com/heyule69/SuperCode/releases)
 
@@ -28,7 +28,7 @@
 
 1. 在「设置 → Agent」检测已有安装，缺少时点击「安装」。
 2. 在「模型供应商」选择官方账号登录，或添加 API 连接。
-3. 添加项目文件夹，选择 Agent 和模型，输入任务即可。
+3. 选择 Agent 和模型，输入任务即可。项目可选；未选择时，聊天文件保存在文档目录的 `SuperCode` 文件夹中。
 
 已有 Agent 的登录和配置会继续使用。下载与更新使用独立目录，测试通过后再启用。
 

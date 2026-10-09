@@ -18,6 +18,7 @@ pub struct Project {
 pub struct Session {
     pub id: String,
     pub project_id: String,
+    pub workspace_path: Option<String>,
     pub title: String,
     pub agent: String,
     pub model: Option<String>,
@@ -62,7 +63,7 @@ impl Store {
              PRAGMA foreign_keys=ON;
              PRAGMA cache_size=-2048;
              CREATE TABLE IF NOT EXISTS projects(id TEXT PRIMARY KEY,name TEXT NOT NULL,path TEXT NOT NULL UNIQUE);
-             CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY,project_id TEXT NOT NULL REFERENCES projects(id),title TEXT NOT NULL,agent TEXT NOT NULL,model TEXT,native_id TEXT UNIQUE,status TEXT NOT NULL,updated_at INTEGER NOT NULL,turn_id TEXT,archived INTEGER NOT NULL DEFAULT 0);
+              CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY,project_id TEXT REFERENCES projects(id),title TEXT NOT NULL,agent TEXT NOT NULL,model TEXT,native_id TEXT UNIQUE,status TEXT NOT NULL,updated_at INTEGER NOT NULL,turn_id TEXT,archived INTEGER NOT NULL DEFAULT 0);
              CREATE TABLE IF NOT EXISTS messages(seq INTEGER PRIMARY KEY AUTOINCREMENT,id TEXT NOT NULL,session_id TEXT NOT NULL REFERENCES sessions(id),role TEXT NOT NULL,text TEXT NOT NULL,kind TEXT NOT NULL,data TEXT NOT NULL,UNIQUE(session_id,id));
              CREATE INDEX IF NOT EXISTS messages_page ON messages(session_id,seq);
              CREATE TABLE IF NOT EXISTS followups(seq INTEGER PRIMARY KEY AUTOINCREMENT,id TEXT UNIQUE NOT NULL,session_id TEXT NOT NULL REFERENCES sessions(id),payload TEXT NOT NULL,status TEXT NOT NULL,error TEXT);
@@ -86,6 +87,29 @@ impl Store {
         if !has_connection {
             conn.execute("ALTER TABLE sessions ADD COLUMN connection_id TEXT", [])?;
         }
+        // Rebuild only the legacy NOT NULL constraint. Keep every dependent row
+        // and verify foreign keys before committing the atomic migration.
+        let required: bool = conn.query_row(
+            "SELECT \"notnull\" FROM pragma_table_info('sessions') WHERE name='project_id'",
+            [],
+            |r| r.get(0),
+        )?;
+        if required {
+            conn.execute_batch("PRAGMA foreign_keys=OFF")?;
+            let migrated = (|| -> rusqlite::Result<()> {
+                let tx = conn.transaction()?;
+                tx.execute_batch("CREATE TABLE sessions_optional(id TEXT PRIMARY KEY,project_id TEXT REFERENCES projects(id),title TEXT NOT NULL,agent TEXT NOT NULL,model TEXT,native_id TEXT UNIQUE,status TEXT NOT NULL,updated_at INTEGER NOT NULL,turn_id TEXT,archived INTEGER NOT NULL DEFAULT 0,connection_id TEXT);
+                    INSERT INTO sessions_optional SELECT id,project_id,title,agent,model,native_id,status,updated_at,turn_id,archived,connection_id FROM sessions;
+                    DROP TABLE sessions; ALTER TABLE sessions_optional RENAME TO sessions;")?;
+                if tx.prepare("PRAGMA foreign_key_check")?.exists([])? {
+                    return Err(rusqlite::Error::InvalidQuery);
+                }
+                tx.commit()
+            })();
+            conn.execute_batch("PRAGMA foreign_keys=ON")?;
+            migrated?;
+        }
+        conn.execute_batch("CREATE TABLE IF NOT EXISTS session_workspaces(session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,path TEXT NOT NULL)")?;
         #[cfg(windows)]
         {
             let tx = conn.transaction()?;
@@ -414,6 +438,68 @@ impl Store {
         self.create_agent_session(project_id, model, "codex")
     }
 
+    pub fn session_workspace(&self, session: &Session) -> Result<Project> {
+        if !session.project_id.is_empty() {
+            return self.project(&session.project_id);
+        }
+        let path = session
+            .workspace_path
+            .as_ref()
+            .ok_or("聊天工作目录不存在")?;
+        Ok(Project {
+            id: String::new(),
+            name: "聊天文件".into(),
+            path: path.clone(),
+        })
+    }
+
+    pub fn workspace(&self, project_id: &str, session_id: Option<&str>) -> Result<Project> {
+        if !project_id.is_empty() {
+            return self.project(project_id);
+        }
+        self.session_workspace(&self.session(session_id.ok_or("请先发送消息创建聊天工作目录")?)?)
+    }
+
+    pub fn create_projectless_session(
+        &self,
+        root: &Path,
+        model: Option<String>,
+        agent: &str,
+        connection_id: Option<&str>,
+    ) -> Result<Session> {
+        if !root.is_absolute() {
+            return Err("聊天目录必须是绝对路径".into());
+        }
+        if !matches!(agent, "codex" | "claude" | "opencode" | "pi") {
+            return Err("该 Agent 尚未接入执行".into());
+        }
+        let connection = match connection_id {
+            Some(id) => self.route_for(agent, id)?.id,
+            None => self.default_connection(agent)?,
+        };
+        let id = uuid::Uuid::new_v4().to_string();
+        let folder = root
+            .join(chrono::Local::now().format("%Y-%m-%d").to_string())
+            .join(format!("chat-{id}"));
+        std::fs::create_dir_all(&folder).map_err(|e| format!("无法创建聊天目录：{e}"))?;
+        let result = (|| -> Result<()> {
+            let mut conn = self.0.lock().map_err(|e| e.to_string())?;
+            let tx = conn.transaction().map_err(|e| e.to_string())?;
+            tx.execute("INSERT INTO sessions(id,project_id,title,agent,model,status,updated_at,connection_id) VALUES(?1,NULL,'新会话',?2,?3,'idle',?4,?5)", params![id,agent,model,now(),connection]).map_err(|e| e.to_string())?;
+            tx.execute(
+                "INSERT INTO session_workspaces(session_id,path) VALUES(?1,?2)",
+                params![id, folder.to_string_lossy()],
+            )
+            .map_err(|e| e.to_string())?;
+            tx.commit().map_err(|e| e.to_string())
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_dir(&folder);
+        }
+        result?;
+        self.session(&id)
+    }
+
     pub fn create_agent_session(
         &self,
         project_id: &str,
@@ -447,7 +533,7 @@ impl Store {
 
     pub fn sessions(&self) -> Result<Vec<Session>> {
         let conn = self.0.lock().map_err(|e| e.to_string())?;
-        let mut stmt=conn.prepare("SELECT id,project_id,title,agent,model,native_id,status,updated_at,turn_id,connection_id FROM sessions WHERE archived=0 AND project_id NOT IN (SELECT id FROM sidebar_items WHERE kind='project' AND removed=1) ORDER BY coalesce((SELECT pinned FROM sidebar_items WHERE kind='session' AND id=sessions.id),0) DESC,updated_at DESC LIMIT 500").map_err(|e|e.to_string())?;
+        let mut stmt=conn.prepare("SELECT id,project_id,title,agent,model,native_id,status,updated_at,turn_id,connection_id,(SELECT path FROM session_workspaces WHERE session_id=sessions.id) FROM sessions WHERE archived=0 AND (project_id IS NULL OR project_id NOT IN (SELECT id FROM sidebar_items WHERE kind='project' AND removed=1)) ORDER BY coalesce((SELECT pinned FROM sidebar_items WHERE kind='session' AND id=sessions.id),0) DESC,updated_at DESC LIMIT 500").map_err(|e|e.to_string())?;
         let rows = stmt
             .query_map([], Self::session_row)
             .map_err(|e| e.to_string())?
@@ -459,7 +545,8 @@ impl Store {
     pub(crate) fn session_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
         Ok(Session {
             id: r.get(0)?,
-            project_id: r.get(1)?,
+            project_id: r.get::<_, Option<String>>(1)?.unwrap_or_default(),
+            workspace_path: r.get(10)?,
             title: r.get(2)?,
             agent: r.get(3)?,
             model: r.get(4)?,
@@ -472,11 +559,11 @@ impl Store {
     }
 
     pub fn session(&self, id: &str) -> Result<Session> {
-        self.0.lock().map_err(|e|e.to_string())?.query_row("SELECT id,project_id,title,agent,model,native_id,status,updated_at,turn_id,connection_id FROM sessions WHERE id=?1",[id],Self::session_row).map_err(|e|e.to_string())
+        self.0.lock().map_err(|e|e.to_string())?.query_row("SELECT id,project_id,title,agent,model,native_id,status,updated_at,turn_id,connection_id,(SELECT path FROM session_workspaces WHERE session_id=sessions.id) FROM sessions WHERE id=?1",[id],Self::session_row).map_err(|e|e.to_string())
     }
 
     pub fn for_native(&self, native: &str) -> Result<Session> {
-        self.0.lock().map_err(|e|e.to_string())?.query_row("SELECT id,project_id,title,agent,model,native_id,status,updated_at,turn_id,connection_id FROM sessions WHERE native_id=?1",[native],Self::session_row).map_err(|e|e.to_string())
+        self.0.lock().map_err(|e|e.to_string())?.query_row("SELECT id,project_id,title,agent,model,native_id,status,updated_at,turn_id,connection_id,(SELECT path FROM session_workspaces WHERE session_id=sessions.id) FROM sessions WHERE native_id=?1",[native],Self::session_row).map_err(|e|e.to_string())
     }
 
     pub fn claim(&self, id: &str) -> Result<()> {
@@ -761,6 +848,94 @@ impl Store {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn projectless_chats_have_durable_independent_workspaces_for_all_agents() {
+        let root =
+            std::env::temp_dir().join(format!("supercode-workspaces-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let db = root.join("test.db");
+        let store = Store::open(&db).unwrap();
+        let mut chats = Vec::new();
+        for agent in ["codex", "claude", "opencode", "pi"] {
+            let chat = store
+                .create_projectless_session(&root.join("files"), None, agent, Some("@local"))
+                .unwrap();
+            assert!(chat.project_id.is_empty());
+            let workspace = store.session_workspace(&chat).unwrap();
+            assert!(Path::new(&workspace.path).is_dir());
+            assert!(Path::new(&workspace.path).starts_with(root.join("files")));
+            std::fs::write(
+                Path::new(&workspace.path).join("result.txt"),
+                agent.as_bytes(),
+            )
+            .unwrap();
+            chats.push(chat);
+        }
+        assert!(store.projects().unwrap().is_empty());
+        assert_eq!(store.sessions().unwrap().len(), 4);
+        assert_ne!(chats[0].workspace_path, chats[1].workspace_path);
+        let fork = store.fork_session(&chats[0].id, None).unwrap();
+        assert_eq!(fork.workspace_path, chats[0].workspace_path);
+        store.archive(&chats[1].id).unwrap();
+        assert_eq!(
+            store.archived_sessions().unwrap()[0].project_name,
+            "无项目聊天"
+        );
+        store.restore_session(&chats[1].id).unwrap();
+        let project = store.add_project(&root).unwrap();
+        store.bind_native(&chats[2].id, "native").unwrap();
+        store.move_session(&chats[2].id, &project.id).unwrap();
+        let moved = store.session(&chats[2].id).unwrap();
+        assert_eq!(moved.project_id, project.id);
+        assert!(moved.native_id.is_none());
+        assert_eq!(store.session_workspace(&moved).unwrap().path, project.path);
+        drop(store);
+        let reopened = Store::open(&db).unwrap();
+        let workspace = reopened.workspace("", Some(&chats[0].id)).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(Path::new(&workspace.path).join("result.txt")).unwrap(),
+            "codex"
+        );
+        assert!(reopened.workspace("", Some("missing")).is_err());
+        drop(reopened);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn legacy_session_constraint_migration_preserves_history_and_foreign_keys() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE projects(id TEXT PRIMARY KEY,name TEXT NOT NULL,path TEXT NOT NULL UNIQUE);
+            CREATE TABLE sessions(id TEXT PRIMARY KEY,project_id TEXT NOT NULL REFERENCES projects(id),title TEXT NOT NULL,agent TEXT NOT NULL,model TEXT,native_id TEXT UNIQUE,status TEXT NOT NULL,updated_at INTEGER NOT NULL,turn_id TEXT,archived INTEGER NOT NULL DEFAULT 0);
+            INSERT INTO projects VALUES('p','旧项目','D:/legacy');
+            INSERT INTO sessions(id,project_id,title,agent,status,updated_at) VALUES('old','p','旧聊天','codex','idle',1);") .unwrap();
+        // Add history before migration, as an existing user's database would have.
+        conn.execute_batch("CREATE TABLE messages(seq INTEGER PRIMARY KEY AUTOINCREMENT,id TEXT NOT NULL,session_id TEXT NOT NULL REFERENCES sessions(id),role TEXT NOT NULL,text TEXT NOT NULL,kind TEXT NOT NULL,data TEXT NOT NULL,UNIQUE(session_id,id));
+            INSERT INTO messages(id,session_id,role,text,kind,data) VALUES('m','old','user','保留内容','userMessage','{}');
+            CREATE TABLE settings(key TEXT PRIMARY KEY,value TEXT NOT NULL); INSERT INTO settings VALUES('theme','dark');").unwrap();
+        let store = Store::from_connection(conn).unwrap();
+        assert_eq!(store.session("old").unwrap().project_id, "p");
+        assert_eq!(store.setting("theme").unwrap().as_deref(), Some("dark"));
+        let conn = store.0.lock().unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT text FROM messages WHERE session_id='old'",
+                [],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+            "保留内容"
+        );
+        assert!(!conn
+            .prepare("PRAGMA foreign_key_check")
+            .unwrap()
+            .exists([])
+            .unwrap());
+        assert!(conn
+            .query_row("PRAGMA foreign_keys", [], |r| r.get::<_, bool>(0))
+            .unwrap());
+        assert!(conn.execute("INSERT INTO messages(id,session_id,role,text,kind,data) VALUES('bad','missing','user','x','userMessage','{}')", []).is_err());
+    }
+
     use super::*;
     #[test]
     fn agent_update_never_switches_selection_during_an_active_turn() {

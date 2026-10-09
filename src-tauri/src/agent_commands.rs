@@ -47,7 +47,7 @@ pub async fn execute_agent_command(
     if session.agent != "codex" {
         return Err("此原生命令只适用于 Codex，Claude 的界面命令请使用 /help 查看".into());
     }
-    let project = state.store.project(&session.project_id)?;
+    let project = state.store.session_workspace(&session)?;
     let client = state
         .runtime
         .get_for_session(&app, Some(&session_id))
