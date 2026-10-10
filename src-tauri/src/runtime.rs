@@ -181,7 +181,11 @@ impl Runtime {
         connection_id: Option<&str>,
     ) -> Result<Arc<Client>, String> {
         crate::desktop_lifecycle::ensure_running(app)?;
-        let route = app.state::<AppState>().store.route_with_connection("codex", session_id, connection_id)?;
+        let route = app.state::<AppState>().store.route_with_connection(
+            "codex",
+            session_id,
+            connection_id,
+        )?;
         let routing = route.fingerprint();
         let tool_configuration = crate::client_features::tool_configuration(app)?;
         let project = session_id
@@ -197,7 +201,12 @@ impl Runtime {
         let mut slot = self.client.lock().await;
         if let Some(client) = slot.as_ref().filter(|c| {
             c.alive.load(Ordering::Relaxed)
-                && context_matches((c.routing, c.tool_configuration), c.project.as_deref(), (routing, tool_configuration), project.as_deref())
+                && context_matches(
+                    (c.routing, c.tool_configuration),
+                    c.project.as_deref(),
+                    (routing, tool_configuration),
+                    project.as_deref(),
+                )
         }) {
             return Ok(client.clone());
         }
@@ -274,8 +283,16 @@ impl Client {
         }
         let mut command = process::command(&executable, &args);
         crate::official_accounts::configure(&mut command, &app, "codex", &route.config)?;
-        if route.config["official"] == true || route.profile.as_ref().is_some_and(|p| p.is_official()) {
-            for name in ["OPENAI_API_KEY", "OPENAI_BASE_URL", "SUPERCODE_PROVIDER_API_KEY"] { command.env_remove(name); }
+        if route.config["official"] == true
+            || route.profile.as_ref().is_some_and(|p| p.is_official())
+        {
+            for name in [
+                "OPENAI_API_KEY",
+                "OPENAI_BASE_URL",
+                "SUPERCODE_PROVIDER_API_KEY",
+            ] {
+                command.env_remove(name);
+            }
         }
         if let Some(project) = project {
             command.current_dir(project);
@@ -512,6 +529,8 @@ pub(crate) async fn read_frame<R: tokio::io::AsyncBufRead + Unpin>(
 pub(crate) fn publish_event(app: &AppHandle, mut message: Value) {
     crate::media::normalize_event(app, &mut message);
     persist_event(app, &message);
+    crate::desktop_control::observe(app, &message);
+    crate::browser::observe(app, &message);
     if message["method"] == "turn/completed" {
         if message["params"]["turn"]["status"] != "completed" {
             if let Some(native) = message["params"]["threadId"].as_str() {

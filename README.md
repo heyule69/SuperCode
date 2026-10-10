@@ -4,7 +4,7 @@
 
 把 Codex、Claude Code、OpenCode 和 Pi 放进一个桌面工作台，管理项目、模型连接和工具，直接用对话完成开发任务。
 
-当前版本 **0.1.5**，主要支持 **Windows**。基于 Tauri 2、Rust、React + TypeScript 和 SQLite。
+当前版本 **0.1.6**，主要支持 **Windows**。基于 Tauri 2、Rust、React + TypeScript 和 SQLite。
 
 [下载 Windows 安装包](https://github.com/heyule69/SuperCode/releases/latest) · [版本记录](https://github.com/heyule69/SuperCode/releases)
 
@@ -16,7 +16,8 @@
 - **模型连接**：Codex、Claude 官方多账号登录，按 Agent 配置 API 协议，支持从 CC Switch 导入连接。
 - **对话工作台**：流式回复、工具记录、文件差异、历史会话和侧边聊天；任务运行中可以追加消息、排队或引导。
 - **图片与媒体**：上传、粘贴图片，在对话中查看图片、播放视频和音频。
-- **技能、插件与 MCP**：发现本机技能，管理 Codex / Claude 插件和 MCP；浏览器、电脑自动化可一键安装并测试。
+- **技能、插件与 MCP**：发现本机技能，管理 Codex / Claude 插件和 MCP；内置浏览器、电脑操作，支持连接测试和随时接管。
+- **内置浏览器与电脑操作**：在右侧查看网页操作过程，浏览器与文件变更独立显示；电脑操作带屏幕光效和 AI 指针，按 Esc 或直接操作即可接管。
 - **桌面体验**：深浅主题、系统通知、托盘和多窗口。聊天保存在本机，Agent 按需启动，空闲后释放。
 - **软件更新**：自动检查 GitHub Releases，在「设置 → 关于」下载更新并重启安装，保留聊天与配置。
 
@@ -37,10 +38,6 @@
 **Agent 管理**
 
 ![Agent 管理：版本检查、安装、更新与测试](.github/assets/agents.jpg)
-
-**自动化工具**
-
-![浏览器与电脑自动化工具](.github/assets/automation.jpg)
 
 ## 从源码运行
 

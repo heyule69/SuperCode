@@ -3,12 +3,13 @@ import { CornerDownRight, SquareTerminal, X } from 'lucide-react';
 import type { ConversationTurn } from './events';
 import { useFloatingLayer } from './useFloatingLayer';
 import { scrollToConversationTurn } from './chatScroll';
+import { finalReply } from './turnPresentation';
 
 export function indexedTurns(turns: ConversationTurn[]) {
   return turns.filter(turn => turn.user).map(turn => ({
     id: turn.id,
     question: turn.user!.text || '附件消息',
-    reply: turn.items.filter(item => item.role === 'assistant' && item.text).at(-1)?.text.replace(/\[([^\]]+)\]\([^)]+\)/g, '$1').replace(/(\*\*|__)(.*?)\1/g, '$2').replace(/`+/g, '').replace(/(^|\n)\s*(?:[-*+] |#{1,6} )/g, '$1').replace(/\s+/g, ' ').slice(0, 220) || '',
+    reply: (turn.run?.data?.status === 'completed' ? finalReply(turn.items).map(item => item.text).join('\n') : turn.items.filter(item => item.role === 'assistant' && item.text).at(-1)?.text ?? '').replace(/\[([^\]]+)\]\([^)]+\)/g, '$1').replace(/(\*\*|__)(.*?)\1/g, '$2').replace(/`+/g, '').replace(/(^|\n)\s*(?:[-*+] |#{1,6} )/g, '$1').replace(/\s+/g, ' ').slice(0, 220),
     command: turn.items.some(item => item.kind === 'commandExecution' || item.kind === 'claudeToolCall' && item.data?.tool === 'Bash'),
   }));
 }

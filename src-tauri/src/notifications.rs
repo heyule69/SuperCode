@@ -5,7 +5,7 @@ use std::{
     sync::Mutex,
     time::{Duration, Instant},
 };
-use tauri::{AppHandle, Emitter, Manager, WebviewWindow};
+use tauri::{AppHandle, Emitter, Manager, Window};
 
 #[derive(Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -123,10 +123,10 @@ fn text(kind: Kind, details: bool, session: &str, project: &str) -> (String, Str
 }
 
 #[tauri::command]
-pub fn update_notification_context(window: WebviewWindow, app: AppHandle, context: Context) {
+pub fn update_notification_context(window: Window, app: AppHandle, context: Context) {
     crate::desktop_lifecycle::update_context(&window, &context.session_id, context.settings_open);
     if let Ok(mut contexts) = app.state::<Notifications>().contexts.lock() {
-        contexts.retain(|label, _| app.get_webview_window(label).is_some());
+        contexts.retain(|label, _| app.get_window(label).is_some());
         contexts.insert(window.label().into(), context);
     }
 }
@@ -215,7 +215,7 @@ fn notify_task(
     let contexts = notifications.contexts.lock().map_err(|e| e.to_string())?;
     let mut foreground = false;
     let mut viewing = false;
-    for (label, win) in app.webview_windows() {
+    for (label, win) in app.windows() {
         if win.is_focused().unwrap_or(false) && !win.is_minimized().unwrap_or(false) {
             foreground = true;
             viewing |= contexts
@@ -379,7 +379,7 @@ fn show(
         )
         .on_activated(move |action| {
             if action.is_none() || action.as_deref() == Some("open") {
-                if let Some(window) = handle.get_webview_window("main") {
+                if let Some(window) = handle.get_window("main") {
                     let _ = handle.emit_to(
                         "main",
                         "notification-open",

@@ -76,6 +76,16 @@ input:focus-visible, textarea:focus-visible, select:focus-visible { outline:0; b
 .assistant-turn .activity-group { margin-bottom:16px; }
 .turn-footer { display:flex; align-items:center; gap:8px; min-height:28px; margin-top:6px; }
 .turn-footer .turn-summary { display:inline-flex; align-items:center; gap:6px; margin:0; padding:4px 0; background:transparent; font-size:12px; text-align:left; }
+.turn-process-header { margin:0 0 20px; border-bottom:1px solid var(--line); padding-bottom:8px; }
+.turn-process-toggle, .turn-process-label { display:flex; align-items:center; gap:8px; min-height:36px; max-width:100%; padding:4px 0; color:var(--muted); background:transparent; text-align:left; font-size:calc(var(--chat-size) - 1px); }
+.turn-process-toggle { cursor:pointer; border-radius:4px; }
+.turn-process-toggle:hover, .turn-process-toggle:focus-visible { color:var(--text); }
+.turn-process-toggle > svg { flex-shrink:0; transition:transform 150ms ease; }
+.turn-process-toggle > .expanded { transform:rotate(90deg); }
+.turn-process-content { margin-bottom:24px; }
+.turn-process-content > .message:last-child, .turn-process-content > .activity-group:last-child { margin-bottom:0; }
+.turn-final-result { min-width:0; }
+.turn-final-result > .message:last-child { margin-bottom:0; }
 .turn-copy { width:28px; height:28px; opacity:0; transition:opacity 100ms; }
 .assistant-turn:hover .turn-copy, .assistant-turn:focus-within .turn-copy { opacity:1; }
 @media (hover:none) { .turn-copy, .user-copy { opacity:1; } }

@@ -89,7 +89,16 @@ pub fn item_message(item: &Value) -> Option<(String, String, String, Value)> {
     if let Some(media) = media_limited {
         data_limited["media"] = media;
     }
-    for key in ["id", "type", "status", "tool", "server", "turnId"] {
+    for key in [
+        "id",
+        "type",
+        "status",
+        "tool",
+        "server",
+        "turnId",
+        "phase",
+        "messageId",
+    ] {
         if let Some(value) = data.get(key) {
             data_limited[key] = value
                 .as_str()
@@ -371,6 +380,19 @@ mod tests {
         assert_eq!(data["status"], "completed");
         assert!(data.get("aggregatedOutput").is_none());
         assert!(item_message(&json!({"type":"unknownFutureEvent"})).is_none());
+    }
+    #[test]
+    fn final_phase_and_content_group_survive_bounded_history_metadata() {
+        let (_, text, _, data) = item_message(&json!({
+            "id":"reply", "type":"agentMessage", "text":"最终结果",
+            "arguments":{"details":"x".repeat(TEXT_LIMIT * 2)},
+            "phase":"final_answer", "messageId":"native-message", "status":"completed"
+        }))
+        .unwrap();
+        assert_eq!(text, "最终结果");
+        assert_eq!(data["phase"], "final_answer");
+        assert_eq!(data["messageId"], "native-message");
+        assert_eq!(data["status"], "completed");
     }
     #[test]
     fn activity_buffer_preserves_streamed_summary_and_interrupted_output() {

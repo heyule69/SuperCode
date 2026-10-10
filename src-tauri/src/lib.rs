@@ -1,5 +1,4 @@
 mod accounts;
-mod official_accounts;
 mod agent_commands;
 mod agent_smoke;
 mod agent_versions;
@@ -7,13 +6,24 @@ mod agents;
 mod app_updates;
 mod automation;
 mod bridge;
+mod browser;
+mod browser_bridge;
+mod browser_native;
 mod ccswitch;
 mod chat_connection;
 mod claude;
 mod client_features;
 mod commands;
+mod computer;
+mod computer_bridge;
+mod computer_gate;
+mod computer_native;
+mod computer_smoke;
 mod connection_order;
 mod credentials;
+mod desktop_control;
+mod desktop_control_smoke;
+mod desktop_glow;
 mod desktop_lifecycle;
 mod desktop_smoke;
 mod extensions;
@@ -26,6 +36,7 @@ mod links;
 mod media;
 mod native_agents;
 mod notifications;
+mod official_accounts;
 mod outbox;
 mod platform_usage;
 mod process;
@@ -56,8 +67,40 @@ pub struct AppState {
 }
 
 pub fn run() {
+    let args: Vec<_> = std::env::args().collect();
+    if args.get(1).is_some_and(|arg| arg == "--browser-mcp") {
+        if let Err(error) = browser_bridge::run(&args[2..]) {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    // These headless modes must run before Tauri/WebView initialization.
+    if args.get(1).is_some_and(|arg| arg == "--computer-mcp") {
+        if let Err(error) = computer::run() {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    if args.get(1).is_some_and(|arg| arg == "--computer-worker") {
+        computer::worker();
+        return;
+    }
+    if args
+        .get(1)
+        .is_some_and(|arg| arg == "--computer-mcp-bridge")
+    {
+        if let Err(error) = computer_bridge::run(&args[2..]) {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
+        return;
+    }
     let desktop_test = std::env::args()
         .any(|arg| matches!(arg.as_str(), "--desktop-smoke-test" | "--tray-hover-test"));
+    let desktop_control_test = std::env::args().any(|arg| arg == "--desktop-control-test");
+    let browser_test = std::env::args().any(|arg| arg == "--browser-smoke-test");
     let installation_test = std::env::args().any(|arg| {
         matches!(
             arg.as_str(),
@@ -80,6 +123,8 @@ pub fn run() {
     let smoke_dir = (smoke_test
         || agents_test
         || desktop_test
+        || desktop_control_test
+        || browser_test
         || followup_test
         || update_test
         || installation_test)
@@ -110,13 +155,15 @@ pub fn run() {
         || automation_test
         || agents_test
         || desktop_test
+        || desktop_control_test
+        || browser_test
         || followup_test
         || installation_test
     {
         builder
     } else {
         builder.plugin(tauri_plugin_single_instance::init(|app, _, _| {
-            if let Some(window) = app.get_webview_window("main") {
+            if let Some(window) = app.get_window("main") {
                 let _ = window.show();
                 let _ = window.unminimize();
                 let _ = window.set_focus();
@@ -145,9 +192,13 @@ pub fn run() {
         .manage(platform_usage::UsageCache::default())
         .manage(ui_recovery::UiRecovery::default())
         .manage(desktop_lifecycle::DesktopLifecycle::default())
+        .manage(desktop_control::DesktopControl::default())
+        .manage(browser::Browser::default())
         .manage(tray_popup::TrayPopup::default())
         .on_page_load(|webview, payload| {
-            if matches!(payload.event(), tauri::webview::PageLoadEvent::Finished) {
+            if !webview.label().starts_with("browser-")
+                && matches!(payload.event(), tauri::webview::PageLoadEvent::Finished)
+            {
                 ui_recovery::attach(webview);
             }
         })
@@ -177,13 +228,25 @@ pub fn run() {
                 activity: std::sync::Mutex::new(protocol::ActivityBuffer::default()),
                 change_snapshots: std::sync::Mutex::new(std::collections::HashMap::new()),
             });
+            if let Err(error) = desktop_control::install(app.handle()) {
+                eprintln!("电脑操作提示不可用：{error}");
+            }
+            browser::install(app.handle())?;
             if !std::env::args().any(|arg| arg == "--legacy-installation-exit-test") {
                 installation_exit::attach(app.handle())?;
             }
             let outbox_handle = app.handle().clone();
             tauri::async_runtime::spawn(async move { outbox::watch(outbox_handle).await });
             let handle = app.handle().clone();
-            if installation_test {
+            if browser_test {
+                tauri::async_runtime::spawn(async move {
+                    browser::smoke(handle).await;
+                });
+            } else if desktop_control_test {
+                tauri::async_runtime::spawn(async move {
+                    desktop_control_smoke::run(handle).await;
+                });
+            } else if installation_test {
                 installation_exit::smoke(app.handle().clone())?;
             } else if update_test {
                 if let Some(window) = app.get_webview_window("main") {
@@ -223,7 +286,12 @@ pub fn run() {
             }
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![
+        .invoke_handler(browser::guard(tauri::generate_handler![
+            browser::browser_open,
+            browser::browser_layout,
+            browser::browser_manual,
+            browser::browser_close,
+            browser::browser_takeover,
             app_updates::app_update_status,
             app_updates::check_app_update,
             app_updates::download_app_update,
@@ -338,7 +406,7 @@ pub fn run() {
             extensions::set_extension_enabled,
             extensions::import_extension,
             extensions::open_extension_folder,
-        ])
+        ]))
         .build(context)
         .expect("无法启动 SuperCode")
         .run(|app, event| {
@@ -352,6 +420,8 @@ pub fn run() {
                 window_state::flush(app);
             }
             if matches!(event, tauri::RunEvent::Exit) {
+                desktop_control::shutdown(app);
+                browser::shutdown(app);
                 let state = app.state::<AppState>();
                 if let Ok(mut client) = state.runtime.client.try_lock() {
                     client.take();

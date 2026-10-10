@@ -22,7 +22,7 @@ export function panelLayout(widths: PanelWidths, available: number, left: boolea
   return { left: leftWidth, right: Math.min(rightWidth, Math.max(0, available - 32)), overlay };
 }
 
-export function usePanelResize(left: boolean, right: boolean, disabled: boolean) {
+export function usePanelResize(left: boolean, right: boolean, disabled: boolean, browser = false) {
   const root = useRef<HTMLDivElement>(null);
   const [widths, setWidths] = useState(() => decodePanelWidths(localStorage.getItem(key)));
   const preferred = useRef(widths);
@@ -38,8 +38,16 @@ export function usePanelResize(left: boolean, right: boolean, disabled: boolean)
   }
   function commit() {
     setWidths({ ...preferred.current });
-    try { localStorage.setItem(key, JSON.stringify(preferred.current)); } catch { /* Layout still works if storage is full. */ }
+    try {
+      localStorage.setItem(browser ? `${key}.browser` : key, JSON.stringify(preferred.current));
+      if (browser) localStorage.setItem(key, JSON.stringify({...decodePanelWidths(localStorage.getItem(key)),left:preferred.current.left}));
+    } catch { /* Layout still works if storage is full. */ }
   }
+  useLayoutEffect(()=>{
+    const saved=localStorage.getItem(browser ? `${key}.browser` : key);
+    preferred.current={...preferred.current,right:browser && !saved ? 520 : decodePanelWidths(saved).right};
+    setWidths({...preferred.current});apply();
+  },[browser]);
   useLayoutEffect(() => {
     apply(); const observer = new ResizeObserver(apply); if (root.current) observer.observe(root.current);
     return () => { observer.disconnect(); root.current?.classList.remove('panel-resizing'); };
@@ -61,7 +69,7 @@ export function usePanelResize(left: boolean, right: boolean, disabled: boolean)
   function handle(side: Side) {
     return {
       role: 'separator', tabIndex: 0, 'aria-orientation': 'vertical' as const,
-      'aria-label': side === 'left' ? '调整侧栏宽度' : '调整工作区宽度',
+      'aria-label': side === 'left' ? '调整侧栏宽度' : browser ? '调整浏览器宽度' : '调整工作区宽度',
       'aria-valuemin': side === 'left' ? 180 : 240, 'aria-valuemax': side === 'left' ? 580 : 620,
       'aria-valuenow': widths[side], className: `panel-resize-handle ${side}`,
       title: '拖动调整宽度，双击恢复默认',
@@ -77,7 +85,7 @@ export function usePanelResize(left: boolean, right: boolean, disabled: boolean)
         set(side, drag.width + (e.clientX - drag.x) * (side === 'left' ? 1 : -1));
       },
       onPointerUp: () => finish(), onPointerCancel: () => finish(true), onLostPointerCapture: () => finish(),
-      onDoubleClick: () => { set(side, defaultWidths[side]); commit(); },
+      onDoubleClick: () => { set(side, browser && side==='right' ? 520 : defaultWidths[side]); commit(); },
       onKeyDown: (e: KeyboardEvent<HTMLDivElement>) => {
         if (e.key === 'Escape') { finish(true); return; }
         if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(e.key)) return;

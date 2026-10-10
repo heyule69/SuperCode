@@ -3,6 +3,14 @@ import { conversationTurns, mergeEvent } from './events';
 import type { RpcEvent } from './types';
 
 describe('Codex event replay', () => {
+  it('retains final phases and native content groups through metadata truncation and turn completion', () => {
+    let messages = mergeEvent([], { method: 'turn/started', params: { turn: { id: 't' } } }, 's');
+    messages = mergeEvent(messages, { method: 'item/completed', params: { turnId: 't', item: { id: 'reply', type: 'agentMessage', text: '最终结果', arguments: { details: 'x'.repeat(160000) }, phase: 'final_answer', messageId: 'native-message' } } }, 's');
+    messages = mergeEvent(messages, { method: 'turn/completed', params: { turn: { id: 't', status: 'completed' } } }, 's');
+    const reply = messages.find(message => message.id === 'reply')!;
+    expect(reply.data).toMatchObject({ phase: 'final_answer', messageId: 'native-message', status: 'completed' });
+    expect(reply.text).toBe('最终结果');
+  });
   it('merges streamed Chinese text and authoritative completion without duplication', () => {
     const event = (method: string, params: Record<string, unknown>): RpcEvent => ({ method, params });
     let messages = mergeEvent([], event('item/started', { item: { id: 'a1', type: 'agentMessage', text: '' } }), 'session');

@@ -10,11 +10,12 @@ import { ConversationIndex } from './ConversationIndex';
 import { AttachmentImage } from './AttachmentImage';
 import { MediaContext, MediaList } from './Media';
 import { messageMedia } from './mediaSources';
+import { presentTurn } from './turnPresentation';
 
 const Markdown = lazy(() => import('./Markdown'));
 const pending = (status: unknown) => ['inProgress', 'running', 'preparing'].includes(String(status));
 const stringify = (value: unknown) => typeof value === 'string' ? value : value == null ? '' : JSON.stringify(value, null, 2).slice(0, 128 * 1024);
-const duration = (ms: number) => { const seconds = Math.max(1, Math.round(ms / 1000)); return seconds < 60 ? `${seconds} 秒` : `${Math.floor(seconds / 60)} 分 ${seconds % 60} 秒`; };
+const duration = (ms: number) => { const seconds = Math.max(1, Math.round(ms / 1000)); return seconds < 60 ? `${seconds} 秒` : `${Math.floor(seconds / 60)} 分钟 ${seconds % 60} 秒`; };
 
 export function activityTitle(m: Message) {
   const d = m.data ?? {};
@@ -123,29 +124,40 @@ const MessageView = memo(function MessageView({ message: m, openFile }: { messag
 
 function TurnView({ turn, agentName, autoExpand, showDiff, openFile }: { turn: ConversationTurn; agentName: string; autoExpand: boolean; showDiff:(name:string,text:string)=>void; openFile:(path:string,line?:number)=>void }) {
   const [allChanges, setAllChanges] = useState(false);
-  const blocks: (Message | Message[])[] = [];
-  for (const item of turn.items) {
-    if(item.kind==='turnDiff')continue;
-    if (item.role === 'assistant' && !item.text && !messageMedia(item).length) continue;
-    const previous = blocks[blocks.length - 1];
-    if (isActivity(item)) { if (Array.isArray(previous)) previous.push(item); else blocks.push([item]); }
-    else blocks.push(item);
-  }
+  const [expandedProcess, setExpandedProcess] = useState<string | null>(null);
+  const presentation = presentTurn(turn);
   const marker = turn.run;
   if (!turn.user && turn.items.length === 1 && turn.items[0].kind === 'modelSwitch') return <MessageView message={turn.items[0]} openFile={openFile} />;
   const completed = !!marker && !pending(marker.data?.status);
-  const reply = turn.items.filter(m => m.role === 'assistant' && m.text).map(m => m.text).join('\n\n');
+  const processKey = marker?.id ?? turn.id;
+  const processOpen = expandedProcess === processKey;
+  const reply = (presentation.completed ? presentation.final : turn.items).filter(m => m.role === 'assistant' && m.text).map(m => m.text).join('\n\n');
   const diff = turn.items.filter(m=>m.kind==='turnDiff').map(m=>m.text).join('\n');
   const files = [...new Map(diffFiles(diff).map(f=>[f.path,f])).values()];
   const added = files.reduce((count, file) => count + file.added, 0);
   const removed = files.reduce((count, file) => count + file.removed, 0);
   const resultText = marker?.data?.status === 'interrupted' ? '已停止' : marker?.data?.status === 'failed' ? '运行失败' : '';
   const summary = <>{marker?.data?.durationMs != null ? <span>用时 {duration(Number(marker.data.durationMs))}</span> : <span>{resultText || '执行过程'}</span>}{resultText && marker?.data?.durationMs != null ? <span>· {resultText}</span> : null}</>;
+  function renderItems(items: Message[], live = false) {
+    const blocks: (Message | Message[])[] = [];
+    for (const item of items) {
+      if (item.kind === 'turnDiff' || item.role === 'assistant' && !item.text && !messageMedia(item).length) continue;
+      const previous = blocks[blocks.length - 1];
+      if (isActivity(item)) { if (Array.isArray(previous)) previous.push(item); else blocks.push([item]); }
+      else blocks.push(item);
+    }
+    return blocks.map((block, index) => Array.isArray(block) ? <ActivityGroup key={block[0].id} messages={block} autoExpand={autoExpand} live={live && index === blocks.length - 1} /> : <MessageView key={block.id} message={block} openFile={openFile} />);
+  }
   return <div className="conversation-turn" data-conversation-turn={turn.id}>
     {turn.user ? <MessageView message={turn.user} openFile={openFile} /> : null}
-    {blocks.length || marker ? <section className="assistant-turn" aria-label={`${agentName} 回复`}>
-      {blocks.map((block, index) => Array.isArray(block) ? <ActivityGroup key={block[0].id} messages={block} autoExpand={autoExpand} live={pending(marker?.data?.status) && index === blocks.length - 1} /> : <MessageView key={block.id} message={block} openFile={openFile} />)}
-      {completed ? <div className="turn-footer"><div className={`turn-summary ${marker.data?.status}`}>{summary}</div>{reply ? <CopyButton className="turn-copy" text={reply} label="复制回复" iconOnly /> : null}</div> : !pending(marker?.data?.status) && reply ? <div className="turn-footer"><CopyButton className="turn-copy" text={reply} label="复制回复" iconOnly /></div> : null}
+    {turn.items.length || marker ? <section className="assistant-turn" aria-label={`${agentName} 回复`}>
+      {presentation.completed ? <div className="turn-process-header">
+          {presentation.process.length ? <button type="button" className="turn-process-toggle" aria-label="执行过程" aria-expanded={processOpen} aria-controls={`process-${turn.id}`} onClick={() => setExpandedProcess(processOpen ? null : processKey)}>{summary}<ChevronRight size={15} className={processOpen ? 'expanded' : ''}/></button> : <div className="turn-process-label">{summary}</div>}
+        </div> : null}
+      {presentation.completed && processOpen ? <div className="turn-process-content" id={`process-${turn.id}`} role="region" aria-label="执行过程详情">{renderItems(presentation.process)}</div> : null}
+      {presentation.completed ? renderItems(presentation.notices) : null}
+      <div className={presentation.completed ? 'turn-final-result' : 'turn-live-content'}>{renderItems(presentation.completed ? presentation.final : turn.items, !presentation.completed && pending(marker?.data?.status))}</div>
+      {presentation.completed ? reply ? <div className="turn-footer"><CopyButton className="turn-copy" text={reply} label="复制回复" iconOnly /></div> : null : completed ? <div className="turn-footer"><div className={`turn-summary ${marker.data?.status}`}>{summary}</div>{reply ? <CopyButton className="turn-copy" text={reply} label="复制回复" iconOnly /> : null}</div> : !pending(marker?.data?.status) && reply ? <div className="turn-footer"><CopyButton className="turn-copy" text={reply} label="复制回复" iconOnly /></div> : null}
       {completed && files.length ? <section className="turn-changes" aria-label="本轮文件变更"><div className="turn-changes-heading"><span className="turn-changes-icon"><FileDiff size={22}/></span><div className="turn-changes-title"><strong>已编辑 {files.length} 个文件</strong><div className="turn-change-totals"><span className="added-count">+{added}</span><span className="removed-count">−{removed}</span></div></div><button className="view-changes" onClick={()=>showDiff('本轮变更',diff)}>查看变更</button></div><div className="turn-changes-files">{(allChanges ? files : files.slice(0, 3)).map(f => {
         const path = f.path.replace(/\\/g, '/');
         const split = path.lastIndexOf('/') + 1;

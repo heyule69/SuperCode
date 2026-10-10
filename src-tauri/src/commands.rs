@@ -199,8 +199,12 @@ pub async fn list_models(
 ) -> Result<Value, String> {
     let agent = agent.as_deref().unwrap_or("codex");
     let route = crate::chat_connection::available_route(
-        &app, agent, session_id.as_deref(), connection_id.as_deref(),
-    ).await?;
+        &app,
+        agent,
+        session_id.as_deref(),
+        connection_id.as_deref(),
+    )
+    .await?;
     let source = crate::chat_connection::model_source(route.as_ref(), agent);
     let Some(route) = route else {
         return Ok(json!({"data":[],"source":source}));
@@ -212,7 +216,10 @@ pub async fn list_models(
     }
     if agent == "claude" {
         let official = route.config["official"] == true
-            || route.profile.as_ref().is_some_and(crate::ccswitch::Profile::is_official);
+            || route
+                .profile
+                .as_ref()
+                .is_some_and(crate::ccswitch::Profile::is_official);
         let config = route.config;
         let mut catalog = crate::providers::catalog_models(&config);
         catalog["source"] = source.clone();
@@ -416,6 +423,16 @@ async fn send_inner(
     if !Path::new(&project.path).is_dir() {
         return Err("项目文件夹已不存在，请重新添加项目".into());
     }
+    // Only accepted user turns receive a new input lease. A revoked client
+    // cannot reuse its transport to reclaim control on a late tool request.
+    crate::browser::authorize_session(app, &session.agent, session_id);
+    if crate::desktop_control::authorize_session(app, &session.agent, session_id)? {
+        match session.agent.as_str() {
+            "codex" => state.runtime.shutdown().await,
+            "claude" => state.claude.shutdown().await,
+            _ => state.native.shutdown().await,
+        }
+    }
     if matches!(session.agent.as_str(), "opencode" | "pi") {
         state.claude.shutdown().await;
         state.runtime.clear_for_agent_switch().await;
@@ -538,6 +555,7 @@ async fn send_inner(
 
 #[tauri::command]
 pub async fn interrupt_turn(session_id: String, app: AppHandle) -> Result<(), String> {
+    crate::browser::stop(&app, &session_id, false);
     let state = app.state::<AppState>();
     let session = state.store.session(&session_id)?;
     if matches!(session.agent.as_str(), "opencode" | "pi") {
@@ -551,6 +569,8 @@ pub async fn interrupt_turn(session_id: String, app: AppHandle) -> Result<(), St
     drop(slot);
     let native = session.native_id.ok_or("会话尚未启动，请稍后再试")?;
     let turn = session.turn_id.ok_or("任务正在启动，请稍后再试")?;
+    client.interrupt_turn(&native, &turn).await?;
+    // Interrupt first; a slow goal/status query must not delay the user's Stop.
     if client
         .request("thread/goal/get", json!({"threadId":native}))
         .await
@@ -563,7 +583,7 @@ pub async fn interrupt_turn(session_id: String, app: AppHandle) -> Result<(), St
             )
             .await?;
     }
-    client.interrupt_turn(&native, &turn).await
+    Ok(())
 }
 
 #[tauri::command]

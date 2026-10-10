@@ -76,7 +76,7 @@ pub fn snapshot(app: &AppHandle) -> Result<Snapshot, String> {
     let projects = state.store.projects()?;
     let mut windows = Vec::new();
     for (label, _, session, settings) in desktop_lifecycle::window_contexts(app) {
-        let Some(window) = app.get_webview_window(&label) else {
+        let Some(window) = app.get_window(&label) else {
             continue;
         };
         let chat = state.store.session(&session).ok();
@@ -136,7 +136,7 @@ pub async fn open(app: AppHandle, point: PhysicalPosition<f64>) -> Result<(), St
         return Ok(());
     }
     let theme = app
-        .get_webview_window("main")
+        .get_window("main")
         .and_then(|w| w.theme().ok())
         .unwrap_or(tauri::Theme::Light);
     let canvas = window_theme::canvas_for_window(&app, "main").unwrap_or_else(|| {

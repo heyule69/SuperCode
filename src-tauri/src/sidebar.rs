@@ -571,7 +571,7 @@ pub async fn open_chat_window(
 ) -> Result<(), String> {
     let s = app.state::<AppState>().store.session(&session_id)?;
     let label = format!("chat-{}", s.id);
-    if let Some(window) = app.get_webview_window(&label) {
+    if let Some(window) = app.get_window(&label) {
         window.show().map_err(|e| e.to_string())?;
         window.unminimize().map_err(|e| e.to_string())?;
         return window.set_focus().map_err(|e| e.to_string());

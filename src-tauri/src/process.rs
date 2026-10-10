@@ -121,6 +121,14 @@ pub struct JobGuard;
 
 impl JobGuard {
     pub fn attach(child: &Child) -> Result<Self, String> {
+        Self::attach_pid(child.id().ok_or("进程已经退出")?)
+    }
+
+    pub fn attach_std(child: &std::process::Child) -> Result<Self, String> {
+        Self::attach_pid(child.id())
+    }
+
+    fn attach_pid(pid: u32) -> Result<Self, String> {
         #[cfg(windows)]
         unsafe {
             use windows_sys::Win32::{
@@ -144,11 +152,7 @@ impl JobGuard {
                 CloseHandle(job);
                 return Err(error.to_string());
             }
-            let process = OpenProcess(
-                PROCESS_SET_QUOTA | PROCESS_TERMINATE,
-                0,
-                child.id().ok_or("进程已经退出")?,
-            );
+            let process = OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, 0, pid);
             if process.is_null() {
                 let error = std::io::Error::last_os_error();
                 CloseHandle(job);
@@ -165,7 +169,7 @@ impl JobGuard {
         }
         #[cfg(not(windows))]
         {
-            let _ = child;
+            let _ = pid;
             Ok(Self)
         }
     }

@@ -1,0 +1,24 @@
+.browser-panel{display:flex;flex-direction:column;min-width:0;min-height:0;overflow:hidden;background:var(--panel, var(--bg));position:relative}
+.browser-panel[hidden]{display:none}
+.browser-panel-heading{display:flex;align-items:center;gap:4px;padding:10px 12px 6px;min-height:44px}
+.browser-page-title{display:flex;align-items:center;gap:8px;flex:1;min-width:0;color:var(--text);font-size:12px}
+.browser-page-title svg{flex-shrink:0;color:var(--muted)}
+.browser-page-title span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.browser-toolbar{display:flex;align-items:center;gap:3px;padding:6px 12px 10px}
+.browser-toolbar .icon-button{flex-shrink:0}
+.browser-toolbar input{min-width:0;flex:1;font-size:12px;padding:8px 10px;border-radius:9px;background:var(--bg);color:var(--text);border:1px solid var(--line);outline:none}
+.browser-toolbar input:focus{border-color:#79aace}
+.browser-status{display:flex;align-items:center;gap:7px;min-height:32px;padding:0 14px;font-size:11px;color:var(--muted);border-top:1px solid var(--line)}
+.browser-status>span:nth-child(2){flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.browser-status-dot{width:5px;height:5px;background:var(--muted);border-radius:50%;flex-shrink:0}
+.browser-status-dot.working{background:#70b6eb;box-shadow:0 0 7px #70b6eb80}
+.browser-status-dot.error{background:#da826e}
+.browser-status kbd{font:inherit;opacity:.8}
+.browser-takeover{display:flex;align-items:center;gap:5px;border:1px solid var(--line);border-radius:7px;padding:3px 7px;background:transparent;color:var(--text);font:inherit;cursor:pointer}
+.browser-viewport{flex:1;min-height:0;position:relative;background:#fff}
+.browser-empty{height:100%;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:16px;background:var(--bg);color:var(--muted);font-size:12px}
+.browser-error{display:flex;align-items:center;gap:6px;padding:7px 12px;font-size:12px;color:var(--danger,#c45548)}
+.browser-error span{flex:1;overflow-wrap:anywhere}
+.browser-expanded{position:absolute;inset:0;width:100%;z-index:30}
+@media(prefers-reduced-motion:no-preference){.browser-status-dot.working{animation:browser-pulse 1.8s ease-in-out infinite}}
+@keyframes browser-pulse{50%{opacity:.5}}

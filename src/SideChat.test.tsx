@@ -78,6 +78,37 @@ it('queues a configured side-chat message only after validation, then clears its
   expect(providerRequired).not.toHaveBeenCalled();
 });
 
+it('uses one side-chat action for stopping and sending, and sends a new draft without interrupting its active task', async () => {
+  missing = false;
+  const original = vi.mocked(call).getMockImplementation()!;
+  vi.mocked(call).mockImplementation(async (command,args={}) => {
+    if(command==='enqueue_followup') {
+      sessions[0] = {...sessions[0],status:'running',turnId:'turn',nativeId:'native'};
+      return null;
+    }
+    return original(command,args);
+  });
+  await render({key:'draft',text:'开始任务'}); await send();
+  const action = container.querySelector<HTMLButtonElement>('footer form .send-button')!;
+  expect(container.querySelectorAll('footer form .send-button')).toHaveLength(1);
+  expect(action.getAttribute('aria-label')).toBe('停止侧边聊天任务');
+  const textarea = container.querySelector<HTMLTextAreaElement>('footer form textarea')!;
+  await act(async () => { Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype,'value')!.set!.call(textarea,'补充说明'); textarea.dispatchEvent(new Event('input',{bubbles:true})); });
+  expect(container.querySelector('footer form .send-button')).toBe(action);
+  expect(action.getAttribute('aria-label')).toBe('发送侧边聊天消息');
+  expect(action.type).toBe('submit');
+  vi.mocked(call).mockClear();
+  await act(async () => action.click());
+  expect(call).toHaveBeenCalledWith('enqueue_followup',expect.objectContaining({sessionId:'side',payload:expect.objectContaining({text:'补充说明'})}));
+  expect(call).not.toHaveBeenCalledWith('interrupt_turn',expect.anything());
+  expect(action.getAttribute('aria-label')).toBe('停止侧边聊天任务');
+  expect(action.type).toBe('button');
+  vi.mocked(call).mockClear();
+  await act(async () => action.click());
+  expect(call).toHaveBeenCalledWith('interrupt_turn',{sessionId:'side'});
+  expect(call).not.toHaveBeenCalledWith('enqueue_followup',expect.anything());
+});
+
 it('can retry the preserved draft with the newly configured connection',async()=>{
   await render({key:'draft',text:'保留这段侧边提问'}); await send();
   const draft: SideDraft=providerRequired.mock.calls[0][1];

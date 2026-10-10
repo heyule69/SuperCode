@@ -35,6 +35,7 @@ beforeEach(() => {
     if (command==='followup_capabilities') return {};
     if (command==='list_followups') return [];
     if (command==='workspace_changes') return { files:[],diff:'',branch:'',isGit:false };
+    if (command==='browser_open') return { sessionId:String(args.sessionId),url:'https://example.com/',title:'Example',status:'idle',action:'' };
     if (command==='create_session') {
       const chat: Session = { id:'standalone',projectId:String(args.projectId),workspacePath:'C:/Documents/SuperCode/chat',title:'新会话',agent:String(args.agent),model:null,connectionId:String(args.connectionId),nativeId:null,status:'idle',turnId:null,updatedAt:1 };
       data.sessions.push(chat); return chat;
@@ -57,6 +58,35 @@ async function type(text: string) {
 async function send() {
   await act(async()=>{container.querySelector<HTMLFormElement>('.composer')!.dispatchEvent(new Event('submit',{bubbles:true,cancelable:true}));await new Promise(resolve=>setTimeout(resolve,30));});
 }
+it('keeps browser and file changes independent, including fullscreen and closing either panel', async () => {
+  const media = vi.spyOn(window, 'matchMedia').mockImplementation(() => ({matches:false,addEventListener:()=>{},removeEventListener:()=>{}} as unknown as MediaQueryList));
+  localStorage.setItem('supercode.context', 'true');
+  localStorage.setItem('supercode.session', 'chat');
+  data.sessions = [{id:'chat',projectId:'existing',title:'面板测试',agent:'claude',connectionId:'api:claude',model:null,status:'idle',nativeId:null,turnId:null,updatedAt:1}];
+  await render();
+  expect(container.querySelector('[aria-label="文件变更"]')).not.toBeNull();
+  await act(async () => { container.querySelector<HTMLButtonElement>('[aria-label="打开内置浏览器"]')!.click(); await vi.dynamicImportSettled(); await new Promise(resolve=>setTimeout(resolve,30)); });
+  const browser = container.querySelector('[aria-label="内置浏览器"]')!;
+  expect(browser).not.toBeNull();
+  expect(browser.querySelector('.context-tabs')).toBeNull();
+  expect(browser.textContent).not.toContain('文件变更');
+  expect(browser.parentElement?.classList.contains('conversation-surface')).toBe(true);
+  expect(container.querySelector('[aria-label="文件变更"]')?.parentElement).toBe(container.querySelector('.app'));
+  await act(async () => container.querySelector<HTMLButtonElement>('[aria-label="全屏查看网页"]')!.click());
+  expect(browser.classList.contains('browser-expanded')).toBe(true);
+  expect(container.querySelector('[aria-label="文件变更"]')).not.toBeNull();
+  await act(async () => container.querySelector<HTMLButtonElement>('[aria-label="收起变更面板"]')!.click());
+  expect(container.querySelector('[aria-label="文件变更"]')).toBeNull();
+  expect(container.querySelector('[aria-label="内置浏览器"]')).toBe(browser);
+  expect(call).toHaveBeenCalledWith('browser_open', expect.objectContaining({sessionId:'chat'}));
+  expect(vi.mocked(call).mock.calls.filter(([command])=>command==='browser_open')).toHaveLength(1);
+  expect(call).not.toHaveBeenCalledWith('browser_close', expect.anything());
+  await act(async () => container.querySelector<HTMLButtonElement>('[aria-label="展开变更面板"]')!.click());
+  await act(async () => container.querySelector<HTMLButtonElement>('[aria-label="关闭浏览器"]')!.click());
+  expect(container.querySelector('[aria-label="内置浏览器"]')).toBeNull();
+  expect(container.querySelector('[aria-label="文件变更"]')).not.toBeNull();
+  media.mockRestore();
+});
 it('docks questions above the composer while keeping approvals in the conversation and restores the composer after answering', async () => {
   pendingRequests = [
     { id: 'question', method: 'item/tool/requestUserInput', params: { questions: [{ id: '0', question: '界面显示正常吗？', options: [{ label: '正常' }] }] } },
@@ -139,6 +169,50 @@ it('checks a pinned running chat before queueing and leaves its conversation and
   expect(data.sessions[0].status).toBe('running');
   expect(container.querySelector<HTMLTextAreaElement>('.composer textarea')?.value).toBe('下一轮补充');
   expect(container.querySelector('[aria-label="添加模型供应商"]')).not.toBeNull();
+});
+
+it('switches one composer button between stopping an empty running chat and queueing a draft without interrupting', async () => {
+  localStorage.setItem('supercode.session','running');
+  data.sessions = [{id:'running',projectId:'existing',title:'正在工作',agent:'claude',connectionId:'api:claude',model:'test-model',status:'running',nativeId:'native',turnId:'turn',updatedAt:1}];
+  await render();
+  const action = container.querySelector<HTMLButtonElement>('.composer .send-button')!;
+  expect(container.querySelectorAll('.composer .send-button')).toHaveLength(1);
+  expect(action.type).toBe('button');
+  expect(action.getAttribute('aria-label')).toBe('停止生成');
+  await type('  ');
+  expect(action.getAttribute('aria-label')).toBe('停止生成');
+  await type('下一轮补充');
+  expect(container.querySelector('.composer .send-button')).toBe(action);
+  expect(action.type).toBe('submit');
+  expect(action.getAttribute('aria-label')).toBe('加入队列');
+  vi.mocked(call).mockClear();
+  await act(async () => { action.click(); await new Promise(resolve=>setTimeout(resolve,30)); });
+  expect(call).toHaveBeenCalledWith('enqueue_followup',expect.objectContaining({sessionId:'running',payload:expect.objectContaining({text:'下一轮补充'})}));
+  expect(call).not.toHaveBeenCalledWith('interrupt_turn',expect.anything());
+  expect(container.querySelector<HTMLTextAreaElement>('.composer textarea')?.value).toBe('');
+  expect(action.getAttribute('aria-label')).toBe('停止生成');
+  vi.mocked(call).mockClear();
+  await act(async () => action.click());
+  expect(call).toHaveBeenCalledWith('interrupt_turn',{sessionId:'running'});
+  expect(call).not.toHaveBeenCalledWith('enqueue_followup',expect.anything());
+  expect(call).not.toHaveBeenCalledWith('send_chat_message',expect.anything());
+});
+
+it('keeps an empty idle chat in send mode when another chat is running, and disables stop until a turn exists', async () => {
+  localStorage.setItem('supercode.session','idle');
+  data.sessions = [
+    {id:'idle',projectId:'existing',title:'空闲聊天',agent:'claude',connectionId:'api:claude',model:'test-model',status:'idle',nativeId:null,turnId:null,updatedAt:2},
+    {id:'starting',projectId:'existing',title:'正在启动',agent:'claude',connectionId:'api:claude',model:'test-model',status:'starting',nativeId:null,turnId:null,updatedAt:1},
+  ];
+  await render();
+  expect(container.querySelector('.composer .stop-button')).toBeNull();
+  expect(container.querySelector<HTMLButtonElement>('.composer .send-button')?.disabled).toBe(true);
+  await act(async () => { container.querySelector<HTMLButtonElement>('.session-row[title="正在启动"]')!.click(); await new Promise(resolve=>setTimeout(resolve,30)); });
+  const stop = container.querySelector<HTMLButtonElement>('.composer .send-button')!;
+  expect(stop.getAttribute('aria-label')).toBe('停止生成');
+  expect(stop.disabled).toBe(true);
+  await act(async () => stop.click());
+  expect(call).not.toHaveBeenCalledWith('interrupt_turn',expect.anything());
 });
 
 it('keeps local help usable without a supplier and permits retrying the draft after configuration', async () => {

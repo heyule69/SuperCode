@@ -6,8 +6,8 @@ import { decodePanelWidths, defaultWidths, panelLayout, usePanelResize } from '.
 
 let root: Root, container: HTMLDivElement;
 let narrow = false;
-function Layout() {
-  const panels = usePanelResize(true, true, false);
+function Layout({browser=false}:{browser?:boolean}) {
+  const panels = usePanelResize(true, true, false, browser);
   return <div ref={panels.root}><div {...panels.handle('left')}/><div {...panels.handle('right')}/></div>;
 }
 beforeEach(() => {
@@ -50,4 +50,13 @@ it('bounds saved values and preserves the chat at smaller window sizes', () => {
   expect(1200 - layout.left - layout.right).toBeGreaterThanOrEqual(360);
   narrow = true;
   expect(panelLayout(defaultWidths, 900, true, true).overlay).toBe(true);
+});
+it('keeps browser widths separate while sharing the saved sidebar width', async()=>{
+  await act(async()=>root.render(<Layout browser/>));
+  expect(handle('right').getAttribute('aria-valuenow')).toBe('520');
+  await pointer('left','pointerdown',288);await pointer('left','pointermove',310);await pointer('left','pointerup',310);
+  await pointer('right','pointerdown',880);await pointer('right','pointermove',840);await pointer('right','pointerup',840);
+  expect(JSON.parse(localStorage.getItem('supercode.panel-widths')!)).toEqual({left:310,right:284});
+  await act(async()=>root.render(<Layout/>));expect(handle('right').getAttribute('aria-valuenow')).toBe('284');
+  await act(async()=>root.render(<Layout browser/>));expect(handle('right').getAttribute('aria-valuenow')).toBe('560');
 });

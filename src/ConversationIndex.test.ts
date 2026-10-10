@@ -18,6 +18,14 @@ describe('conversation outline', () => {
     expect(indexedTurns(conversationTurns([...history, message('u2', 'user', '新增一轮', 'userMessage')]))).toHaveLength(2);
     expect(indexedTurns(conversationTurns([]))).toEqual([]);
   });
+  it('uses the completed result for the outline even when later commentary exists', () => {
+    const final = { ...message('final', 'assistant', '**结果已保存**'), data: { phase: 'final_answer' } };
+    const cleanup = { ...message('cleanup', 'assistant', '清理预览缓存'), data: { phase: 'commentary' } };
+    const run = { ...message('run', 'activity', '', 'runMarker'), data: { status: 'completed' } };
+    const history = [message('u', 'user', '处理文件', 'userMessage'), final, cleanup];
+    expect(indexedTurns(conversationTurns([...history, run]))[0].reply).toBe('结果已保存');
+    expect(indexedTurns(conversationTurns(history))[0].reply).toBe('清理预览缓存');
+  });
 });
 
 describe('visible conversation round', () => {

@@ -16,7 +16,7 @@ function render(items = messages, autoExpand = false) {
   return renderToStaticMarkup(<Conversation messages={items} agentName="Claude Code" autoExpand={autoExpand} showDiff={() => {}} openFile={() => {}}/>);
 }
 
-describe('continuous task replies', () => {
+describe('task replies and execution history', () => {
   it('shows tool screenshots with collapsed details and allows a media-only assistant reply', () => {
     const media = [{ kind: 'image', path: 'D:/cache/截图.png', name: '截图' }];
     const html = render([messages[0], message('shot', 'tool', '', 'mcpToolCall', { tool: 'screenshot', status: 'completed', media })]);
@@ -25,27 +25,30 @@ describe('continuous task replies', () => {
     const assistant = render([messages[0], message('picture', 'assistant', '', 'agentMessage', { media })]);
     expect(assistant).toContain('data-media-source="D:/cache/截图.png"');
   });
-  it('keeps intermediate and final text in one reply with one copy action', () => {
+  it('collapses intermediate text and tools behind elapsed time when a task completes', () => {
     const html = render();
     expect(html.match(/class="assistant-turn"/g)).toHaveLength(1);
     expect(html.match(/aria-label="复制回复"/g)).toHaveLength(1);
-    expect(html).toContain('排版已经修好了');
+    expect(html).not.toContain('排版已经修好了');
     expect(html).toContain('PDF 已保存');
     expect(html).not.toContain('message-avatar');
     expect(html).not.toContain('message-label');
     expect(html).toContain('aria-label="你的消息"');
     expect(html).toContain('用时 15 秒');
-    expect(html).toContain('<div class="turn-summary completed">');
-    expect(html).not.toContain('<button class="turn-summary');
+    expect(html).toContain('class="turn-process-toggle"');
+    expect(html).toContain('aria-label="执行过程" aria-expanded="false"');
+    expect(html.indexOf('用时 15 秒')).toBeLessThan(html.indexOf('PDF 已保存'));
+    expect(html).not.toContain('运行了命令');
   });
-  it('shows a short tool summary below the reply, including after completion', () => {
-    const compact = render();
+  it('shows live explanations and tool summaries until the task is finished', () => {
+    const running = [...messages.slice(0, -1), message('run', 'activity', '', 'runMarker', { status: 'inProgress' })];
+    const compact = render(running);
     expect(compact).not.toContain('class="activity-row"');
     expect(compact).toContain('class="activity-group-summary"');
     expect(compact).toContain('运行了命令');
     expect(compact.indexOf('排版已经修好了')).toBeLessThan(compact.indexOf('运行了命令'));
     expect(compact.indexOf('运行了命令')).toBeLessThan(compact.indexOf('PDF 已保存'));
-    const expanded = render(messages, true);
+    const expanded = render(running, true);
     expect(expanded).toContain('class="activity-row"');
     expect(expanded.indexOf('排版已经修好了')).toBeLessThan(expanded.indexOf('执行命令'));
     expect(expanded.indexOf('执行命令')).toBeLessThan(expanded.indexOf('PDF 已保存'));
@@ -84,7 +87,7 @@ describe('continuous task replies', () => {
   });
   it('combines adjacent tools without merging the text on either side', () => {
     const extra = message('edit', 'tool', '已保存', 'claudeToolCall', { tool: 'Edit', arguments: { file_path: 'src/App.tsx' }, status: 'completed' });
-    const html = render([...messages.slice(0, 3), extra, ...messages.slice(3)]);
+    const html = render([...messages.slice(0, 3), extra, messages[3], message('run', 'activity', '', 'runMarker', { status: 'inProgress' })]);
     expect(html.match(/class="activity-group-summary"/g)).toHaveLength(1);
     expect(html).toContain('运行了命令、编辑了文件');
     expect(html.indexOf('排版已经修好了')).toBeLessThan(html.indexOf('运行了命令、编辑了文件'));

@@ -598,6 +598,7 @@ fn mcp(app: &AppHandle, acp: bool) -> Result<Value, String> {
     let mut rows = vec![];
     let mut object = serde_json::Map::new();
     for s in servers.into_iter().filter(|s| s.enabled) {
+        let s = crate::desktop_control::wrap(app, s, if acp { "opencode" } else { "pi" })?;
         let name = format!(
             "supercode_{}",
             s.id.chars()
@@ -677,7 +678,8 @@ const PI_EXTENSION: &str = r#"export default function(pi) {
   if (config.provider) pi.registerProvider('supercode', config.provider);
   pi.on('tool_call', async (event, ctx) => {
     if (config.permission === 'summary') return {block:true,reason:'Summary does not allow tools'};
-    const read = ['read', 'grep', 'find', 'ls', 'glob'].includes(event.toolName);
+    const desktopRead = event.toolName.includes('supercode_computer') && /(?:__|[./:])desktop_(?:list_windows|snapshot)$/.test(event.toolName);
+    const read = ['read', 'grep', 'find', 'ls', 'glob'].includes(event.toolName) || desktopRead;
     if (config.permission === 'read' && !read) return {block:true,reason:'Read-only mode'};
     if (config.permission !== 'full' && (!read || config.permission === 'strict')) {
       if (!await ctx.ui.confirm('允许本次工具操作？', event.toolName + '\n' + JSON.stringify(event.input))) return {block:true,reason:'User declined'};
@@ -1349,7 +1351,7 @@ impl Mapper {
                     match e["type"].as_str().unwrap_or("") {
                         "text_start" | "text_delta" | "thinking_start" | "thinking_delta" => {
                             let thought = e["type"].as_str().unwrap().starts_with("thinking");
-                            let row=self.items.entry(id.clone()).or_insert_with(||if thought{json!({"id":id,"type":"reasoning","summary":[""],"status":"inProgress"})}else{json!({"id":id,"type":"agentMessage","text":"","status":"inProgress"})});
+                            let row=self.items.entry(id.clone()).or_insert_with(||if thought{json!({"id":id,"type":"reasoning","summary":[""],"status":"inProgress"})}else{json!({"id":id,"type":"agentMessage","messageId":format!("{}-msg-{}", t.turn, self.message),"text":"","status":"inProgress"})});
                             let old = if thought {
                                 row["summary"][0].as_str().unwrap_or("")
                             } else {
@@ -1377,13 +1379,13 @@ impl Mapper {
                             let id = format!("{}-msg-{}-{i}", t.turn, self.message);
                             let row = match b["type"].as_str() {
                                 Some("text") => {
-                                    json!({"id":id,"type":"agentMessage","text":b["text"],"status":"completed"})
+                                    json!({"id":id,"type":"agentMessage","messageId":format!("{}-msg-{}", t.turn, self.message),"text":b["text"],"status":"completed"})
                                 }
                                 Some("thinking") => {
                                     json!({"id":id,"type":"reasoning","summary":[b["thinking"]],"status":"completed"})
                                 }
                                 Some("image" | "audio" | "video") => {
-                                    json!({"id":id,"type":"agentMessage","text":"","contentItems":[b],"status":"completed"})
+                                    json!({"id":id,"type":"agentMessage","messageId":format!("{}-msg-{}", t.turn, self.message),"text":"","contentItems":[b],"status":"completed"})
                                 }
                                 _ => continue,
                             };

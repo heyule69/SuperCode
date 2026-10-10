@@ -27,7 +27,7 @@ function metadata(value: Record<string, any>): Record<string, any> {
   room += limit - 16 * 1024;
   const result = trim(details, 0);
   if (mediaLimited) result.media = mediaLimited;
-  for (const key of ['id', 'type', 'status', 'tool', 'server', 'turnId', 'startedAt', 'durationMs', 'exitCode', 'success']) if (key in value) result[key] = typeof value[key] === 'string' ? cut(value[key], 4096) : value[key];
+  for (const key of ['id', 'type', 'status', 'tool', 'server', 'turnId', 'phase', 'messageId', 'startedAt', 'durationMs', 'exitCode', 'success']) if (key in value) result[key] = typeof value[key] === 'string' ? cut(value[key], 4096) : value[key];
   return result;
 }
 

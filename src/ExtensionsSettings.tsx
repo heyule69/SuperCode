@@ -9,7 +9,6 @@ const empty: ExtensionCatalog = { plugins: [], mcp: [], warnings: [] };
 export default function ExtensionsSettings({ projectId, busy }: { projectId: string; busy: boolean }) {
   const [catalog, setCatalog] = useState(empty);
   const [servers, setServers] = useState<ToolServer[]>([]);
-  const [deps, setDeps] = useState<{ npx?: string; uvx?: string }>({});
   const [tab, setTab] = useState<'plugins' | 'mcp'>('plugins');
   const [agent, setAgent] = useState('all');
   const [search, setSearch] = useState('');
@@ -33,7 +32,7 @@ export default function ExtensionsSettings({ projectId, busy }: { projectId: str
       call<{ servers: ToolServer[]; npx?: string; uvx?: string }>('list_tool_servers'),
     ]);
     if (revision !== generation.current) return;
-    setCatalog(extensions); setServers(tools.servers); setDeps(tools);
+    setCatalog(extensions); setServers(tools.servers);
   }
   async function run(action: () => Promise<void>) {
     if (lock.current) return;
@@ -58,13 +57,10 @@ export default function ExtensionsSettings({ projectId, busy }: { projectId: str
     await call('save_tool_servers', { servers: next }); setServers(next); setStatus(undefined);
     setMessage('已保存，下一次任务生效');
   }
-  function editor(server: ToolServer) { setEditing(server); setArgsText(server.args.join('\n')); setAdding(false); }
+  function editor(server: ToolServer) { if ((server.id === 'computer' && server.kind === 'computer') || (server.id === 'browser' && server.kind === 'browser')) { setMessage('浏览器和电脑操作随 SuperCode 提供，可在“自动化工具”中测试或停用。'); setAdding(false); return; } setEditing(server); setArgsText(server.args.join('\n')); setAdding(false); }
   function preset(kind: 'custom' | 'browser' | 'computer') {
-    const existing = servers.find(s => s.kind === kind && kind !== 'custom');
-    if (existing) { editor(existing); return; }
-    editor(kind === 'browser' ? { id: 'browser', name: '浏览器 · Playwright', kind, command: deps.npx ?? 'npx', args: ['-y', '@playwright/mcp@0.0.83', '--browser', 'msedge', '--isolated'], url: null, enabled: false }
-      : kind === 'computer' ? { id: 'computer', name: '电脑 · Windows MCP', kind, command: deps.uvx ?? 'uvx', args: ['windows-mcp@0.7.5', 'serve'], url: null, enabled: false }
-      : { id: `tool_${crypto.randomUUID().replace(/-/g, '')}`, name: '', kind, command: '', args: [], url: null, enabled: false });
+    if (kind !== 'custom') { setMessage('浏览器和电脑操作已内置，请在“自动化工具”中测试或停用。'); setAdding(false); return; }
+    editor({ id: `tool_${crypto.randomUUID().replace(/-/g, '')}`, name: '', kind, command: '', args: [], url: null, enabled: false });
     setTab('mcp');
   }
   async function importPlugin(plugin?: ExtensionPlugin) {
@@ -83,7 +79,7 @@ export default function ExtensionsSettings({ projectId, busy }: { projectId: str
       <button className="quiet-button" disabled={working || !desktop} onClick={() => void run(async () => { setBrowse(!browse); setTab('plugins'); setSearch(''); await reload(!browse); })}><BookOpen size={14}/>{browse ? '已添加' : '浏览目录'}</button>
       <button className="primary-button" disabled={disabled} onClick={() => { setAdding(!adding); setImporting(false); }} aria-expanded={adding}>添加<ChevronDown size={13}/></button>
     </div></div>
-    {adding ? <div className="extensions-add" aria-label="添加扩展"><button onClick={() => { setImporting(true); setAdding(false); }}><Puzzle size={16}/>导入插件文件夹</button><button onClick={() => preset('custom')}><Server size={16}/>添加 MCP 服务</button><button onClick={() => preset('browser')}><Globe size={16}/>浏览器 · Playwright</button><button onClick={() => preset('computer')}><FolderOpen size={16}/>电脑 · Windows MCP</button></div> : null}
+    {adding ? <div className="extensions-add" aria-label="添加扩展"><button onClick={() => { setImporting(true); setAdding(false); }}><Puzzle size={16}/>导入插件文件夹</button><button onClick={() => preset('custom')}><Server size={16}/>添加 MCP 服务</button><button onClick={() => preset('browser')}><Globe size={16}/>内置浏览器</button></div> : null}
     {error ? <p className="cc-error" role="alert">{error}</p> : null}
     {message ? <p className="provider-feedback" role="status"><Check size={14}/>{message}</p> : null}
     {!desktop ? <p className="muted">桌面版会自动读取本机已安装的插件和 MCP 配置。</p> : null}
@@ -97,7 +93,7 @@ export default function ExtensionsSettings({ projectId, busy }: { projectId: str
       <div className="settings-section-heading"><h3>{servers.some(s => s.id === editing.id) ? '编辑 MCP' : '添加 MCP'}</h3><button type="button" className="icon-button" aria-label="关闭 MCP 配置" onClick={() => setEditing(undefined)}><X size={15}/></button></div>
       <div className="preference-grid"><label>名称<input required value={editing.name} onChange={e => setEditing({ ...editing, name: e.target.value })}/></label><label>传输<select value={editing.url === null ? 'stdio' : 'http'} onChange={e => setEditing({ ...editing, url: e.target.value === 'http' ? '' : null })}><option value="stdio">本机程序 / stdio</option><option value="http">HTTP MCP</option></select></label></div>
       {editing.url !== null ? <label>地址<input required placeholder="https://example.com/mcp" value={editing.url} onChange={e => setEditing({ ...editing, url: e.target.value })}/></label> : <><label>程序<input required value={editing.command} onChange={e => setEditing({ ...editing, command: e.target.value })}/></label><label>参数（每行一项或 JSON 数组）<textarea rows={3} value={argsText} onChange={e => setArgsText(e.target.value)}/></label></>}
-      <div className="settings-save-row"><label className="preference-toggle"><span>启用</span><input type="checkbox" role="switch" checked={editing.enabled} onChange={e => setEditing({ ...editing, enabled: e.target.checked })}/></label><span>Codex 与 Claude Code 共用</span>{servers.some(s => s.id === editing.id) ? <button className="quiet-button" type="button" disabled={disabled} onClick={() => void run(async () => { await saveTools(servers.filter(s => s.id !== editing.id)); setEditing(undefined); })}>删除</button> : null}<button className="primary-button" disabled={disabled}>保存</button></div>
+      <div className="settings-save-row"><label className="preference-toggle"><span>启用</span><input type="checkbox" role="switch" checked={editing.enabled} onChange={e => setEditing({ ...editing, enabled: e.target.checked })}/></label><span>四个 Agent 共用</span>{servers.some(s => s.id === editing.id) ? <button className="quiet-button" type="button" disabled={disabled} onClick={() => void run(async () => { await saveTools(servers.filter(s => s.id !== editing.id)); setEditing(undefined); })}>删除</button> : null}<button className="primary-button" disabled={disabled}>保存</button></div>
     </form> : null}
     {tab === 'plugins' ? <><div className="extensions-section-heading"><span>{browse ? '本机插件目录' : '已添加的插件'}</span><span>{plugins.length} 个</span></div><div className="extensions-list">
       {plugins.map(p => <div className="extension-item" key={p.id}><div className="extension-item-main"><div className="extension-art">{p.icon ? <img src={p.icon} alt=""/> : <Puzzle size={21}/>}</div><button className="extension-description" onClick={() => setExpanded(expanded === p.id ? '' : p.id)} aria-expanded={expanded === p.id}><strong>{p.name}</strong><p>{p.description || p.components.join(' · ') || '本机插件'}</p><small><AgentIcon agent={p.agent}/>{p.agent === 'claude' ? 'Claude Code' : 'Codex'}{p.components.length ? ` · ${p.components.join('、')}` : ''}</small></button>
@@ -108,7 +104,7 @@ export default function ExtensionsSettings({ projectId, busy }: { projectId: str
       <div className="extensions-catalog-links"><span>更多插件</span><button className="quiet-button" disabled={!desktop} onClick={() => void run(async () => { await call('open_external_link', { url: 'https://chatgpt.com/plugins' }); })}>Codex 官方目录 ↗</button><button className="quiet-button" disabled={!desktop} onClick={() => void run(async () => { await call('open_external_link', { url: 'https://code.claude.com/docs/en/discover-plugins' }); })}>Claude Code 插件 ↗</button></div>
     </> : <><div className="extensions-section-heading"><span>工具连接</span><button className="quiet-button" disabled={disabled} onClick={() => preset('custom')}><Plus size={13}/>添加 MCP</button></div><div className="extensions-list">
       {nativeMcp.map(m => { const parent = pluginParentEnabled(m, catalog.plugins); const connection = m.agent === 'codex' ? status?.find(s => s.name === m.name || s.name.endsWith(`/${m.name}`)) : undefined; return <div className="extension-item" key={m.id}><div className="extension-item-main"><div className="extension-art"><Server size={20}/></div><div className="extension-description"><strong>{m.name}</strong><p>{m.source} · {m.transport}{m.endpoint ? ` · ${m.endpoint}` : ''}</p><small><AgentIcon agent={m.agent}/>{m.agent === 'claude' ? 'Claude Code' : 'Codex'}{m.limitation ? ` · ${m.limitation}` : !parent ? ' · 先启用所属插件' : connection ? ` · ${connection.error ? '连接失败' : `${Object.keys(connection.tools ?? {}).length} 个工具`}` : ` · ${m.enabled ? '已启用' : '已关闭'}`}</small></div><label className="preference-toggle extension-switch"><input type="checkbox" role="switch" aria-label={`启用 MCP ${m.name} ${m.agent}`} checked={m.enabled} disabled={disabled || !!m.limitation || !parent} onChange={e => void run(() => toggle(m.id, e.target.checked))}/></label></div></div>; })}
-      {custom.map(s => <div className="extension-item" key={s.id}><div className="extension-item-main"><div className="extension-art"><Server size={20}/></div><button className="extension-description" onClick={() => editor(s)}><strong>{s.name}</strong><p>SuperCode · {s.url ? 'HTTP' : 'stdio'}</p><small>Codex 与 Claude Code · {s.enabled ? '已启用' : '已关闭'}</small></button><label className="preference-toggle extension-switch"><input type="checkbox" role="switch" aria-label={`启用 MCP ${s.name}`} checked={s.enabled} disabled={disabled} onChange={e => void run(() => saveTools(servers.map(v => v.id === s.id ? { ...v, enabled: e.target.checked } : v)))}/></label><button className="icon-button" aria-label={`编辑 ${s.name}`} onClick={() => editor(s)}><ChevronRight size={14}/></button></div></div>)}
+      {custom.map(s => <div className="extension-item" key={s.id}><div className="extension-item-main"><div className="extension-art"><Server size={20}/></div><button className="extension-description" onClick={() => editor(s)}><strong>{s.name}</strong><p>SuperCode · {['browser','computer'].includes(s.id) && s.kind === s.id ? '软件自带' : s.url ? 'HTTP' : 'stdio'}</p><small>Codex、Claude Code、OpenCode、Pi · {s.enabled ? '已启用' : '已关闭'}</small></button><label className="preference-toggle extension-switch"><input type="checkbox" role="switch" aria-label={`启用 MCP ${s.name}`} checked={s.enabled} disabled={disabled} onChange={e => void run(() => saveTools(servers.map(v => v.id === s.id ? { ...v, enabled: e.target.checked } : v)))}/></label><button className="icon-button" aria-label={`${['browser','computer'].includes(s.id) && s.kind === s.id ? '查看' : '编辑'} ${s.name}`} onClick={() => editor(s)}><ChevronRight size={14}/></button></div></div>)}
     </div>{!nativeMcp.length && !custom.length && !working ? <div className="extensions-empty"><Server size={25}/><strong>{search ? '没有匹配的 MCP' : '尚未添加 MCP'}</strong><p>添加 HTTP 服务或本机程序后，Agent 可以使用对应工具。</p></div> : null}
       <div className="extensions-catalog-links"><span>工具在执行任务时按需连接</span><button className="quiet-button" disabled={disabled} onClick={() => void run(async () => { const result = await call<{ data?: { name: string; tools?: Record<string, unknown>; error?: string }[] }>('tool_server_status'); setStatus(result.data ?? []); setMessage('已读取 Codex MCP 运行状态'); })}>检查 Codex 连接</button></div>
     </>}

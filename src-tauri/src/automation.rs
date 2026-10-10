@@ -25,9 +25,7 @@ use tokio::{
 
 const KEY: &str = "automation_installations";
 const MCP_VERSION: &str = "0.0.83";
-const WINDOWS_VERSION: &str = "0.7.5";
 const NODE_VERSION: &str = "22.23.3";
-const UV_VERSION: &str = "0.12.23";
 const MAX_LINE: usize = 8 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -45,8 +43,8 @@ impl Kind {
     }
     fn version(self) -> &'static str {
         match self {
-            Self::Browser => MCP_VERSION,
-            Self::Computer => WINDOWS_VERSION,
+            Self::Browser => "1",
+            Self::Computer => crate::computer::VERSION,
         }
     }
 }
@@ -145,6 +143,28 @@ fn installed(app: &AppHandle) -> Result<Vec<Installation>, String> {
     serde_json::from_str(&raw).map_err(|_| "自动化安装记录损坏，请重新安装".into())
 }
 fn valid_installation(base: &Path, install: &Installation) -> bool {
+    if install.kind == Kind::Browser
+        && install
+            .server
+            .args
+            .first()
+            .is_some_and(|a| a == "--browser-mcp")
+    {
+        return cfg!(windows)
+            && crate::browser::server().is_ok_and(|s| {
+                s.command == install.server.command
+                    && s.args == install.server.args
+                    && install.version == "1"
+            });
+    }
+    if install.kind == Kind::Computer {
+        return cfg!(windows)
+            && crate::computer::server().is_ok_and(|s| {
+                s.command == install.server.command
+                    && s.args == install.server.args
+                    && install.version == crate::computer::VERSION
+            });
+    }
     // Reject stale/edited paths. A successful test alone does not make missing executables usable.
     let base = ordinary_path(base.canonicalize().unwrap_or_else(|_| base.to_path_buf()));
     let root = ordinary_path(install.root.clone());
@@ -167,8 +187,32 @@ fn valid_installation(base: &Path, install: &Installation) -> bool {
                         .windows(2)
                         .any(|a| a[0] == "--executable-path" && Path::new(&a[1]).is_file())
             }
-            Kind::Computer => install.root.join(".venv/Scripts/python.exe").is_file(),
+            Kind::Computer => false,
         }
+}
+fn builtin_installation(kind: Kind) -> Result<Installation, String> {
+    let server = if kind == Kind::Browser {
+        crate::browser::server()?
+    } else {
+        crate::computer::server()?
+    };
+    let root = Path::new(&server.command)
+        .parent()
+        .ok_or("内置电脑工具目录不存在")?
+        .to_path_buf();
+    Ok(Installation {
+        kind,
+        version: kind.version().into(),
+        root,
+        server,
+        tools: if kind == Kind::Browser {
+            crate::browser_bridge::tools().len()
+        } else {
+            crate::computer::TOOL_COUNT
+        },
+        tested_at: 0,
+        summary: "随 SuperCode 提供，无需另行安装。尚未进行本机测试。".into(),
+    })
 }
 // Node's CLI resolver cannot accept Windows verbatim paths (EISDIR on C:).
 // Canonicalize first to resolve MSIX redirection, then use normal absolute paths.
@@ -193,7 +237,19 @@ pub fn list_automation(app: AppHandle) -> Result<Vec<Status>, String> {
     Ok([Kind::Browser, Kind::Computer]
         .into_iter()
         .map(|kind| {
-            let installation = ready.iter().find(|i| i.kind == kind).cloned();
+            let installation = if cfg!(windows) {
+                let mut builtin = builtin_installation(kind).ok();
+                if let Some(test) = ready.iter().find(|i| {
+                    i.kind == kind
+                        && i.version == kind.version()
+                        && valid_installation(&app.state::<AppState>().data_dir, i)
+                }) {
+                    builtin = Some(test.clone());
+                }
+                builtin
+            } else {
+                ready.iter().find(|i| i.kind == kind).cloned()
+            };
             let valid = installation
                 .as_ref()
                 .is_some_and(|i| valid_installation(&app.state::<AppState>().data_dir, i));
@@ -227,7 +283,11 @@ pub fn list_automation(app: AppHandle) -> Result<Vec<Status>, String> {
                 }
                 .into(),
                 message: if valid {
-                    "测试通过"
+                    if installation.as_ref().is_some_and(|i| i.tested_at > 0) {
+                        "测试通过"
+                    } else {
+                        "软件自带 · 尚未测试"
+                    }
                 } else if installation.is_some() {
                     "安装文件缺失，请修复安装"
                 } else {
@@ -297,11 +357,14 @@ async fn operate(
             .setting(&pending_key)?
             .and_then(|raw| serde_json::from_str::<Option<Installation>>(&raw).ok())
             .flatten();
-        let mut installation = if !repair
+        let mut installation = if cfg!(windows) {
+            builtin_installation(kind)?
+        } else if !repair
             && previous.as_ref().is_some_and(|i| {
                 valid_installation(&app.state::<AppState>().data_dir, i)
                     && i.version == kind.version()
-            }) {
+            })
+        {
             previous.unwrap()
         } else if !repair
             && !test_only
@@ -326,7 +389,11 @@ async fn operate(
         }
         task.check()?;
         task.progress("testing", "正在连接 MCP 并测试实际功能", None, None);
-        let result = probe(&installation, &task.cancel).await?;
+        let result = if kind == Kind::Browser {
+            crate::browser::probe(&app, &task.cancel).await?
+        } else {
+            probe(&installation, &task.cancel).await?
+        };
         installation.tools = result.0;
         installation.summary = result.1;
         installation.tested_at = now();
@@ -390,10 +457,14 @@ pub async fn set_automation_enabled(
         .operation
         .try_lock()
         .map_err(|_| "正在安装或测试，请稍后更改")?;
-    let installation = installed(&app)?
-        .into_iter()
-        .find(|i| i.kind == kind)
-        .ok_or("请先安装并测试")?;
+    let installation = if cfg!(windows) {
+        builtin_installation(kind)?
+    } else {
+        installed(&app)?
+            .into_iter()
+            .find(|i| i.kind == kind)
+            .ok_or("请先安装并测试")?
+    };
     if enabled && !valid_installation(&app.state::<AppState>().data_dir, &installation) {
         return Err("安装文件缺失，请先修复".into());
     }
@@ -412,12 +483,16 @@ fn artifact(tool: &str) -> Result<(String, &'static str), String> {
     if !arm && !cfg!(target_arch = "x86_64") {
         return Err("暂不支持此 CPU 架构".into());
     }
-    Ok(match (tool,arm) {
-        ("node",false)=>(format!("https://nodejs.org/dist/v{NODE_VERSION}/node-v{NODE_VERSION}-win-x64.zip"),"2b0ff57b049cda1bbcea2240eec20467018713c1efe1f7360c2681859b90ed71"),
-        ("node",true)=>(format!("https://nodejs.org/dist/v{NODE_VERSION}/node-v{NODE_VERSION}-win-arm64.zip"),"33dad22e4cef5ee8f9fbb1b0d037fdacd0e56d12a4580f0d63f68b894deab535"),
-        ("uv",false)=>(format!("https://github.com/astral-sh/uv/releases/download/{UV_VERSION}/uv-x86_64-pc-windows-msvc.zip"),"75d05de6762778c31ee183398de7dd15093fad0ed90b1f236d8205ea5ec00c90"),
-        ("uv",true)=>(format!("https://github.com/astral-sh/uv/releases/download/{UV_VERSION}/uv-aarch64-pc-windows-msvc.zip"),"13294e232ececbe709c06b74e6ced06f2a225ea5591476685362f22be56a50d5"),
-        _=>return Err("未知运行环境".into()),
+    Ok(match (tool, arm) {
+        ("node", false) => (
+            format!("https://nodejs.org/dist/v{NODE_VERSION}/node-v{NODE_VERSION}-win-x64.zip"),
+            "2b0ff57b049cda1bbcea2240eec20467018713c1efe1f7360c2681859b90ed71",
+        ),
+        ("node", true) => (
+            format!("https://nodejs.org/dist/v{NODE_VERSION}/node-v{NODE_VERSION}-win-arm64.zip"),
+            "33dad22e4cef5ee8f9fbb1b0d037fdacd0e56d12a4580f0d63f68b894deab535",
+        ),
+        _ => return Err("未知运行环境".into()),
     })
 }
 async fn download(url: &str, hash: &str, target: &Path, task: &Task) -> Result<(), String> {
@@ -525,16 +600,10 @@ impl Drop for StagingDirectory {
     }
 }
 async fn portable(tool: &str, root: &Path, task: &Task) -> Result<PathBuf, String> {
-    task.progress(
-        "downloading",
-        if tool == "node" {
-            "正在下载 Node.js"
-        } else {
-            "正在下载 Python 安装器"
-        },
-        None,
-        None,
-    );
+    if tool != "node" {
+        return Err("未知运行环境".into());
+    }
+    task.progress("downloading", "正在下载 Node.js", None, None);
     let (url, hash) = artifact(tool)?;
     let archive = root.join(format!("{tool}.zip"));
     download(&url, hash, &archive, task).await?;
@@ -546,7 +615,7 @@ async fn portable(tool: &str, root: &Path, task: &Task) -> Result<PathBuf, Strin
     tokio::task::spawn_blocking(move || extract_zip(&archive2, &dest2))
         .await
         .map_err(|e| e.to_string())??;
-    let executable = if tool == "node" {
+    let executable = {
         dest.join(format!(
             "node-v{NODE_VERSION}-win-{}",
             if cfg!(target_arch = "aarch64") {
@@ -556,8 +625,6 @@ async fn portable(tool: &str, root: &Path, task: &Task) -> Result<PathBuf, Strin
             }
         ))
         .join("node.exe")
-    } else {
-        dest.join("uv.exe")
     };
     if !executable.is_file() {
         return Err("压缩包缺少运行程序".into());
@@ -634,6 +701,9 @@ async fn execute(
     Ok(out)
 }
 async fn setup(task: &Task) -> Result<Installation, String> {
+    if task.kind == Kind::Computer {
+        return builtin_installation(task.kind);
+    }
     let base = task.app.state::<AppState>().data_dir.clone();
     let root = base
         .join("automation")
@@ -733,58 +803,14 @@ async fn setup(task: &Task) -> Result<Installation, String> {
             ],
         )
     } else {
-        let uv = portable("uv", &root, task).await?;
-        let env = [
-            ("UV_PYTHON_INSTALL_DIR", root.join("python")),
-            ("UV_CACHE_DIR", base.join("automation/cache/uv")),
-        ];
-        task.progress("installing", "正在下载 Python 并创建独立环境", None, None);
-        execute(
-            &uv,
-            &[
-                "--no-config".into(),
-                "venv".into(),
-                "--python".into(),
-                "3.13".into(),
-                "--managed-python".into(),
-                root.join(".venv").to_string_lossy().into_owned(),
-            ],
-            &root,
-            &env,
-            task,
-        )
-        .await?;
-        task.progress("installing", "正在安装 Windows MCP", None, None);
-        execute(
-            &uv,
-            &[
-                "--no-config".into(),
-                "pip".into(),
-                "install".into(),
-                "--python".into(),
-                root.join(".venv/Scripts/python.exe")
-                    .to_string_lossy()
-                    .into_owned(),
-                "--index-url".into(),
-                "https://pypi.org/simple".into(),
-                format!("windows-mcp=={WINDOWS_VERSION}"),
-            ],
-            &root,
-            &env,
-            task,
-        )
-        .await?;
-        (
-            root.join(".venv/Scripts/windows-mcp.exe"),
-            vec!["serve".into()],
-        )
+        return Err("未知自动化安装类型".into());
     };
     let server = ToolServer {
         id: task.kind.id().into(),
         name: if task.kind == Kind::Browser {
             "浏览器 · Playwright"
         } else {
-            "电脑 · Windows MCP"
+            "电脑 · SuperCode 内置"
         }
         .into(),
         kind: task.kind.id().into(),
@@ -1023,7 +1049,15 @@ async fn claude_control(mcp: &mut Mcp, id: &str, request: Value) -> Result<Value
         }
     }
 }
-async fn verify_agent(app: &AppHandle, agent: &str) -> Result<Value, String> {
+pub(crate) async fn verify_agent(app: &AppHandle, agent: &str) -> Result<Value, String> {
+    if !matches!(agent, "codex" | "claude") {
+        return Err("连接状态探针仅支持 Codex 和 Claude".into());
+    }
+    let expected: Vec<_> = client_features::servers(app)?
+        .into_iter()
+        .filter(|s| s.enabled && matches!(s.id.as_str(), "computer" | "browser"))
+        .map(|s| format!("supercode_{}", s.id))
+        .collect();
     let root = app
         .state::<AppState>()
         .data_dir
@@ -1128,8 +1162,8 @@ async fn verify_agent(app: &AppHandle, agent: &str) -> Result<Value, String> {
                 )
             })?;
             let mut connected = Vec::new();
-            for name in ["supercode_browser", "supercode_computer"] {
-                if let Some(row) = rows.iter().find(|r| r["name"] == name) {
+            for name in &expected {
+                if let Some(row) = rows.iter().find(|r| r["name"] == name.as_str()) {
                     let tools = row["tools"]
                         .as_object()
                         .map(|v| v.len())
@@ -1143,14 +1177,14 @@ async fn verify_agent(app: &AppHandle, agent: &str) -> Result<Value, String> {
                     }
                 }
             }
-            if connected.len() == 2 {
+            if connected.len() == expected.len() && !expected.is_empty() {
                 return Ok::<Value, String>(
                     json!({"ok":true,"agent":agent,"servers":connected,"modelTurn":false}),
                 );
             }
             if step == 29 {
                 return Err(format!(
-                    "Agent 尚未连接两项自动化工具：{}",
+                    "Agent 尚未连接已启用的自动化工具：{}",
                     serde_json::to_string(rows)
                         .unwrap_or_default()
                         .chars()
@@ -1281,40 +1315,36 @@ async fn probe(
         }
         "已验证打开网页、点击按钮和读取页面".into()
     } else {
-        let snapshot = tools
-            .iter()
-            .find(|t| {
-                t["name"]
-                    .as_str()
-                    .is_some_and(|s| s.eq_ignore_ascii_case("Snapshot"))
-            })
-            .ok_or("电脑 MCP 缺少 Snapshot 工具")?;
-        for tool in ["Click", "Type", "Scroll"] {
-            if !names.iter().any(|n| n.eq_ignore_ascii_case(tool)) {
-                return Err(format!("电脑 MCP 缺少 {tool} 工具"));
+        for tool in crate::computer::tools() {
+            if !names.contains(&tool["name"].as_str().unwrap()) {
+                return Err("内置电脑工具列表不完整".into());
             }
         }
-        let props = snapshot["inputSchema"]["properties"].as_object();
-        let mut args = serde_json::Map::new();
-        for key in ["use_vision", "use_dom"] {
-            if props.is_some_and(|p| p.contains_key(key)) {
-                args.insert(key.into(), json!(false));
-            }
+        let result = mcp.tool("desktop_list_windows", json!({}), cancel).await?;
+        let windows: Value =
+            serde_json::from_str(&result).map_err(|_| "电脑工具返回了无效窗口列表")?;
+        if windows["windows"].as_array().is_none_or(|v| v.is_empty()) {
+            return Err("未能读取本机窗口，请重新测试".into());
         }
         let result = mcp
             .tool(
-                snapshot["name"].as_str().unwrap(),
-                Value::Object(args),
+                "desktop_snapshot",
+                json!({"includeImage":true,"includeTree":true}),
                 cancel,
             )
             .await?;
-        if !result.contains("Focused Window:")
-            || !result.contains("Opened Windows:")
-            || result.contains("Error capturing desktop state:")
+        let snapshot: Value =
+            serde_json::from_str(&result).map_err(|_| "电脑工具返回了无效截图信息")?;
+        if snapshot["imageWidth"].as_u64().unwrap_or(0) == 0
+            || snapshot["snapshotId"].as_str().is_none()
         {
-            return Err("电脑 MCP 未能读取桌面状态，请重新测试".into());
+            return Err("内置电脑工具未能读取窗口截图".into());
         }
-        "已验证读取桌面状态；点击、输入、滚动工具可用".into()
+        if snapshot.get("accessibilityWarning").is_some() {
+            "已验证窗口识别和截图；当前应用未提供可用的辅助功能树".into()
+        } else {
+            "已验证窗口识别、截图和辅助功能读取；输入工具已就绪".into()
+        }
     };
     Ok((tools.len(), summary))
 }
@@ -1388,7 +1418,7 @@ mod tests {
     fn only_known_kinds_deserialize_and_artifacts_are_pinned() {
         assert!(serde_json::from_str::<Kind>("\"custom command\"").is_err());
         assert!(artifact("untrusted").is_err());
-        for tool in ["node", "uv"] {
+        for tool in ["node"] {
             let (url, hash) = artifact(tool).unwrap();
             assert!(url.starts_with("https://"));
             assert_eq!(hash.len(), 64);

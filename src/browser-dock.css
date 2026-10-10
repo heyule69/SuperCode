@@ -1,0 +1,20 @@
+.conversation-surface{display:grid;grid-template-columns:minmax(0,1fr);grid-template-rows:minmax(0,1fr);min-width:0;min-height:0;position:relative;overflow:hidden}
+.conversation-surface[hidden]{display:none}
+.conversation-surface.has-browser{grid-template-columns:minmax(0,1fr) var(--browser-extent,520px)}
+.conversation-surface.has-browser.browser-stacked{grid-template-columns:minmax(0,1fr);grid-template-rows:minmax(0,1fr) var(--browser-extent,360px)}
+.conversation-surface>.workspace{min-width:0;min-height:0;container-type:inline-size}
+.browser-resize-handle{position:absolute;left:-3px;top:0;bottom:0;width:7px;z-index:12;cursor:col-resize;touch-action:none;outline:none}
+.browser-stacked .browser-resize-handle{left:0;right:0;top:-3px;bottom:auto;width:auto;height:7px;cursor:row-resize}
+.browser-resize-handle:focus-visible{outline:none;box-shadow:none}
+.browser-resize-handle:focus-visible::after{content:'';position:absolute;top:50%;left:50%;width:8px;height:8px;transform:translate(-50%,-50%);border-radius:50%;background:var(--bg);outline:2px solid var(--accent)}
+.browser-resize-hidden{display:none}
+.browser-resizing,.browser-resizing *{cursor:col-resize!important;user-select:none!important}
+.browser-stacked.browser-resizing,.browser-stacked.browser-resizing *{cursor:row-resize!important}
+@container(max-width:620px){
+  .workspace .composer-toolbar{flex-wrap:wrap;row-gap:10px}
+  .workspace .composer-options{width:100%}
+  .workspace .composer-right{width:100%;min-width:0;flex-wrap:nowrap;justify-content:flex-end}
+  .workspace .composer .model-chip{max-width:170px;min-width:0}
+  .workspace .composer-footnote>div{flex-wrap:wrap;gap:8px;justify-content:flex-end}
+  .workspace .new-chat-title{font-size:26px}
+}

@@ -99,7 +99,7 @@ fn menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
         .unwrap_or_default();
     entries.sort_by_key(|(_, number, _, _)| *number);
     for (label, number, session_id, settings) in entries {
-        let Some(window) = app.get_webview_window(&label) else {
+        let Some(window) = app.get_window(&label) else {
             continue;
         };
         let session = app
@@ -165,7 +165,7 @@ pub fn refresh(app: &AppHandle) {
     }
 }
 
-pub fn update_context(window: &tauri::WebviewWindow, session: &str, settings: bool) {
+pub fn update_context(window: &Window, session: &str, settings: bool) {
     let app = window.app_handle();
     let Some(state) = app.try_state::<DesktopLifecycle>() else {
         return;
@@ -191,7 +191,7 @@ pub fn update_context(window: &tauri::WebviewWindow, session: &str, settings: bo
 }
 
 pub fn show_window(app: &AppHandle, label: &str) -> Result<(), String> {
-    let window = app.get_webview_window(label).ok_or("窗口已关闭")?;
+    let window = app.get_window(label).ok_or("窗口已关闭")?;
     window.show().map_err(|e| e.to_string())?;
     window.unminimize().map_err(|e| e.to_string())?;
     window.set_focus().map_err(|e| e.to_string())
@@ -212,7 +212,7 @@ pub async fn new_workspace_window(app: AppHandle) -> Result<String, String> {
     ensure_running(&app)?;
     let label = format!("chat-workspace-{}", uuid::Uuid::new_v4());
     let theme = app
-        .get_webview_window("main")
+        .get_window("main")
         .and_then(|window| window.theme().ok())
         .unwrap_or(tauri::Theme::Dark);
     let canvas = window_theme::canvas_for_window(&app, "main").unwrap_or_else(|| {
@@ -247,7 +247,9 @@ pub async fn new_workspace_window(app: AppHandle) -> Result<String, String> {
         builder = builder.data_directory(directory);
     }
     let window = builder.build().map_err(|e| e.to_string())?;
-    update_context(&window, "", false);
+    if let Some(parent) = app.get_window(window.label()) {
+        update_context(&parent, "", false);
+    }
     refresh(&app);
     Ok(label)
 }
@@ -274,7 +276,7 @@ pub fn install(app: &AppHandle) -> tauri::Result<()> {
         .default_window_icon()
         .expect("SuperCode application icon")
         .clone();
-    if let Some(window) = app.get_webview_window("main") {
+    if let Some(window) = app.get_window("main") {
         update_context(&window, "", false);
     }
     let builder = TrayIconBuilder::with_id(TRAY)
@@ -394,7 +396,7 @@ pub fn request_app_exit(app: AppHandle) -> Result<(), String> {
             "退出并停止任务".into(),
             "继续运行".into(),
         ));
-    if let Some(window) = app.get_webview_window("main") {
+    if let Some(window) = app.get_window("main") {
         dialog = dialog.parent(&window);
     }
     dialog.show(move |accepted| {
