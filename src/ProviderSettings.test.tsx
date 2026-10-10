@@ -66,6 +66,32 @@ it('uses fixed Anthropic Messages for Claude third-party connections',async()=>{
   expect(node.querySelector('#provider-key')).not.toBeNull();expect(node.querySelector('#provider-protocol')?.textContent).toBe('Anthropic Messages');expect(node.querySelector('.provider-engine-note')?.textContent).toContain('Claude Code');
   expect(mocks.call.mock.calls.some(([command])=>command==='start_official_login')).toBe(false);
 });
+it.each([
+  ['智谱 GLM','https://open.bigmodel.cn/api/v1','glm-5.3','https://docs.bigmodel.cn/cn/coding-plan/tool/codex'],
+  ['DeepSeek','https://api.deepseek.com','deepseek-flash','https://api-docs.deepseek.com/quick_start/agent_integrations/codex/'],
+])('configures %s on Codex with the documented Responses endpoint',async(name,url,model,docs)=>{
+  await render();await act(async()=>tab('codex').click());await act(async()=>button('添加').click());
+  await act(async()=>providerCard(name).click());
+  expect(node.querySelector<HTMLInputElement>('#provider-url')!.value).toBe(url);
+  expect(node.querySelector<HTMLInputElement>('#provider-default-model')!.value).toBe(model);
+  expect(node.querySelector('#provider-protocol')?.textContent).toBe('OpenAI Responses');
+  expect(node.querySelector('.provider-engine-note')?.textContent).toContain('Codex');
+  expect([...node.querySelector<HTMLSelectElement>('#provider-plan')!.options].every(option=>option.textContent?.includes('Responses'))).toBe(true);
+  await act(async()=>node.querySelector<HTMLAnchorElement>('.provider-plan-help a')!.click());
+  expect(mocks.call).toHaveBeenCalledWith('open_external_link',{url:docs});
+});
+it('separates subscription and pay-as-you-go Codex endpoints when changing plans',async()=>{
+  await render();await act(async()=>tab('codex').click());await act(async()=>button('添加').click());
+  await act(async()=>providerCard('火山方舟 / 豆包').click());
+  expect(node.querySelector<HTMLInputElement>('#provider-url')!.value).toBe('https://ark.cn-beijing.volces.com/api/coding/v3');
+  expect(node.querySelector<HTMLInputElement>('#provider-default-model')!.value).toBe('ark-code-latest');
+  await act(async()=>{const input=node.querySelector<HTMLInputElement>('#provider-key')!;Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value')!.set!.call(input,'subscription-key');input.dispatchEvent(new Event('input',{bubbles:true}));});
+  await act(async()=>{const select=node.querySelector<HTMLSelectElement>('#provider-plan')!;select.value='standard-responses';select.dispatchEvent(new Event('change',{bubbles:true}));});
+  expect(node.querySelector<HTMLInputElement>('#provider-url')!.value).toBe('https://ark.cn-beijing.volces.com/api/v3');
+  expect(node.querySelector<HTMLInputElement>('#provider-default-model')!.value).toBe('');
+  expect(node.querySelector<HTMLInputElement>('#provider-key')!.value).toBe('');
+  expect(node.querySelector('.provider-plan-help')?.textContent).toContain('按量 API Key');
+});
 it('keeps OpenCode and Pi API connections with their own engine rather than using another agent login',async()=>{
   await render();await act(async()=>tab('opencode').click());await act(async()=>button('添加').click());
   expect(providerCard('ChatGPT 官方登录')).toBeUndefined();await act(async()=>providerCard('OpenAI API').click());

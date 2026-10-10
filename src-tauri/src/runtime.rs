@@ -118,6 +118,7 @@ pub struct Client {
     pub last_used: Arc<AtomicU64>,
     pub pid: u32,
     routing: u64,
+    tool_configuration: u64,
     project: Option<std::path::PathBuf>,
     pub loaded_threads: Mutex<Vec<String>>,
     pub turn_settings: Mutex<Option<(String, String, String)>>,
@@ -182,6 +183,7 @@ impl Runtime {
         crate::desktop_lifecycle::ensure_running(app)?;
         let route = app.state::<AppState>().store.route_with_connection("codex", session_id, connection_id)?;
         let routing = route.fingerprint();
+        let tool_configuration = crate::client_features::tool_configuration(app)?;
         let project = session_id
             .map(|id| {
                 let state = app.state::<AppState>();
@@ -195,7 +197,7 @@ impl Runtime {
         let mut slot = self.client.lock().await;
         if let Some(client) = slot.as_ref().filter(|c| {
             c.alive.load(Ordering::Relaxed)
-                && context_matches(c.routing, c.project.as_deref(), routing, project.as_deref())
+                && context_matches((c.routing, c.tool_configuration), c.project.as_deref(), (routing, tool_configuration), project.as_deref())
         }) {
             return Ok(client.clone());
         }
@@ -221,6 +223,7 @@ impl Runtime {
                 self.epoch.clone(),
                 generation,
                 &route,
+                tool_configuration,
                 project.as_deref(),
             )
             .await?,
@@ -250,6 +253,7 @@ impl Client {
         epoch: Arc<AtomicU64>,
         generation: u64,
         route: &crate::session_config::Route,
+        tool_configuration: u64,
         project: Option<&std::path::Path>,
     ) -> Result<Self, String> {
         let executable = crate::agents::resolve(&app, "codex")?.program;
@@ -386,6 +390,7 @@ impl Client {
             turns,
             pid,
             routing: route.fingerprint(),
+            tool_configuration,
             project: project.map(std::path::Path::to_owned),
         })
     }
@@ -467,9 +472,9 @@ impl Client {
 }
 
 fn context_matches(
-    active_route: u64,
+    active_route: (u64, u64),
     active_project: Option<&std::path::Path>,
-    route: u64,
+    route: (u64, u64),
     project: Option<&std::path::Path>,
 ) -> bool {
     active_route == route && project.is_none_or(|path| active_project == Some(path))
@@ -735,12 +740,13 @@ mod tests {
     fn project_extension_context_is_not_reused_for_another_project() {
         let a = std::path::Path::new("project-a");
         let b = std::path::Path::new("project-b");
-        assert!(context_matches(1, Some(a), 1, Some(a)));
-        assert!(!context_matches(1, Some(a), 1, Some(b)));
-        assert!(!context_matches(1, None, 1, Some(a)));
-        assert!(!context_matches(1, Some(a), 2, Some(a)));
+        assert!(context_matches((1, 3), Some(a), (1, 3), Some(a)));
+        assert!(!context_matches((1, 3), Some(a), (1, 3), Some(b)));
+        assert!(!context_matches((1, 3), None, (1, 3), Some(a)));
+        assert!(!context_matches((1, 3), Some(a), (2, 3), Some(a)));
+        assert!(!context_matches((1, 3), Some(a), (1, 4), Some(a)));
         // Inventory queries can reuse a matching live client without switching it.
-        assert!(context_matches(1, Some(a), 1, None));
+        assert!(context_matches((1, 3), Some(a), (1, 3), None));
         assert!(!context_is_busy(0, false));
         assert!(!context_is_busy(1, true));
         assert!(context_is_busy(1, false));

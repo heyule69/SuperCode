@@ -306,6 +306,7 @@ pub async fn send(
     let model = crate::providers::real_claude_model(&config, model.as_deref());
     let signature = json!([
         fingerprint,
+        crate::client_features::tool_configuration(app)?,
         session.id,
         cwd,
         model,

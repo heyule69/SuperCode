@@ -1,14 +1,55 @@
-.app-update-settings { max-width: 620px; margin-top: 28px; padding: 20px 0; border-top: 1px solid var(--border); }
-.app-update-heading { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
-.app-update-heading p { margin: 6px 0 0; color: var(--muted); font-size: 12px; }
-.app-update-settings button { display: inline-flex; align-items: center; gap: 6px; }
-.app-update-automatic { display: flex; align-items: center; gap: 8px; margin: 20px 0; font-size: 13px; }
-.app-update-automatic input { width: 14px; height: 14px; margin: 0; }
-.app-update-notes { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 180px; overflow: auto; line-height: 1.6; font-size: 12px; }
-.app-update-settings progress { width: 100%; height: 5px; margin: 8px 0; accent-color: var(--text); }
-.app-update-error { color: #e66f61; font-size: 12px; overflow-wrap: anywhere; }
-.app-update-link { margin-top: 16px; padding: 0; border: 0; background: none; color: var(--muted); font-size: 12px; cursor: pointer; }
+.settings-about .settings-content { max-width: 700px; }
+.about-settings .about-app { gap: 18px; padding: 0; margin-bottom: 32px; }
+.about-settings .about-app > .app-brand-icon { width: 56px; height: 56px; }
+.about-settings .about-app strong { font-size: 24px; line-height: 1.3; letter-spacing: -.5px; }
+.about-settings .about-app div > span { margin-top: 6px; font-size: var(--ui-size); }
+.app-update-settings { width: 100%; min-width: 0; padding: 24px 0 0; background: var(--surface); border: 1px solid var(--line); border-radius: 16px; }
+.app-update-heading { display: flex; justify-content: space-between; align-items: center; gap: 16px; margin: 0 24px; }
+.app-update-heading-copy { display: flex; align-items: center; gap: 12px; min-width: 0; }
+.app-update-heading-copy > div { min-width: 0; }
+.app-update-state-icon { display: grid; place-items: center; width: 40px; height: 40px; flex: none; border: 1px solid var(--line); border-radius: 12px; background: var(--bg); color: var(--muted); }
+.app-update-heading h3 { margin: 0; font-size: calc(var(--ui-size) + 2px); font-weight: 600; line-height: 1.5; }
+.app-update-heading p { margin: 4px 0 0; color: var(--muted); font-size: var(--ui-size); line-height: 1.6; overflow-wrap: anywhere; }
+.app-update-settings button { display: inline-flex; justify-content: center; align-items: center; gap: 7px; cursor: pointer; }
+.app-update-settings button svg { flex: none; }
+.app-update-heading > button { flex: none; min-height: 34px; border-radius: 8px; font-size: calc(var(--ui-size) - 1px); }
+.app-update-release { margin: 26px 24px 0; }
+.app-update-release > h4 { margin: 0 0 12px; font-size: calc(var(--ui-size) - 1px); font-weight: 500; color: var(--muted); }
+.app-update-notes { overflow-wrap: anywhere; font-size: var(--ui-size); line-height: 1.85; }
+.app-update-notes > :first-child { margin-top: 0; }
+.app-update-notes > :last-child { margin-bottom: 0; }
+.app-update-notes p { margin: 14px 0; }
+.app-update-notes ul, .app-update-notes ol { margin: 0 0 16px; padding-left: 20px; }
+.app-update-notes li { padding-left: 3px; margin: 8px 0; }
+.app-update-notes li::marker { color: var(--muted); }
+.app-update-notes li > p { margin: 8px 0; }
+.app-update-notes h5 { margin: 18px 0 8px; font-size: inherit; font-weight: 600; }
+.app-update-notes a { color: var(--text); text-underline-offset: 3px; }
+.app-update-notes code { padding: 2px 5px; border-radius: 4px; background: var(--surface2); font-size: .92em; }
+.app-update-notes blockquote { margin: 14px 0; padding-left: 14px; border-left: 2px solid var(--line); color: var(--muted); }
+.app-update-progress { margin: 20px 24px 0; }
+.app-update-settings progress { display: block; width: 100%; height: 5px; accent-color: var(--text); }
+.app-update-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 12px 20px; margin: 24px; }
+.app-update-actions > .primary-button { min-height: 38px; padding: 9px 16px; font-size: var(--ui-size); border-radius: 9px; }
+.app-update-link { min-height: 34px; padding: 4px 0; border: 0; background: none; color: var(--muted); font-size: calc(var(--ui-size) - 1px); }
+.app-update-link:hover:not(:disabled) { color: var(--text); }
+.app-update-restart-note { margin: -12px 24px 24px; color: var(--muted); font-size: calc(var(--ui-size) - 1px); line-height: 1.6; }
+.app-update-error { margin: 20px 24px 0; color: var(--danger); font-size: var(--ui-size); line-height: 1.7; overflow-wrap: anywhere; }
+.app-update-settings .app-update-automatic { display: flex; justify-content: space-between; align-items: center; gap: 16px; padding: 16px 24px; border-top: 1px solid var(--line); font-size: var(--ui-size); cursor: pointer; }
+.app-update-automatic input { appearance: none; position: relative; width: 32px; height: 20px; min-height: 20px; margin: 0; flex: none; border: 0; border-radius: 12px; background: var(--line); cursor: pointer; }
+.app-update-automatic input::after { content: ''; position: absolute; top: 3px; left: 3px; width: 14px; height: 14px; border-radius: 50%; background: var(--surface); transition: transform 160ms ease; }
+.app-update-automatic input:checked { background: var(--accent); }
+.app-update-automatic input:checked::after { transform: translateX(12px); background: var(--bg); }
+.app-update-automatic input:disabled { opacity: .45; cursor: default; }
 .app-update-notice { display: flex; gap: 12px; align-items: center; padding: 6px 20px; border-bottom: 1px solid var(--border); font-size: 12px; color: var(--muted); }
 .app-update-notice > button:not(.icon-button) { border: 0; background: none; color: var(--text); padding: 2px 0; cursor: pointer; font: inherit; }
 .app-update-notice > .icon-button { margin-left: auto; }
-@media (max-width: 600px) { .app-update-heading { flex-wrap: wrap; } }
+@media (max-width: 600px) {
+  .about-settings .about-app { margin-bottom: 24px; }
+  .app-update-settings { padding-top: 20px; border-radius: 12px; }
+  .app-update-heading { flex-wrap: wrap; gap: 14px; }
+  .app-update-heading, .app-update-release, .app-update-actions, .app-update-progress, .app-update-error { margin-left: 18px; margin-right: 18px; }
+  .app-update-heading-copy { flex: 1 1 160px; }
+  .app-update-settings .app-update-automatic { padding: 16px 18px; }
+  .app-update-restart-note { margin-left: 18px; margin-right: 18px; }
+}

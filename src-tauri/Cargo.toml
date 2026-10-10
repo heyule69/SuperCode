@@ -1,6 +1,6 @@
 [package]
 name = "supercode"
-version = "0.1.4"
+version = "0.1.5"
 description = "A lightweight desktop workspace for coding agents"
 edition = "2021"
 
@@ -49,3 +49,6 @@ opt-level = "s"
 lto = "thin"
 codegen-units = 1
 strip = true
+
+[profile.release.package.supercode]
+codegen-units = 16

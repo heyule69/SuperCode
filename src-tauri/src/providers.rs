@@ -475,6 +475,16 @@ fn make_profile(mut s: Settings, previous: Option<&Profile>) -> Result<Profile, 
             "model_provider".into(),
             toml::Value::String("supercode_api".into()),
         );
+        // Apply a vendor requirement only to its exact bundled endpoint. A user
+        // changing the address to a gateway must not inherit that restriction.
+        let preset = bundled_catalog().as_array().and_then(|providers| {
+            providers.iter().find(|p| p["id"] == s.provider_id)?["presets"]
+                .as_array()?.iter().find(|p| p["id"] == s.plan && p["protocol"] == "responses"
+                    && p["baseUrl"].as_str().is_some_and(|url| url.trim_end_matches('/') == base.trim_end_matches('/')))
+        });
+        if preset.is_some_and(|p| p["codex"]["webSearch"] == "disabled") {
+            table.insert("web_search".into(), toml::Value::String("disabled".into()));
+        }
         let mut connection = toml::Table::new();
         for (k, v) in [
             ("name", s.name.as_str()),
@@ -899,5 +909,41 @@ mod tests {
         assert!(make_profile(fake_official, None).is_err());
         let legacy = Profile { id: "legacy-chat".into(), agent: "claude".into(), name: "旧连接".into(), config: json!({"protocol":"chat","baseUrl":"https://example.test/v1","apiKey":"test-key"}) };
         assert!(make_profile(settings("claude", "chat"), Some(&legacy)).is_ok());
+    }
+    #[test]
+    fn all_bundled_responses_presets_generate_codex_api_routes_without_official_login() {
+        for provider in bundled_catalog().as_array().unwrap() {
+            for preset in provider["presets"].as_array().unwrap().iter()
+                .filter(|p| p["protocol"] == "responses" && p["baseUrl"] != "") {
+                let model = preset["models"][0].as_str().unwrap_or("model-from-account");
+                let s = serde_json::from_value::<Settings>(json!({
+                    "name":provider["name"], "agent":"codex", "providerId":provider["id"], "plan":preset["id"],
+                    "protocol":"responses", "baseUrl":preset["baseUrl"], "model":model, "models":[model], "apiKey":"test-key"
+                })).unwrap();
+                let profile = make_profile(s, None).unwrap();
+                assert!(!profile.is_official(), "{} / {}", provider["id"], preset["id"]);
+                let table = toml::from_str::<toml::Table>(profile.config["config"].as_str().unwrap()).unwrap();
+                let route = &table["model_providers"]["supercode_api"];
+                assert_eq!(route["wire_api"].as_str(), Some("responses"));
+                assert_eq!(route["base_url"].as_str().unwrap().trim_end_matches('/'), preset["baseUrl"].as_str().unwrap().trim_end_matches('/'));
+                assert_eq!(route["env_key"].as_str(), Some("SUPERCODE_PROVIDER_API_KEY"));
+                assert_eq!(route["requires_openai_auth"].as_bool(), Some(false));
+                assert!(!profile.config["config"].as_str().unwrap().contains("test-key"));
+                let roundtrip = settings(&profile);
+                assert_eq!(roundtrip.agent, "codex");
+                assert_eq!(roundtrip.provider_id, provider["id"].as_str().unwrap());
+                assert_eq!(roundtrip.plan, preset["id"].as_str().unwrap());
+            }
+        }
+    }
+    #[test]
+    fn hy3_search_requirement_is_endpoint_specific() {
+        for (base, disabled) in [("https://tokenhub.tencentmaas.com/v1/", true), ("https://gateway.example/v1", false)] {
+            let s = serde_json::from_value::<Settings>(json!({"name":"Hy3", "agent":"codex", "providerId":"tencent", "plan":"tokenhub-responses",
+                "protocol":"responses", "baseUrl":base, "model":"hy3", "models":["hy3"], "apiKey":"test-key"})).unwrap();
+            let profile = make_profile(s, None).unwrap();
+            let table = toml::from_str::<toml::Table>(profile.config["config"].as_str().unwrap()).unwrap();
+            assert_eq!(table.get("web_search").and_then(toml::Value::as_str), disabled.then_some("disabled"));
+        }
     }
 }

@@ -10,7 +10,7 @@ export interface SidebarSection { id: string; name: string }
 export interface SidebarState { projects: Record<string, SidebarItem>; sessions: Record<string, SidebarItem>; sections: SidebarSection[] }
 export interface ArchivedSession { session: Session; projectName: string; projectPath: string }
 export interface Bootstrap { projects: Project[]; sessions: Session[]; agents: Agent[]; codexPath: string | null; loadMcp: boolean; profiles: AgentProfile[]; officialAgents: string[]; connectionOrder?: Record<string, string[]>; sidebar?: SidebarState }
-export interface ProviderPreset { id: string; name: string; protocol: string; baseUrl: string; models: string[] }
+export interface ProviderPreset { id: string; name: string; protocol: string; baseUrl: string; models: string[]; docsUrl?: string; note?: string }
 export interface Provider { id: string; name: string; mark: string; category: string; presets: ProviderPreset[] }
 export interface ProviderSettings { id: string | null; name: string; agent: string; providerId: string; plan: string; protocol: string; baseUrl: string; model: string; models: string[]; apiKey?: string | null; hasCredential: boolean; official?: boolean }
 export type PermissionMode = 'read' | 'ask' | 'strict' | 'auto' | 'edit' | 'deny' | 'full';

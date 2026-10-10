@@ -5,16 +5,17 @@ import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import SideChat, { type SideDraft } from './SideChat';
 import { call } from './api';
 import { PROVIDER_REQUIRED } from './chatConnection';
-import type { Session } from './types';
+import type { Session, RpcEvent } from './types';
 
 vi.mock('./api', () => ({ desktop:true, call:vi.fn(), subscribe:vi.fn(async()=>()=>{}) }));
 vi.mock('@tauri-apps/api/event', () => ({ listen:vi.fn(async()=>()=>{}) }));
 const defaults = {text:'',model:'test-model',readOnly:true,permissionMode:'read',attachments:[],effort:null};
 let root: Root, container: HTMLDivElement, missing: boolean, sessions: Session[];
+let requests: RpcEvent[];
 const providerRequired = vi.fn();
 beforeEach(() => {
   (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
-  missing = true; sessions = []; providerRequired.mockClear();
+  missing = true; sessions = []; requests = []; providerRequired.mockClear();
   vi.mocked(call).mockReset();
   vi.mocked(call).mockImplementation(async (command,args={}) => {
     if(command==='check_chat_connection') { if(missing) throw PROVIDER_REQUIRED; return null; }
@@ -23,7 +24,8 @@ beforeEach(() => {
       sessions.push(session); return session;
     }
     if(command==='bootstrap') return {sessions};
-    if(command==='runtime_info') return {requests:[]};
+    if(command==='runtime_info') return {requests};
+    if(command==='respond_request') { requests = requests.filter(r => r.id !== args.id); return null; }
     if(['list_messages','list_followups'].includes(command)) return [];
     if(command==='followup_capabilities') return {steeringMode:'native'};
     return null;
@@ -35,6 +37,22 @@ async function render(draft:SideDraft) {
   await act(async()=>root.render(<SideChat draft={draft} projectId="" agent="pi" connectionId={draft.connectionId??'@local'} defaults={defaults} close={()=>{}} opened={()=>{}} openFile={()=>{}} showDiff={()=>{}} providerRequired={providerRequired}/>));
 }
 async function send() {await act(async()=>{container.querySelector('form')!.dispatchEvent(new Event('submit',{bubbles:true,cancelable:true}));});}
+it('keeps the side-chat question beside its composer and cancels it without submitting a chat message', async () => {
+  missing = false;
+  requests = [{ id: 'pi:question', method: 'item/tool/requestUserInput', params: { threadId: null, nativeRequest: { method: 'select' }, questions: [{ id: '0', question: '怎么继续？', options: [{ label: '继续' }] }] } }];
+  await render({ key: 'draft', text: '测试' }); await send();
+  for (let i = 0; i < 10 && !container.querySelector('.question-request'); i++) {
+    await act(async () => { await vi.dynamicImportSettled(); await new Promise(resolve => setTimeout(resolve, 20)); });
+  }
+  expect(container.querySelector('.side-chat-scroll .question-request')).toBeNull();
+  expect(container.querySelector('footer .question-dock .question-request')).not.toBeNull();
+  expect(container.querySelector('[aria-label="侧边聊天消息"]')?.getAttribute('rows')).toBe('1');
+  vi.mocked(call).mockClear();
+  await act(async () => container.querySelector<HTMLButtonElement>('.question-request-skip')!.click());
+  expect(call).toHaveBeenCalledWith('respond_request', { id: 'pi:question', result: { answers: { '0': { answers: [] } } } });
+  expect(call).not.toHaveBeenCalledWith('enqueue_followup', expect.anything());
+  expect(container.querySelector('.question-dock')).toBeNull();
+});
 
 it('preserves edited side-chat text, attachments and the original queue item when its supplier is missing',async()=>{
   const draft: SideDraft={key:'draft',text:'选中内容',sourceId:'queued',payload:{...defaults,attachments:[{kind:'skill',name:'recall',path:'D:/skills/recall/SKILL.md'}]}};

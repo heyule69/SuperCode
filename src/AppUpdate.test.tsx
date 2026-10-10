@@ -17,7 +17,7 @@ beforeEach(() => {
 });
 afterEach(async () => { await act(async () => root.unmount()); node.remove(); });
 const button = (text: string) => [...node.querySelectorAll<HTMLButtonElement>('button')].find(b => b.textContent === text)!;
-async function render(busy = false) { await act(async () => root.render(<AppUpdateSettings busy={busy}/>)); }
+async function render(busy = false) { await act(async () => root.render(<AppUpdateSettings busy={busy}/>)); await act(async () => { await vi.dynamicImportSettled(); }); }
 it('checks explicitly and downloads without silently restarting', async () => {
   await render(); expect(node.textContent).toContain('发现新版本 0.2.0');
   await act(async () => button('检查更新').click()); expect(mocks.call).toHaveBeenCalledWith('check_app_update', { force: true });
@@ -49,4 +49,17 @@ it('preserves ready state and shows backend task rejection without losing the pa
   status = { ...status, phase: 'ready' }; await render();
   mocks.call.mockImplementation(async (command: string) => { if (command === 'install_app_update') throw new Error('还有任务正在运行'); return status; });
   await act(async () => button('重启并更新').click()); expect(node.textContent).toContain('还有任务正在运行'); expect(button('重启并更新').disabled).toBe(false);
+});
+it('formats release notes as readable lists and opens only secure external links', async () => {
+  status.notes = '## 改进\n\n- **多账号**管理\n- 修复连接显示\n\n[版本详情](https://github.com/heyule69/SuperCode/releases/tag/v0.2.0)\n\n[不支持的链接](javascript:alert%281%29)\n\n![远程图片](https://example.com/image.png)\n\n<script>unsafe()</script>';
+  await render();
+  const notes = node.querySelector('.app-update-notes')!;
+  expect([...notes.querySelectorAll('li')].map(li => li.textContent)).toEqual(['多账号管理', '修复连接显示']);
+  expect(notes.querySelector('strong')?.textContent).toBe('多账号');
+  expect(notes.querySelector('h5')?.textContent).toBe('改进');
+  expect(notes.querySelector('script, img')).toBeNull();
+  expect(notes.querySelectorAll('a')).toHaveLength(1);
+  await act(async () => notes.querySelector<HTMLAnchorElement>('a')!.click());
+  expect(mocks.call).toHaveBeenCalledWith('open_external_link', { url: 'https://github.com/heyule69/SuperCode/releases/tag/v0.2.0' });
+  expect(mocks.call).not.toHaveBeenCalledWith('install_app_update', {});
 });

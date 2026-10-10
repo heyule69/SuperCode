@@ -4,7 +4,7 @@ import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import App from './App';
 import { call } from './api';
-import type { Bootstrap, Message, Session } from './types';
+import type { Bootstrap, Message, Session, RpcEvent } from './types';
 import { PROVIDER_REQUIRED } from './chatConnection';
 
 vi.mock('./api', () => ({ desktop:true, call:vi.fn(), subscribe:vi.fn(async()=>()=>{}) }));
@@ -14,9 +14,10 @@ vi.mock('./DesktopTitleBar', () => ({ DesktopTitleBar:()=>null }));
 vi.mock('./PlatformUsageView', () => ({ PlatformUsageIndicator:()=> <span data-testid="platform-allowance">供应商额度</span> }));
 vi.mock('./AppUpdate', () => ({ default:()=>null, AppUpdateNotice:()=>null }));
 let root: Root, container: HTMLDivElement, data: Bootstrap, messages: Message[], providerMissing: boolean;
+let pendingRequests: RpcEvent[];
 beforeEach(() => {
   (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
-  localStorage.clear(); vi.mocked(call).mockClear(); messages = []; providerMissing = false;
+  localStorage.clear(); vi.mocked(call).mockClear(); messages = []; pendingRequests = []; providerMissing = false;
   data = { projects:[{id:'existing',name:'已有项目',path:'D:/existing'}],sessions:[],agents:[],profiles:[{id:'api:claude',agent:'claude',name:'Test API',model:'test-model',hasCredential:true,current:true}],officialAgents:[],connectionOrder:{},sidebar:{ projects:{}, sessions:{}, sections:[] },codexPath:null,loadMcp:false } as Bootstrap;
   vi.mocked(call).mockImplementation(async (command, args={}) => {
     if (command==='bootstrap') return structuredClone(data);
@@ -29,7 +30,7 @@ beforeEach(() => {
     }
     if (command==='list_messages') return [...messages];
     if (command==='get_usage') return { records:[] };
-    if (command==='pending_requests') return [];
+    if (command==='pending_requests') return pendingRequests;
     if (command==='list_local_skills') return { skills:[] };
     if (command==='followup_capabilities') return {};
     if (command==='list_followups') return [];
@@ -56,6 +57,26 @@ async function type(text: string) {
 async function send() {
   await act(async()=>{container.querySelector<HTMLFormElement>('.composer')!.dispatchEvent(new Event('submit',{bubbles:true,cancelable:true}));await new Promise(resolve=>setTimeout(resolve,30));});
 }
+it('docks questions above the composer while keeping approvals in the conversation and restores the composer after answering', async () => {
+  pendingRequests = [
+    { id: 'question', method: 'item/tool/requestUserInput', params: { questions: [{ id: '0', question: '界面显示正常吗？', options: [{ label: '正常' }] }] } },
+    { id: 'approval', method: 'claude/tool/requestApproval', params: { toolName: 'Shell', input: { command: 'example' } } },
+  ];
+  await render(); await act(async () => { await vi.dynamicImportSettled(); });
+  const dock = container.querySelector('.composer-area .question-dock')!;
+  expect(dock.querySelector('.question-request')).not.toBeNull();
+  expect(container.querySelector('.chat-scroll .question-request')).toBeNull();
+  expect(container.querySelector('.chat-scroll .request-card')).not.toBeNull();
+  expect(container.querySelector('.composer textarea')?.getAttribute('rows')).toBe('1');
+  expect(container.querySelector<HTMLTextAreaElement>('.composer textarea')?.style.height).toBe('28px');
+  expect(dock.compareDocumentPosition(container.querySelector('.composer')!) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  await act(async () => dock.querySelector<HTMLButtonElement>('.question-request-option')!.click());
+  await act(async () => dock.querySelector<HTMLButtonElement>('.question-request-send')!.click());
+  expect(call).toHaveBeenCalledWith('respond_request', { id: 'question', result: { answers: { '0': { answers: ['正常'] } } } });
+  expect(container.querySelector('.question-dock')).toBeNull();
+  expect(container.querySelector('.composer textarea')?.getAttribute('rows')).toBe('2');
+  expect(container.querySelector('.chat-scroll .request-card')).not.toBeNull();
+});
 it('sends a projectless draft without opening the project picker and keeps it in the direct chat area', async () => {
   await render();
   expect(container.querySelector('[aria-label="选择项目"]')?.textContent).toBe('SuperCode');

@@ -190,6 +190,10 @@
 .credential-saved { display: inline-flex; align-items: center; gap: 3px; font-size: 10px; color: var(--accent); }
 .provider-engine-note { display: flex; gap: 12px; align-items: center; font-size: 11px; color: var(--muted); margin-top: 4px; }
 .provider-engine-note strong { font-size: 11px; font-weight: 500; color: var(--text); }
+.provider-plan-help { margin: -2px 0 14px; color: var(--muted); font-size: 11px; line-height: 1.7; }
+.provider-plan-help p { margin: 0 0 5px; }
+.provider-plan-help a { display: inline-flex; align-items: center; gap: 5px; color: var(--accent); text-decoration: none; }
+.provider-plan-help a:hover { text-decoration: underline; text-underline-offset: 3px; }
 .provider-model-list { min-height: 64px; flex: 1; overflow: auto; border: 1px solid var(--line); border-radius: 5px; margin-bottom: 10px; }
 .provider-model-list.is-empty { flex: 0 0 96px; min-height: 96px; display: grid; place-items: center; background: var(--surface2); border-style: dashed; }
 .provider-model-list > .muted { margin: 0; padding: 12px; font-size: 11px; }

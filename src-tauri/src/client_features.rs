@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
     collections::HashSet,
+    hash::{Hash, Hasher},
     path::{Path, PathBuf},
 };
 use tauri::{AppHandle, Manager};
@@ -87,7 +88,8 @@ pub fn instructions(app: &AppHandle) -> String {
         .ok()
         .flatten()
         .unwrap_or_default();
-    format!("Read and write every project text file as UTF-8 without BOM. Tell the user before converting non-UTF-8 files.\nYou are running inside the SuperCode graphical desktop app. The conversation supports inline images, video and audio, not just terminal text. Tool image results are displayed automatically. To show a local media file, write ![descriptive caption](<absolute file path>); use an absolute path with spaces inside angle brackets. The same syntax supports video and audio files. Use ordinary Markdown links for files that should only be referenced. Do not open another application or copy screenshots to the desktop merely to make media visible in the conversation. Never claim a media file was shown unless you actually returned the media result or referenced an existing file.\n{}",text)
+    let tools = automation_instructions(&servers(app).unwrap_or_default());
+    format!("Read and write every project text file as UTF-8 without BOM. Tell the user before converting non-UTF-8 files.\nYou are running inside the SuperCode graphical desktop app. The conversation supports inline images, video and audio, not just terminal text. Tool image results are displayed automatically. To show a local media file, write ![descriptive caption](<absolute file path>); use an absolute path with spaces inside angle brackets. The same syntax supports video and audio files. Use ordinary Markdown links for files that should only be referenced. Do not open another application or copy screenshots to the desktop merely to make media visible in the conversation. Never claim a media file was shown unless you actually returned the media result or referenced an existing file.\n{tools}\n{text}")
 }
 
 #[tauri::command]
@@ -290,6 +292,32 @@ pub fn servers(app: &AppHandle) -> Result<Vec<ToolServer>, String> {
         .setting("tool_servers")?
         .unwrap_or("[]".into());
     serde_json::from_str(&raw).map_err(|e| e.to_string())
+}
+
+// A warm process only knows the MCP configuration it received at startup.
+// Ignore display names and ordering, but replace it when its effective tools change.
+pub(crate) fn tool_configuration(app: &AppHandle) -> Result<u64, String> {
+    Ok(tool_configuration_key(&servers(app)?))
+}
+fn tool_configuration_key(servers: &[ToolServer]) -> u64 {
+    let mut enabled: Vec<_> = servers.iter().filter(|s| s.enabled).collect();
+    enabled.sort_by(|a, b| a.id.cmp(&b.id));
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    for server in enabled {
+        server.id.hash(&mut hash);
+        if let Some(url) = &server.url {
+            ("http", url).hash(&mut hash);
+        } else {
+            ("stdio", &server.command, &server.args).hash(&mut hash);
+        }
+    }
+    hash.finish()
+}
+fn automation_instructions(servers: &[ToolServer]) -> String {
+    let names: Vec<_> = servers.iter().filter(|s| s.enabled && matches!(s.id.as_str(), "browser" | "computer"))
+        .map(|s| format!("supercode_{} ({})", s.id, s.name)).collect();
+    if names.is_empty() { return String::new(); }
+    format!("SuperCode has configured and enabled these managed MCP servers: {}. This describes configuration, not live connection status. Check the tools actually advertised in this session and use those tools for authorized automation. Some MCP tools may be deferred; use the tool discovery/search tool, when advertised, to search for these server names before concluding that their tools are unavailable. If a configured server has no advertised tools, report a connection/loading problem and direct the user to SuperCode's automation settings; do not claim its package is missing or propose installing a second copy without checking installation status. Follow the user's approvals and permissions for every action.", names.join(", "))
 }
 #[tauri::command]
 pub fn list_tool_servers(app: AppHandle) -> Result<Value, String> {
@@ -620,8 +648,8 @@ mod tests {
     #[test]
     fn native_steering_cannot_silently_change_active_permissions_or_reasoning() {
         for signature in [
-            json!(["route", "session", "cwd", "model", "read", null]),
-            json!(["route", "session", "cwd", "model", true, "read", null]),
+            json!(["route", 42, "session", "cwd", "model", "read", null]),
+            json!(["route", 42, "session", "cwd", "model", true, "read", null]),
         ] {
             let s = signature.to_string();
             assert!(validate_steering_settings(&s, "read", None).is_ok());
@@ -629,6 +657,43 @@ mod tests {
             assert!(validate_steering_settings(&s, "read", Some("high")).is_err());
         }
         assert!(validate_steering_settings("[]", "read", None).is_err());
+    }
+    #[test]
+    fn enabling_installing_or_reconfiguring_tools_invalidates_warm_connections() {
+        let mut computer = ToolServer { id: "computer".into(), name: "电脑自动化".into(), kind: "computer".into(), command: "C:/tools/windows-mcp.exe".into(), args: vec!["serve".into()], url: None, enabled: true };
+        let empty = tool_configuration_key(&[]);
+        let installed = tool_configuration_key(&[computer.clone()]);
+        assert_ne!(empty, installed);
+        computer.enabled = false;
+        assert_eq!(empty, tool_configuration_key(&[computer.clone()]));
+        computer.enabled = true;
+        computer.command = "C:/tools/new/windows-mcp.exe".into();
+        assert_ne!(installed, tool_configuration_key(&[computer.clone()]));
+        let before_args = tool_configuration_key(&[computer.clone()]);
+        computer.args.push("--flag".into());
+        assert_ne!(before_args, tool_configuration_key(&[computer.clone()]));
+        computer.url = Some("https://example.com/mcp".into());
+        let before_url = tool_configuration_key(&[computer.clone()]);
+        computer.url = Some("https://example.com/new-mcp".into());
+        assert_ne!(before_url, tool_configuration_key(&[computer]));
+    }
+    #[test]
+    fn tool_display_changes_do_not_restart_connections() {
+        let mut computer = ToolServer { id: "computer".into(), name: "电脑".into(), kind: "computer".into(), command: "windows-mcp.exe".into(), args: vec!["serve".into()], url: None, enabled: true };
+        let browser = ToolServer { id: "browser".into(), command: "node.exe".into(), ..computer.clone() };
+        let original = tool_configuration_key(&[computer.clone(), browser.clone()]);
+        computer.name = "Windows MCP".into();
+        assert_eq!(original, tool_configuration_key(&[browser, computer]));
+    }
+    #[test]
+    fn managed_tools_context_distinguishes_configuration_from_live_connection() {
+        let mut computer = ToolServer { id: "computer".into(), name: "电脑 · Windows MCP".into(), kind: "computer".into(), command: "windows-mcp.exe".into(), args: vec!["serve".into()], url: None, enabled: true };
+        let context = automation_instructions(&[computer.clone()]);
+        assert!(context.contains("supercode_computer"));
+        assert!(context.contains("not live connection status"));
+        assert!(context.contains("tool discovery/search"));
+        computer.enabled = false;
+        assert!(automation_instructions(&[computer]).is_empty());
     }
     #[test]
     fn native_full_access_and_read_modes_are_distinct() {

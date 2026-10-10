@@ -773,6 +773,7 @@ pub async fn send(
     let route = state.store.route(&s.agent, Some(&s.id))?;
     let signature = json!([
         route.fingerprint(),
+        client_features::tool_configuration(app)?,
         s.id,
         cwd,
         model.as_ref().or(s.model.as_ref()),

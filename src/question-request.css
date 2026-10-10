@@ -1,0 +1,70 @@
+.question-request {
+  margin: 0 0 24px;
+  padding: 16px 20px 14px;
+  color: var(--text);
+  background: var(--composer-bg, var(--surface2));
+  border: 1px solid var(--composer-line, var(--line));
+  border-radius: 24px;
+  min-width: 0;
+  font-size: var(--chat-size, 14px);
+}
+.question-request:focus { outline: none; }
+.question-request-header, .question-request-header > span, .question-request-header > div {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.question-request-header { justify-content: space-between; color: var(--muted); margin-bottom: 14px; }
+.question-request-header > span { font-size: 13px; }
+.question-request-page { font-size: 12px; font-variant-numeric: tabular-nums; }
+.question-request-close { display: grid; place-items: center; width: 36px; height: 36px; margin: -4px -6px -4px 0; border-radius: 50%; background: transparent; color: var(--muted); }
+.question-request-close:hover, .question-request-back:hover { background: var(--hover); color: var(--text); }
+.question-request-heading { margin: 0 0 14px; }
+.question-request-heading > span { display: block; margin-bottom: 6px; color: var(--muted); font-size: 12px; }
+.question-request-heading h3 { font-size: inherit; line-height: 1.65; font-weight: 600; margin: 0; overflow-wrap: anywhere; }
+.question-request-heading > small { display: block; margin-top: 4px; color: var(--muted); font-size: 12px; }
+.question-request-options { display: grid; gap: 4px; }
+.question-request-option { display: flex; align-items: flex-start; gap: 12px; width: 100%; text-align: left; min-height: 48px; padding: 10px 12px; margin: 0; border-radius: 12px; background: transparent; border: 1px solid transparent; }
+.question-request-option:hover { background: var(--hover); }
+.question-request-option.is-selected { background: var(--hover); border-color: var(--composer-line, var(--line)); }
+.question-request-number { display: grid; place-items: center; flex: 0 0 24px; height: 24px; border: 1px solid color-mix(in srgb, var(--muted) 25%, transparent); border-radius: 6px; color: var(--muted); font-size: 12px; line-height: 1; font-variant-numeric: tabular-nums; }
+.is-selected .question-request-number { background: var(--text); color: var(--bg); border-color: var(--text); }
+.question-request-option-text { min-width: 0; line-height: 1.65; overflow-wrap: anywhere; }
+.question-request-option-text strong { display: block; font-weight: 550; font-size: inherit; }
+.question-request-option-text small { display: block; color: var(--muted); font-size: 12px; line-height: 1.6; margin-top: 3px; }
+.question-request-option-arrow { align-self: center; margin-left: auto; color: var(--muted); opacity: 0; }
+.question-request-option:hover .question-request-option-arrow, .question-request-option:focus-visible .question-request-option-arrow { opacity: 1; }
+.question-request-footer { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 16px; margin-top: 20px; }
+.question-request-custom { display: flex; align-items: flex-start; gap: 12px; flex: 1 1 180px; min-width: 0; padding: 10px 0; color: var(--muted); }
+.question-request-custom > svg { margin-top: 3px; flex-shrink: 0; }
+.question-request-custom textarea { width: 100%; min-height: 24px; max-height: 112px; resize: none; background: transparent; border: 0; padding: 0; margin: 0; line-height: 24px; font-size: inherit; overflow-y: auto; }
+.question-request-custom textarea::placeholder { color: var(--muted); opacity: .75; }
+.question-request-custom textarea:focus-visible { outline-offset: 5px; border-radius: 2px; }
+.question-request-footer-space { flex: 1; }
+.question-request-actions { display: flex; align-items: center; gap: 8px; flex-shrink: 0; margin-left: auto; }
+.question-request-actions > button { min-height: 40px; padding: 8px 16px; border-radius: 22px; font-size: 13px; font-weight: 550; white-space: nowrap; }
+.question-request-actions .question-request-back { display: grid; place-items: center; min-width: 40px; padding: 8px; color: var(--muted); background: transparent; }
+.question-request-skip { border: 1px solid color-mix(in srgb, var(--muted) 25%, transparent); background: transparent; }
+.question-request-skip:hover { background: var(--hover); }
+.question-request-send { background: var(--text); color: var(--bg); }
+.question-request-send:disabled { background: color-mix(in srgb, var(--text) 24%, transparent); color: var(--text); opacity: .65; }
+.question-request-error { color: var(--danger); font-size: 12px; line-height: 1.6; margin: 12px 0 0; overflow-wrap: anywhere; }
+.question-dock { max-height: min(62vh, 560px); overflow-y: auto; overscroll-behavior: contain; margin: 0 -3px 5px; padding: 3px; }
+.question-dock .question-request { margin: 0 0 8px; max-height: min(60vh, 520px); display: flex; flex-direction: column; }
+.question-dock .question-request:last-child { margin-bottom: 0; }
+.question-dock .question-request-content { min-height: 0; overflow-y: auto; overscroll-behavior: contain; }
+.question-dock .question-request-header, .question-dock .question-request-footer, .question-dock .question-request-error { flex-shrink: 0; }
+.composer-area.has-question .composer { display: flex; align-items: flex-end; flex-wrap: wrap; gap: 4px; padding: 8px 12px; }
+.composer-area.has-question .composer-input { flex: 1; min-width: 120px; align-self: center; }
+.composer-area.has-question .composer textarea { min-height: 24px; padding: 2px 4px; line-height: 24px; }
+.composer-area.has-question .composer-toolbar { flex: 0 1 auto; margin-left: auto; padding: 0; }
+.composer-area.has-question .composer-footnote { display: none; }
+.composer-area.has-question .composer > .attachment-strip { flex-basis: 100%; }
+.side-chat > footer.has-question textarea[aria-label="侧边聊天消息"] { min-height: 24px; max-height: 96px; }
+@media (max-width: 600px) {
+  .question-request { padding: 14px 16px; border-radius: 20px; }
+  .question-request-footer { flex-wrap: wrap; gap: 8px; margin-top: 16px; }
+  .question-request-custom { flex-basis: 100%; }
+  .question-request-actions { margin-left: auto; }
+  .question-request-option { padding: 10px 6px; }
+}

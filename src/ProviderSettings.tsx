@@ -1,5 +1,5 @@
 import { lazy, Suspense, useEffect, useRef, useState, type PointerEvent, type SelectHTMLAttributes } from 'react';
-import { ArrowLeft, ArrowUp, ArrowDown, Check, ChevronDown, ChevronRight, Download, GripVertical, LoaderCircle, Plus, RefreshCw, Search, Trash2, X } from 'lucide-react';
+import { ArrowLeft, ArrowUp, ArrowDown, Check, ChevronDown, ChevronRight, Download, ExternalLink, GripVertical, LoaderCircle, Plus, RefreshCw, Search, Trash2, X } from 'lucide-react';
 import catalog from '../resources/providers.json';
 import { CredentialInput } from './CredentialInput';
 import { AgentIcon, ProviderIcon } from './AgentIcon';
@@ -58,6 +58,7 @@ export default function ProviderSettings({ profiles, officialAgents, order, busy
   }
   const active = config ? profiles.find(p => p.id === config.id)?.current : false;
   const provider = providersForAgent(providers, config?.agent ?? agentTab).find(p => p.id === config?.providerId);
+  const selectedPreset = provider?.presets.find(p => p.id === config?.plan);
   const completeIds = connectionIds(agentTab, profiles, officialAgents, order);
   const loggedInAgents = Object.keys(account).filter(id => account[id].loggedIn);
   const ids = visibleProviderIds(agentTab, profiles, loggedInAgents, order);
@@ -72,9 +73,11 @@ export default function ProviderSettings({ profiles, officialAgents, order, busy
   const official = officialProvider(agentTab);
   const pickerProviders = providersForAgent(providers, agentTab).map(p => {
     const name = p.id === 'openai' ? 'OpenAI API' : p.id === 'anthropic' ? 'Anthropic API' : p.name;
-    const subtitle = `${p.category} · ${p.presets.some(v => /coding|token/.test(v.id)) ? 'Coding Plan / API' : p.category === '自定义' ? '兼容 API' : '标准 API'}`;
+    const plans = p.presets.map(preset => preset.name).join(' ');
+    const access = p.category === '自定义' ? '兼容 API' : p.category === '本地' ? p.presets.some(preset => preset.id.startsWith('cloud')) ? '本地 / 云端 API' : '本地 API' : /M Plan/.test(plans) ? 'M Plan / API' : /Token Plan/.test(plans) ? 'Token Plan / API' : /Coding Plan/.test(plans) ? 'Coding Plan / API' : /Beta/.test(plans) ? 'API · Beta' : '标准 API';
+    const subtitle = `${p.category} · ${access}`;
     return { p, name, subtitle };
-  }).filter(({ p, name, subtitle }) => `${p.name} ${name} ${subtitle}`.toLowerCase().includes(search.trim().toLowerCase()));
+  }).filter(({ p, name, subtitle }) => `${p.name} ${name} ${subtitle} ${p.presets.map(preset => preset.name).join(' ')}`.toLowerCase().includes(search.trim().toLowerCase()));
   function clearDrag() { pointerDrag.current = null; setDragId(''); setDropTarget(null); }
   function dragMove(e: PointerEvent<HTMLButtonElement>) {
     const drag = pointerDrag.current; const area = providerList.current;
@@ -155,6 +158,7 @@ export default function ProviderSettings({ profiles, officialAgents, order, busy
         <label htmlFor="provider-name">连接名称</label><input id="provider-name" value={config.name} disabled={working || busy} onChange={e => setConfig({ ...config, name: e.target.value })} autoComplete="off" />
         {config.official ? accountControls(config.agent) : <>
         {config.providerId !== 'custom' ? <><label htmlFor="provider-plan" title="切换套餐将新建连接，需要对应的 API Key">套餐 / 接入方式</label><SelectControl id="provider-plan" value={config.plan} disabled={working || busy} onChange={e => { if (provider) { const p = provider.presets.find(p => p.id === e.target.value)!; setConfig({ ...config, name: provider.presets.some(v => config.name === `${provider.name} · ${v.name}`) ? `${provider.name} · ${p.name}` : config.name, plan: p.id, protocol: p.protocol, baseUrl: p.baseUrl, model: p.models[0] ?? '', models: p.models, apiKey: '', hasCredential: false, id: null }); } }}>{provider?.presets.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}{!provider?.presets.some(p => p.id === config.plan) ? <option value={config.plan}>导入的配置</option> : null}</SelectControl></> : null}
+        {selectedPreset?.note || selectedPreset?.docsUrl ? <div className="provider-plan-help">{selectedPreset.note ? <p>{selectedPreset.note}</p> : null}{selectedPreset.docsUrl ? <a href={selectedPreset.docsUrl} target="_blank" rel="noreferrer" onClick={e => { if (desktop) { e.preventDefault(); void run(async () => { await call('open_external_link', { url: selectedPreset.docsUrl }); }); } }}>官方接入文档<ExternalLink size={12}/></a> : null}</div> : null}
         <label htmlFor="provider-protocol">API 协议</label>{agentProtocols[config.agent].length === 1 && agentProtocols[config.agent].includes(config.protocol) ? <div className="provider-fixed-protocol" id="provider-protocol">{protocolLabels[config.protocol]}</div> : <SelectControl id="provider-protocol" value={config.protocol} disabled={working || busy || !!config.id} onChange={e => setConfig({ ...config, protocol: e.target.value, plan: config.providerId === 'custom' ? e.target.value : config.plan })}>{agentProtocols[config.agent].map(id => <option key={id} value={id}>{protocolLabels[id]}</option>)}{!agentProtocols[config.agent].includes(config.protocol) ? <option value={config.protocol}>{protocolLabels[config.protocol]}（已有连接）</option> : null}</SelectControl>}
         <label htmlFor="provider-url">Base URL</label><input id="provider-url" className="code-input" value={config.baseUrl} disabled={working || busy} onChange={e => setConfig({ ...config, baseUrl: e.target.value })} placeholder="https://api.example.com/v1" spellCheck={false} autoComplete="off" />
         <label htmlFor="provider-key" title="Windows 使用本机用户加密保存密钥">API Key {config.hasCredential ? <span className="credential-saved"><Check size={12} />已保存</span> : null}</label><CredentialInput key={config.id ?? 'new'} id="provider-key" saved={config.hasCredential} revision={credentialRevision} value={config.apiKey ?? ''} disabled={working || busy} onChange={apiKey => setConfig({ ...config, apiKey })} />
