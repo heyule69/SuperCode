@@ -1,0 +1,15 @@
+@import './diff-colors.css';
+.turn-change-dock { display:flex; justify-content:center; min-width:0; padding:0 0 10px; flex:none; }
+.turn-change-anchor { position:relative; max-width:100%; }
+.turn-change-chip { display:flex; align-items:center; justify-content:center; gap:10px; max-width:100%; padding:8px 13px; border:1px solid var(--frame-line,var(--line)); border-radius:20px; background:var(--surface); color:var(--text); font-size:12px; box-shadow:0 2px 6px #00000007; }
+.turn-change-chip:hover,.turn-change-chip[aria-expanded=true] { background:var(--hover); }
+.turn-change-chip > svg { color:var(--muted); transition:transform 160ms ease; }
+.turn-change-chip > svg.is-open { transform:rotate(180deg); }
+.turn-change-numbers { display:inline-flex; gap:6px; white-space:nowrap; font-variant-numeric:tabular-nums; flex:none; }
+.composer-popover.turn-change-popover { left:50%; margin-left:calc(min(410px,100vw - 24px) / -2); width:min(410px,calc(100vw - 24px)); padding:7px; border-radius:16px; box-shadow:0 12px 36px #00000025; }
+.turn-change-popover-heading { padding:7px 10px 8px; font-size:11px; color:var(--muted); }
+.composer-popover.turn-change-popover button { width:100%; padding:10px; min-width:0; border-radius:8px; }
+.turn-change-popover button > svg { color:var(--muted); flex:none; }
+.turn-change-filename { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.turn-change-popover .turn-change-view-all { color:var(--muted); font-size:11px; }
+@media(prefers-reduced-motion:reduce) { .turn-change-chip > svg { transition:none; } }

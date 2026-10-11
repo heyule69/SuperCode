@@ -10,6 +10,7 @@ import { StreamReveal } from './streamReveal';
 import { FileText, Globe, Image as ImageIcon } from 'lucide-react';
 import { MarkdownMedia, MediaList } from './Media';
 import { referencedMedia } from './mediaSources';
+import './code-syntax.css';
 
 function RevealSpan({ node, children, ...props }: ComponentProps<'span'> & ExtraProps) {
   const at = Number(node?.properties['data-stream-at']);
@@ -31,8 +32,17 @@ const MarkdownActions = createContext<{ openFile?: (path: string, line?: number)
 function MarkdownCode({ children, className, node: _node, ...props }: ComponentProps<'code'> & ExtraProps) {
   const { openFile } = useContext(MarkdownActions);
   const value = contentText(children);
+  const [highlighter,setHighlighter]=useState<typeof import('./codeHighlight').highlightCode>();
+  useEffect(()=>{
+    if (!className?.startsWith('language-')) return;
+    let disposed=false;
+    void import('./codeHighlight').then(module=>{if(!disposed)setHighlighter(()=>module.highlightCode);});
+    return ()=>{disposed=true;};
+  },[className]);
+  const highlighted=useMemo(()=>className?.startsWith('language-') && highlighter ? highlighter(value,className.slice(9)) : undefined,[className,highlighter,value]);
   const link = !className && !value.includes('\n') ? resourceFromText(value) : null;
   if (link?.kind === 'file') return <a className="markdown-file-link" href={link.target} data-resource-path={value} title={link.target} onClick={event => { event.preventDefault(); openFile?.(link.target, link.line); }}><code {...props}>{children}</code></a>;
+  if (highlighted !== undefined) return <code {...props} className={`code-syntax ${className}`} dangerouslySetInnerHTML={{__html:highlighted}}/>;
   return <code {...props} className={className}>{children}</code>;
 }
 

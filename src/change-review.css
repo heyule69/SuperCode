@@ -1,0 +1,84 @@
+@import './diff-colors.css';
+.change-review { --review-line:color-mix(in srgb,var(--muted) 16%,transparent); --review-soft:color-mix(in srgb,var(--hover) 80%,var(--bg)); container:review / inline-size; display:flex; flex-direction:column; height:100%; min-height:0; min-width:0; font-size:13px; }
+.workspace-panel-content.workspace-change-content { padding:0; overflow:hidden; }
+.change-review-toolbar { display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:10px; padding:8px 14px 14px; border-bottom:1px solid var(--review-line); flex:none; }
+.change-review-summary { display:flex; align-items:center; flex-wrap:wrap; gap:8px; min-width:0; }
+.change-review-pill { display:flex; align-items:center; gap:9px; padding:8px 13px; min-height:36px; border-radius:24px; background:var(--review-soft); white-space:nowrap; }
+.change-review-pill > small { color:var(--muted); font-size:11px; }
+.change-review-branch { color:var(--muted); max-width:220px; }
+.change-review-branch > span { overflow:hidden; text-overflow:ellipsis; }
+.change-count { display:inline-flex; align-items:center; gap:6px; white-space:nowrap; flex:none; font-variant-numeric:tabular-nums; font-size:12px; }
+.change-review-tools { display:flex; align-items:center; padding:3px; gap:2px; background:var(--review-soft); border-radius:22px; flex:none; }
+.change-review-tools .icon-button { border-radius:18px; width:30px; height:30px; }
+.change-review-tools .icon-button[aria-pressed=true] { background:var(--hover); color:var(--chat-link,var(--text)); }
+.change-review-body { display:grid; grid-template-columns:minmax(0,1fr); min-height:0; min-width:0; flex:1; }
+.change-review-body.with-tree { grid-template-columns:minmax(0,1fr) 210px; }
+.change-review-scroll { min-height:0; min-width:0; overflow:auto; overscroll-behavior:contain; }
+.change-file { border-bottom:1px solid var(--review-line); min-width:0; }
+.change-file-header { display:flex; align-items:center; gap:6px; padding:7px 12px; min-height:40px; font-size:12px; }
+.change-file.is-selected > .change-file-header { background:color-mix(in srgb,var(--hover) 55%,transparent); }
+.change-file-toggle { display:flex; align-items:center; gap:9px; min-width:0; flex:1; padding:3px 4px; border-radius:6px; background:transparent; text-align:left; }
+.change-file-toggle:hover { background:var(--hover); }
+.change-file-toggle > svg:last-child { color:var(--muted); flex:none; transition:transform 180ms ease; }
+.change-file-toggle > svg.is-open { transform:rotate(90deg); }
+.change-file-path { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.change-file-path > span { color:var(--muted); }
+.change-file-status { color:var(--muted); font-size:11px; white-space:nowrap; flex:none; }
+.change-source-button.icon-button { height:27px; width:27px; flex:none; }
+.change-file-diff { padding-bottom:12px; min-width:0; }
+.change-hunk { min-width:0; }
+.change-context-bar { display:flex; align-items:center; margin:3px 12px 7px; padding:5px 10px; min-height:29px; border-radius:8px; color:var(--muted); background:var(--review-soft); font-size:11px; }
+.change-context-bar > button { display:flex; align-items:center; gap:8px; width:100%; padding:0; text-align:left; background:transparent; color:inherit; font-size:inherit; }
+.change-context-bar small { margin-left:auto; font-size:10px; }
+.change-context-bar svg { transition:transform 160ms ease; }
+.change-context-bar svg.is-open { transform:rotate(180deg); }
+.change-code-line { display:grid; grid-template-columns:34px 34px 18px minmax(0,1fr); min-height:24px; padding:2px 12px 2px 0; font:12px/1.7 var(--code-font,Consolas,monospace); }
+.change-line-number { text-align:right; padding-right:8px; color:var(--muted); user-select:none; font-variant-numeric:tabular-nums; }
+.change-line-sign { text-align:center; color:var(--muted); user-select:none; }
+.change-code-line code { font:inherit; background:transparent; padding:0; min-width:0; white-space:pre; color:var(--text); }
+.change-code-line.added { background:var(--review-added-bg); box-shadow:inset 3px 0 var(--review-green); }
+.change-code-line.removed { background:var(--review-removed-bg); box-shadow:inset 3px 0 var(--review-red); }
+.change-code-line.added :is(.change-line-number,.change-line-sign) { color:var(--review-green); background:var(--review-added-gutter); }
+.change-code-line.removed :is(.change-line-number,.change-line-sign) { color:var(--review-red); background:var(--review-removed-gutter); }
+.change-line-sign { margin-right:8px; }
+.change-hunk:has(.change-code-line) { overflow-x:auto; }
+.change-review.is-wrapped .change-code-line code { white-space:pre-wrap; overflow-wrap:anywhere; }
+.change-review:not(.is-wrapped) .change-code-line { grid-template-columns:34px 34px 18px minmax(max-content,1fr); min-width:max-content; }
+.change-code-line code { padding-left:6px; }
+.change-preview { overflow:auto; height:100%; flex:1; }
+.change-preview .change-file { flex:none; }
+.change-preview .change-file-header { padding:9px 16px; justify-content:space-between; gap:9px; }
+.change-preview .change-file-path { font-size:12px; flex:1; }
+.change-preview .change-file-diff { flex:none; }
+.change-file-note { display:flex; align-items:center; flex-wrap:wrap; gap:10px; color:var(--muted); padding:12px 16px 18px; font-size:12px; line-height:1.7; }
+.change-file-note .quiet-button { padding:5px 9px; font-size:11px; background:transparent; }
+.change-diff-note { color:var(--muted); font-size:11px; padding:9px 16px; }
+.change-review-tree { display:flex; flex-direction:column; min-height:0; min-width:0; padding:12px 8px; border-left:1px solid var(--review-line); }
+.change-tree-search.workspace-file-search { border-color:var(--review-line); background:transparent; margin:0 2px 12px; min-height:33px; padding:5px 8px; }
+.change-tree-search.workspace-file-search input { font-size:11px; }
+.change-tree-scroll { min-height:0; overflow:auto; overscroll-behavior:contain; }
+.change-tree-group { margin-bottom:8px; }
+.change-tree-folder { display:flex; align-items:center; gap:5px; width:100%; padding:7px 5px; background:transparent; color:var(--muted); font-size:11px; border-radius:6px; }
+.change-tree-folder > span { overflow:hidden; white-space:nowrap; text-overflow:ellipsis; }
+.change-tree-folder:hover { color:var(--text); background:var(--hover); }
+.change-tree-folder > svg:first-child { transition:transform 180ms ease; }
+.change-tree-folder > svg.is-open { transform:rotate(90deg); }
+.change-tree-file { display:flex; align-items:center; gap:6px; padding:5px 7px; min-height:28px; width:100%; border-radius:6px; background:transparent; text-align:left; font-size:11px; }
+.change-tree-file > span:not(.change-count):not(.file-kind-icon) { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.change-tree-file:hover,.change-tree-file.is-selected { background:var(--hover); }
+.change-tree-file .change-count { font-size:10px; gap:4px; }
+.change-review-footer { display:flex; align-items:center; justify-content:space-between; gap:8px; padding:10px 14px; border-top:1px solid var(--review-line); font-size:11px; color:var(--muted); flex:none; }
+@container review (max-width:560px) {
+  .change-review-body.with-tree { grid-template-columns:minmax(0,1fr); grid-template-rows:auto minmax(0,1fr); }
+  .change-review-tree { grid-row:1; padding:10px; border-left:0; border-bottom:1px solid var(--review-line); max-height:200px; }
+  .change-tree-search.workspace-file-search { margin-bottom:6px; }
+  .change-review-scroll { grid-row:2; }
+  .change-review-body:not(.with-tree) .change-review-scroll { grid-row:1; }
+  .change-file-header { padding:9px 7px; gap:4px; }
+  .change-file-toggle { gap:6px; }
+  .change-file-header .change-count { font-size:11px; gap:4px; }
+  .change-review-toolbar { padding:8px 10px 12px; gap:8px; }
+  .change-context-bar small { display:none; }
+  .change-code-line { grid-template-columns:27px 27px 17px minmax(0,1fr); }
+}
+@media(prefers-reduced-motion:reduce) { .change-file-toggle > svg,.change-context-bar svg,.change-tree-folder svg { transition:none; } }

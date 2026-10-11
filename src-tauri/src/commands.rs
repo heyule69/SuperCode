@@ -823,6 +823,95 @@ fn contained_file(root: &Path, path: &str) -> Result<PathBuf, String> {
     contained_workspace_path(root, path, false)
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceEntry {
+    name: String,
+    path: String,
+    is_directory: bool,
+}
+
+#[derive(Serialize)]
+pub struct WorkspaceDirectory {
+    entries: Vec<WorkspaceEntry>,
+    truncated: bool,
+}
+
+fn workspace_directory(root: &Path, path: &str) -> Result<WorkspaceDirectory, String> {
+    let root = std::fs::canonicalize(root).map_err(|e| e.to_string())?;
+    let directory = contained_workspace_path(&root, path, true)?;
+    if !directory.is_dir() {
+        return Err("请选择工作空间内的文件夹".into());
+    }
+    let mut entries = Vec::new();
+    let mut truncated = false;
+    // Read one level on demand, with bounded scanning and output for large directories.
+    for (scanned, entry) in std::fs::read_dir(directory)
+        .map_err(|e| e.to_string())?
+        .enumerate()
+    {
+        if scanned >= 4096 {
+            truncated = true;
+            break;
+        }
+        let entry = entry.map_err(|e| e.to_string())?;
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| "文件名不是 UTF-8，未修改文件编码")?;
+        if matches!(name.as_str(), ".git" | ".supercode") {
+            continue;
+        }
+        let kind = entry.file_type().map_err(|e| e.to_string())?;
+        if kind.is_symlink() || !(kind.is_file() || kind.is_dir()) {
+            continue;
+        }
+        // Do not follow symlinks or Windows junctions outside the workspace.
+        let resolved = match std::fs::canonicalize(entry.path()) {
+            Ok(resolved) if resolved.starts_with(&root) => resolved,
+            _ => continue,
+        };
+        if !(resolved.is_file() || resolved.is_dir()) {
+            continue;
+        }
+        entries.push(WorkspaceEntry {
+            name,
+            path: entry
+                .path()
+                .strip_prefix(&root)
+                .map_err(|e| e.to_string())?
+                .to_string_lossy()
+                .replace('\\', "/"),
+            is_directory: resolved.is_dir(),
+        });
+    }
+    entries.sort_by(|a, b| {
+        b.is_directory
+            .cmp(&a.is_directory)
+            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    truncated |= entries.len() > 500;
+    entries.truncate(500);
+    Ok(WorkspaceDirectory { entries, truncated })
+}
+
+#[tauri::command]
+pub async fn list_workspace_directory(
+    project_id: String,
+    session_id: Option<String>,
+    path: String,
+    state: State<'_, AppState>,
+) -> Result<WorkspaceDirectory, String> {
+    let root = state
+        .store
+        .workspace(&project_id, session_id.as_deref())?
+        .path;
+    tauri::async_runtime::spawn_blocking(move || workspace_directory(Path::new(&root), &path))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
 fn contained_workspace_path(root: &Path, path: &str, directory: bool) -> Result<PathBuf, String> {
     let root = std::fs::canonicalize(root).map_err(|e| e.to_string())?;
     let candidate = std::fs::canonicalize(root.join(path)).map_err(|e| e.to_string())?;
@@ -1065,6 +1154,38 @@ mod tests {
             ["nested/result.html", "中文.txt"]
         );
         // The exact temporary directory is owned by this test.
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn directory_browsing_is_lazy_sorted_bounded_and_contained() {
+        let base = std::env::temp_dir().join(format!("supercode-tree-{}", uuid::Uuid::new_v4()));
+        let root = base.join("workspace");
+        std::fs::create_dir_all(root.join("文件夹")).unwrap();
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::write(root.join("文件夹/child.txt"), "中文").unwrap();
+        std::fs::write(root.join("report.md"), "content").unwrap();
+        let listing = workspace_directory(&root, ".").unwrap();
+        assert_eq!(
+            listing
+                .entries
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>(),
+            ["文件夹", "report.md"]
+        );
+        assert!(!listing.truncated);
+        assert!(listing.entries[0].is_directory);
+        let nested = workspace_directory(&root, "文件夹").unwrap();
+        assert_eq!(nested.entries[0].path, "文件夹/child.txt");
+        assert!(workspace_directory(&root, "..").is_err());
+        assert!(workspace_directory(&root, "report.md").is_err());
+        for number in 0..510 {
+            std::fs::write(root.join(format!("file-{number:03}.txt")), "x").unwrap();
+        }
+        let listing = workspace_directory(&root, ".").unwrap();
+        assert_eq!(listing.entries.len(), 500);
+        assert!(listing.truncated);
         std::fs::remove_dir_all(base).unwrap();
     }
 }

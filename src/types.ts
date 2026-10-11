@@ -16,6 +16,8 @@ export interface ProviderSettings { id: string | null; name: string; agent: stri
 export type PermissionMode = 'read' | 'ask' | 'strict' | 'auto' | 'edit' | 'deny' | 'full';
 export interface Model { id: string; model: string; displayName: string; isDefault: boolean; defaultReasoningEffort?: string; supportedReasoningEfforts?: { reasoningEffort: string; description?: string }[] }
 export interface Changes { isGit: boolean; branch: string; files: { path: string; status: string }[]; diff: string }
+export interface WorkspaceEntry { name: string; path: string; isDirectory: boolean }
+export interface WorkspaceDirectory { entries: WorkspaceEntry[]; truncated: boolean }
 export interface RpcEvent { id?: string | number; method: string; params: Record<string, any> }
 export interface RuntimeInfo { running: boolean; pid: number | null; shellBytes: number; agentBytes: number; requests: RpcEvent[]; idleReleaseSeconds: number; memoryMetric: string }
 export const isActive = (status?: string) => ['starting', 'running', 'waiting'].includes(status ?? '');

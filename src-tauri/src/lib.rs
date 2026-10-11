@@ -364,6 +364,7 @@ pub fn run() {
             providers::get_model_source,
             commands::workspace_changes,
             commands::read_project_file,
+            commands::list_workspace_directory,
             commands::open_project_path,
             commands::rename_session,
             commands::archive_session,

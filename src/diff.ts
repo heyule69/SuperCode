@@ -1,6 +1,19 @@
 function gitPath(value: string) {
   if (!value.startsWith('"')) return value;
-  try { return JSON.parse(value) as string; } catch { return value.slice(1, -1); }
+  try {
+    // Parse C escapes in order so an escaped backslash is never an octal byte.
+    let result = '', bytes: number[] = [];
+    const flush = () => { if (bytes.length) { result += new TextDecoder('utf-8', { fatal: true }).decode(new Uint8Array(bytes)); bytes = []; } };
+    const escapes: Record<string, string> = { '\\': '\\', '"': '"', n: '\n', r: '\r', t: '\t', b: '\b', f: '\f', v: '\v', a: '\x07' };
+    for (let index = 1; index < value.length - 1; index++) {
+      if (value[index] === '\\') {
+        const octal = /^[0-7]{3}/.exec(value.slice(index + 1));
+        if (octal) { bytes.push(parseInt(octal[0], 8)); index += 3; continue; }
+        flush(); result += escapes[value[++index]] ?? value[index];
+      } else { flush(); result += value[index]; }
+    }
+    flush(); return result;
+  } catch { return value.slice(1, -1); }
 }
 export function diffFiles(diff: string) {
   const files: { path: string; added: number; removed: number; diff: string }[] = [];

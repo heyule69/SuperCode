@@ -434,13 +434,13 @@ async fn inspect_panels_and_escape(
     evaluate(
         app,
         &renderer(),
-        "document.querySelector('[aria-label=\"展开变更面板\"]')?.click();true".into(),
+        "document.querySelector('[aria-label=\"打开工作空间\"]')?.click();true".into(),
         None,
         None,
     )
     .await?;
     tokio::time::sleep(Duration::from_millis(500)).await;
-    if evaluate(app, &renderer(), "!!document.querySelector('[aria-label=\"文件变更\"]') && !!document.querySelector('[aria-label=\"内置浏览器\"]') && !document.querySelector('[aria-label=\"内置浏览器\"]').classList.contains('context-panel')".into(), None, None).await? != true {
+    if evaluate(app, &renderer(), "!!document.querySelector('[aria-label=\"工作空间\"]') && !!document.querySelector('[aria-label=\"内置浏览器\"]') && !document.querySelector('[aria-label=\"内置浏览器\"]').classList.contains('context-panel')".into(), None, None).await? != true {
         return Err("Browser and file changes are not separate visible panels".into());
     }
     let original = app
@@ -452,7 +452,7 @@ async fn inspect_panels_and_escape(
     let context = serde_json::to_string(&json!({"sessionId":session,"settingsOpen":false})).unwrap();
     evaluate(app, &renderer(), format!("(async()=>{{await window.__TAURI_INTERNALS__.invoke('update_notification_context',{{context:{context}}});return true}})()"), None, None).await?;
     crate::desktop_lifecycle::show_window(app, &page.window)?;
-    for label in ["全屏查看网页", "返回分屏", "收起变更面板", "展开变更面板"]
+    for label in ["全屏查看网页", "返回分屏", "收起工作空间", "打开工作空间"]
     {
         let script = format!("document.querySelector('[aria-label=\"{label}\"]')?.click();true");
         evaluate(app, &renderer(), script, None, None).await?;
@@ -460,7 +460,7 @@ async fn inspect_panels_and_escape(
         if !page.visible.load(Ordering::Acquire) || app.get_webview(&original).is_none() {
             return Err(format!("Panel action {label} discarded the native browser"));
         }
-        if label != "收起变更面板" && evaluate(app, &renderer(), "(()=>{const b=document.querySelector('[aria-label=\"内置浏览器\"]')?.getBoundingClientRect(),r=document.querySelector('[aria-label=\"文件变更\"]')?.getBoundingClientRect();return !!b&&!!r&&b.right<=r.left+1})()".into(), None, None).await? != true {
+        if label != "收起工作空间" && evaluate(app, &renderer(), "(()=>{const b=document.querySelector('[aria-label=\"内置浏览器\"]')?.getBoundingClientRect(),r=document.querySelector('[aria-label=\"工作空间\"]')?.getBoundingClientRect();return !!b&&!!r&&b.right<=r.left+1})()".into(), None, None).await? != true {
             return Err(format!("Browser covers the file changes after {label}"));
         }
     }

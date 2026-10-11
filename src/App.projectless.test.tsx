@@ -3,7 +3,7 @@ import { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import App from './App';
-import { call } from './api';
+import { call, subscribe } from './api';
 import type { Bootstrap, Message, Session, RpcEvent } from './types';
 import { PROVIDER_REQUIRED } from './chatConnection';
 
@@ -15,9 +15,11 @@ vi.mock('./PlatformUsageView', () => ({ PlatformUsageIndicator:()=> <span data-t
 vi.mock('./AppUpdate', () => ({ default:()=>null, AppUpdateNotice:()=>null }));
 let root: Root, container: HTMLDivElement, data: Bootstrap, messages: Message[], providerMissing: boolean;
 let pendingRequests: RpcEvent[];
+let notify: (event: RpcEvent) => void;
 beforeEach(() => {
   (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
   localStorage.clear(); vi.mocked(call).mockClear(); messages = []; pendingRequests = []; providerMissing = false;
+  vi.mocked(subscribe).mockImplementation(async handler => { notify = handler; return () => {}; });
   data = { projects:[{id:'existing',name:'已有项目',path:'D:/existing'}],sessions:[],agents:[],profiles:[{id:'api:claude',agent:'claude',name:'Test API',model:'test-model',hasCredential:true,current:true}],officialAgents:[],connectionOrder:{},sidebar:{ projects:{}, sessions:{}, sections:[] },codexPath:null,loadMcp:false } as Bootstrap;
   vi.mocked(call).mockImplementation(async (command, args={}) => {
     if (command==='bootstrap') return structuredClone(data);
@@ -49,7 +51,7 @@ beforeEach(() => {
   });
   container = document.createElement('div'); document.body.append(container); root = createRoot(container);
 });
-afterEach(async () => { await act(async()=>root.unmount()); container.remove(); });
+afterEach(async () => { await act(async()=>root.unmount()); container.remove(); vi.restoreAllMocks(); });
 async function render() { await act(async()=>{root.render(<App/>); await new Promise(resolve=>setTimeout(resolve,30));}); }
 async function type(text: string) {
   const textarea = container.querySelector<HTMLTextAreaElement>('.composer textarea')!;
@@ -58,33 +60,68 @@ async function type(text: string) {
 async function send() {
   await act(async()=>{container.querySelector<HTMLFormElement>('.composer')!.dispatchEvent(new Event('submit',{bubbles:true,cancelable:true}));await new Promise(resolve=>setTimeout(resolve,30));});
 }
+it('shows turn changes above the composer while running and preserves the separate workspace diff', async () => {
+  vi.spyOn(window,'matchMedia').mockImplementation(()=>({matches:false,addEventListener:()=>{},removeEventListener:()=>{}} as unknown as MediaQueryList));
+  localStorage.setItem('supercode.context','true'); localStorage.setItem('supercode.workspace-view','changes'); localStorage.setItem('supercode.session','chat');
+  data.sessions=[{id:'chat',projectId:'existing',title:'正在修改',agent:'codex',connectionId:'api:claude',model:null,status:'running',nativeId:'native',turnId:'t',updatedAt:1}];
+  messages=[{id:'u',seq:1,sessionId:'chat',role:'user',kind:'userMessage',text:'编辑文件',data:{}},{id:'run-t',seq:2,sessionId:'chat',role:'activity',kind:'runMarker',text:'',data:{turnId:'t',status:'inProgress'}}];
+  const fallback=vi.mocked(call).getMockImplementation()!;
+  vi.mocked(call).mockImplementation(async(command,args)=>command==='workspace_changes'?{isGit:true,branch:'main',files:[{path:'old.ts',status:'M'}],diff:'diff --git a/old.ts b/old.ts\n@@ -1 +1 @@\n-old\n+existing'}:fallback(command,args));
+  await render(); await act(async()=>{await vi.dynamicImportSettled();});
+  const diff='diff --git a/live.ts b/live.ts\n@@ -1 +1 @@\n-before\n+current';
+  await act(async()=>{notify({method:'turn/diff/updated',params:{threadId:'native',turnId:'t',diff}});await new Promise(resolve=>setTimeout(resolve,80));await vi.dynamicImportSettled();});
+  await act(async()=>{await vi.dynamicImportSettled();});
+  const dock=container.querySelector('.composer-area .turn-change-dock')!;
+  expect(dock.textContent).toContain('1 个文件已更改');
+  expect(dock.compareDocumentPosition(container.querySelector('.composer')!) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  expect(container.querySelector('.change-file-header')?.textContent).toContain('old.ts');
+  await act(async()=>dock.querySelector<HTMLButtonElement>('.turn-change-chip')!.click());
+  expect(dock.textContent).toContain('live.ts'); expect(dock.textContent).not.toContain('old.ts');
+  await act(async()=>{dock.querySelector<HTMLButtonElement>('[role="menuitem"]')!.click();await vi.dynamicImportSettled();});
+  expect(container.querySelector('[aria-label="代码差异"] .change-code-line.added code')?.textContent).toBe('current');
+});
+it('reloads persisted adapter edit snapshots during a turn without waiting for completion', async () => {
+  localStorage.setItem('supercode.session','chat');
+  data.sessions=[{id:'chat',projectId:'existing',title:'实时编辑',agent:'claude',connectionId:'api:claude',model:null,status:'running',nativeId:'native',turnId:'t',updatedAt:1}];
+  messages=[{id:'u',seq:1,sessionId:'chat',role:'user',kind:'userMessage',text:'编辑文件',data:{}},{id:'run-t',seq:2,sessionId:'chat',role:'activity',kind:'runMarker',text:'',data:{turnId:'t',status:'inProgress'}}];
+  await render();
+  messages.push({id:'change-t:live.ts',seq:3,sessionId:'chat',role:'activity',kind:'turnDiff',text:'diff --git a/live.ts b/live.ts\n@@ -0,0 +1 @@\n+new',data:{turnId:'t',path:'live.ts'}});
+  const before=vi.mocked(call).mock.calls.filter(([command])=>command==='list_messages').length;
+  await act(async()=>{
+    notify({method:'item/completed',params:{threadId:'native',turnId:'t',item:{id:'edit1',type:'claudeToolCall',tool:'Edit',status:'completed'}}});
+    notify({method:'item/completed',params:{threadId:'native',turnId:'t',item:{id:'edit2',type:'claudeToolCall',tool:'Write',status:'completed'}}});
+    await new Promise(resolve=>setTimeout(resolve,260));await vi.dynamicImportSettled();
+  });
+  expect(container.querySelector('.turn-change-dock')?.textContent).toContain('1 个文件已更改');
+  expect(vi.mocked(call).mock.calls.filter(([command])=>command==='list_messages')).toHaveLength(before+1);
+});
 it('keeps browser and file changes independent, including fullscreen and closing either panel', async () => {
   const media = vi.spyOn(window, 'matchMedia').mockImplementation(() => ({matches:false,addEventListener:()=>{},removeEventListener:()=>{}} as unknown as MediaQueryList));
   localStorage.setItem('supercode.context', 'true');
   localStorage.setItem('supercode.session', 'chat');
   data.sessions = [{id:'chat',projectId:'existing',title:'面板测试',agent:'claude',connectionId:'api:claude',model:null,status:'idle',nativeId:null,turnId:null,updatedAt:1}];
   await render();
-  expect(container.querySelector('[aria-label="文件变更"]')).not.toBeNull();
+  expect(container.querySelector('[aria-label="工作空间"]')).not.toBeNull();
   await act(async () => { container.querySelector<HTMLButtonElement>('[aria-label="打开内置浏览器"]')!.click(); await vi.dynamicImportSettled(); await new Promise(resolve=>setTimeout(resolve,30)); });
   const browser = container.querySelector('[aria-label="内置浏览器"]')!;
   expect(browser).not.toBeNull();
   expect(browser.querySelector('.context-tabs')).toBeNull();
   expect(browser.textContent).not.toContain('文件变更');
   expect(browser.parentElement?.classList.contains('conversation-surface')).toBe(true);
-  expect(container.querySelector('[aria-label="文件变更"]')?.parentElement).toBe(container.querySelector('.app'));
+  expect(container.querySelector('[aria-label="工作空间"]')?.parentElement).toBe(container.querySelector('.app'));
   await act(async () => container.querySelector<HTMLButtonElement>('[aria-label="全屏查看网页"]')!.click());
   expect(browser.classList.contains('browser-expanded')).toBe(true);
-  expect(container.querySelector('[aria-label="文件变更"]')).not.toBeNull();
-  await act(async () => container.querySelector<HTMLButtonElement>('[aria-label="收起变更面板"]')!.click());
-  expect(container.querySelector('[aria-label="文件变更"]')).toBeNull();
+  expect(container.querySelector('[aria-label="工作空间"]')).not.toBeNull();
+  await act(async () => container.querySelector<HTMLButtonElement>('[aria-label="收起工作空间"]')!.click());
+  expect(container.querySelector('[aria-label="工作空间"]')).toBeNull();
   expect(container.querySelector('[aria-label="内置浏览器"]')).toBe(browser);
   expect(call).toHaveBeenCalledWith('browser_open', expect.objectContaining({sessionId:'chat'}));
   expect(vi.mocked(call).mock.calls.filter(([command])=>command==='browser_open')).toHaveLength(1);
   expect(call).not.toHaveBeenCalledWith('browser_close', expect.anything());
-  await act(async () => container.querySelector<HTMLButtonElement>('[aria-label="展开变更面板"]')!.click());
+  await act(async () => container.querySelector<HTMLButtonElement>('[aria-label="打开工作空间"]')!.click());
   await act(async () => container.querySelector<HTMLButtonElement>('[aria-label="关闭浏览器"]')!.click());
   expect(container.querySelector('[aria-label="内置浏览器"]')).toBeNull();
-  expect(container.querySelector('[aria-label="文件变更"]')).not.toBeNull();
+  expect(container.querySelector('[aria-label="工作空间"]')).not.toBeNull();
   media.mockRestore();
 });
 it('docks questions above the composer while keeping approvals in the conversation and restores the composer after answering', async () => {
@@ -136,8 +173,8 @@ it('starts an unbound draft from the direct chat section even when a project is 
   await render();
   expect(container.querySelector('[aria-label="选择项目"]')?.textContent).toBe('已有项目');
   expect(container.querySelector('.sidebar-projects')?.textContent).toContain('已有项目');
-  expect(container.querySelector('.sidebar-direct')?.textContent).toContain('暂无对话');
-  await act(async()=>container.querySelector<HTMLButtonElement>('[aria-label="新建直接对话"]')!.click());
+  expect(container.querySelector('.sidebar-direct')?.textContent).toContain('开始一个新任务');
+  await act(async()=>container.querySelector<HTMLButtonElement>('[aria-label="新建任务"]')!.click());
   expect(container.querySelector('[aria-label="选择项目"]')?.textContent).toBe('SuperCode');
   expect(call).not.toHaveBeenCalledWith('create_session', expect.anything());
 });

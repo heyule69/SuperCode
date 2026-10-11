@@ -1,6 +1,7 @@
 .desktop-workarea .sidebar,.context-panel,.side-chat{position:relative;min-width:0}
 .desktop-workarea .sidebar{border-right:0}
-.desktop-workarea .context-panel,.desktop-workarea .side-chat{border-left:0}
+.desktop-workarea .context-panel{border-left:1px solid var(--line)}
+.desktop-workarea .side-chat{border-left:0}
 .panel-resize-handle{position:absolute;top:0;bottom:0;width:7px;z-index:12;cursor:col-resize;touch-action:none;background:transparent;border:0;box-shadow:none;outline:none}
 .panel-resize-handle.left{right:-3px}
 .panel-resize-handle.right{left:-3px}

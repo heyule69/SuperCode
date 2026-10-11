@@ -5,6 +5,8 @@ import { call, desktop } from './api';
 import { exportFilename, projectSessions, sidebarAreas, type SidebarGroup } from './sidebarState';
 import { isActive, type ArchivedSession, type Project, type Session, type SidebarSection, type SidebarState } from './types';
 import { SessionIndicator } from './SessionIndicator';
+import { Collapsible } from './Collapsible';
+import { sidebarTime } from './sidebarTime';
 
 type Target = { kind: 'project'; item: Project } | { kind: 'session'; item: Session } | { kind: 'section'; item: SidebarSection } | { kind: 'root' };
 type SessionDialog = { [Kind in 'rename' | 'share' | 'delete']: { kind: Kind; session: Session } }['rename' | 'share' | 'delete'];
@@ -37,6 +39,18 @@ export function Sidebar(props: SidebarProps) {
   const current = useRef(props); current.current = props;
   const actionLock = useRef(false);
   const layerId = useId();
+  const [collapsedAreas, setCollapsedAreas] = useState<string[]>(() => {
+    try { const saved: unknown = JSON.parse(localStorage.getItem('supercode.sidebar-sections') ?? '[]'); return Array.isArray(saved) ? saved.filter((item): item is string => typeof item === 'string') : []; }
+    catch { return []; }
+  });
+  const regionId = useId();
+  function toggleArea(area: string) {
+    setCollapsedAreas(old => {
+      const next = old.includes(area) ? old.filter(item => item !== area) : [...old, area];
+      localStorage.setItem('supercode.sidebar-sections', JSON.stringify(next));
+      return next;
+    });
+  }
 
   function closeMenu(restore = false) { if (restore) menu?.origin.focus({ preventScroll: true }); setMenu(null); setSub(null); setError(''); setFeedback(''); }
   function show(event: MouseEvent, target: Target, fromButton = false) {
@@ -217,7 +231,7 @@ export function Sidebar(props: SidebarProps) {
     const meta = state.sessions[session.id];
     return <div className={`sidebar-chat-row ${session.id === sessionId ? 'selected' : ''} ${meta?.unread && !isActive(session.status) ? 'unread' : ''}`} key={session.id} onContextMenu={e => show(e, { kind: 'session', item: session })}>
       <button className={`session-row ${session.id === sessionId ? 'selected' : ''}`} aria-current={session.id === sessionId ? 'page' : undefined} onClick={() => void selectSession(session)} title={session.title}>
-        <span className="session-title">{session.title}{standalone && session.projectId ? <small>{projects.find(p => p.id === session.projectId)?.name}</small> : null}</span><SessionIndicator status={session.status} unread={meta?.unread}/>{session.status === 'waiting' ? <span className="waiting-badge" aria-label="需要确认">!</span> : null}
+        <span className="session-title">{session.title}{standalone && session.projectId ? <small>{projects.find(p => p.id === session.projectId)?.name}</small> : null}</span>{!isActive(session.status) ? <time className="sidebar-session-time" dateTime={Number.isFinite(session.updatedAt) && session.updatedAt > 0 && session.updatedAt < 8.64e12 ? new Date(session.updatedAt * 1000).toISOString() : undefined}>{sidebarTime(session.updatedAt)}</time> : null}<SessionIndicator status={session.status} unread={meta?.unread}/>{session.status === 'waiting' ? <span className="waiting-badge" aria-label="需要确认">!</span> : null}
       </button>
       <button className="sidebar-row-menu" aria-label={`${session.title} 的菜单`} onClick={e => show(e, { kind: 'session', item: session }, true)}><MoreHorizontal size={15}/></button>
     </div>;
@@ -235,11 +249,11 @@ export function Sidebar(props: SidebarProps) {
     return <div className="project-group" key={project.id}>
       <div className="project-heading" onContextMenu={e => show(e, { kind: 'project', item: project })}>
         <button className="icon-button project-folder" aria-label={`${expanded ? '收起' : '展开'} ${project.name} 的会话`} title={expanded ? '收起项目会话' : '展开项目会话'} aria-expanded={expanded} onClick={e => { if (e.detail < 2) toggleProject(project.id); }}><span className="project-folder-glyph" aria-hidden="true"><FolderClosed className="project-folder-closed" size={18}/><FolderOpen className="project-folder-open" size={18}/></span></button>
-        <button className={`project-row ${project.id === projectId ? 'active' : ''}`} aria-expanded={expanded} onClick={e => { if (e.detail < 2) { toggleProject(project.id); activateProject(project); } }} title={`${project.path} · 单击展开或收起会话`}><span>{project.name}</span></button>
+        <button className={`project-row ${project.id === projectId ? 'active' : ''}`} aria-expanded={expanded} onClick={e => { if (e.detail < 2) { toggleProject(project.id); activateProject(project); } }} title={`${project.path} · 单击展开或收起会话`}><span>{project.name}</span><ChevronRight size={13} className={`sidebar-project-chevron ${expanded ? 'is-open' : ''}`}/></button>
         <button className="sidebar-row-menu" aria-label={`${project.name} 的项目菜单`} onClick={e => show(e, { kind: 'project', item: project }, true)}><MoreHorizontal size={15}/></button>
         <button className="sidebar-row-menu project-new-chat" aria-label={`在 ${project.name} 中新建聊天`} title="新建聊天" onClick={() => void createSession(project)}><SquarePen size={16}/></button>
       </div>
-      {expanded ? <div className="session-list">{projectSessions(project.id, sessions, state).map(s => chatRow(s))}</div> : null}
+      <Collapsible open={expanded}><div className="session-list">{projectSessions(project.id, sessions, state).map(s => chatRow(s))}</div></Collapsible>
     </div>;
   }
   function renderGroup(group: SidebarGroup, direct = false) {
@@ -253,13 +267,13 @@ export function Sidebar(props: SidebarProps) {
   const shownArchives = archives.filter(row => `${row.session.title} ${row.projectName}`.toLowerCase().includes(archiveSearch.toLowerCase()));
   return <>
     <div className="sidebar-navigation">
-      <section className="sidebar-projects sidebar-region" aria-label="项目列表">
-        <div className="sidebar-section-label"><span>项目</span><div><button className="icon-button" aria-label="侧栏管理" onClick={e => show(e, { kind: 'root' }, true)}><MoreHorizontal size={15}/></button><button className="icon-button" title="添加项目" onClick={addProject}><Plus size={15}/></button></div></div>
-        <div className="project-list sidebar-items">{!ready ? <div className="sidebar-loading" role="status">正在加载项目…</div> : areas.projects.map(group => renderGroup(group))}{ready && !projects.length ? <button className="empty-project" onClick={addProject}><FolderOpen size={22}/><span>添加项目</span></button> : null}</div>
+      <section className="sidebar-direct sidebar-region" aria-label="任务列表">
+        <div className="sidebar-section-label"><button className="sidebar-section-toggle" aria-expanded={!collapsedAreas.includes('tasks')} aria-controls={`${regionId}-tasks`} onClick={() => toggleArea('tasks')}><span>任务</span><small>{sessions.filter(item => !item.projectId).length}</small><ChevronRight size={13} className={!collapsedAreas.includes('tasks') ? 'is-open' : ''}/></button><div><button className="icon-button" aria-label="新建任务" title="新建任务" disabled={!ready || blocked} onClick={() => void createSession()}><Plus size={15}/></button></div></div>
+        <Collapsible id={`${regionId}-tasks`} open={!collapsedAreas.includes('tasks')}><div className="sidebar-items">{!ready ? <div className="sidebar-loading" role="status">正在加载任务…</div> : areas.direct.length ? areas.direct.map(group => renderGroup(group, true)) : <span className="sidebar-direct-empty">开始一个新任务</span>}</div></Collapsible>
       </section>
-      <section className="sidebar-direct sidebar-region" aria-label="直接对话">
-        <div className="sidebar-section-label"><span>直接对话</span><div><button className="icon-button" aria-label="新建直接对话" title="新建直接对话" disabled={!ready || blocked} onClick={() => void createSession()}><Plus size={15}/></button></div></div>
-        <div className="project-list sidebar-items">{!ready ? <div className="sidebar-loading" role="status">正在加载对话…</div> : areas.direct.length ? areas.direct.map(group => renderGroup(group, true)) : <span className="sidebar-direct-empty">暂无对话</span>}</div>
+      <section className="sidebar-projects sidebar-region" aria-label="项目列表">
+        <div className="sidebar-section-label"><button className="sidebar-section-toggle" aria-expanded={!collapsedAreas.includes('projects')} aria-controls={`${regionId}-projects`} onClick={() => toggleArea('projects')}><span>项目</span><small>{projects.length}</small><ChevronRight size={13} className={!collapsedAreas.includes('projects') ? 'is-open' : ''}/></button><div><button className="icon-button" aria-label="侧栏管理" onClick={e => show(e, { kind: 'root' }, true)}><MoreHorizontal size={15}/></button><button className="icon-button" title="添加项目" onClick={addProject}><Plus size={15}/></button></div></div>
+        <Collapsible id={`${regionId}-projects`} open={!collapsedAreas.includes('projects')}><div className="sidebar-items">{!ready ? <div className="sidebar-loading" role="status">正在加载项目…</div> : areas.projects.map(group => renderGroup(group))}{ready && !projects.length ? <button className="empty-project" onClick={addProject}><FolderOpen size={22}/><span>添加项目</span></button> : null}</div></Collapsible>
       </section>
     </div>
     {error && !menu && !dialog ? <div className="sidebar-action-error" role="alert"><span>{error}</span><button className="icon-button" title="关闭提示" onClick={() => setError('')}><X size={13}/></button></div> : null}

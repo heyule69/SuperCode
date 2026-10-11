@@ -1,0 +1,42 @@
+.desktop-workarea > .app { grid-template-rows:minmax(0,1fr); transition:grid-template-columns 240ms cubic-bezier(.2,.7,.2,1); }
+.desktop-workarea > .app.panel-resizing { transition:none; }
+.desktop-workarea .sidebar { grid-column:1; grid-row:1; overflow:hidden; transition:opacity 170ms ease,visibility 0s; }
+.desktop-workarea .conversation-surface { grid-column:2; grid-row:1; }
+.desktop-workarea .context-panel,.desktop-workarea .side-chat { grid-column:3; grid-row:1; }
+.desktop-workarea .workspace-panel { background:var(--bg); min-width:0; transition:opacity 170ms ease,transform 240ms ease,visibility 0s,width 240ms ease; }
+.desktop-workarea .pane-collapsed { opacity:0; visibility:hidden; pointer-events:none; transition:opacity 150ms ease,visibility 0s 240ms; }
+.desktop-workarea .sidebar.pane-collapsed { padding-left:0; padding-right:0; }
+.desktop-workarea .workspace-panel[hidden] { display:none; }
+.desktop-workarea .sidebar-navigation { display:flex; flex-direction:column; gap:24px; min-height:0; flex:1; overflow:auto; overscroll-behavior:contain; scrollbar-width:thin; padding-bottom:18px; }
+.sidebar-navigation > .sidebar-region { flex:none; min-height:auto; }
+.smooth-collapse { display:grid; grid-template-rows:0fr; opacity:0; transition:grid-template-rows 220ms cubic-bezier(.2,.7,.2,1),opacity 150ms ease; }
+.smooth-collapse.is-open { grid-template-rows:1fr; opacity:1; }
+.smooth-collapse-inner { min-height:0; overflow:hidden; }
+.sidebar-section-toggle { display:flex; align-items:center; gap:6px; min-height:28px; padding:3px 0; background:transparent; color:var(--muted); text-align:left; font-size:12px; border-radius:6px; }
+.sidebar-section-toggle > span { font-weight:550; }
+.sidebar-section-toggle > small { font-size:11px; font-weight:400; }
+.sidebar-section-toggle:hover { color:var(--text); }
+.sidebar-section-toggle svg,.sidebar-project-chevron { transition:transform 200ms ease; }
+.sidebar-section-toggle .is-open,.sidebar-project-chevron.is-open { transform:rotate(90deg); }
+.sidebar .sidebar-section-label { padding-bottom:6px; }
+.sidebar .sidebar-section-label > div { opacity:0; transition:opacity 140ms ease; }
+.sidebar-region:hover > .sidebar-section-label > div,.sidebar-region:focus-within > .sidebar-section-label > div { opacity:1; }
+.sidebar-navigation .sidebar-chat-row { border-radius:9px; min-height:36px; }
+.sidebar-navigation .sidebar-chat-row.selected .session-title { font-weight:550; }
+.sidebar-navigation .sidebar-direct .session-row { padding:10px 12px; }
+.sidebar-navigation .sidebar-projects .session-row { padding-left:38px; }
+.sidebar-session-time { flex:none; margin-left:6px; font-size:10px; color:var(--muted); white-space:nowrap; font-weight:400; }
+.sidebar-chat-row:hover .sidebar-session-time,.sidebar-chat-row:focus-within .sidebar-session-time { visibility:hidden; }
+.sidebar-items .project-heading { min-height:36px; }
+.sidebar-items .project-heading .project-row { gap:8px; padding-right:12px; }
+.sidebar-project-chevron { flex:none; color:var(--muted); }
+.sidebar-items .project-heading:hover .sidebar-project-chevron,.sidebar-items .project-heading:focus-within .sidebar-project-chevron { visibility:hidden; }
+.sidebar-items .project-group { margin-bottom:8px; }
+.sidebar .empty-project { border:0; flex-direction:row; padding:12px; font-size:12px; gap:9px; }
+.sidebar .empty-project svg { width:18px; height:18px; }
+.sidebar-direct-empty { font-size:12px; opacity:.7; padding-top:10px; }
+@media(max-width:1100px) {
+  .desktop-workarea .app .workspace-panel { display:flex; position:absolute; right:0; top:0; bottom:0; width:var(--context-width,284px); z-index:60; border-left:1px solid var(--frame-line,var(--line)); box-shadow:-10px 0 35px #00000012; }
+  .desktop-workarea .app .workspace-panel.pane-collapsed { transform:translateX(100%); }
+}
+@media(prefers-reduced-motion:reduce) { .desktop-workarea > .app,.desktop-workarea .sidebar,.desktop-workarea .workspace-panel,.desktop-workarea .pane-collapsed,.smooth-collapse,.sidebar-section-toggle svg,.sidebar-project-chevron { transition:none; } }

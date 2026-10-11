@@ -1,5 +1,5 @@
 import { lazy, Suspense, useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
-import { Sparkles, ArrowUp, ArrowUpRight, FileCode2, Folder, GitBranch, Globe, LoaderCircle, MessageSquare, MoreHorizontal, PanelLeftOpen, PanelRightClose, PanelRightOpen, RefreshCw, Search, Square, SquarePen, Terminal, X } from 'lucide-react';
+import { Sparkles, ArrowUp, ArrowUpRight, Folder, Globe, MessageSquare, MoreHorizontal, PanelLeftOpen, PanelRightClose, PanelRightOpen, RefreshCw, Search, Square, SquarePen, Terminal, X } from 'lucide-react';
 import { call, desktop, subscribe } from './api';
 import { isDisplayEvent, mergeEvent } from './events';
 import { Conversation, JumpToLatest } from './Conversation';
@@ -49,8 +49,8 @@ const AgentSettings = lazy(() => import('./AgentSettings'));
 const ClientSettings = lazy(() => import('./ClientSettings'));
 const UsagePanel = lazy(() => import('./UsagePanel'));
 const QuotaPanel = lazy(() => import('./QuotaPanel'));
-const DiffView = lazy(() => import('./DiffView'));
-const SourceView = lazy(() => import('./SourceView'));
+const WorkspacePanel = lazy(() => import('./WorkspacePanel'));
+const TurnChangesDock = lazy(() => import('./TurnChangesDock'));
 
 const RequestCard = lazy(() => import('./RequestCard'));
 const QuestionDock = lazy(() => import('./QuestionDock'));
@@ -121,6 +121,9 @@ export default function App() {
   const [narrow, setNarrow] = useState(() => window.matchMedia('(max-width: 1100px)').matches);
   const [contextOverlay, setContextOverlay] = useState(false);
   const showContext = narrow ? contextOverlay : context;
+  const [workspaceExpanded, setWorkspaceExpanded] = useState(false);
+  const [workspaceMounted, setWorkspaceMounted] = useState(context);
+  useEffect(() => { if (showContext) setWorkspaceMounted(true); else setWorkspaceExpanded(false); }, [showContext]);
   const [browserSession,setBrowserSession]=useState<string|null>(null);
   const [browserExpanded,setBrowserExpanded]=useState(false);
   const showBrowser=!!sessionId && browserSession===sessionId;
@@ -175,7 +178,7 @@ export default function App() {
   const project = projects.find(p => p.id === projectId);
   const session = sessions.find(s => s.id === sessionId);
   const workspacePath = project?.path ?? session?.workspacePath ?? undefined;
-  const panels = usePanelResize(sidebar, !!(showContext || sideDraft), settingsOpen);
+  const panels = usePanelResize(sidebar, !!(showContext || sideDraft), settingsOpen, false, workspaceExpanded && !sideDraft);
   const browserDock = useBrowserDock(showBrowser, browserExpanded);
   useChatReadReceipt({ sessionId, status: session?.status, unread: !!sidebarState.sessions[sessionId]?.unread, throughSeq: messages.reduce((seq, message) => Math.max(seq, message.seq), 0), loading: messagesLoading, settingsOpen,
     onRead: id => setSidebarState(old => ({ ...old, sessions: { ...old.sessions, [id]: { ...old.sessions[id], unread: false } } })), onError: report });
@@ -302,6 +305,7 @@ export default function App() {
 
   useEffect(() => {
     let disposed = false; let off: (() => void) | undefined;
+    let changeTimer: ReturnType<typeof setTimeout> | undefined;
     void refresh().then(data => {
       if (disposed) return;
       const { session: first, project: p } = restoreWorkspace(data, savedWorkspace);
@@ -350,14 +354,23 @@ export default function App() {
         setRequests(old => old.filter(r => r.params.turnId !== p.turn.id));
         void refresh().catch(report);
       }
-      if (event.method === 'turn/diff/updated' && matches) setChanges(old => ({ ...old, diff: p.diff ?? old.diff }));
+      // Edit/Write snapshots are persisted before the tool event is emitted.
+      // Read them during the turn, coalescing rapid edits into one IPC request.
+      if (matches && event.method === 'item/completed' && p.item?.type === 'claudeToolCall' && ['Edit', 'Write'].includes(p.item.tool)) {
+        if (changeTimer) clearTimeout(changeTimer);
+        const selectedSession = current.current.sessionId;
+        changeTimer = setTimeout(() => {
+          if (disposed || current.current.sessionId !== selectedSession) return;
+          flush(); void loadMessages(selectedSession).catch(report);
+        }, 200);
+      }
     }, text => setLogs(old => [...old.slice(-199), text]), () => {
       setRequests([]); setRuntime(old => old ? { ...old, running: false } : old); flush(); void refresh().then(() => current.current.sessionId ? loadMessages(current.current.sessionId) : undefined).catch(report);
     }, () => { void sidebarUpdateRef.current().catch(report); }).then(cleanup => { if (disposed) cleanup(); else off = cleanup; }).catch(report);
-    return () => { disposed = true; off?.(); if (flushTimer.current) clearTimeout(flushTimer.current); queue.current = []; };
+    return () => { disposed = true; off?.(); if (changeTimer) clearTimeout(changeTimer); if (flushTimer.current) clearTimeout(flushTimer.current); queue.current = []; };
   }, [refresh, loadMessages, refreshChanges, refreshUsage, flush]);
 
-  useEffect(() => { if ((projectId || sessionId) && context) void refreshChanges(projectId); }, [projectId, sessionId, context, refreshChanges]);
+  useEffect(() => { if ((projectId || sessionId) && showContext) void refreshChanges(projectId); }, [projectId, sessionId, showContext, refreshChanges]);
   useLayoutEffect(() => { applyPreferences(prefs); const query = window.matchMedia('(prefers-color-scheme: dark)'); const update = () => applyPreferences(prefs); query.addEventListener('change', update); return () => query.removeEventListener('change', update); }, [prefs]);
   useEffect(() => {
     if (desktop) void call('update_notification_preferences', { preferences: notificationPreferences(prefs) }).catch(report);
@@ -686,7 +699,7 @@ export default function App() {
     const owner = workspaceSessionId || sessionId;
     try {
       if (systemDocument(path) && !/\.(txt|md|csv|html?)$/i.test(path)) { await call('open_project_path', { projectId: id, sessionId: owner || null, path, action: 'open' }); return; }
-      const text = await call<string>('read_project_file', { projectId: id, sessionId: owner || null, path }); if (current.current.sessionId === sessionId) { setPreview({ name: path, text, line }); if (workspaceSessionId) setSideDraft(null); if (narrow) setContextOverlay(true); else setContext(true); }
+      const text = await call<string>('read_project_file', { projectId: id, sessionId: owner || null, path }); if (current.current.sessionId === sessionId && current.current.projectId === projectId) { setPreview({ name: path, text, line }); if (workspaceSessionId) setSideDraft(null); if (narrow) setContextOverlay(true); else setContext(true); }
     } catch (e) { if (current.current.sessionId === sessionId) report(e); }
   }, [projectId, sessionId, narrow]);
   const openPath = useCallback(async (path: string, action: 'open' | 'reveal') => { await call('open_project_path', { projectId, sessionId: sessionId || null, path, action }); }, [projectId, sessionId]);
@@ -827,7 +840,7 @@ export default function App() {
     ] },
     { label: '视图', items: [
       { label: '显示侧栏', shortcut: 'Ctrl+B', checked: sidebar, run: () => setSidebar(v => !v) },
-      { label: '文件变更', checked: showContext, disabled: settingsOpen, run: () => narrow ? setContextOverlay(v => !v) : setContext(v => !v) },
+      { label: '工作空间', checked: showContext, disabled: settingsOpen, run: () => narrow ? setContextOverlay(v => !v) : setContext(v => !v) },
       { label: '运行日志', checked: logsOpen, disabled: settingsOpen, run: () => setLogsOpen(v => !v) },
       { label: '外观', divider: true, run: () => { setSettingsTab('appearance'); openSettings(); } },
       { label: '资源与进程', run: () => { setSettingsTab('resources'); openSettings(); } },
@@ -839,17 +852,17 @@ export default function App() {
   ];
 
   return <div className="desktop-shell"><DesktopTitleBar menus={desktopMenus} back={() => void navigate(-1)} forward={() => void navigate(1)} canBack={settingsOpen || navigation.index > 0} canForward={navigation.index < navigation.entries.length - 1} sidebar={sidebar} toggleSidebar={() => setSidebar(v => !v)} blocked={!!modal || sidebarDialog} report={report}/><div className="desktop-workarea"><ActivityRail settings={settingsOpen} blocked={!!modal || sidebarDialog} home={() => setSettingsOpen(false)} create={() => { setSettingsOpen(false); void newSession(); }} search={() => setModal('search')} projects={() => { setSettingsOpen(false); setSidebar(true); }} preferences={() => { setSettingsTab('general'); openSettings(); }}/><div ref={panels.root} className={`app ${settingsOpen ? 'settings-open' : ''} ${sidebar ? '' : 'sidebar-hidden'} ${showContext || sideDraft ? '' : 'context-hidden'} ${sideDraft?'has-side-chat':''}`}>
-    {sidebar ? <aside className="sidebar" hidden={settingsOpen} inert={!!modal || sidebarDialog}>
+    <aside className={`sidebar ${sidebar ? "" : "pane-collapsed"}`} hidden={settingsOpen} aria-hidden={!sidebar} inert={!sidebar || !!modal || sidebarDialog}>
       {!settingsOpen ? <div {...panels.handle('left')}/> : null}
       <div className="brand"><span>SuperCode</span><button className="icon-button brand-search" aria-label="搜索会话" title="搜索会话 (Ctrl+K)" onClick={() => setModal('search')}><Search size={16}/></button></div>
       <button className="new-chat" title="新建聊天 (Ctrl+N)" onClick={() => void newSession()}><SquarePen size={15} />新聊天</button>
       <Sidebar projects={projects} sessions={sessions} state={sidebarState} projectId={projectId} sessionId={sessionId} ready={ready} blocked={!!modal || settingsOpen} collapsed={collapsedProjects} setCollapsed={setCollapsedProjects} selectProject={selectProject} selectSession={selectSession} addProject={() => void addProject()} createSession={newSession} updated={reconcileSidebar} dialogChanged={setSidebarDialog}/>
-    </aside> : null}
+    </aside>
 
     <div ref={browserDock.root} className={`conversation-surface${showBrowser ? ' has-browser' : ''}`} hidden={settingsOpen}>
     <main className={`workspace${newChat ? ' new-chat-page' : ''}`} hidden={settingsOpen} inert={!!modal || sidebarDialog}>
       {desktop ? <AppUpdateNotice open={() => { setSettingsTab('about'); openSettings(); }}/> : null}
-      <header className="workspace-header"><div className="breadcrumbs">{!sidebar ? <button className="icon-button" title="展开侧栏" onClick={() => setSidebar(true)}><PanelLeftOpen size={18} /></button> : null}<Folder size={15} /><strong title={`${project?.name ?? '工作区'} · ${session?.title ?? '新会话'}`}>{session?.title ?? project?.name ?? '新聊天'}</strong>{!desktop ? <span className="preview-badge">界面预览</span> : null}</div><div className="header-actions"><button className={`icon-button ${showBrowser ? 'on' : ''}`} aria-label="打开内置浏览器" aria-pressed={showBrowser} title={showBrowser ? '收起浏览器' : '内置浏览器'} disabled={!desktop || !sessionId} onClick={()=>{setBrowserSession(showBrowser ? null : sessionId);setBrowserExpanded(false);}}><Globe size={16}/></button>{session ? <button className="icon-button" title="会话设置" onClick={() => { setRename(session.title); setModal('rename'); }}><MoreHorizontal size={18} /></button> : null}<button className={`icon-button ${logsOpen ? 'on' : ''}`} title="运行日志" onClick={() => setLogsOpen(v => !v)}><Terminal size={16} /></button><button className="icon-button" aria-label={showContext ? '收起变更面板' : '展开变更面板'} aria-pressed={showContext} title={showContext ? '收起变更面板' : '展开变更面板'} onClick={() => { if(narrow)setContextOverlay(v => !v);else setContext(v => !v); }}>{showContext ? <PanelRightClose size={17} /> : <PanelRightOpen size={17} />}</button></div></header>
+      <header className="workspace-header"><div className="breadcrumbs">{!sidebar ? <button className="icon-button" title="展开侧栏" onClick={() => setSidebar(true)}><PanelLeftOpen size={18} /></button> : null}<Folder size={15} /><strong title={`${project?.name ?? '工作区'} · ${session?.title ?? '新会话'}`}>{session?.title ?? project?.name ?? '新聊天'}</strong>{!desktop ? <span className="preview-badge">界面预览</span> : null}</div><div className="header-actions"><button className={`icon-button ${showBrowser ? 'on' : ''}`} aria-label="打开内置浏览器" aria-pressed={showBrowser} title={showBrowser ? '收起浏览器' : '内置浏览器'} disabled={!desktop || !sessionId} onClick={()=>{setBrowserSession(showBrowser ? null : sessionId);setBrowserExpanded(false);}}><Globe size={16}/></button>{session ? <button className="icon-button" title="会话设置" onClick={() => { setRename(session.title); setModal('rename'); }}><MoreHorizontal size={18} /></button> : null}<button className={`icon-button ${logsOpen ? 'on' : ''}`} title="运行日志" onClick={() => setLogsOpen(v => !v)}><Terminal size={16} /></button><button className="icon-button" aria-label={showContext ? '收起工作空间' : '打开工作空间'} aria-pressed={showContext} title={showContext ? '收起工作空间' : '打开工作空间'} onClick={() => { if(narrow)setContextOverlay(v => !v);else setContext(v => !v); }}>{showContext ? <PanelRightClose size={17} /> : <PanelRightOpen size={17} />}</button></div></header>
       <div className="chat-scroll" aria-busy={!ready} ref={scrollArea} onClickCapture={e => { if ((e.target as Element).closest('.activity-row, .activity-group-summary, .activity-toggle-more, .turn-process-toggle')) stickToBottom.current = false; }} onScroll={() => { if (settingsOpenRef.current) return; const el = scrollArea.current; if (el) { stickToBottom.current = el.scrollHeight - el.scrollTop - el.clientHeight < 100; setShowJump(!stickToBottom.current); } }}>
         {!ready ? <div className="startup-loading" role="status"><span className="pending-text">正在加载工作区…</span></div> : messages.length || busy || messagesLoading || currentRequests.length ? <div className="messages" aria-busy={messagesLoading}>{hasMore ? <button className="load-earlier" disabled={messagesLoading} onClick={() => void loadMessages(sessionId, messages.find(m => m.seq > 0)?.seq).catch(report)}>{messagesLoading ? '正在加载…' : '加载更早的消息'}</button> : null}{messagesLoading && !messages.length ? <div className="working-indicator"><span className="pending-text">正在加载会话…</span></div> : null}<Conversation messages={messages} agentName={agentName} autoExpand={autoExpand} showDiff={showDiff} openFile={showFile} openPath={openPath} projectId={projectId} sessionId={sessionId} />{handoffTarget ? <div className="working-indicator" role="status"><span className="pending-text">{handoffTarget === '@compact' ? '正在压缩上下文…' : `正在切换到 ${handoffTarget}…`}</span></div> : busy && !latest ? <div className="working-indicator"><span className="pending-text">{session?.status === 'starting' ? '正在启动 Agent…' : '正在思考…'}</span></div> : null}{currentRequests.filter(request => request.method !== 'item/tool/requestUserInput').map(request => <Suspense key={String(request.id)} fallback={<div className="working-indicator">正在加载确认请求…</div>}><RequestCard request={request} respond={result => respondRequest(request, result)} /></Suspense>)}</div>
           : <NewChat project={project} projects={projects} selectProject={selectProject} addProject={() => void addProject()}/>}
@@ -859,6 +872,7 @@ export default function App() {
         {commandMessage ? <div className="command-feedback" role="status"><pre>{commandMessage}</pre><button className="icon-button" title="关闭命令结果" onClick={() => setCommandMessage('')}><X size={14} /></button></div> : null}
         {questionPending ? <Suspense fallback={<div className="working-indicator">正在加载提问…</div>}><QuestionDock requests={currentRequests} respond={respondRequest} /></Suspense> : null}
         <FollowupQueue rows={followups.rows} agent={agentId} turnId={session?.turnId} steeringMode={followups.steeringMode} change={changeFollowup} steer={steerFollowup} openSide={row=>void openSide(row)}/>
+        {messages.some(message => message.kind === 'turnDiff') ? <Suspense fallback={null}><TurnChangesDock key={sessionId} messages={messages} activeTurnId={busy ? session?.turnId : undefined} showDiff={showDiff}/></Suspense> : null}
         <form className={`composer ${busy ? 'busy' : ''}`} onSubmit={e => { e.preventDefault(); void send(); }}>
           {slashOptions.length || composerFocused && skillQuery && !commandsDismissed && (skillsLoading || skillsError) ? <div className="slash-menu" id="agent-commands" role="listbox" aria-label="命令与技能" aria-busy={skillsLoading}>{slashOptions.map((c, index) => <button id={`agent-command-${index}`} className={index === slashIndex ? 'selected' : ''} type="button" role="option" aria-selected={index === slashIndex} key={c.name} onMouseDown={e => e.preventDefault()} onClick={() => selectCommand(index)}><span className="slash-option-name">{c.skill ? <Sparkles size={14}/> : <Terminal size={14}/>}<code>{c.name}</code></span><span className="slash-option-detail" title={c.detail}>{c.detail}{c.skill ? <small>{skillSource(c.skill)}</small> : null}</span>{c.skill ? <small className="slash-option-kind">技能</small> : null}</button>)}{skillsLoading ? <div className="slash-menu-status" role="status">读取技能…</div> : skillsError ? <div className="slash-menu-status error-text" role="alert">{skillsError}</div> : null}</div> : null}
           <AttachmentStrip attachments={attachments} loading={importingImages} remove={path => setAttachments(old => old.filter(a => a.path !== path))} />
@@ -880,7 +894,10 @@ export default function App() {
     <SelectionActions key={sessionId} area={scrollArea} add={text=>{setInput(old=>[old,text.split('\n').map(line=>`> ${line}`).join('\n')].filter(Boolean).join('\n\n'));requestAnimationFrame(()=>textarea.current?.focus());}} details={setSelectionDetail} ask={text=>void openSide(undefined,`关于下面这段内容：\n\n${text}\n\n请帮我进一步解释。`)}/>
     {sideDraft && !settingsOpen ? <Suspense fallback={<aside className="side-chat">正在打开侧边聊天…</aside>}><SideChat key={sideDraft.key} draft={sideDraft} projectId={sideDraft.projectId??projectId} agent={sideDraft.agent??agentId} connectionId={sideDraft.connectionId??connectionId} defaults={followupPayload('')} close={()=>setSideDraft(null)} opened={()=>void refresh()} openFile={showFile} showDiff={showDiff} providerRequired={(agent,draft)=>{setSideDraft(draft);showProviderRequired(agent);}} resizeHandle={<div {...panels.handle('right')}/>}/></Suspense> : null}
     {selectionDetail?<div className="modal-backdrop" onClick={()=>setSelectionDetail('')}><section className="modal" role="dialog" aria-modal="true" aria-label="选中内容" onClick={e=>e.stopPropagation()}><div className="modal-heading"><h2>选中内容</h2><button className="icon-button" aria-label="关闭选中内容" onClick={()=>setSelectionDetail('')}><X size={16}/></button></div><pre className="selection-detail">{selectionDetail}</pre><CopyButton text={selectionDetail} label="复制选中内容"/></section></div>:null}
-    {showContext && !sideDraft ? <aside className="context-panel" aria-label="文件变更" hidden={settingsOpen} inert={!!modal || sidebarDialog}>{!settingsOpen ? <div {...panels.handle('right')}/> : null}<div className="context-header"><span title={workspacePath}>工作区</span>{workspacePath && !project ? <button className="icon-button" title="定位聊天目录" onClick={() => void openPath('.', 'reveal').catch(report)}><Folder size={15}/></button> : null}<button className="icon-button" aria-label="关闭变更面板" title="关闭变更面板" onClick={() => narrow ? setContextOverlay(false) : setContext(false)}><X size={16} /></button><button className={`icon-button ${changesLoading ? 'spin' : ''}`} title="刷新变更" disabled={changesLoading || !workspacePath} onClick={() => void refreshChanges(projectId)}><RefreshCw size={15} /></button></div><div className="context-tabs"><span className="active">文件变更<small>{changes.files.length}</small></span>{changes.branch ? <span className="branch"><GitBranch size={12} />{changes.branch}</span> : null}</div>{changesLoading && !changes.files.length && !preview ? <div className="context-empty"><LoaderCircle size={22} className="spin" /><strong>正在检查文件变更…</strong></div> : preview ? <div className="file-preview"><div className="file-preview-header"><FileCode2 size={14} /><span title={preview.name}>{preview.name}</span><CopyButton text={preview.text} label="复制文件内容" iconOnly /><button className="icon-button" title="关闭文件" onClick={() => setPreview(null)}><X size={14} /></button></div><Suspense fallback={<pre>{preview.text}</pre>}>{preview.diff ? <DiffView text={preview.text} /> : <SourceView text={preview.text} line={preview.line} />}</Suspense></div> : changes.files.length ? <><div className="changed-files">{changes.files.map(f => <button key={f.path} disabled={f.path.endsWith("/")} onClick={() => reviewFile(f.path)} title={f.path.endsWith("/") ? `${f.path} · 未跟踪文件夹` : f.path}><FileCode2 size={15} /><span>{f.path}</span><small className={f.status === '??' ? 'untracked' : ''}>{f.status === '??' ? 'U' : f.status}</small></button>)}</div>{changes.diff ? <button className="workspace-diff-button" onClick={() => showDiff('工作区变更', changes.diff)}>查看全部差异</button> : null}</> : <div className="context-empty"><span><FileCode2 size={24} /></span><strong>{!workspacePath ? '聊天文件' : !project ? '聊天工作目录'  : changes.isGit ? '暂无文件变更' : '未启用 Git'}</strong><p>{!workspacePath ? '发送消息后自动创建独立目录，也可以选择项目' : !project ? workspacePath  : changes.isGit ? '文件修改后会显示在这里' : '初始化 Git 后可查看文件差异'}</p></div>}</aside> : null}
+    <aside className={`context-panel workspace-panel ${showContext && !sideDraft ? '' : 'pane-collapsed'}`} aria-label={showContext && !sideDraft ? '工作空间' : undefined} aria-hidden={!showContext || !!sideDraft} hidden={settingsOpen || !!sideDraft} inert={!showContext || !!modal || sidebarDialog}>
+      {!settingsOpen && showContext && !workspaceExpanded ? <div {...panels.handle('right')}/> : null}
+      {showContext || workspaceMounted ? <Suspense fallback={<div className="workspace-loading">正在打开工作空间…</div>}><WorkspacePanel active={showContext && !settingsOpen && !sideDraft} projectId={projectId} sessionId={sessionId} workspacePath={workspacePath} workspaceName={project?.name ?? session?.title} changes={changes} loading={changesLoading} preview={preview} expanded={workspaceExpanded} refresh={() => void refreshChanges(projectId)} close={() => narrow ? setContextOverlay(false) : setContext(false)} expand={() => setWorkspaceExpanded(value => !value)} closePreview={() => setPreview(null)} openFile={path => void showFile(path)} reviewFile={reviewFile} showDiff={showDiff} reveal={() => void openPath('.', 'reveal').catch(report)}/></Suspense> : null}
+    </aside>
 
     {settingsOpen ? <Suspense fallback={<div className="startup-loading" role="status">正在加载设置…</div>}><SettingsPage tab={settingsTab} select={setSettingsTab} blocked={!!modal || sidebarDialog}>
       {modalError ? <div className="error-banner modal-error" role="alert"><span>{modalError}</span><button className="icon-button" aria-label="关闭错误提示" onClick={() => setModalError('')}><X size={14} /></button></div> : null}

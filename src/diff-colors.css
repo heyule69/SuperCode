@@ -1,0 +1,4 @@
+/* One palette for live turn summaries, review cards and opened patches. */
+.change-review,.turn-change-dock { --review-green:light-dark(#168344,#3ecf7a); --review-red:light-dark(#c32e25,#ff453a); --review-added-bg:light-dark(#e8f2eb,#203427); --review-removed-bg:light-dark(#f8e8e5,#40231e); --review-added-gutter:light-dark(#e0ede4,#172b1e); --review-removed-gutter:light-dark(#f3ddd8,#311a16); }
+.change-added { color:var(--review-green); }
+.change-removed { color:var(--review-red); }

@@ -121,7 +121,7 @@ input:focus-visible, textarea:focus-visible, select:focus-visible { outline:0; b
 .turn-changes-title > strong { font-size:var(--chat-size); font-weight:600; }
 .turn-change-totals { display:flex; gap:6px; margin-top:4px; font-size:calc(var(--chat-size) - 1px); font-variant-numeric:tabular-nums; }
 .turn-changes .added-count { color:var(--diff-added); }
-.turn-changes .removed-count { color:var(--danger); }
+.turn-changes .removed-count { color:var(--diff-removed); }
 .turn-changes .view-changes { padding:6px 10px; border:1px solid var(--line); border-radius:8px; background:transparent; color:var(--text); white-space:nowrap; font-size:calc(var(--chat-size) - 1px); }
 .turn-changes .view-changes:hover { background:var(--hover); }
 .turn-changes > .turn-changes-files { display:block; padding:4px 0; background:var(--bg); }

@@ -29,6 +29,7 @@
   --chat-user-bg:#e3e6e9;
   --chat-link:#2868be;
   --diff-added:#168344;
+  --diff-removed:#c32e25;
   --full-access:#b64e0b;
 }
 :root[data-theme=dark], .theme-preview.theme-dark {
@@ -49,6 +50,7 @@
   --chat-user-bg:#303030;
   --chat-link:#7daaff;
   --diff-added:#3ecf7a;
+  --diff-removed:#ff453a;
   --full-access:#ed8a46;
 }
 :root[data-theme=graphite], .theme-preview.theme-graphite {

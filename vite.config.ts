@@ -1,8 +1,9 @@
 import { defineConfig } from 'vitest/config';
 import react from '@vitejs/plugin-react';
+import { fileIconTheme } from './build/fileIconTheme';
 
 export default defineConfig({
-  plugins: [react()],
+  plugins: [react(), fileIconTheme()],
   test: { include:['src/**/*.test.{ts,tsx,mjs}'] },
   clearScreen: false,
   server: { port: 1420, strictPort: true },

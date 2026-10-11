@@ -1,5 +1,6 @@
 node_modules/
 dist/
+/public/file-icons/
 src-tauri/target/
 src-tauri/gen/schemas/
 installer/target/

@@ -6,8 +6,8 @@ import { decodePanelWidths, defaultWidths, panelLayout, usePanelResize } from '.
 
 let root: Root, container: HTMLDivElement;
 let narrow = false;
-function Layout({browser=false}:{browser?:boolean}) {
-  const panels = usePanelResize(true, true, false, browser);
+function Layout({browser=false,left=true,right=true,expanded=false}:{browser?:boolean;left?:boolean;right?:boolean;expanded?:boolean}) {
+  const panels = usePanelResize(left, right, false, browser, expanded);
   return <div ref={panels.root}><div {...panels.handle('left')}/><div {...panels.handle('right')}/></div>;
 }
 beforeEach(() => {
@@ -59,4 +59,12 @@ it('keeps browser widths separate while sharing the saved sidebar width', async(
   expect(JSON.parse(localStorage.getItem('supercode.panel-widths')!)).toEqual({left:310,right:284});
   await act(async()=>root.render(<Layout/>));expect(handle('right').getAttribute('aria-valuenow')).toBe('284');
   await act(async()=>root.render(<Layout browser/>));expect(handle('right').getAttribute('aria-valuenow')).toBe('560');
+});
+it('uses stable tracks to animate hidden panes and restores saved widths after expansion', async () => {
+  await act(async () => root.render(<Layout left={false} right={false}/>));
+  expect(container.firstElementChild?.getAttribute('style')).toContain('0px minmax(0,1fr) 0px');
+  await act(async () => root.render(<Layout expanded/>));
+  expect(container.firstElementChild?.getAttribute('style')).toContain('288px minmax(0,1fr) 752px');
+  await act(async () => root.render(<Layout/>));
+  expect(container.firstElementChild?.getAttribute('style')).toContain('288px minmax(0,1fr) 284px');
 });

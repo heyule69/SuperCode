@@ -12,3 +12,14 @@ it('separates files and handles quoted filenames without including diff headers'
   const diff = 'diff --git "a/a b.ts" "b/a b.ts"\n--- "a/a b.ts"\n+++ "b/a b.ts"\n@@ -0,0 +1 @@\n+first\ndiff --git a/b.ts b/b.ts\n@@ -1 +1 @@\n-old\n+new';
   expect(diffFiles(diff).map(f => [f.path, f.added, f.removed])).toEqual([['a b.ts', 1, 0], ['b.ts', 1, 1]]);
 });
+it('decodes Git octal UTF-8 paths without interpreting escaped backslashes as octal bytes', () => {
+  const diff = String.raw`diff --git "a/\344\270\255\346\226\207.ts" "b/\344\270\255\346\226\207.ts"
+@@ -1 +1 @@
+-old
++new
+diff --git "a/\\345.txt" "b/\\345.txt"
+@@ -1 +1 @@
+-old
++new`;
+  expect(diffFiles(diff).map(file => file.path)).toEqual(['中文.ts', String.raw`\345.txt`]);
+});

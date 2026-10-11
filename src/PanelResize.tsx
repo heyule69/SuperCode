@@ -22,19 +22,21 @@ export function panelLayout(widths: PanelWidths, available: number, left: boolea
   return { left: leftWidth, right: Math.min(rightWidth, Math.max(0, available - 32)), overlay };
 }
 
-export function usePanelResize(left: boolean, right: boolean, disabled: boolean, browser = false) {
+export function usePanelResize(left: boolean, right: boolean, disabled: boolean, browser = false, expanded = false) {
   const root = useRef<HTMLDivElement>(null);
   const [widths, setWidths] = useState(() => decodePanelWidths(localStorage.getItem(key)));
   const preferred = useRef(widths);
-  const options = useRef({ left, right, disabled });
-  options.current = { left, right, disabled };
+  const options = useRef({ left, right, disabled, expanded });
+  options.current = { left, right, disabled, expanded };
   const dragging = useRef<{ side: Side; x: number; initial: PanelWidths; width: number } | null>(null);
   function apply() {
     const el = root.current; if (!el) return;
     const o = options.current;
     const size = panelLayout(preferred.current, el.clientWidth, o.left, o.right);
-    el.style.setProperty('--context-width', `${size.right}px`);
-    el.style.gridTemplateColumns = o.disabled ? 'minmax(0,1fr)' : `${o.left ? `${size.left}px ` : ''}minmax(0,1fr)${o.right && !size.overlay ? ` ${size.right}px` : ''}`;
+    const rightWidth = o.expanded ? Math.max(size.right, Math.min(820, el.clientWidth - (o.left ? size.left : 0) - (size.overlay ? 32 : 360))) : size.right;
+    el.style.setProperty('--context-width', `${rightWidth}px`);
+    // Stable track count allows native CSS interpolation while panes open and close.
+    el.style.gridTemplateColumns = `${o.left && !o.disabled ? size.left : 0}px minmax(0,1fr) ${o.right && !size.overlay && !o.disabled ? rightWidth : 0}px`;
   }
   function commit() {
     setWidths({ ...preferred.current });
@@ -51,7 +53,7 @@ export function usePanelResize(left: boolean, right: boolean, disabled: boolean,
   useLayoutEffect(() => {
     apply(); const observer = new ResizeObserver(apply); if (root.current) observer.observe(root.current);
     return () => { observer.disconnect(); root.current?.classList.remove('panel-resizing'); };
-  }, [left, right, disabled]);
+  }, [left, right, disabled, expanded]);
   function set(side: Side, value: number) {
     const el = root.current; if (!el) return;
     const size = panelLayout(preferred.current, el.clientWidth, left, right);

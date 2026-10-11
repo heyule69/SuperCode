@@ -1,0 +1,5 @@
+.file-kind-icon { display:inline-flex; align-items:center; justify-content:center; flex:none; vertical-align:middle; }
+.file-kind-icon img { display:block; width:100%; height:100%; object-fit:contain; }
+.file-kind-icon .file-icon-light { display:none; }
+:root:not([data-theme=dark]):not([data-theme=graphite]) .file-kind-icon:has(.file-icon-light) .file-icon-dark { display:none; }
+:root:not([data-theme=dark]):not([data-theme=graphite]) .file-kind-icon .file-icon-light { display:block; }

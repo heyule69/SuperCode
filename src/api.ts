@@ -54,6 +54,7 @@ export async function call<T>(command: string, args: Record<string, unknown> = {
     case 'followup_capabilities': result={steeringMode:'native',queue:'client',editableUntilSubmitted:true};break;
     case 'list_messages': result = [] as Message[]; break;
     case 'workspace_changes': result = { isGit: false, branch: '', files: [], diff: '' }; break;
+    case 'list_workspace_directory': result = { entries: [], truncated: false }; break;
     case 'rename_session': data.sessions = data.sessions.map(s => s.id === args.sessionId ? { ...s, title: String(args.title) } : s); writePreview(data); break;
     case 'archive_session': {
       const archives = JSON.parse(localStorage.getItem(archiveKey) ?? '[]') as Session[];
