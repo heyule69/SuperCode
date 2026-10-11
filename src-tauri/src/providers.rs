@@ -556,7 +556,10 @@ pub async fn delete_provider_profile(id: String, app: AppHandle) -> Result<(), S
 pub async fn fetch_provider_models(id: String, app: AppHandle) -> Result<Vec<String>, String> {
     let p = find(&app, &id)?;
     if p.is_official() {
-        let value = crate::commands::list_models(Some(p.agent), None, Some(p.id), app).await?;
+        let value = crate::commands::list_models(Some(p.agent), None, Some(p.id), Some(true), app).await?;
+        if let Some(warning) = value["warning"].as_str() {
+            return Err(warning.into());
+        }
         return Ok(value["data"]
             .as_array()
             .map(|a| {

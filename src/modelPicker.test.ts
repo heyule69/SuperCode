@@ -6,6 +6,16 @@ const kimi: ModelSource = { providerId: 'kimi', providerName: 'Kimi Code', mark:
 const model = (id: string, isDefault = false): Model => ({ id, model: id, displayName: id, isDefault });
 const profile = (id: string, modelId = 'k3'): AgentProfile => ({ id, agent: 'claude', name: id, model: modelId, current: false, hasCredential: true, modelSource: { ...kimi, connectionName: id }, models: [modelId, 'kimi-for-coding'] });
 
+it('replaces an old official snapshot with the complete current catalog and effort options', () => {
+  const official = { ...profile('official', 'old'), agent: 'codex', officialAccount: true, models: ['old', 'older', 'oldest'] };
+  const live = ['latest', 'frontier', 'balanced', 'fast', 'old', 'older', 'oldest'].map(id => ({ ...model(id, id === 'latest'), supportedReasoningEfforts: [{ reasoningEffort: 'high' }] }));
+  const groups = modelGroups({ models: live, catalogLoaded: true, profiles: [official], activeProfile: official, source: { providerId:'openai',providerName:'OpenAI',mark:'O',available:true }, agent:'codex',value:'latest',connectionId:official.id });
+  expect(groups).toHaveLength(1);
+  expect(groups[0].options.map(o => o.model)).toEqual(live.map(m => m.model));
+  expect(groups[0].options[0]).toMatchObject({ selected:true, supportedReasoningEfforts:[{reasoningEffort:'high'}] });
+  expect(modelGroups({ models:[],catalogLoaded:true,profiles:[official],activeProfile:official,source:{providerId:'openai',providerName:'OpenAI',mark:'O',available:true},agent:'codex',value:'old',connectionId:official.id })[0].options).toEqual([]);
+});
+
 it('keeps managed official accounts separate even when their model IDs match', () => {
   const accounts: AgentProfile[] = ['personal', 'work'].map(accountId => ({ id: `account:${accountId}`, accountId, agent: 'codex', name: accountId, model: 'same-model', officialAccount: true, current: false, hasCredential: false }));
   const options = { models: [model('same-model')], profiles: accounts, source: { providerId: 'openai', providerName: 'OpenAI', mark: 'O', connectionName: 'personal', available: true }, agent: 'codex', value: 'same-model', connectionId: 'account:personal', loggedInAgents: ['codex', 'account:personal', 'account:work'] };

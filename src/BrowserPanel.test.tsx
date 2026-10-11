@@ -33,8 +33,21 @@ it('shows real operation state, stops on Esc and keeps other chats isolated',asy
   expect(call).toHaveBeenCalledWith('browser_takeover',{sessionId:'s'});
   await act(async()=>listeners.get('browser-state')?.({payload:{sessionId:'s',status:'stopped',action:'已由你接管'}}));expect(node.textContent).toContain('你正在控制浏览器');expect(node.querySelector('.browser-takeover')).toBeNull();
 });
-it('hides the native surface behind app modals and releases it on close',async()=>{
+it('hides the native surface behind app modals and closes only the panel while working',async()=>{
   await render();await render(false);await new Promise(resolve=>setTimeout(resolve,30));
   expect(call).toHaveBeenCalledWith('browser_layout',expect.objectContaining({sessionId:'s',visible:false,mountId:expect.any(String)}));
-  await act(async()=>node.querySelector<HTMLButtonElement>('[aria-label="关闭浏览器"]')!.click());expect(call).toHaveBeenCalledWith('browser_close',{sessionId:'s'});expect(close).toHaveBeenCalledOnce();
+  await act(async()=>listeners.get('browser-state')?.({payload:{sessionId:'s',status:'working',action:'正在点击'}}));
+  await act(async()=>node.querySelector<HTMLButtonElement>('[aria-label="关闭浏览器"]')!.click());expect(call).toHaveBeenCalledWith('browser_close',{sessionId:'s',mountId:expect.any(String)});expect(close).toHaveBeenCalledOnce();
+  expect(call).not.toHaveBeenCalledWith('browser_takeover',expect.anything());
+  expect(call).not.toHaveBeenCalledWith('interrupt_turn',expect.anything());
+});
+it('does not let a delayed close from an unmounted panel close its replacement',async()=>{
+  await render();
+  let finish!:(value:unknown)=>void;
+  vi.mocked(call).mockReturnValueOnce(new Promise(resolve=>{finish=resolve;}));
+  await act(async()=>node.querySelector<HTMLButtonElement>('[aria-label="关闭浏览器"]')!.click());
+  await act(async()=>root.render(null));
+  await render();
+  await act(async()=>finish(undefined));
+  expect(close).not.toHaveBeenCalled();
 });

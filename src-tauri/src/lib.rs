@@ -37,6 +37,7 @@ mod media;
 mod native_agents;
 mod notifications;
 mod official_accounts;
+mod official_models;
 mod outbox;
 mod platform_usage;
 mod process;
@@ -318,6 +319,7 @@ pub fn run() {
             links::open_external_link,
             media::prepare_media,
             media::open_media,
+            media::reveal_media,
             commands::bootstrap,
             ui_recovery::get_ui_recovery,
             commands::pending_requests,

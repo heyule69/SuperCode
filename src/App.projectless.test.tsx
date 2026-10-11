@@ -60,6 +60,59 @@ async function type(text: string) {
 async function send() {
   await act(async()=>{container.querySelector<HTMLFormElement>('.composer')!.dispatchEvent(new Event('submit',{bubbles:true,cancelable:true}));await new Promise(resolve=>setTimeout(resolve,30));});
 }
+it('loads official models locally on startup, reuses the result, and explicitly refreshes without a CLI', async () => {
+  localStorage.setItem('supercode.session','official-chat');
+  const official = { id:'official', agent:'codex', name:'ChatGPT', officialAccount:true, model:'old', models:['old','older','oldest'], current:true, hasCredential:false };
+  data.profiles = [official]; data.officialAgents = ['codex'];
+  data.sessions = [{id:'official-chat',projectId:'existing',title:'官方模型',agent:'codex',connectionId:'official',model:'old',status:'idle',nativeId:null,turnId:null,updatedAt:1}];
+  const source = {providerId:'openai',providerName:'OpenAI',mark:'O',connectionName:'ChatGPT 官方账号',available:true};
+  const live = ['latest','frontier','balanced','fast','old','older','oldest'].map(model => ({id:model,model,displayName:model,isDefault:model==='latest'}));
+  const fallback = vi.mocked(call).getMockImplementation()!;
+  vi.mocked(call).mockImplementation(async (command,args) => command==='get_model_source' ? source : command==='list_models' ? {data:live,source,warning:args?.forceRefresh?'官方模型接口返回 HTTP 403，当前显示本地模型目录':undefined} : command==='list_provider_accounts' ? [{agent:'codex',loggedIn:true}] : fallback(command,args));
+  await render();
+  expect(vi.mocked(call).mock.calls.filter(([command])=>command==='list_models')).toHaveLength(1);
+  expect(call).not.toHaveBeenCalledWith('list_models',expect.objectContaining({forceRefresh:true}));
+  await act(async()=>{container.querySelector<HTMLButtonElement>('[aria-label="选择模型"]')!.click();});
+  expect(container.querySelectorAll('.model-option')).toHaveLength(7);
+  expect(container.querySelector('.model-menu-scroll')?.textContent).toContain('latest');
+  expect(call).toHaveBeenCalledWith('list_models',{agent:'codex',sessionId:'official-chat',connectionId:'official'});
+  await act(async()=>{container.querySelector<HTMLButtonElement>('[aria-label="关闭模型选择"]')!.click();});
+  await act(async()=>{container.querySelector<HTMLButtonElement>('[aria-label="选择模型"]')!.click();});
+  expect(vi.mocked(call).mock.calls.filter(([command])=>command==='list_models')).toHaveLength(1);
+  await act(async()=>{container.querySelector<HTMLButtonElement>('[aria-label="刷新模型"]')!.click();});
+  expect(vi.mocked(call).mock.calls.filter(([command])=>command==='list_models')).toHaveLength(2);
+  expect(container.querySelectorAll('.model-option')).toHaveLength(7);
+  expect(call).toHaveBeenCalledWith('list_models',{agent:'codex',sessionId:'official-chat',connectionId:'official',forceRefresh:true});
+  expect(container.querySelector('.model-catalog-warning')?.textContent).toContain('HTTP 403');
+});
+it('discards a delayed official catalog after changing the conversation account', async () => {
+  localStorage.setItem('supercode.session','account-a-chat');
+  data.profiles = ['a','b'].map(accountId=>({id:accountId,accountId,agent:'codex',name:accountId,officialAccount:true,model:`saved-${accountId}`,models:[`saved-${accountId}`],current:accountId==='a',hasCredential:false}));
+  data.officialAgents=['codex'];
+  data.sessions = ['a','b'].map(id=>({id:`account-${id}-chat`,projectId:'existing',title:`账号 ${id}`,agent:'codex',connectionId:id,model:`saved-${id}`,status:'idle',nativeId:null,turnId:null,updatedAt:1}));
+  const source = (id: unknown) => ({providerId:'openai',providerName:'OpenAI',mark:'O',connectionName:String(id),available:true});
+  let finishA!: (catalog: unknown) => void;
+  const fallback=vi.mocked(call).getMockImplementation()!;
+  vi.mocked(call).mockImplementation(async (command,args={}) => {
+    if(command==='get_model_source')return source(args.connectionId);
+    if(command==='list_provider_accounts')return ['a','b'].map(connectionId=>({agent:'codex',connectionId,loggedIn:true}));
+    if(command==='list_models' && args.connectionId==='a')return new Promise(resolve=>{finishA=resolve;});
+    if(command==='list_models')return {data:[{id:'live-b',model:'live-b',displayName:'Live B',isDefault:true}],source:source('b')};
+    return fallback(command,args);
+  });
+  await render();
+  await act(async()=>{container.querySelector<HTMLButtonElement>('[aria-label="选择模型"]')!.click();});
+  await act(async()=>{container.querySelector<HTMLButtonElement>('.session-row[title="账号 b"]')!.click();await new Promise(resolve=>setTimeout(resolve,30));});
+  // The route changed while A's independent catalog read was still in flight.
+  await act(async()=>{finishA({data:[{id:'live-a',model:'live-a',displayName:'Live A',isDefault:true}],source:source('a')});});
+  expect(container.querySelector('.model-chip')?.textContent).not.toContain('Live A');
+  const close=container.querySelector<HTMLButtonElement>('[aria-label="关闭模型选择"]');
+  if(close)await act(async()=>close.click());
+  await act(async()=>{container.querySelector<HTMLButtonElement>('[aria-label="选择模型"]')!.click();});
+  expect(container.querySelector('.model-menu-scroll')?.textContent).toContain('Live B');
+  expect(container.querySelector('.model-menu-scroll')?.textContent).not.toContain('Live A');
+  expect(call).toHaveBeenCalledWith('list_models',{agent:'codex',sessionId:'account-b-chat',connectionId:'b'});
+});
 it('shows turn changes above the composer while running and preserves the separate workspace diff', async () => {
   vi.spyOn(window,'matchMedia').mockImplementation(()=>({matches:false,addEventListener:()=>{},removeEventListener:()=>{}} as unknown as MediaQueryList));
   localStorage.setItem('supercode.context','true'); localStorage.setItem('supercode.workspace-view','changes'); localStorage.setItem('supercode.session','chat');

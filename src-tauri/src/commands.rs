@@ -195,6 +195,7 @@ pub async fn list_models(
     agent: Option<String>,
     session_id: Option<String>,
     connection_id: Option<String>,
+    force_refresh: Option<bool>,
     app: AppHandle,
 ) -> Result<Value, String> {
     let agent = agent.as_deref().unwrap_or("codex");
@@ -241,24 +242,12 @@ pub async fn list_models(
             return Ok(catalog);
         }
     }
-    if app
-        .state::<AppState>()
-        .claude
-        .client
-        .lock()
-        .await
-        .as_ref()
-        .is_some_and(|c| c.active.load(std::sync::atomic::Ordering::Acquire))
-    {
-        return Err("Claude 正在运行，请先完成任务后加载 Codex 模型".into());
-    }
-    let mut catalog = app
-        .state::<AppState>()
-        .runtime
-        .get_for_connection(&app, session_id.as_deref(), connection_id.as_deref())
-        .await?
-        .request("model/list", json!({"limit":100}))
-        .await?;
+    let mut catalog = crate::official_models::catalog(
+        &app,
+        route.config["accountId"].as_str(),
+        force_refresh.unwrap_or(false),
+    )
+    .await?;
     catalog["source"] = source;
     Ok(catalog)
 }
@@ -474,7 +463,17 @@ async fn send_inner(
     let model = match model.or(session.model.clone()).or(profile_model) {
         Some(model) => Some(model),
         None => {
-            let catalog = client.request("model/list", json!({"limit":100})).await?;
+            let catalog = if route.config["official"] == true
+                || route
+                    .profile
+                    .as_ref()
+                    .is_some_and(crate::ccswitch::Profile::is_official)
+            {
+                crate::official_models::catalog(app, route.config["accountId"].as_str(), false)
+                    .await?
+            } else {
+                crate::providers::catalog_models(&route.config)
+            };
             catalog["data"]
                 .as_array()
                 .and_then(|models| models.iter().find(|m| m["isDefault"] == true))

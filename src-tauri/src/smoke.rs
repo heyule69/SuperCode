@@ -240,6 +240,7 @@ async fn verify(app: &AppHandle) -> Result<Value, String> {
     if imported {
         let source = crate::ccswitch::scan_ccswitch(None)?;
         let selected = source
+            .profiles
             .iter()
             .find(|p| p.agent == agent && p.current)
             .ok_or("CC Switch 没有此 Agent 的当前配置")?;
@@ -294,7 +295,7 @@ async fn verify(app: &AppHandle) -> Result<Value, String> {
     let session = state
         .store
         .create_agent_session(&project.id, None, &agent)?;
-    let models = commands::list_models(Some(agent.clone()), None, None, app.clone()).await?;
+    let models = commands::list_models(Some(agent.clone()), None, None, None, app.clone()).await?;
     if models["data"].as_array().is_none_or(|a| a.is_empty()) {
         return Err("Agent 未返回模型列表".into());
     }
@@ -857,7 +858,7 @@ async fn verify_handoff(
     }
     let second_model = if agent == "codex" {
         let catalog =
-            commands::list_models(Some(agent.into()), Some(b.id.clone()), None, app.clone()).await?;
+            commands::list_models(Some(agent.into()), Some(b.id.clone()), None, None, app.clone()).await?;
         catalog["data"]
             .as_array()
             .and_then(|models| {

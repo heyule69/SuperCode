@@ -1,4 +1,4 @@
-//! Read-only CC Switch SQLite import. Credentials stay on the Rust side.
+//! Read-only CC Switch import (SQLite and legacy JSON). Credentials stay in Rust.
 use crate::AppState;
 use rusqlite::{Connection, OpenFlags};
 use serde::Serialize;
@@ -97,23 +97,113 @@ impl Profile {
 }
 fn home() -> Result<PathBuf, String> {
     std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
+        .filter(|s| !s.is_empty())
+        .or_else(|| std::env::var_os("HOME").filter(|s| !s.is_empty()))
         .map(PathBuf::from)
         .ok_or("无法定位用户目录".into())
 }
-fn database(path: Option<String>) -> Result<PathBuf, String> {
-    let mut path = match path.filter(|s| !s.trim().is_empty()) {
-        Some(p) => PathBuf::from(p.trim()),
-        None => std::env::var_os("CC_SWITCH_CONFIG_DIR")
-            .map(PathBuf::from)
-            .unwrap_or(home()?.join(".cc-switch")),
+fn expand_path(path: &str, home: &std::path::Path) -> PathBuf {
+    let path = path.trim();
+    if path == "~" {
+        home.into()
+    } else if let Some(relative) = path.strip_prefix("~/").or_else(|| path.strip_prefix("~\\")) {
+        home.join(relative)
+    } else {
+        PathBuf::from(path)
+    }
+}
+fn path_override(
+    store: &std::path::Path,
+    home: &std::path::Path,
+) -> Result<Option<PathBuf>, String> {
+    use std::io::Read;
+    let file = match std::fs::File::open(store) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err("无法读取 CC Switch 自定义目录设置".into()),
+    };
+    let mut bytes = Vec::new();
+    file.take(64 * 1024 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| "无法读取 CC Switch 自定义目录设置")?;
+    if bytes.len() > 64 * 1024 {
+        return Err("CC Switch 路径设置超过大小限制".into());
+    }
+    let text = std::str::from_utf8(&bytes)
+        .map_err(|_| "CC Switch 路径设置不是 UTF-8，未转换或修改原文件")?;
+    if text.starts_with('\u{feff}') {
+        return Err("CC Switch 路径设置含 BOM，未转换或修改原文件".into());
+    }
+    let value: Value = serde_json::from_str(text).map_err(|_| "CC Switch 路径设置 JSON 无效")?;
+    Ok(value["app_config_dir_override"]
+        .as_str()
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| expand_path(s, home))
+        .filter(|p| p.is_dir()))
+}
+fn locate_database(
+    manual: Option<&str>,
+    configured: Option<PathBuf>,
+    store: Option<&std::path::Path>,
+    user_home: &std::path::Path,
+    legacy_home: Option<PathBuf>,
+) -> Result<PathBuf, String> {
+    let mut path = if let Some(path) = manual.filter(|s| !s.trim().is_empty()) {
+        expand_path(path, user_home)
+    } else if let Some(path) =
+        configured.filter(|p| !p.as_os_str().to_string_lossy().trim().is_empty())
+    {
+        expand_path(&path.to_string_lossy(), user_home)
+    } else if let Some(path) = store
+        .map(|p| path_override(p, user_home))
+        .transpose()?
+        .flatten()
+    {
+        path
+    } else {
+        let default = user_home.join(".cc-switch");
+        if source_in_directory(&default).is_some() {
+            default
+        } else {
+            legacy_home
+                .map(|p| p.join(".cc-switch"))
+                .filter(|p| source_in_directory(p).is_some())
+                .unwrap_or(default)
+        }
     };
     if path.is_dir() {
-        path = path.join("cc-switch.db");
+        path = source_in_directory(&path).unwrap_or_else(|| path.join("cc-switch.db"));
     }
     if !path.is_file() {
-        return Err("未找到 CC Switch 的 cc-switch.db，可输入数据库路径或所在目录".into());
+        return Err(
+            "未找到 CC Switch 配置，可输入 cc-switch.db、旧版 config.json 或所在目录".into(),
+        );
     }
     Ok(path)
+}
+fn source_in_directory(dir: &std::path::Path) -> Option<PathBuf> {
+    ["cc-switch.db", "config.json"]
+        .into_iter()
+        .map(|name| dir.join(name))
+        .find(|p| p.is_file())
+}
+fn database(path: Option<String>) -> Result<PathBuf, String> {
+    // CC Switch stores its custom directory in Tauri's app_paths.json.
+    let store = if cfg!(windows) {
+        std::env::var_os("APPDATA")
+            .map(|p| PathBuf::from(p).join("com.ccswitch.desktop/app_paths.json"))
+    } else {
+        None
+    };
+    locate_database(
+        path.as_deref(),
+        std::env::var_os("CC_SWITCH_CONFIG_DIR")
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from),
+        store.as_deref(),
+        &home()?,
+        std::env::var_os("HOME").map(PathBuf::from),
+    )
 }
 fn claude_env(raw: &Value) -> Value {
     let env = raw["env"]
@@ -137,7 +227,26 @@ fn claude_env(raw: &Value) -> Value {
         .unwrap_or_default();
     Value::Object(env)
 }
+fn imported_base_url(value: &str) -> Result<String, String> {
+    let url = reqwest::Url::parse(value.trim()).map_err(|_| "CC Switch API 地址无效")?;
+    if !matches!(url.scheme(), "https" | "http") || url.host_str().is_none() {
+        return Err("CC Switch API 地址须使用 HTTP 或 HTTPS".into());
+    }
+    if !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err("CC Switch API 地址不能包含账号、密码、查询参数或片段".into());
+    }
+    // Existing CC Switch connections may use a LAN or remote HTTP gateway.
+    // Import preserves its transport rather than applying new-connection rules.
+    Ok(value.trim().trim_end_matches('/').into())
+}
 fn sanitize(agent: &str, raw: Value) -> Result<Value, String> {
+    if !raw.is_object() {
+        return Err("配置 JSON 必须是对象".into());
+    }
     if agent == "claude" {
         let mut safe = json!({"env":claude_env(&raw),"model":raw["model"],"source":"ccswitch"});
         safe["model"] = json!(crate::providers::real_claude_model(&safe, None));
@@ -160,9 +269,34 @@ fn sanitize(agent: &str, raw: Value) -> Result<Value, String> {
     if safe.get("service_tier").and_then(toml::Value::as_str) == Some("priority") {
         safe.insert("service_tier".into(), toml::Value::String("fast".into()));
     }
+    let active_provider = cfg
+        .get("model_provider")
+        .and_then(toml::Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    safe.remove("model_provider");
+    if let Some(provider) = active_provider {
+        safe.insert(
+            "model_provider".into(),
+            toml::Value::String(provider.into()),
+        );
+    }
+    // CC Switch also supports inline bearer tokens. Only the active custom
+    // provider may supply one; dormant provider entries cannot change login.
+    let inline_key = active_provider
+        .filter(|provider| *provider != "openai")
+        .and_then(|provider| cfg.get("model_providers")?.get(provider))
+        .and_then(|provider| provider.get("experimental_bearer_token"))
+        .and_then(toml::Value::as_str)
+        .or_else(|| {
+            cfg.get("experimental_bearer_token")
+                .and_then(toml::Value::as_str)
+        });
     let key = raw["auth"]["OPENAI_API_KEY"]
         .as_str()
-        .filter(|s| !s.is_empty());
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .or_else(|| inline_key.map(str::trim).filter(|s| !s.is_empty()));
     if let Some(provider) = safe
         .get("model_provider")
         .and_then(toml::Value::as_str)
@@ -178,14 +312,25 @@ fn sanitize(agent: &str, raw: Value) -> Result<Value, String> {
             let source = cfg
                 .get("model_providers")
                 .and_then(|v| v.get(&provider))
-                .and_then(toml::Value::as_table)
-                .ok_or("Codex 缺少供应商连接配置")?;
+                .and_then(toml::Value::as_table);
             let mut connection = toml::Table::new();
-            for key in ["name", "base_url", "wire_api"] {
-                if let Some(v) = source.get(key).filter(|v| v.is_str()) {
+            for key in ["name", "wire_api"] {
+                if let Some(v) = source
+                    .and_then(|source| source.get(key))
+                    .filter(|v| v.is_str())
+                {
                     connection.insert(key.into(), v.clone());
                 }
             }
+            let base = source
+                .and_then(|source| source.get("base_url"))
+                .or_else(|| cfg.get("base_url"))
+                .and_then(toml::Value::as_str)
+                .ok_or("Codex 缺少供应商连接地址")?;
+            connection.insert(
+                "base_url".into(),
+                toml::Value::String(imported_base_url(base)?),
+            );
             if connection
                 .get("wire_api")
                 .and_then(toml::Value::as_str)
@@ -209,8 +354,6 @@ fn sanitize(agent: &str, raw: Value) -> Result<Value, String> {
                 )])),
             );
         }
-    } else if key.is_some() {
-        return Err("此 Codex API Key 配置未指定供应商，暂不能导入".into());
     }
     if !safe.contains_key("model_provider") {
         safe.insert(
@@ -218,17 +361,72 @@ fn sanitize(agent: &str, raw: Value) -> Result<Value, String> {
             toml::Value::String("openai".into()),
         );
     }
+    // An omitted model_provider means built-in OpenAI, not a broken config.
+    // API credentials always get an explicit API route, separate from login.
+    // Never select leftover model_providers entries without an active provider.
+    if key.is_some() && safe.get("model_provider").and_then(toml::Value::as_str) == Some("openai") {
+        let base = active_provider
+            .and_then(|provider| cfg.get("model_providers")?.get(provider))
+            .and_then(|v| v.get("base_url"))
+            .and_then(toml::Value::as_str)
+            .or_else(|| cfg.get("base_url").and_then(toml::Value::as_str))
+            .or_else(|| cfg.get("openai_base_url").and_then(toml::Value::as_str))
+            .unwrap_or("https://api.openai.com/v1");
+        let connection = toml::Table::from_iter([
+            ("name".into(), toml::Value::String("OpenAI API".into())),
+            (
+                "base_url".into(),
+                toml::Value::String(imported_base_url(base)?),
+            ),
+            ("wire_api".into(), toml::Value::String("responses".into())),
+            (
+                "env_key".into(),
+                toml::Value::String("SUPERCODE_PROVIDER_API_KEY".into()),
+            ),
+            ("requires_openai_auth".into(), toml::Value::Boolean(false)),
+        ]);
+        safe.insert(
+            "model_provider".into(),
+            toml::Value::String("supercode_api".into()),
+        );
+        safe.insert(
+            "model_providers".into(),
+            toml::Value::Table(toml::Table::from_iter([(
+                "supercode_api".into(),
+                toml::Value::Table(connection),
+            )])),
+        );
+    }
     Ok(
         json!({"config":toml::to_string(&safe).map_err(|_|"配置序列化失败")?,"model":safe.get("model").and_then(toml::Value::as_str),"apiKey":key}),
     )
 }
-fn read(path: Option<String>) -> Result<Vec<(Profile, bool)>, String> {
-    let connection = Connection::open_with_flags(database(path)?, OpenFlags::SQLITE_OPEN_READ_ONLY)
+struct ReadResult {
+    path: PathBuf,
+    profiles: Vec<(Profile, bool)>,
+    warnings: Vec<String>,
+}
+#[derive(Serialize)]
+pub struct ScanResult {
+    pub path: String,
+    pub profiles: Vec<Summary>,
+    pub warnings: Vec<String>,
+}
+fn read(path: Option<String>) -> Result<ReadResult, String> {
+    let path = database(path)?;
+    if path
+        .extension()
+        .and_then(std::ffi::OsStr::to_str)
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
+    {
+        return read_legacy(path);
+    }
+    let connection = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)
         .map_err(|_| "无法以只读方式打开 CC Switch 数据库")?;
     connection
         .busy_timeout(std::time::Duration::from_secs(3))
         .map_err(|e| e.to_string())?;
-    let mut stmt=connection.prepare("SELECT id,app_type,name,settings_config,is_current FROM providers WHERE app_type IN ('claude','codex') ORDER BY app_type,name LIMIT 500").map_err(|_|"数据库不是受支持的 CC Switch providers 格式")?;
+    let mut stmt=connection.prepare("SELECT id,app_type,name,settings_config,COALESCE(is_current,0) FROM providers WHERE app_type IN ('claude','codex') ORDER BY app_type,name LIMIT 500").map_err(|_|"数据库不是受支持的 CC Switch providers 格式")?;
     let rows = stmt
         .query_map([], |r| {
             Ok((
@@ -241,29 +439,120 @@ fn read(path: Option<String>) -> Result<Vec<(Profile, bool)>, String> {
         })
         .map_err(|_| "无法读取 CC Switch 配置")?;
     let mut profiles = vec![];
+    let mut warnings = vec![];
     for row in rows {
-        let (id, agent, name, raw, current) =
-            row.map_err(|_| "CC Switch 数据含无法读取的 UTF-8 文本，未转换或修改原文件")?;
+        let (id, agent, name, raw, current) = match row {
+            Ok(row) => row,
+            Err(rusqlite::Error::FromSqlConversionFailure(_, _, error))
+                if error.is::<std::str::Utf8Error>() =>
+            {
+                warnings.push("已跳过非 UTF-8 配置：未转换或修改原文件".into());
+                continue;
+            }
+            Err(_) => {
+                warnings.push("已跳过无法读取的配置：字段格式无效，未转换或修改原文件".into());
+                continue;
+            }
+        };
         if raw.len() > 1024 * 1024 {
-            return Err(format!("{name} 配置超过 1 MB"));
+            warnings.push(format!("{name}：配置超过 1 MB，已跳过"));
+            continue;
         }
-        let raw: Value =
-            serde_json::from_str(&raw).map_err(|_| format!("{name} 配置 JSON 无效"))?;
+        let config = serde_json::from_str::<Value>(&raw)
+            .map_err(|_| "配置 JSON 无效".into())
+            .and_then(|raw| sanitize(&agent, raw));
+        let config = match config {
+            Ok(config) => config,
+            Err(error) => {
+                warnings.push(format!("{name}：{error}，已跳过"));
+                continue;
+            }
+        };
         profiles.push((
             Profile {
                 id: format!("{agent}:{id}"),
-                config: sanitize(&agent, raw).map_err(|e| format!("{name}：{e}"))?,
+                config,
                 agent,
                 name,
             },
             current,
         ));
     }
-    Ok(profiles)
+    Ok(ReadResult {
+        path,
+        profiles,
+        warnings,
+    })
+}
+fn read_legacy(path: PathBuf) -> Result<ReadResult, String> {
+    use std::io::Read;
+    let file = std::fs::File::open(&path).map_err(|_| "无法只读打开 CC Switch 旧版配置")?;
+    let mut bytes = Vec::new();
+    file.take(8 * 1024 * 1024 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| "无法读取 CC Switch 旧版配置")?;
+    if bytes.len() > 8 * 1024 * 1024 {
+        return Err("CC Switch 旧版配置超过 8 MB".into());
+    }
+    let text = std::str::from_utf8(&bytes)
+        .map_err(|_| "CC Switch 旧版配置不是 UTF-8，未转换或修改原文件")?;
+    if text.starts_with('\u{feff}') {
+        return Err("CC Switch 旧版配置含 BOM，未转换或修改原文件".into());
+    }
+    let value: Value = serde_json::from_str(text).map_err(|_| "CC Switch 旧版配置 JSON 无效")?;
+    if !value["claude"]["providers"].is_object() && !value["codex"]["providers"].is_object() {
+        return Err("文件不是受支持的 CC Switch 旧版供应商配置".into());
+    }
+    let mut profiles = Vec::new();
+    let mut warnings = Vec::new();
+    let total: usize = ["claude", "codex"]
+        .into_iter()
+        .filter_map(|agent| value[agent]["providers"].as_object().map(|rows| rows.len()))
+        .sum();
+    if total > 500 {
+        return Err("CC Switch 配置超过 500 个连接".into());
+    }
+    for agent in ["claude", "codex"] {
+        if let Some(rows) = value[agent]["providers"].as_object() {
+            for (id, row) in rows {
+                let name = row["name"].as_str().unwrap_or(id);
+                if row["settingsConfig"].to_string().len() > 1024 * 1024 {
+                    warnings.push(format!("{name}：配置超过 1 MB，已跳过"));
+                    continue;
+                }
+                match sanitize(agent, row["settingsConfig"].clone()) {
+                    Ok(config) => profiles.push((
+                        Profile {
+                            id: format!("{agent}:{id}"),
+                            agent: agent.into(),
+                            name: name.into(),
+                            config,
+                        },
+                        value[agent]["current"].as_str() == Some(id),
+                    )),
+                    Err(error) => warnings.push(format!("{name}：{error}，已跳过")),
+                }
+            }
+        }
+    }
+    Ok(ReadResult {
+        path,
+        profiles,
+        warnings,
+    })
 }
 #[tauri::command]
-pub fn scan_ccswitch(path: Option<String>) -> Result<Vec<Summary>, String> {
-    Ok(read(path)?.into_iter().map(|(p, c)| p.summary(c)).collect())
+pub fn scan_ccswitch(path: Option<String>) -> Result<ScanResult, String> {
+    let result = read(path)?;
+    Ok(ScanResult {
+        path: result.path.to_string_lossy().into(),
+        profiles: result
+            .profiles
+            .into_iter()
+            .map(|(p, c)| p.summary(c))
+            .collect(),
+        warnings: result.warnings,
+    })
 }
 #[tauri::command]
 pub fn import_ccswitch(
@@ -279,6 +568,7 @@ pub fn import_ccswitch(
     }
     let all = read(path)?;
     let selected = all
+        .profiles
         .into_iter()
         .filter(|(p, _)| ids.contains(&p.id))
         .map(|(p, _)| p)
@@ -343,6 +633,296 @@ pub fn codex_overrides(config: &Value) -> Result<Vec<String>, String> {
 mod tests {
     use super::*;
     #[test]
+    fn existing_http_gateway_routes_survive_import_without_relaxing_address_structure() {
+        for config in [
+            "model_provider='gateway'\n[model_providers.gateway]\nbase_url='http://gateway.local:8317/v1/'",
+            "base_url='http://192.0.2.1:8317/v1/'",
+        ] {
+            let safe = sanitize("codex", json!({"config":config,"auth":{"OPENAI_API_KEY":"private-token"}})).unwrap();
+            let table: toml::Table = toml::from_str(safe["config"].as_str().unwrap()).unwrap();
+            let provider = table["model_provider"].as_str().unwrap();
+            assert!(table["model_providers"][provider]["base_url"].as_str().unwrap().starts_with("http://"));
+            assert_eq!(table["model_providers"][provider]["env_key"].as_str(), Some("SUPERCODE_PROVIDER_API_KEY"));
+            assert!(!safe["config"].as_str().unwrap().contains("private-token"));
+        }
+        for invalid in [
+            "file:///tmp/config",
+            "http://secret@gateway.local/v1",
+            "http://gateway.local/v1?key=secret",
+        ] {
+            assert!(imported_base_url(invalid).is_err());
+        }
+    }
+    #[test]
+    fn codex_config_variants_keep_only_active_credentials_and_preserve_gateway_routes() {
+        for config in [
+            "model_provider='  gateway  '\n[model_providers.gateway]\nbase_url='https://gateway.example/v1'\nexperimental_bearer_token='inline-secret'",
+            "model_provider='gateway'\nbase_url='https://gateway.example/v1'\nexperimental_bearer_token='inline-secret'",
+            "model_provider=' '\nbase_url='https://gateway.example/v1'\nexperimental_bearer_token='inline-secret'",
+        ] {
+            let safe = sanitize("codex", json!({"config":config})).unwrap();
+            assert_eq!(safe["apiKey"], "inline-secret");
+            let table: toml::Table = toml::from_str(safe["config"].as_str().unwrap()).unwrap();
+            let provider = table["model_provider"].as_str().unwrap();
+            assert_eq!(table["model_providers"][provider]["base_url"].as_str(), Some("https://gateway.example/v1"));
+            assert!(codex_overrides(&safe).unwrap().iter().all(|arg| !arg.contains("inline-secret")));
+        }
+        let config = "model='m'\n[model_providers.leftover]\nexperimental_bearer_token='dormant-secret'\n[model_providers.openai]\nbase_url='https://wrong.example/v1'\nexperimental_bearer_token='dormant-secret'";
+        let safe = sanitize("codex", json!({"config":config})).unwrap();
+        assert!(safe["apiKey"].is_null());
+        assert!(Profile {
+            id: "a".into(),
+            agent: "codex".into(),
+            name: "Login".into(),
+            config: safe
+        }
+        .is_official());
+        let safe = sanitize(
+            "codex",
+            json!({"config":config,"auth":{"OPENAI_API_KEY":"auth-secret"}}),
+        )
+        .unwrap();
+        let table: toml::Table = toml::from_str(safe["config"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            table["model_providers"]["supercode_api"]["base_url"].as_str(),
+            Some("https://api.openai.com/v1")
+        );
+        let safe = sanitize("codex", json!({"config":"experimental_bearer_token='inline-secret'","auth":{"OPENAI_API_KEY":"auth-secret"}})).unwrap();
+        assert_eq!(safe["apiKey"], "auth-secret");
+    }
+    #[test]
+    fn legacy_json_and_new_sqlite_layouts_are_detected_without_user_data_or_cli_installations() {
+        let dir = std::env::temp_dir().join(format!("supercode-cc-兼容-{}", uuid::Uuid::new_v4()));
+        let home = dir.join("全新用户 空格");
+        let source = home.join(".cc-switch");
+        std::fs::create_dir_all(&source).unwrap();
+        let legacy = source.join("config.json");
+        std::fs::write(&legacy,serde_json::to_vec(&json!({"version":2,"claude":{"current":"a","providers":{"a":{"name":"旧版 Claude","settingsConfig":{"env":{"ANTHROPIC_MODEL":"m"}}},"bad":{"name":"错误行","settingsConfig":null}}},"codex":{"current":"b","providers":{"b":{"name":"旧版 API","settingsConfig":{"auth":{"OPENAI_API_KEY":"test-secret"},"config":"model='m'"}}}}})).unwrap()).unwrap();
+        let before = std::fs::read(&legacy).unwrap();
+        let detected = locate_database(None, None, None, &home, None).unwrap();
+        assert_eq!(detected, legacy);
+        let scan = scan_ccswitch(Some(detected.to_string_lossy().into())).unwrap();
+        assert_eq!(scan.profiles.len(), 2);
+        assert_eq!(scan.warnings.len(), 1);
+        assert!(scan.profiles.iter().all(|p| p.current));
+        assert!(!serde_json::to_string(&scan)
+            .unwrap()
+            .contains("test-secret"));
+        assert_eq!(before, std::fs::read(&legacy).unwrap());
+        // New releases add columns; only stable provider fields are read.
+        let db = source.join("cc-switch.db");
+        let c = Connection::open(&db).unwrap();
+        c.execute_batch("CREATE TABLE providers(id TEXT,app_type TEXT,name TEXT,settings_config TEXT,is_current INTEGER,meta TEXT,provider_type TEXT,sort_index INTEGER); INSERT INTO providers VALUES('a','claude','新版 Claude','{\"env\":{\"ANTHROPIC_MODEL\":\"m\"}}',NULL,'{}',NULL,10)").unwrap();
+        drop(c);
+        assert_eq!(locate_database(None, None, None, &home, None).unwrap(), db);
+        let scan = scan_ccswitch(Some(source.to_string_lossy().into())).unwrap();
+        assert_eq!(scan.profiles.len(), 1);
+        assert!(scan.warnings.is_empty());
+        assert!(!scan.profiles[0].current);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn default_codex_api_keys_import_as_api_connections_without_using_inactive_providers() {
+        for config in [
+            "model='m'",
+            "model='m'\nmodel_provider='openai'",
+            "model='m'\n[model_providers.leftover]\nbase_url='https://wrong.example/v1'",
+        ] {
+            let safe = sanitize(
+                "codex",
+                json!({"auth":{"OPENAI_API_KEY":"test-secret"},"config":config}),
+            )
+            .unwrap();
+            let table: toml::Table = toml::from_str(safe["config"].as_str().unwrap()).unwrap();
+            assert_eq!(table["model_provider"].as_str(), Some("supercode_api"));
+            let connection = &table["model_providers"]["supercode_api"];
+            assert_eq!(
+                connection["base_url"].as_str(),
+                Some("https://api.openai.com/v1")
+            );
+            assert_eq!(
+                connection["env_key"].as_str(),
+                Some("SUPERCODE_PROVIDER_API_KEY")
+            );
+            assert_eq!(connection["requires_openai_auth"].as_bool(), Some(false));
+            let summary = Profile {
+                id: "api".into(),
+                agent: "codex".into(),
+                name: "API".into(),
+                config: safe,
+            }
+            .summary(false);
+            assert!(!summary.official_account);
+            assert!(summary.has_credential);
+            assert!(!serde_json::to_string(&summary)
+                .unwrap()
+                .contains("test-secret"));
+        }
+        let safe = sanitize("codex", json!({"auth":{"OPENAI_API_KEY":"test-secret"},"config":"base_url='https://gateway.example/v1'\nmodel='m'"})).unwrap();
+        let table: toml::Table = toml::from_str(safe["config"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            table["model_providers"]["supercode_api"]["base_url"].as_str(),
+            Some("https://gateway.example/v1")
+        );
+        let official = Profile {
+            id: "login".into(),
+            agent: "codex".into(),
+            name: "登录".into(),
+            config: sanitize("codex", json!({"auth":{},"config":"model='m'"})).unwrap(),
+        };
+        assert!(official.is_official());
+    }
+    #[test]
+    fn partial_scan_preserves_valid_connections_and_never_exposes_failed_config_contents() {
+        let dir =
+            std::env::temp_dir().join(format!("supercode-cc-partial-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("cc-switch.db");
+        let c = Connection::open(&path).unwrap();
+        c.execute_batch("CREATE TABLE providers(id TEXT,app_type TEXT,name TEXT,settings_config TEXT,is_current INTEGER)").unwrap();
+        for (id, agent, name, config) in [
+            (
+                "claude",
+                "claude",
+                "正常 Claude",
+                json!({"env":{"ANTHROPIC_AUTH_TOKEN":"test-secret","ANTHROPIC_MODEL":"m"}})
+                    .to_string(),
+            ),
+            (
+                "api",
+                "codex",
+                "tokeni",
+                json!({"auth":{"OPENAI_API_KEY":"test-secret"},"config":"model='m'"}).to_string(),
+            ),
+            (
+                "broken",
+                "codex",
+                "错误配置",
+                json!({"auth":{"OPENAI_API_KEY":"test-secret"},"config":"invalid='test-secret"})
+                    .to_string(),
+            ),
+            ("json", "codex", "错误 JSON", "invalid test-secret".into()),
+        ] {
+            c.execute(
+                "INSERT INTO providers VALUES(?1,?2,?3,?4,1)",
+                rusqlite::params![id, agent, name, config],
+            )
+            .unwrap();
+        }
+        c.execute_batch(
+            "INSERT INTO providers VALUES('encoding','codex','错误编码',CAST(x'fffe' AS TEXT),1)",
+        )
+        .unwrap();
+        drop(c);
+        let before = std::fs::read(&path).unwrap();
+        let scan = scan_ccswitch(Some(path.to_string_lossy().into())).unwrap();
+        assert_eq!(scan.profiles.len(), 2);
+        assert_eq!(scan.warnings.len(), 3);
+        assert!(scan
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("非 UTF-8")));
+        assert!(scan
+            .profiles
+            .iter()
+            .any(|p| p.name == "tokeni" && !p.official_account));
+        assert!(!serde_json::to_string(&scan)
+            .unwrap()
+            .contains("test-secret"));
+        assert_eq!(before, std::fs::read(&path).unwrap());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn database_detection_follows_manual_environment_custom_default_and_legacy_locations() {
+        let dir = std::env::temp_dir().join(format!("supercode-cc-path-{}", uuid::Uuid::new_v4()));
+        let user_home = dir.join("user");
+        let legacy = dir.join("legacy");
+        let custom = dir.join("custom");
+        let env_dir = dir.join("env");
+        for path in [legacy.join(".cc-switch"), custom.clone(), env_dir.clone()] {
+            std::fs::create_dir_all(&path).unwrap();
+            std::fs::write(path.join("cc-switch.db"), b"").unwrap();
+        }
+        let store = dir.join("app_paths.json");
+        std::fs::write(
+            &store,
+            serde_json::to_vec(&json!({"app_config_dir_override":custom})).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            locate_database(None, None, None, &user_home, Some(legacy.clone())).unwrap(),
+            legacy.join(".cc-switch/cc-switch.db")
+        );
+        let default = user_home.join(".cc-switch");
+        std::fs::create_dir_all(&default).unwrap();
+        std::fs::write(default.join("cc-switch.db"), b"").unwrap();
+        assert_eq!(
+            locate_database(None, None, None, &user_home, Some(legacy)).unwrap(),
+            default.join("cc-switch.db")
+        );
+        assert_eq!(
+            locate_database(None, None, Some(&store), &user_home, None).unwrap(),
+            custom.join("cc-switch.db")
+        );
+        assert_eq!(
+            locate_database(None, Some(env_dir.clone()), Some(&store), &user_home, None).unwrap(),
+            env_dir.join("cc-switch.db")
+        );
+        assert_eq!(
+            locate_database(
+                None,
+                Some(PathBuf::from(" ")),
+                Some(&store),
+                &user_home,
+                None
+            )
+            .unwrap(),
+            custom.join("cc-switch.db")
+        );
+        assert_eq!(
+            locate_database(
+                None,
+                Some(PathBuf::from("~/.cc-switch")),
+                None,
+                &user_home,
+                None
+            )
+            .unwrap(),
+            default.join("cc-switch.db")
+        );
+        assert_eq!(
+            locate_database(
+                Some("~/.cc-switch"),
+                Some(env_dir),
+                Some(&store),
+                &user_home,
+                None
+            )
+            .unwrap(),
+            default.join("cc-switch.db")
+        );
+        std::fs::write(&store, b"\xff\xfe").unwrap();
+        assert!(locate_database(None, None, Some(&store), &user_home, None)
+            .unwrap_err()
+            .contains("UTF-8"));
+        assert!(
+            locate_database(Some("~/.cc-switch"), None, Some(&store), &user_home, None).is_ok()
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    #[ignore = "Read-only inspection of the current user's CC Switch database; run explicitly"]
+    fn installed_database_is_automatically_detected_without_importing() {
+        let scan = scan_ccswitch(None).unwrap();
+        assert!(!scan.profiles.is_empty(), "no supported connections found");
+        println!(
+            "Detected database: {}\nImportable connections: {}\nSkipped connections: {}",
+            scan.path,
+            scan.profiles.len(),
+            scan.warnings.len()
+        );
+    }
+    #[test]
     fn import_excludes_hooks_permissions_and_never_returns_credentials_in_summary() {
         let config=sanitize("claude",json!({"env":{"ANTHROPIC_AUTH_TOKEN":"test-secret","ANTHROPIC_MODEL":"test-model","NODE_OPTIONS":"unsafe"},"hooks":{"command":"unsafe"},"permissions":{"defaultMode":"bypassPermissions"}})).unwrap();
         assert!(config.get("hooks").is_none());
@@ -373,9 +953,10 @@ mod tests {
         drop(c);
         let before = std::fs::read(&path).unwrap();
         let rows = read(Some(path.to_string_lossy().into())).unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].0.name, "中文");
-        assert!(rows[0].1);
+        assert_eq!(rows.profiles.len(), 1);
+        assert_eq!(rows.profiles[0].0.name, "中文");
+        assert!(rows.profiles[0].1);
+        assert!(rows.warnings.is_empty());
         assert_eq!(before, std::fs::read(&path).unwrap());
         std::fs::remove_dir_all(dir).unwrap();
     }

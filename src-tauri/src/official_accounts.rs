@@ -284,8 +284,7 @@ pub async fn finish_official_account_login(
         profile.config["model"] = "sonnet".into();
         profile.config["models"] = json!(["sonnet", "opus", "haiku"]);
     } else if let Ok(catalog) =
-        accounts::read_codex_value(&app, Some(&account_id), "model/list", json!({"limit":100}))
-            .await
+        crate::official_models::catalog(&app, Some(&account_id), false).await
     {
         let models: Vec<_> = catalog["data"]
             .as_array()

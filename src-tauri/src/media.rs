@@ -127,6 +127,24 @@ pub async fn open_media(
     .map_err(|e| e.to_string())?
 }
 
+#[tauri::command]
+pub async fn reveal_media(
+    path: String,
+    project_id: Option<String>,
+    session_id: Option<String>,
+    app: AppHandle,
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        // Locate the original file, including cached tool images outside a project.
+        let path = resolve_file(&app, &path, project_id, session_id)?;
+        app.opener()
+            .reveal_item_in_dir(path)
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 impl Media {
     fn register(&self, path: PathBuf, mime: &str, image: bool) -> Result<String, String> {
         let token = format!("{:x}", Sha256::digest(path.to_string_lossy().as_bytes()));

@@ -78,7 +78,7 @@ function optionsFor(models: Model[], source: ModelSource, connectionId: string, 
   });
 }
 
-export function modelGroups({ models, profiles, activeProfile, source, agent, value, connectionId, order, loggedInAgents = [] }: { models: Model[]; profiles: AgentProfile[]; activeProfile?: AgentProfile; source?: ModelSource; agent: string; value: string; connectionId?: string; order?: ConnectionOrder; loggedInAgents?: string[] }): ModelGroup[] {
+export function modelGroups({ models, catalogLoaded = false, profiles, activeProfile, source, agent, value, connectionId, order, loggedInAgents = [] }: { models: Model[]; catalogLoaded?: boolean; profiles: AgentProfile[]; activeProfile?: AgentProfile; source?: ModelSource; agent: string; value: string; connectionId?: string; order?: ConnectionOrder; loggedInAgents?: string[] }): ModelGroup[] {
   const currentId = connectionId ?? activeProfile?.id ?? '';
   const currentProfile = profiles.find(p => p.agent === agent && p.id === currentId);
   const legacyOfficial = agent === 'codex' && currentId === '@local' && source?.available === true && source.connectionName === 'ChatGPT 官方账号';
@@ -91,7 +91,7 @@ export function modelGroups({ models, profiles, activeProfile, source, agent, va
   const currentGroupId = officialCurrent ? '@official' : currentId;
   const profileModels = (profile: AgentProfile): Model[] => [...new Set([profile.model, ...profile.models ?? []].filter((m): m is string => !!m))].map(id => ({ id, model: id, displayName: id, isDefault: id === profile.model }));
   const officialModels = profiles.filter(p => p.agent === agent && p.officialAccount && !p.accountId).flatMap(profileModels);
-  const currentModels = !currentAvailable ? [] : models.length ? models : currentProfile ? profileModels(currentProfile) : officialCurrent ? officialModels : [];
+  const currentModels = !currentAvailable ? [] : catalogLoaded || models.length ? models : currentProfile ? profileModels(currentProfile) : officialCurrent ? officialModels : [];
   const current = { id: currentGroupId, source: currentSource, options: optionsFor(currentModels, currentSource, currentId, true, value || currentProfile?.model || '') };
   const ids = visibleProviderIds(agent, profiles, verifiedAgents, order).filter(id => id !== currentGroupId || currentAvailable);
   if (currentAvailable && !ids.includes(currentGroupId)) ids.push(currentGroupId);

@@ -1,13 +1,15 @@
-import { useEffect, useId, useLayoutEffect, useRef, useState, type MouseEvent, type ReactNode } from 'react';
+import { useContext, useEffect, useId, useLayoutEffect, useRef, useState, type MouseEvent, type ReactNode } from 'react';
 import { createPortal } from 'react-dom';
 import { Copy, ExternalLink, FileText, FolderOpen } from 'lucide-react';
 import { call, desktop } from './api';
 import { describeLink, resourceFromText, systemDocument } from './links';
+import { MediaContext } from './Media';
 
-type Resource = { kind: 'file' | 'external'; target: string; line?: number };
+type Resource = { kind: 'file' | 'external'; target: string; line?: number; media?: boolean };
 export type OpenPath = (path: string, action: 'open' | 'reveal') => void | Promise<void>;
 
 export function ResourceMenu({ children, openFile, openPath }: { children: ReactNode; openFile: (path: string, line?: number) => void; openPath?: OpenPath }) {
+  const mediaContext = useContext(MediaContext);
   const [menu, setMenu] = useState<{ resource: Resource; x: number; y: number; origin: HTMLElement } | null>(null);
   const [feedback, setFeedback] = useState('');
   const [busy, setBusy] = useState(false);
@@ -46,18 +48,19 @@ export function ResourceMenu({ children, openFile, openPath }: { children: React
 
   function show(event: MouseEvent<HTMLDivElement>) {
     const target = event.target as HTMLElement;
+    const media = target.closest<HTMLElement>('[data-media-source]');
     const tagged = target.closest<HTMLElement>('[data-resource-path]');
     const anchor = target.closest<HTMLAnchorElement>('a[href]');
     const code = target.closest<HTMLElement>('code:not(pre code)');
     const selection = window.getSelection();
     const selected = selection && !selection.isCollapsed && event.currentTarget.contains(selection.anchorNode) ? resourceFromText(selection.toString()) : null;
-    const resource = tagged ? describeLink(tagged.dataset.resourcePath ?? '') : anchor ? describeLink(anchor.getAttribute('href') ?? '') : selected ?? (code ? resourceFromText(code.textContent ?? '') : null);
+    const resource = media ? describeLink(media.dataset.mediaSource ?? '') : tagged ? describeLink(tagged.dataset.resourcePath ?? '') : anchor ? describeLink(anchor.getAttribute('href') ?? '') : selected ?? (code ? resourceFromText(code.textContent ?? '') : null);
     if (!resource || (resource.kind !== 'file' && resource.kind !== 'external')) return;
     event.preventDefault();
-    const origin = tagged ?? anchor ?? code ?? target;
+    const origin = media ? target.closest<HTMLElement>('button, [tabindex]') ?? media : tagged ?? anchor ?? code ?? target;
     const bounds = origin.getBoundingClientRect();
     setFeedback(''); setBusy(false);
-    setMenu({ resource: { kind: resource.kind, target: resource.target, line: resource.line }, x: event.clientX || bounds.left, y: event.clientY || bounds.bottom, origin });
+    setMenu({ resource: { kind: resource.kind, target: resource.target, line: resource.line, media: !!media }, x: event.clientX || bounds.left, y: event.clientY || bounds.bottom, origin });
   }
   async function act(action: 'open' | 'reveal' | 'copy') {
     if (!menu || busy) return;
@@ -69,6 +72,8 @@ export function ResourceMenu({ children, openFile, openPath }: { children: React
         if (resource.kind === 'external') {
           if (desktop) await call('open_external_link', { url: resource.target });
           else window.open(resource.target, '_blank', 'noopener,noreferrer');
+        } else if (resource.media && desktop) {
+          await call(action === 'reveal' ? 'reveal_media' : 'open_media', { path: resource.target, projectId: mediaContext.projectId ?? null, sessionId: mediaContext.sessionId || null });
         } else if (action === 'reveal' || systemDocument(resource.target)) {
           if (!openPath) throw new Error('请在桌面版中打开文件');
           await openPath(resource.target, action);
@@ -88,8 +93,8 @@ export function ResourceMenu({ children, openFile, openPath }: { children: React
     const next = event.key === 'Home' ? 0 : event.key === 'End' ? buttons.length - 1 : event.key === 'ArrowDown' ? (at + 1) % buttons.length : (at + buttons.length - 1) % buttons.length;
     buttons[next].focus();
   }}>
-    <button role="menuitem" disabled={busy} onClick={() => void act('open')}>{menu.resource.kind === 'file' ? <FileText size={15}/> : <ExternalLink size={15}/>}<span>{menu.resource.kind === 'file' ? '打开文件' : '打开链接'}</span></button>
-    {menu.resource.kind === 'file' ? <button role="menuitem" disabled={busy || !openPath} onClick={() => void act('reveal')}><FolderOpen size={15}/><span>在文件夹中显示</span></button> : null}
+    <button role="menuitem" disabled={busy} onClick={() => void act('open')}>{menu.resource.kind === 'file' ? <FileText size={15}/> : <ExternalLink size={15}/>}<span>{menu.resource.kind === 'file' ? menu.resource.media ? '在系统中打开' : '打开文件' : '打开链接'}</span></button>
+    {menu.resource.kind === 'file' ? <button role="menuitem" disabled={busy || !(menu.resource.media && desktop || openPath)} onClick={() => void act('reveal')}><FolderOpen size={15}/><span>在文件夹中显示</span></button> : null}
     <button role="menuitem" disabled={busy} onClick={() => void act('copy')}><Copy size={15}/><span>{feedback === '已复制' ? feedback : menu.resource.kind === 'file' ? '复制路径' : '复制链接'}</span></button>
     {feedback && feedback !== '已复制' ? <div className="resource-menu-error" role="alert">{feedback}</div> : null}
   </div>, document.body) : null}</div>;

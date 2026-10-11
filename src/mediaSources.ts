@@ -23,6 +23,12 @@ export function mediaReference(source: string, name?: string, kind?: MediaKind):
   return { path: link.target, kind: type, name: name?.trim().slice(0, 160) || filename || (type === 'image' ? '图片' : type === 'video' ? '视频' : '音频') };
 }
 
+// Image syntax is also used for video/audio embeds. Unknown HTTP image URLs
+// remain supported without treating known video or audio files as images.
+export function embeddedMedia(source: string, name?: string) {
+  return mediaReference(source, name, mediaKind(source) ?? 'image');
+}
+
 export function messageMedia(message: Message): MediaReference[] {
   const refs = Array.isArray(message.data?.media) ? message.data.media : [];
   const result = refs.slice(0, 12).flatMap((value: unknown) => {

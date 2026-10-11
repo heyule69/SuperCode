@@ -61,9 +61,25 @@ async fn verify(app: &AppHandle) -> Result<Value, String> {
         let mut catalog_guards = vec![];
         for account in &accounts {
             let agent = account["agent"].as_str().ok_or("账号 Agent 缺失")?;
+            if agent == "codex"
+                && account["loggedIn"] == true
+                && account.get("connectionId").is_none()
+            {
+                state.store.use_official(agent)?;
+                let catalog =
+                    commands::list_models(Some(agent.into()), None, None, None, app.clone())
+                        .await?;
+                let models = catalog["data"].as_array().ok_or("官方模型列表无效")?;
+                if models.is_empty() || catalog["source"]["available"] != true {
+                    return Err("已登录账号未返回官方模型".into());
+                }
+                catalog_guards.push(json!({"agent":agent,"models":models.iter().filter_map(|model| model["model"].as_str()).collect::<Vec<_>>() }));
+            }
             if account["loggedIn"] == false {
                 state.store.use_official(agent)?;
-                let catalog = commands::list_models(Some(agent.into()), None, None, app.clone()).await?;
+                let catalog =
+                    commands::list_models(Some(agent.into()), None, None, None, app.clone())
+                        .await?;
                 if catalog["data"]
                     .as_array()
                     .is_none_or(|models| !models.is_empty())

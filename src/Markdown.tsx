@@ -10,6 +10,7 @@ import { StreamReveal } from './streamReveal';
 import { FileText, Globe, Image as ImageIcon } from 'lucide-react';
 import { MarkdownMedia, MediaList } from './Media';
 import { referencedMedia } from './mediaSources';
+import { groupMarkdownImages } from './markdownImages';
 import './code-syntax.css';
 
 function RevealSpan({ node, children, ...props }: ComponentProps<'span'> & ExtraProps) {
@@ -74,7 +75,7 @@ export default function Markdown({ text, openFile, streaming = false }: { text: 
     const timer = window.setTimeout(() => setSettled(value => value + 1), Math.max(0, expires - performance.now()) + 10);
     return () => window.clearTimeout(timer);
   }, [expires]);
-  const plugins = useMemo(() => [() => (root: Root) => reveal.decorate(root)], [reveal, text, streaming, settled]);
+  const plugins = useMemo(() => [() => (root: Root) => { groupMarkdownImages(root); reveal.decorate(root); }], [reveal, text, streaming, settled]);
   const media = useMemo(() => referencedMedia(text), [text]);
   return <MarkdownActions.Provider value={actions}><ReactMarkdown remarkPlugins={[remarkGfm]} rehypePlugins={plugins} urlTransform={safeUrl} components={components}>{text}</ReactMarkdown><MediaList media={media}/>{error ? <p className="inline-error" role="alert">{error}</p> : null}</MarkdownActions.Provider>;
 }

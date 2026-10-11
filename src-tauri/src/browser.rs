@@ -1,4 +1,4 @@
-//! Visible, application-owned WebView2 browser. Agents never receive GUI IPC access.
+//! Application-owned WebView2 sessions, independent of their panel visibility.
 use crate::{browser_bridge, client_features::ToolServer, AppState};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -45,6 +45,8 @@ pub(crate) struct Tab {
     pub hwnd: isize,
     pub scale: AtomicU64,
     pub rect: Mutex<(f64, f64, f64, f64)>,
+    used: Mutex<Instant>,
+    layout_revision: AtomicU64,
     revision: AtomicU64,
     observation: Mutex<Option<Observation>>,
     operation: tokio::sync::Mutex<()>,
@@ -217,7 +219,7 @@ pub(crate) fn active_tab(app: &AppHandle) -> Option<Arc<Tab>> {
         .map(|l| l.session.clone())?;
     let tab = tab(app, &session).ok()?;
     let active = matches!(tab.status.lock().unwrap().as_str(), "working" | "error");
-    (active && tab.visible.load(Ordering::Acquire)).then_some(tab)
+    active.then_some(tab)
 }
 pub fn stop(app: &AppHandle, session: &str, interrupt: bool) {
     let state = app.state::<Browser>();
@@ -268,15 +270,32 @@ async fn ensure_tab(app: &AppHandle, session: &str, window: &str) -> Result<Arc<
         if tab.window != window {
             return Err("此聊天的浏览器已在另一个窗口打开".into());
         }
+        *tab.used.lock().unwrap() = Instant::now();
         return Ok(tab);
     }
     let state = app.state::<Browser>();
     let _creating = state.creating.lock().await;
     if let Ok(tab) = tab(app, session) {
+        if tab.window != window {
+            return Err("此聊天的浏览器已在另一个窗口打开".into());
+        }
+        *tab.used.lock().unwrap() = Instant::now();
         return Ok(tab);
     }
     if state.tabs.lock().unwrap().len() >= 8 {
-        return Err("请先关闭一个浏览器标签页（最多 8 个）".into());
+        let lease = state.lease.lock().unwrap();
+        let mut tabs = state.tabs.lock().unwrap();
+        let candidate = inactive_hidden_tab(&tabs, lease.as_ref());
+        let old = candidate.and_then(|id| tabs.remove(&id));
+        drop(tabs);
+        drop(lease);
+        if let Some(old) = old {
+            if let Some(view) = app.get_webview(&old.label) {
+                view.close().map_err(|e| e.to_string())?;
+            }
+        } else {
+            return Err("浏览器会话已达上限（最多 8 个），请先收起其他页面".into());
+        }
     }
     let parent = app.get_window(window).ok_or("浏览器所属窗口已关闭")?;
     #[cfg(windows)]
@@ -294,7 +313,9 @@ async fn ensure_tab(app: &AppHandle, session: &str, window: &str) -> Result<Arc<
         focused: AtomicBool::new(false),
         hwnd,
         scale: AtomicU64::new(scale.to_bits()),
-        rect: Mutex::new((0., 0., 0., 0.)),
+        rect: Mutex::new((10000., 0., 960., 640.)),
+        used: Mutex::new(Instant::now()),
+        layout_revision: AtomicU64::new(0),
         revision: AtomicU64::new(0),
         observation: Mutex::new(None),
         operation: tokio::sync::Mutex::new(()),
@@ -323,7 +344,7 @@ async fn ensure_tab(app: &AppHandle, session: &str, window: &str) -> Result<Arc<
         .add_child(
             builder,
             tauri::LogicalPosition::new(10000., 0.),
-            tauri::LogicalSize::new(1., 1.),
+            tauri::LogicalSize::new(960., 640.),
         )
         .map_err(|e| e.to_string())?;
     view.hide().map_err(|e| e.to_string())?;
@@ -334,6 +355,41 @@ async fn ensure_tab(app: &AppHandle, session: &str, window: &str) -> Result<Arc<
         .unwrap()
         .insert(session.into(), tab.clone());
     Ok(tab)
+}
+fn inactive_hidden_tab(tabs: &HashMap<String, Arc<Tab>>, lease: Option<&Lease>) -> Option<String> {
+    tabs.iter()
+        .filter(|(id, tab)| {
+            !tab.visible.load(Ordering::Acquire)
+                && !lease.is_some_and(|lease| {
+                    lease.session == **id && lease.gate.load(Ordering::Acquire)
+                })
+                && tab.operation.try_lock().is_ok()
+        })
+        .min_by_key(|(_, tab)| *tab.used.lock().unwrap())
+        .map(|(id, _)| id.clone())
+}
+fn hide_panel(app: &AppHandle, tab: &Tab) {
+    tab.visible.store(false, Ordering::Release);
+    tab.focused.store(false, Ordering::Release);
+    // A user can dismiss the UI while the agent is still preparing its first call.
+    // Mark this turn as presented so that call will not reopen the dismissed panel.
+    if let Some(lease) = app
+        .state::<Browser>()
+        .lease
+        .lock()
+        .unwrap()
+        .as_ref()
+        .filter(|lease| lease.session == tab.session)
+    {
+        lease.presented.store(true, Ordering::Release);
+    }
+}
+fn park_view(view: &Webview) -> Result<(), String> {
+    // WebView2 stops producing screenshots when its controller is hidden.
+    // Keep the page rendering outside the window without changing its viewport.
+    view.set_position(tauri::LogicalPosition::new(10000., 0.))
+        .map_err(|e| e.to_string())?;
+    view.show().map_err(|e| e.to_string())
 }
 #[tauri::command]
 pub async fn browser_open(
@@ -377,18 +433,22 @@ pub async fn browser_layout(
         return Err("浏览器区域无效".into());
     }
     let view = app.get_webview(&tab.label).ok_or("浏览器已关闭")?;
-    let bounds = (x, y, width, height);
-    if *tab.rect.lock().unwrap() != bounds {
-        tab.revision.fetch_add(1, Ordering::AcqRel);
-        *tab.rect.lock().unwrap() = bounds;
-    }
+    let layout_revision = tab.layout_revision.fetch_add(1, Ordering::AcqRel) + 1;
     let shown = visible && width >= 180. && height >= 120.;
-    let was_visible = tab.visible.swap(shown, Ordering::AcqRel);
-    // A desktop-tool handoff minimizes our window; it must not interrupt that desktop action.
-    if was_visible && !shown && !crate::desktop_control::active(&app) {
-        stop(&app, &session_id, true);
-    }
     if shown {
+        // Resizing waits for an in-flight action, so its observed coordinates stay valid.
+        let _operation = tab.operation.lock().await;
+        // An old mount/layout must not reveal a panel that was closed while waiting.
+        if *tab.mount.lock().unwrap() != mount_id
+            || tab.layout_revision.load(Ordering::Acquire) != layout_revision
+        {
+            return Ok(());
+        }
+        let bounds = (x, y, width, height);
+        if *tab.rect.lock().unwrap() != bounds {
+            tab.revision.fetch_add(1, Ordering::AcqRel);
+            *tab.rect.lock().unwrap() = bounds;
+        }
         if let Some(window) = app.get_window(&tab.window) {
             if let Ok(scale) = window.scale_factor() {
                 tab.scale.store(scale.to_bits(), Ordering::Release);
@@ -399,9 +459,15 @@ pub async fn browser_layout(
             size: tauri::LogicalSize::new(width, height).into(),
         })
         .map_err(|e| e.to_string())?;
+        if tab.layout_revision.load(Ordering::Acquire) != layout_revision {
+            return Ok(());
+        }
         view.show().map_err(|e| e.to_string())?;
+        tab.visible.store(true, Ordering::Release);
     } else {
-        view.hide().map_err(|e| e.to_string())?;
+        hide_panel(&app, &tab);
+        // Preserve the viewport and observation: hiding the UI is not a page resize.
+        park_view(&view)?;
     }
     Ok(())
 }
@@ -412,23 +478,24 @@ pub fn browser_takeover(session_id: String, app: AppHandle) {
 #[tauri::command]
 pub async fn browser_close(
     session_id: String,
+    mount_id: String,
     webview: Webview,
     app: AppHandle,
 ) -> Result<(), String> {
-    let tab = tab(&app, &session_id)?;
+    let Ok(tab) = tab(&app, &session_id) else {
+        return Ok(());
+    };
     if tab.window != webview.window().label() {
         return Err("浏览器不属于此窗口".into());
     }
-    stop(&app, &session_id, true);
-    tab.visible.store(false, Ordering::Release);
-    if let Some(view) = app.get_webview(&tab.label) {
-        view.close().map_err(|e| e.to_string())?;
+    if *tab.mount.lock().unwrap() != mount_id {
+        return Ok(());
     }
-    app.state::<Browser>()
-        .tabs
-        .lock()
-        .unwrap()
-        .remove(&session_id);
+    tab.layout_revision.fetch_add(1, Ordering::AcqRel);
+    hide_panel(&app, &tab);
+    if let Some(view) = app.get_webview(&tab.label) {
+        park_view(&view)?;
+    }
     Ok(())
 }
 #[tauri::command]
@@ -500,8 +567,6 @@ async fn cdp(
     let method = method.to_owned();
     let parameters = args.to_string();
     let gate = lease.map(|l| l.gate.clone());
-    let visible = tab.visible.clone();
-    let guarded = lease.is_some();
     let (tx, rx) = tokio::sync::oneshot::channel();
     let sender = Arc::new(Mutex::new(Some(tx)));
     let completion = sender.clone();
@@ -509,12 +574,6 @@ async fn cdp(
         if gate.as_ref().is_some_and(|g| !g.load(Ordering::Acquire)) {
             if let Some(tx) = sender.lock().unwrap().take() {
                 let _ = tx.send(Err("user_takeover".into()));
-            }
-            return;
-        }
-        if guarded && !visible.load(Ordering::Acquire) {
-            if let Some(tx) = sender.lock().unwrap().take() {
-                let _ = tx.send(Err("浏览器面板已隐藏，操作已暂停".into()));
             }
             return;
         }
@@ -724,13 +783,14 @@ async fn execute(
 ) -> Result<Value, String> {
     browser_bridge::validate(name, &args)?;
     lease.check()?;
-    if !tab.visible.load(Ordering::Acquire) {
-        return Err("请在此聊天右侧打开浏览器后继续；隐藏页面不会被操作".into());
-    }
     let _operation = tab
         .operation
         .try_lock()
         .map_err(|_| "另一个浏览器操作正在进行，请等待返回结果")?;
+    lease.check()?;
+    if !tab.visible.load(Ordering::Acquire) {
+        park_view(&app.get_webview(&tab.label).ok_or("浏览器已关闭")?)?;
+    }
     lease.check()?;
     status(
         app,
@@ -951,8 +1011,10 @@ async fn request(
         } else {
             ensure_tab(&app, &lease.session, "main").await?
         };
+        *tab.used.lock().unwrap() = Instant::now();
         let first_call = !lease.presented.swap(true, Ordering::AcqRel);
         if !tab.visible.load(Ordering::Acquire) && first_call {
+            status(&app, &tab, "working", "正在准备网页");
             let _ = app.emit_to(
                 tab.window.clone(),
                 "browser-show",
@@ -1202,6 +1264,70 @@ pub async fn smoke(app: AppHandle) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn test_tab(session: &str, visible: bool) -> Arc<Tab> {
+        Arc::new(Tab {
+            session: session.into(),
+            label: session.into(),
+            window: "main".into(),
+            visible: Arc::new(AtomicBool::new(visible)),
+            mount: Mutex::new(String::new()),
+            focused: AtomicBool::new(false),
+            hwnd: 0,
+            scale: AtomicU64::new(1f64.to_bits()),
+            rect: Mutex::new((0., 0., 500., 400.)),
+            used: Mutex::new(Instant::now()),
+            layout_revision: AtomicU64::new(0),
+            revision: AtomicU64::new(1),
+            observation: Mutex::new(None),
+            operation: tokio::sync::Mutex::new(()),
+            status: Mutex::new("idle".into()),
+            action: Mutex::new(String::new()),
+            location: Mutex::new(("about:blank".into(), "新标签页".into())),
+        })
+    }
+    #[test]
+    fn retained_browser_cache_keeps_visible_active_and_busy_pages() {
+        let active = test_tab("active", false);
+        let visible = test_tab("visible", true);
+        let busy = test_tab("busy", false);
+        let older = test_tab("older", false);
+        let newer = test_tab("newer", false);
+        *older.used.lock().unwrap() = Instant::now() - Duration::from_secs(60);
+        let guard = busy.operation.try_lock().unwrap();
+        let mut tabs = [&active, &visible, &busy, &older, &newer]
+            .into_iter()
+            .map(|page| (page.session.clone(), page.clone()))
+            .collect::<HashMap<_, _>>();
+        let lease = Lease {
+            session: "active".into(),
+            agent: "codex".into(),
+            turn: None,
+            gate: Arc::new(AtomicBool::new(true)),
+            presented: Arc::new(AtomicBool::new(true)),
+        };
+        assert_eq!(
+            inactive_hidden_tab(&tabs, Some(&lease)),
+            Some("older".into())
+        );
+        tabs.remove("older");
+        assert_eq!(
+            inactive_hidden_tab(&tabs, Some(&lease)),
+            Some("newer".into())
+        );
+        tabs.remove("newer");
+        assert_eq!(inactive_hidden_tab(&tabs, Some(&lease)), None);
+        drop(guard);
+        assert_eq!(
+            inactive_hidden_tab(&tabs, Some(&lease)),
+            Some("busy".into())
+        );
+        tabs.remove("busy");
+        lease.gate.store(false, Ordering::Release);
+        assert_eq!(
+            inactive_hidden_tab(&tabs, Some(&lease)),
+            Some("active".into())
+        );
+    }
     #[test]
     fn browser_urls_reject_privileged_schemes_and_embedded_credentials() {
         for value in [
@@ -1227,6 +1353,8 @@ mod tests {
             hwnd: 0,
             scale: AtomicU64::new(1f64.to_bits()),
             rect: Mutex::new((0., 0., 500., 400.)),
+            used: Mutex::new(Instant::now()),
+            layout_revision: AtomicU64::new(0),
             revision: AtomicU64::new(1),
             observation: Mutex::new(Some(Observation {
                 id: "snap".into(),

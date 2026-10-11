@@ -18,8 +18,10 @@ export default function BrowserPanel({ sessionId, visible, close, resizeHandle, 
   const [address,setAddress]=useState('');const [error,setError]=useState('');const [ready,setReady]=useState(false);const [loading,setLoading]=useState(false);
   const [navigating,setNavigating]=useState(false);const addressFocused=useRef(false);const visibility=useRef(visible);visibility.current=visible;
   const requestLayout=useRef<()=>void>(()=>{});
+  const mounted=useRef('');const live=useRef(false);
   useEffect(()=>{
     const mountId=crypto.randomUUID();let disposed=false;let opened=false;const offs:Array<()=>void>=[];let observer:ResizeObserver|undefined;let frame=0;
+    mounted.current=mountId;live.current=true;
     const layout=()=>{
       if(!opened || disposed)return;
       cancelAnimationFrame(frame);frame=requestAnimationFrame(()=>{
@@ -44,7 +46,7 @@ export default function BrowserPanel({ sessionId, visible, close, resizeHandle, 
         window.addEventListener('resize',layout);document.addEventListener('visibilitychange',layout);
       }catch(e){if(!disposed)setError(String(e));}
     })();
-    return ()=>{disposed=true;cancelAnimationFrame(frame);offs.forEach(off=>off());observer?.disconnect();window.removeEventListener('resize',layout);document.removeEventListener('visibilitychange',layout);void call('browser_layout',{sessionId,mountId,x:0,y:0,width:0,height:0,visible:false}).catch(()=>{});};
+    return ()=>{disposed=true;live.current=false;cancelAnimationFrame(frame);offs.forEach(off=>off());observer?.disconnect();window.removeEventListener('resize',layout);document.removeEventListener('visibilitychange',layout);void call('browser_layout',{sessionId,mountId,x:0,y:0,width:0,height:0,visible:false}).catch(()=>{});};
   },[sessionId]);
   useEffect(()=>requestLayout.current(),[visible,expanded,ready]);
   useEffect(()=>{
@@ -52,10 +54,10 @@ export default function BrowserPanel({ sessionId, visible, close, resizeHandle, 
     window.addEventListener('keydown',stop,true);return ()=>window.removeEventListener('keydown',stop,true);
   },[sessionId,state.status]);
   async function manual(action:string,url?:string){setError('');setNavigating(true);try{await call('browser_manual',{sessionId,action,address:url??null});}catch(e){setError(String(e));}finally{setNavigating(false);}}
-  async function dismiss(){try{await call('browser_close',{sessionId});close();}catch(e){setError(String(e));}}
+  async function dismiss(){const mountId=mounted.current;try{await call('browser_close',{sessionId,mountId});if(live.current && mounted.current===mountId)close();}catch(e){if(live.current && mounted.current===mountId)setError(String(e));}}
   return <aside className={`browser-panel${expanded?' browser-expanded':''}`} hidden={!visible} aria-label="内置浏览器">
     {resizeHandle}
-    <div className="browser-panel-heading"><div className="browser-page-title"><Globe size={14}/><span title={state.title}>{state.title==='新标签页'?'浏览器':state.title||'浏览器'}</span></div><button className="icon-button" onClick={expand} title={expanded?'返回分屏':'全屏查看网页'} aria-label={expanded?'返回分屏':'全屏查看网页'}>{expanded?<Minimize2 size={15}/>:<Maximize2 size={15}/>}</button><button className="icon-button" onClick={()=>void dismiss()} aria-label="关闭浏览器" title="关闭浏览器"><X size={16}/></button></div>
+    <div className="browser-panel-heading"><div className="browser-page-title"><Globe size={14}/><span title={state.title}>{state.title==='新标签页'?'浏览器':state.title||'浏览器'}</span></div><button className="icon-button" onClick={expand} title={expanded?'返回分屏':'全屏查看网页'} aria-label={expanded?'返回分屏':'全屏查看网页'}>{expanded?<Minimize2 size={15}/>:<Maximize2 size={15}/>}</button><button className="icon-button" onClick={()=>void dismiss()} aria-label="关闭浏览器" title="收起浏览器，任务继续"><X size={16}/></button></div>
     <form className="browser-toolbar" onSubmit={e=>{e.preventDefault();try{void manual('navigate',browserAddress(address));}catch(e){setError(String(e));}}}>
       <button type="button" className="icon-button" aria-label="网页后退" disabled={!ready||navigating} onClick={()=>void manual('back')}><ArrowLeft size={15}/></button>
       <button type="button" className="icon-button" aria-label="网页前进" disabled={!ready||navigating} onClick={()=>void manual('forward')}><ArrowRight size={15}/></button>

@@ -1,4 +1,5 @@
-//! Official sign-in remains owned by the installed agent. SuperCode never receives OAuth tokens.
+//! Official sign-in remains owned by the installed agent. Saved-login checks are
+//! local; OAuth credentials never cross IPC into the frontend.
 use crate::{process, AppState};
 use serde_json::{json, Value};
 use std::{
@@ -58,7 +59,7 @@ pub async fn list_provider_accounts(
     app: AppHandle,
 ) -> Result<Vec<Value>, String> {
     async fn one(agent: &str, force: bool, app: &AppHandle) -> Value {
-        if crate::agents::resolve(app, agent).is_err() {
+        if agent != "codex" && crate::agents::resolve(app, agent).is_err() {
             return json!({"agent":agent,"loggedIn":false});
         }
         match app.state::<Accounts>().get(agent, force, app).await {
@@ -276,6 +277,7 @@ pub(crate) fn claude_command(
 pub async fn official_account_status(agent: String, app: AppHandle) -> Result<Value, String> {
     app.state::<Accounts>().get(&agent, true, &app).await
 }
+#[cfg(test)]
 fn codex_status(value: &Value) -> Value {
     let method = value["account"]["type"].as_str();
     json!({"loggedIn":matches!(method, Some("chatgpt" | "chatgptAuthTokens")),"method":method,"plan":value["account"]["planType"]})
@@ -289,14 +291,7 @@ async fn read_official_status(
     app: &AppHandle,
 ) -> Result<Value, String> {
     if agent == "codex" {
-        let value = read_codex_value(
-            app,
-            account_id,
-            "account/read",
-            json!({"refreshToken":false}),
-        )
-        .await?;
-        return Ok(codex_status(&value));
+        return crate::official_models::status(app, account_id);
     }
     if agent != "claude" {
         return Err("不支持此 Agent 的账号".into());

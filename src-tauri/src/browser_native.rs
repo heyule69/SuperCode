@@ -28,7 +28,11 @@ mod platform {
     fn keyboard_input(key: u32, foreground: bool) {
         if let Some(app) = APP.get() {
             if let Some(tab) = browser::active_tab(app) {
-                if key == 27 || (foreground && tab.focused.load(Ordering::Acquire)) {
+                if key == 27
+                    || (foreground
+                        && tab.visible.load(Ordering::Acquire)
+                        && tab.focused.load(Ordering::Acquire))
+                {
                     browser::stop(app, &tab.session, true);
                 }
             }
@@ -51,6 +55,9 @@ mod platform {
         {
             if let Some(app) = APP.get() {
                 if let Some(tab) = browser::active_tab(app) {
+                    if !tab.visible.load(Ordering::Acquire) {
+                        return CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam);
+                    }
                     // Hooks never call Tauri's synchronous UI dispatcher: a stalled renderer
                     // must not block this input thread and prevent the subsequent Esc.
                     if tab.hwnd != 0 {

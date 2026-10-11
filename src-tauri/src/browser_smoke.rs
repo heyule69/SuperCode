@@ -94,6 +94,8 @@ fn renderer() -> Tab {
         hwnd: 0,
         scale: AtomicU64::new(1f64.to_bits()),
         rect: Mutex::new((0., 0., 1400., 900.)),
+        used: Mutex::new(Instant::now()),
+        layout_revision: AtomicU64::new(0),
         revision: AtomicU64::new(0),
         observation: Mutex::new(None),
         operation: tokio::sync::Mutex::new(()),
@@ -140,6 +142,39 @@ async fn select(app: &AppHandle, session: &str) -> Result<(), String> {
     }
     Ok(())
 }
+async fn show_panel(app: &AppHandle, page: &Tab, shown: bool) -> Result<(), String> {
+    let selector = if shown {
+        "打开内置浏览器"
+    } else {
+        "关闭浏览器"
+    };
+    if evaluate(
+        app, &renderer(),
+        format!("(()=>{{const button=document.querySelector('[aria-label=\"{selector}\"]');if(!button)return false;button.click();return true;}})()"),
+        None, None,
+    ).await? != true {
+        return Err(format!("Browser panel control missing: {selector}"));
+    }
+    let start = Instant::now();
+    loop {
+        let mounted = evaluate(
+            app,
+            &renderer(),
+            "!!document.querySelector('[aria-label=\"内置浏览器\"]')".into(),
+            None,
+            None,
+        )
+        .await?
+            == true;
+        if page.visible.load(Ordering::Acquire) == shown && mounted == shown {
+            return Ok(());
+        }
+        if start.elapsed() > Duration::from_secs(5) {
+            return Err(format!("Browser panel visibility did not become {shown}"));
+        }
+        tokio::time::sleep(Duration::from_millis(40)).await;
+    }
+}
 struct Fixture(tokio::task::JoinHandle<()>);
 impl Drop for Fixture {
     fn drop(&mut self) {
@@ -176,6 +211,7 @@ pub(super) async fn verify(app: &AppHandle) -> Result<Value, String> {
     let (address, _fixture) = fixture().await?;
     let mut reports = vec![];
     for agent in ["codex", "claude", "opencode", "pi"] {
+        println!("Browser lifecycle regression: {agent}");
         let session = state.store.create_agent_session(&project.id, None, agent)?;
         let native = format!("browser-regression-{agent}");
         state.store.bind_native(&session.id, &native)?;
@@ -197,15 +233,26 @@ pub(super) async fn verify(app: &AppHandle) -> Result<Value, String> {
         let first = adapter
             .tool("browser_navigate", json!({"url":address}))
             .await?;
+        let first_snapshot = read(&first)?;
         if !first["content"]
             .as_array()
             .unwrap()
             .iter()
             .any(|v| v["type"] == "image")
         {
-            return Err("Agent browser snapshot did not contain a real screenshot".into());
+            return Err(format!(
+                "Agent browser snapshot did not contain a real screenshot: {}",
+                first["content"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|v| v["type"] == "text")
+                    .map(|v| v["text"].as_str().unwrap_or(""))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            ));
         }
-        let first = read(&first)?;
+        let first = first_snapshot;
         let tab = tab(app, &session.id)?;
         let rect = *tab.rect.lock().unwrap();
         if !tab.visible.load(Ordering::Acquire) || rect.0 < 500. || rect.2 < 300. {
@@ -213,9 +260,38 @@ pub(super) async fn verify(app: &AppHandle) -> Result<Value, String> {
                 "Right-side native browser was not presented: {rect:?}"
             ));
         }
-        let clicked=read(&adapter.tool("browser_click",json!({"snapshotId":first["snapshotId"],"ref":reference(&first,"SC Browser Button")?})).await?)?;
+        let revision = tab.revision.load(Ordering::Acquire);
+        let action = adapter.tool(
+            "browser_click",
+            json!({"snapshotId":first["snapshotId"],"ref":reference(&first,"SC Browser Button")?}),
+        );
+        let dismiss = async {
+            // Hide the actual rendered panel while the click is in flight.
+            tokio::time::sleep(Duration::from_millis(60)).await;
+            show_panel(app, &tab, false).await
+        };
+        let (clicked, dismissed) = tokio::join!(action, dismiss);
+        dismissed?;
+        let clicked = clicked?;
+        if !clicked["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v["type"] == "image")
+        {
+            return Err("Hidden browser did not return a real screenshot".into());
+        }
+        let clicked = read(&clicked)?;
+        if tab.visible.load(Ordering::Acquire)
+            || app.get_webview(&tab.label).is_none()
+            || !Arc::ptr_eq(&tab, &super::tab(app, &session.id)?)
+            || *tab.rect.lock().unwrap() != rect
+            || tab.revision.load(Ordering::Acquire) != revision
+        {
+            return Err("Closing the panel destroyed or resized the active browser page".into());
+        }
         let marker = format!("中文-{agent}");
-        let filled=read(&adapter.tool("browser_fill",json!({"snapshotId":clicked["snapshotId"],"ref":reference(&clicked,"SC Browser Input")?,"text":marker})).await?)?;
+        read(&adapter.tool("browser_fill",json!({"snapshotId":clicked["snapshotId"],"ref":reference(&clicked,"SC Browser Input")?,"text":marker})).await?)?;
         if evaluate(
             app,
             &tab,
@@ -235,8 +311,35 @@ pub(super) async fn verify(app: &AppHandle) -> Result<Value, String> {
             .await?
                 != "1"
         {
-            return Err("Input or single click did not reach visible page".into());
+            return Err("Input or single click did not reach the hidden page".into());
         }
+        if tab.visible.load(Ordering::Acquire) {
+            return Err("A background action reopened the dismissed panel".into());
+        }
+        show_panel(app, &tab, true).await?;
+        if !Arc::ptr_eq(&tab, &super::tab(app, &session.id)?)
+            || evaluate(
+                app,
+                &tab,
+                "document.querySelector('input').value".into(),
+                None,
+                None,
+            )
+            .await?
+                != marker
+            || evaluate(
+                app,
+                &tab,
+                "document.querySelector('output').textContent".into(),
+                None,
+                None,
+            )
+            .await?
+                != "1"
+        {
+            return Err("Reopening the panel did not preserve its page and input".into());
+        }
+        let filled = read(&adapter.tool("browser_snapshot", json!({})).await?)?;
         if evaluate(
             app,
             &tab,
@@ -333,7 +436,13 @@ pub(super) async fn verify(app: &AppHandle) -> Result<Value, String> {
         if read(&cancelled)?["code"] != "user_takeover" {
             return Err("A cancelled queued call still ran".into());
         }
+        show_panel(app, &tab, false).await?;
         let warm = read(&adapter.tool("browser_snapshot", json!({})).await?)?;
+        if tab.visible.load(Ordering::Acquire) {
+            return Err(
+                "The first tool reopened a panel closed while the agent was preparing".into(),
+            );
+        }
         #[cfg(windows)]
         if agent == "pi" {
             let before = evaluate(app, &tab, "scrollY".into(), None, None).await?;
@@ -385,6 +494,11 @@ pub(super) async fn verify(app: &AppHandle) -> Result<Value, String> {
         {
             return Err("Native Escape callback did not revoke control synchronously".into());
         }
+        if read(&adapter.tool("browser_snapshot", json!({})).await?)?["code"] != "user_takeover"
+            || *tab.status.lock().unwrap() != "stopped"
+        {
+            return Err("A hidden browser action was accepted after native Escape".into());
+        }
         runtime::publish_event(
             app,
             json!({"method":"turn/completed","params":{"threadId":native,"turn":{"id":"fixture-next","status":"completed"}}}),
@@ -398,7 +512,7 @@ pub(super) async fn verify(app: &AppHandle) -> Result<Value, String> {
             .lock()
             .unwrap()
             .remove(&session.id);
-        reports.push(json!({"agent":agent,"stdio":true,"visibleRightPane":true,"clickAndUnicode":true,"pointer":true,"scroll":true,"escAndLateCalls":true,"warmNextTurn":true,"nativeEscapeCallback":true}));
+        reports.push(json!({"agent":agent,"stdio":true,"visibleRightPane":true,"closedPanelContinues":true,"closedBeforeFirstTool":true,"samePageOnReopen":true,"hiddenEsc":true,"clickAndUnicode":true,"pointer":true,"scroll":true,"escAndLateCalls":true,"warmNextTurn":true,"nativeEscapeCallback":true}));
     }
     let (endpoint, token) = state_endpoint(app)?;
     let bad = reqwest::Client::new()
@@ -449,7 +563,8 @@ async fn inspect_panels_and_escape(
         .label()
         .to_owned();
     // Adding a child webview must not break commands that target its parent window.
-    let context = serde_json::to_string(&json!({"sessionId":session,"settingsOpen":false})).unwrap();
+    let context =
+        serde_json::to_string(&json!({"sessionId":session,"settingsOpen":false})).unwrap();
     evaluate(app, &renderer(), format!("(async()=>{{await window.__TAURI_INTERNALS__.invoke('update_notification_context',{{context:{context}}});return true}})()"), None, None).await?;
     crate::desktop_lifecycle::show_window(app, &page.window)?;
     for label in ["全屏查看网页", "返回分屏", "收起工作空间", "打开工作空间"]

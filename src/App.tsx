@@ -100,6 +100,10 @@ export default function App() {
   const [composerFocused, setComposerFocused] = useState(false);
   const [model, setModel] = useState('');
   const [models, setModels] = useState<Model[]>([]);
+  const [modelCatalogRevision, setModelCatalogRevision] = useState('');
+  const [modelCatalogWarning, setModelCatalogWarning] = useState('');
+  const modelLoadedAt = useRef(0);
+  const modelLoadingRevision = useRef<{ revision: string; request: number } | null>(null);
   const [modelSource, setModelSource] = useState<ModelSource>();
   const [modelSourceRevision, setModelSourceRevision] = useState('');
   const [connectionRevision, setConnectionRevision] = useState(0);
@@ -221,7 +225,7 @@ export default function App() {
   useEffect(() => {
     let disposed = false;
     const request = ++modelRequest.current;
-    setModels([]); setModelSource(undefined); setModelSourceRevision(profileRevision);
+    setModels([]); setModelCatalogRevision(''); setModelCatalogWarning(''); setModelSource(undefined); setModelSourceRevision(profileRevision);
     if (!ready || !desktop) { setLoadingModels(false); return; }
     setLoadingModels(true);
     const args = { agent: agentId, sessionId: sessionId || null, connectionId };
@@ -230,12 +234,11 @@ export default function App() {
       if (disposed || request !== modelRequest.current) return;
       setModelSource(source);
       if (source.available !== true) return;
-      // API catalogs are stored locally. Official Codex discovery stays on demand.
-      const automatic = agentId === 'claude' || !!activeProfile && !activeProfile.officialAccount || ['opencode', 'pi'].includes(agentId);
-      if (!automatic) return;
+      // All configured catalogs are local on startup; no CLI model discovery.
       const result = await call<ModelCatalog>('list_models', args);
       if (disposed || request !== modelRequest.current) return;
-      setModels(result.data); setModelSource(result.source);
+      setModels(result.data); setModelCatalogRevision(profileRevision); setModelCatalogWarning(result.warning || result.notice || ''); setModelSource(result.source);
+      modelLoadedAt.current = Date.now();
       setModel(previous => session?.model ? session.model : result.data.some(m => m.model === previous) ? previous : result.data.find(m => m.isDefault)?.model ?? '');
     })().catch(e => { if (!disposed && request === modelRequest.current) report(e); }).finally(() => { if (!disposed && request === modelRequest.current) setLoadingModels(false); });
     return () => { disposed = true; };
@@ -254,7 +257,7 @@ export default function App() {
   newSessionRef.current = () => { void newSession(); };
 
   function showProviderRequired(agent = agentId) {
-    if (agent === agentId) { modelRequest.current++; setModels([]); setModelSource({ providerId: 'unknown', providerName: '', mark: '', available: false }); setModelSourceRevision(profileRevision); setLoadingModels(false); }
+    if (agent === agentId) { modelRequest.current++; setModels([]); setModelCatalogRevision(''); setModelSource({ providerId: 'unknown', providerName: '', mark: '', available: false }); setModelSourceRevision(profileRevision); setLoadingModels(false); }
     setProviderRequiredAgent(agent); setError(''); setModal('provider');
   }
   function report(e: unknown) { if (isProviderRequired(e)) { showProviderRequired(); return; } const text = e instanceof Error ? e.message : String(e); if (modalRef.current || settingsOpenRef.current) setModalError(text); else setError(text); }
@@ -505,7 +508,7 @@ export default function App() {
     attachmentDrafts.current.set(draftKey.current, attachmentsRef.current);
     draftKey.current = `${(p?.id ?? '')}:${nextAgent}`;
     const selection = draftModels.current.get(draftKey.current);
-    setAgentId(nextAgent); setModels([]); modelRequest.current++;
+    setAgentId(nextAgent); setModels([]); setModelCatalogRevision(''); modelRequest.current++;
     setDraftConnectionId(selection?.connectionId); setModel(selection?.model ?? ''); setModelSource(undefined); setUsage(undefined); setEffort(selection?.effort ?? '');
     setAttachments(attachmentDrafts.current.get(draftKey.current) ?? []); setInput(drafts.current.get(draftKey.current) ?? '');
     flush(); setProjectId((p?.id ?? '')); setSessionId(''); setMessages([]); setPreview(null); setChanges(emptyChanges);
@@ -519,7 +522,7 @@ export default function App() {
     attachmentDrafts.current.set(draftKey.current, attachmentsRef.current); setAttachments(attachmentDrafts.current.get(s.id) ?? []); setEffort('');
     setDraftConnectionId(undefined);
     draftKey.current = s.id; setInput(drafts.current.get(s.id) ?? ''); setHasMore(false); setShowJump(false);
-    flush(); setSessionId(s.id); setProjectId(s.projectId); setMessages([]); setPreview(null); setAgentId(s.agent); setModels([]); setModelSource(profiles.find(p => p.id === s.connectionId)?.modelSource); setModel(s.model ?? ''); setUsage(undefined); setError(''); stickToBottom.current = true;
+    flush(); setSessionId(s.id); setProjectId(s.projectId); setMessages([]); setPreview(null); setAgentId(s.agent); setModels([]); setModelCatalogRevision(''); setModelSource(profiles.find(p => p.id === s.connectionId)?.modelSource); setModel(s.model ?? ''); setUsage(undefined); setError(''); stickToBottom.current = true;
     current.current = { sessionId: s.id, projectId: s.projectId, nativeId: s.nativeId }; setModal(null);
     try { await loadMessages(s.id); } catch (e) { report(e); }
   }
@@ -649,7 +652,7 @@ export default function App() {
     const nextDefault = defaultFor(agentId);
     if (!sessionId && nextDefault !== connectionId && (!draftConnectionId || draftConnectionId === '@local' || _resetAgent === agentId && providerRequiredAgent === agentId)) {
       setDraftConnectionId(undefined); draftModels.current.delete(draftKey.current);
-      modelRequest.current++; setModels([]); setModelSource(undefined); setModel('');
+      modelRequest.current++; setModels([]); setModelCatalogRevision(''); setModelSource(undefined); setModel('');
     }
     // A blocked side draft has no conversation binding yet. Let an explicitly
     // added default replace its hidden fallback while preserving the saved text.
@@ -669,7 +672,7 @@ export default function App() {
     setLoadingModels(false);
     try {
       if (!sessionId) {
-        setDraftConnectionId(option.connectionId); setModel(option.model); setModelSource(option.source); setModels([]); setUsage(undefined);
+        setDraftConnectionId(option.connectionId); setModel(option.model); setModelSource(option.source); setModels([]); setModelCatalogRevision(''); setUsage(undefined);
         setEffort(option.defaultReasoningEffort ?? '');
         draftModels.current.set(draftKey.current, { connectionId: option.connectionId, model: option.model, effort: option.defaultReasoningEffort ?? '' });
         return;
@@ -678,7 +681,7 @@ export default function App() {
       const saved = await call<Session>('switch_session_model', { sessionId: id, connectionId: option.connectionId, model: option.model });
       if (current.current.sessionId === id) {
         current.current.nativeId = saved.nativeId;
-        setModel(saved.model ?? option.model); setModels([]); setModelSource(option.source); setUsage(undefined);
+        setModel(saved.model ?? option.model); setModels([]); setModelCatalogRevision(''); setModelSource(option.source); setUsage(undefined);
         setEffort(option.defaultReasoningEffort ?? '');
         await loadMessages(id);
       }
@@ -686,12 +689,25 @@ export default function App() {
     } catch (e) { report(e); await refresh(); }
     finally { setConfiguring(false); setHandoffTarget(''); }
   }
-  async function loadModels() {
+  async function loadModels(force = false) {
+    if (modelLoadingRevision.current?.revision === profileRevision && modelLoadingRevision.current.request === modelRequest.current) return;
+    if (!force && modelCatalogRevision === profileRevision && Date.now() - modelLoadedAt.current < 60_000) return;
     setLoadingModels(true);
     const requestedAgent = agentId;
     const request = ++modelRequest.current;
-    try { const result = await call<ModelCatalog>('list_models', { agent: requestedAgent, sessionId: sessionId || null, connectionId }); if (request === modelRequest.current) { setModels(result.data.filter(m => !('hidden' in m) || !m.hidden)); setModelSource(result.source); setModelSourceRevision(profileRevision); setModel(previous => previous || result.data.find(m => m.isDefault)?.model || ''); } }
-    catch (e) { if (request === modelRequest.current) report(e); } finally { if (request === modelRequest.current) setLoadingModels(false); }
+    modelLoadingRevision.current = { revision: profileRevision, request };
+    try {
+      const result = await call<ModelCatalog>('list_models', { agent: requestedAgent, sessionId: sessionId || null, connectionId, forceRefresh: true });
+      if (request !== modelRequest.current) return;
+      const visible = result.data.filter(m => !('hidden' in m) || !m.hidden);
+      setModels(visible); setModelCatalogRevision(profileRevision); setModelCatalogWarning(result.warning || result.notice || ''); modelLoadedAt.current = Date.now();
+      setModelSource(result.source); setModelSourceRevision(profileRevision);
+      setModel(previous => previous || visible.find(m => m.isDefault)?.model || '');
+    } catch (e) { if (request === modelRequest.current) report(e); }
+    finally {
+      if (modelLoadingRevision.current?.request === request) modelLoadingRevision.current = null;
+      if (request === modelRequest.current) setLoadingModels(false);
+    }
   }
   async function stop() { setStopping(true); try { await call('interrupt_turn', { sessionId }); } catch (e) { report(e); } finally { setStopping(false); } }
   const showFile = useCallback(async (path: string, line?: number, workspaceSessionId?: string) => {
@@ -712,7 +728,7 @@ export default function App() {
   async function inspectRuntime() { try { setRuntime(await call<RuntimeInfo>('runtime_info')); } catch (e) { report(e); } }
   async function saveCodex() {
     setConfiguring(true);
-    try { await call('configure_codex', { path: codexPath.trim() || null, loadMcp }); setModels([]); await refresh(); await inspectRuntime(); }
+    try { await call('configure_codex', { path: codexPath.trim() || null, loadMcp }); setModels([]); setModelCatalogRevision(''); await refresh(); await inspectRuntime(); }
     catch (e) { report(e); } finally { setConfiguring(false); }
   }
   async function archive() {
@@ -729,7 +745,7 @@ export default function App() {
     const data = await refresh();
     const active = current.current;
     const next = data.sessions.find(s => s.id === active.sessionId);
-    if (next && (next.connectionId !== sessions.find(s => s.id === active.sessionId)?.connectionId || next.model !== sessions.find(s => s.id === active.sessionId)?.model)) { setModel(next.model ?? ''); setModels([]); setUsage(undefined); await loadMessages(next.id); }
+    if (next && (next.connectionId !== sessions.find(s => s.id === active.sessionId)?.connectionId || next.model !== sessions.find(s => s.id === active.sessionId)?.model)) { setModel(next.model ?? ''); setModels([]); setModelCatalogRevision(''); setUsage(undefined); await loadMessages(next.id); }
     if (next && (next.projectId !== active.projectId || next.nativeId !== active.nativeId)) {
       current.current = { sessionId: next.id, projectId: next.projectId, nativeId: next.nativeId };
       setProjectId(next.projectId);
@@ -882,7 +898,7 @@ export default function App() {
             <PermissionMenu value={permissionMode} agent={agentId} busy={anyBusy} onChange={mode => {setPermissionMode(mode);}} />
           </div><div className="composer-right">
             <AgentMenu value={agentId} agents={agents} busy={anyBusy} choose={switchAgent}/>
-            <ModelMenu value={model} models={modelSourceRevision === profileRevision ? models : []} profiles={profiles} activeProfile={activeProfile} connectionId={connectionId} order={connectionOrder} source={currentModelSource} busy={anyBusy || configuring} loading={loadingModels} agent={agentId} choose={chooseModel} reload={() => void loadModels()} manage={() => {setProviderSettingsAgent(agentId);setSettingsTab('providers');openSettings();}} effort={effort} setEffort={setEffort} hasConversation={!!session?.nativeId} />
+            <ModelMenu value={model} models={modelSourceRevision === profileRevision ? models : []} catalogLoaded={modelCatalogRevision === profileRevision} catalogWarning={modelCatalogRevision === profileRevision ? modelCatalogWarning : ''} profiles={profiles} activeProfile={activeProfile} connectionId={connectionId} order={connectionOrder} source={currentModelSource} busy={anyBusy || configuring} loading={loadingModels} agent={agentId} choose={chooseModel} reload={force => void loadModels(force)} manage={() => {setProviderSettingsAgent(agentId);setSettingsTab('providers');openSettings();}} effort={effort} setEffort={setEffort} hasConversation={!!session?.nativeId} />
             <button className={`send-button${stopMode ? ' stop-button' : ''}`} type={stopMode ? 'button' : 'submit'} disabled={stopMode ? !session?.turnId || stopping : !hasDraft || sending || importingImages} onClick={stopMode ? () => void stop() : undefined} aria-label={stopMode ? '停止生成' : anyBusy ? '加入队列' : '发送消息'} title={stopMode ? '停止生成' : anyBusy ? '加入队列，当前任务完成后发送' : '发送消息'}>{stopMode ? <Square size={14} fill="currentColor" /> : <ArrowUp size={18} />}</button></div></div>
         </form><div className="composer-footnote"><span /><div>{currentModelSource?.available === true ? <PlatformUsageIndicator key={`${agentId}:${connectionId}`} agent={agentId} connectionId={agentId === 'codex' && connectionId === '@local' ? '@official' : connectionId} revision={profileRevision} openStats={() => {setSettingsTab('quota');openSettings();}} /> : null}<UsageIndicator usage={usage} busy={anyBusy || !session?.nativeId} compact={() => void handleCommand('/compact','')} openStats={() => {setSettingsTab('usage');openSettings();}} /><span>{prefs.enterSend ? 'Enter 发送' : 'Ctrl Enter 发送'} · Shift Enter 换行</span></div></div>
       </div>

@@ -3,7 +3,7 @@ import { createPortal } from 'react-dom';
 import { convertFileSrc } from '@tauri-apps/api/core';
 import { ExternalLink, Image, LoaderCircle, Maximize2, Music2, Play, X } from 'lucide-react';
 import { call, desktop } from './api';
-import { mediaReference, type MediaReference } from './mediaSources';
+import { embeddedMedia, type MediaReference } from './mediaSources';
 import './media.css';
 
 export const MediaContext = createContext<{ projectId?: string; sessionId?: string; openFile?: (path: string, line?: number) => void }>({});
@@ -53,32 +53,37 @@ export const MediaCard = memo(function MediaCard({ media }: { media: MediaRefere
     : media.kind === 'video' && !playing ? <button type="button" className="chat-video-start" onClick={() => setPlaying(true)} aria-label={`加载视频 ${media.name}`}><Play size={28}/><span>打开视频播放器</span></button>
     : media.kind === 'video' ? <video className="chat-media-player" src={fullSource} controls playsInline preload="metadata" onPlay={activatePlayer} onError={() => setError('当前播放器无法播放此视频，可在系统中打开')}/>
     : <audio className="chat-media-player" src={fullSource} controls preload="none" onPlay={activatePlayer} onError={() => setError('当前播放器无法播放此音频，可在系统中打开')}/>;
-  return <span ref={target} className={`chat-media-card chat-media-${media.kind}`} data-media-source={media.path}>
+  return <span ref={target} className={`chat-media-card chat-media-${media.kind}`} data-media-source={media.path} tabIndex={-1}>
     {content}<span className="chat-media-caption"><Icon size={14}/><span title={media.name}>{media.name}</span>{(desktop || context.openFile) && !/^https?:/i.test(media.path) ? <button type="button" className="icon-button" aria-label={`在系统中打开 ${media.name}`} onClick={openInSystem}><ExternalLink size={14}/></button> : null}</span>
-    {expanded && fullSource ? <ImageViewer source={fullSource} name={media.name} close={() => { setExpanded(false); imageButton.current?.focus({ preventScroll: true }); }}/> : null}
+    {expanded && fullSource ? <ImageViewer source={fullSource} path={media.path} name={media.name} close={() => { setExpanded(false); imageButton.current?.focus({ preventScroll: true }); }}/> : null}
   </span>;
 });
 
-function ImageViewer({ source, name, close }: { source: string; name: string; close: () => void }) {
+function ImageViewer({ source, path, name, close }: { source: string; path: string; name: string; close: () => void }) {
   const dismiss = useRef<HTMLButtonElement>(null);
   const [failed, setFailed] = useState(false);
   useEffect(() => {
     dismiss.current?.focus();
-    const handle = (event: KeyboardEvent) => { if (event.key === 'Escape') { event.preventDefault(); event.stopImmediatePropagation(); close(); } else if (event.key === 'Tab') { event.preventDefault(); dismiss.current?.focus(); } };
+    const handle = (event: KeyboardEvent) => { if (document.querySelector('.resource-context-menu')) return; if (event.key === 'Escape') { event.preventDefault(); event.stopImmediatePropagation(); close(); } else if (event.key === 'Tab') { event.preventDefault(); dismiss.current?.focus(); } };
     document.addEventListener('keydown', handle, true); return () => document.removeEventListener('keydown', handle, true);
   }, []);
-  return createPortal(<div className="image-preview-backdrop" onMouseDown={event => { if (event.target === event.currentTarget) close(); }}><section className="image-preview" role="dialog" aria-modal="true" aria-label={`图片预览 ${name}`}><header><span>{name}</span><button ref={dismiss} type="button" className="icon-button" aria-label="关闭图片预览" onClick={close}><X size={20}/></button></header><div className="image-preview-content">{failed ? <p role="status">原图无法显示</p> : <img src={source} alt={name} referrerPolicy="no-referrer" onError={() => setFailed(true)}/>}</div></section></div>, document.body);
+  return createPortal(<div className="image-preview-backdrop" onMouseDown={event => { if (event.target === event.currentTarget) close(); }}><section className="image-preview" role="dialog" aria-modal="true" aria-label={`图片预览 ${name}`} data-media-source={path} tabIndex={-1}><header><span>{name}</span><button ref={dismiss} type="button" className="icon-button" aria-label="关闭图片预览" onClick={close}><X size={20}/></button></header><div className="image-preview-content">{failed ? <p role="status">原图无法显示</p> : <img src={source} alt={name} referrerPolicy="no-referrer" onError={() => setFailed(true)}/>}</div></section></div>, document.body);
 }
 
 export function MediaList({ media }: { media: MediaReference[] }) {
-  return media.length ? <div className="chat-media-list">{media.map(ref => <MediaCard key={ref.path} media={ref}/>)}</div> : null;
+  const groups: (MediaReference | MediaReference[])[] = [];
+  for (const ref of media) {
+    const last = groups[groups.length - 1];
+    if (ref.kind === 'image') { if (Array.isArray(last)) last.push(ref); else groups.push([ref]); }
+    else groups.push(ref);
+  }
+  return media.length ? <div className="chat-media-list">{groups.map(group => Array.isArray(group)
+    ? <div className="chat-image-gallery" role="group" aria-label="图片组" data-image-count={group.length} key={`images-${group[0].path}`}>{group.map(ref => <MediaCard key={ref.path} media={ref}/>)}</div>
+    : <MediaCard key={group.path} media={group}/>)}</div> : null;
 }
 
 export function MarkdownMedia({ src, alt }: { src?: string; alt?: string }) {
-  const media = mediaReference(src ?? '', alt, 'image');
+  const media = embeddedMedia(src ?? '', alt);
   if (!media) return <span className="chat-media-invalid">{alt || '媒体'} · 无法显示此来源</span>;
-  // Markdown's image syntax is also the desktop client's media embed syntax.
-  const extension = src?.match(/\.(mp4|m4v|webm|mov|mkv|mp3|wav|ogg|oga|flac|m4a)(?:[?#].*)?$/i)?.[1]?.toLowerCase();
-  if (extension) media.kind = ['mp4', 'm4v', 'webm', 'mov', 'mkv'].includes(extension) ? 'video' : 'audio';
   return <MediaCard media={media}/>;
 }
