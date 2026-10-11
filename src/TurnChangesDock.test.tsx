@@ -16,15 +16,22 @@ const showDiff=vi.fn();
 beforeEach(()=>{(globalThis as any).IS_REACT_ACT_ENVIRONMENT=true;host=document.createElement('div');document.body.append(host);root=createRoot(host);showDiff.mockClear();});
 afterEach(async()=>{await act(async()=>root.unmount());host.remove();});
 async function render(messages:Message[],activeTurnId?:string) { await act(async()=>root.render(<TurnChangesDock messages={messages} activeTurnId={activeTurnId} showDiff={showDiff}/>)); }
-it('updates cumulative live snapshots once, keeps the finished result, and resets on the next prompt',async()=>{
+it('updates cumulative live snapshots once, hides the finished result, and resets on the next prompt',async()=>{
   let messages=update(running()); await render(messages,'turn1');
   expect(host.textContent).toContain('1 个文件已更改');
   expect(host.textContent).toContain('+1');
   messages=update(messages,patch+'\n+extra');await render(messages,'turn1');
   expect(host.textContent).toContain('+2');
   expect(host.textContent).not.toContain('+3');
-  messages=mergeEvent(messages,{method:'turn/completed',params:{turn:{id:'turn1',status:'completed'}}},'s');await render(messages);
-  expect(host.textContent).toContain('1 个文件已更改');
+  await act(async()=>host.querySelector<HTMLButtonElement>('.turn-change-chip')!.click());
+  expect(host.querySelector('[role="menu"]')).not.toBeNull();
+  const live=messages;
+  for(const status of ['completed','failed','interrupted']) {
+    messages=mergeEvent(live,{method:'turn/completed',params:{turn:{id:'turn1',status}}},'s');await render(messages,'turn1');
+    expect(host.querySelector('.turn-change-dock')).toBeNull();
+    expect(host.querySelector('[role="menu"]')).toBeNull();
+  }
+  await render(messages);expect(host.textContent).toBe('');
   await render([...messages,user('next')]);expect(host.textContent).toBe('');
   await render(messages,'turn2');expect(host.textContent).toBe('');
 });

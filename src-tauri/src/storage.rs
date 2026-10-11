@@ -813,6 +813,37 @@ impl Store {
     pub fn record_usage(&self, session: &Session, turn: &str, mut data: Value) -> Result<()> {
         use rusqlite::OptionalExtension;
         let conn = self.0.lock().map_err(|e| e.to_string())?;
+        if data["total"].as_object().is_none_or(|v| v.is_empty()) {
+            let existing: Option<String> = conn
+                .query_row(
+                    "SELECT data FROM usage_records WHERE session_id=?1 AND turn_id=?2",
+                    params![session.id, turn],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(|e| e.to_string())?;
+            if let Some(mut existing) =
+                existing.and_then(|text| serde_json::from_str::<Value>(&text).ok())
+            {
+                for key in ["contextTokens", "modelContextWindow"] {
+                    if let Some(value) = data.get(key) {
+                        existing[key] = value.clone();
+                    }
+                }
+                if data["last"]
+                    .as_object()
+                    .is_some_and(|value| !value.is_empty())
+                {
+                    existing["last"] = data["last"].clone();
+                }
+                data = existing;
+            } else {
+                data["cumulative"] = serde_json::json!(false);
+                data["turn"] = serde_json::json!({});
+            }
+            conn.execute("INSERT INTO usage_records VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT(session_id,turn_id) DO UPDATE SET data=excluded.data,updated_at=excluded.updated_at", params![session.id,turn,session.agent,session.model.as_deref().unwrap_or(""),data.to_string(),now()]).map_err(|e|e.to_string())?;
+            return Ok(());
+        }
         if data["cumulative"] == true {
             let prior: Option<String> = conn.query_row("SELECT data FROM usage_records WHERE session_id=?1 AND rowid<COALESCE((SELECT rowid FROM usage_records WHERE session_id=?1 AND turn_id=?2),9223372036854775807) ORDER BY rowid DESC LIMIT 1", params![session.id,turn], |r| r.get(0)).optional().map_err(|e| e.to_string())?;
             let prior: Value = prior
@@ -1056,6 +1087,39 @@ mod tests {
         assert!(store.sessions().unwrap().is_empty());
     }
     #[test]
+    fn context_only_usage_survives_reload_without_erasing_billing_or_reusing_another_turn() {
+        let store = Store::from_connection(Connection::open_in_memory().unwrap()).unwrap();
+        let p = store.add_project(Path::new("D:/context-fixture")).unwrap();
+        let s = store.create_session(&p.id, Some("glm".into())).unwrap();
+        store.record_usage(&s, "one", serde_json::json!({"total":{"inputTokens":1000,"outputTokens":200},"last":{},"cumulative":false,"contextTokens":300,"costUsd":0.25})).unwrap();
+        store.record_usage(&s, "one", serde_json::json!({"total":{},"last":{},"contextTokens":400,"modelContextWindow":128000})).unwrap();
+        let record = store.usage_records(Some(&s.id)).unwrap().remove(0);
+        assert_eq!(record["data"]["contextTokens"], 400);
+        assert_eq!(record["data"]["modelContextWindow"], 128000);
+        assert_eq!(record["data"]["turn"]["inputTokens"], 1000);
+        assert_eq!(record["data"]["costUsd"], 0.25);
+        store
+            .record_usage(
+                &s,
+                "two",
+                serde_json::json!({"total":{},"last":{},"contextTokens":12345}),
+            )
+            .unwrap();
+        let record = store.usage_records(Some(&s.id)).unwrap().remove(0);
+        assert_eq!(record["turnId"], "two");
+        assert_eq!(record["data"]["contextTokens"], 12345);
+        assert_eq!(record["data"]["turn"], serde_json::json!({}));
+        assert!(record["data"]["costUsd"].is_null());
+        store
+            .record_usage(
+                &s,
+                "two",
+                serde_json::json!({"total":{},"last":{},"contextTokens":null}),
+            )
+            .unwrap();
+        assert!(store.usage_records(Some(&s.id)).unwrap()[0]["data"]["contextTokens"].is_null());
+    }
+    #[test]
     fn cumulative_usage_updates_deduplicate_and_do_not_subtract_later_turns() {
         let store = Store::from_connection(Connection::open_in_memory().unwrap()).unwrap();
         let project = store.add_project(Path::new("D:/usage-test")).unwrap();
@@ -1215,5 +1279,26 @@ mod tests {
         store.set_status(&session.id, "idle", None).unwrap();
         store.archive(&session.id).unwrap();
         assert!(store.sessions().unwrap().is_empty());
+    }
+    #[test]
+    fn repeated_user_text_preserves_distinct_client_acknowledgements() {
+        let store = Store::from_connection(Connection::open_in_memory().unwrap()).unwrap();
+        let project = store.add_project(Path::new("D:/项目/消息顺序")).unwrap();
+        let session = store.create_session(&project.id, None).unwrap();
+        let mut identities = Vec::new();
+        for _ in 0..2 {
+            let client_id = uuid::Uuid::new_v4().to_string();
+            crate::client_features::validate_client_message_id(Some(&client_id)).unwrap();
+            let metadata = serde_json::json!({"clientMessageId": client_id});
+            store.save_message(&crate::client_features::user_message_id(&metadata), &session.id, "user", "继续", "userMessage", &metadata).unwrap();
+            identities.push(client_id);
+        }
+        let messages = store.messages(&session.id, None).unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_ne!(messages[0].id, messages[1].id);
+        for (message, client_id) in messages.iter().zip(identities) {
+            assert_eq!(message.text, "继续");
+            assert_eq!(message.data["clientMessageId"], client_id);
+        }
     }
 }

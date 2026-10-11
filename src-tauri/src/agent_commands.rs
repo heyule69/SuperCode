@@ -21,6 +21,12 @@ pub fn goal_text(goal: &Value) -> String {
         goal["tokensUsed"].as_u64().unwrap_or(0)
     )
 }
+fn new_goal(thread: &str, objective: &str) -> Result<Value, String> {
+    let objective = objective.trim();
+    if objective.is_empty() { return Err("请填写目标内容".into()); }
+    if objective.len() > 128 * 1024 { return Err("目标内容过长".into()); }
+    Ok(json!({"threadId":thread,"objective":objective}))
+}
 #[tauri::command]
 pub async fn execute_agent_command(
     session_id: String,
@@ -68,6 +74,8 @@ pub async fn execute_agent_command(
         native
     };
     let result = match command.as_str() {
+        // The menu supplies an objective, never a slash-command control word.
+        "goal-create" => client.request("thread/goal/set", new_goal(&native, &argument)?).await?,
         "goal-status" => {
             client
                 .request("thread/goal/get", json!({"threadId":native}))
@@ -106,13 +114,10 @@ pub async fn execute_agent_command(
                     .await?
             }
             objective => {
-                if objective.len() > 128 * 1024 {
-                    return Err("目标内容过长".into());
-                }
                 client
                     .request(
                         "thread/goal/set",
-                        json!({"threadId":native,"objective":objective}),
+                        new_goal(&native, objective)?,
                     )
                     .await?
             }
@@ -120,11 +125,11 @@ pub async fn execute_agent_command(
         _ => return Err("未知原生命令，请使用 /help 查看可用命令".into()),
     };
     // Codex starts and continues goal turns itself. Never enqueue a duplicate UI turn.
-    if command == "goal"
+    if (command == "goal-create" || command == "goal"
         && !matches!(
             argument.trim(),
             "" | "status" | "pause" | "resume" | "clear"
-        )
+        ))
         && session.title == "新会话"
     {
         state
@@ -135,7 +140,7 @@ pub async fn execute_agent_command(
         goal_text(goal)
     } else if command == "compact" {
         "已向 Codex 请求上下文压缩。".into()
-    } else if argument == "clear" {
+    } else if command == "goal" && argument == "clear" {
         "目标已清除。".into()
     } else {
         "当前会话没有目标。".into()
@@ -149,4 +154,20 @@ pub async fn execute_agent_command(
         &json!({"command":command,"result":result}),
     )?;
     Ok(json!({"text":text,"result":result,"session":state.store.session(&session_id)?}))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn menu_objectives_are_literal_and_never_interpreted_as_goal_controls() {
+        for text in ["pause", "resume", "clear", "status", " 完成登录功能\n并通过测试 "] {
+            let request = new_goal("thread", text).unwrap();
+            assert_eq!(request["objective"], text.trim());
+            assert!(request.get("status").is_none());
+            assert_eq!(request["threadId"], "thread");
+        }
+        assert!(new_goal("thread", "  ").is_err());
+        assert!(new_goal("thread", &"x".repeat(128 * 1024 + 1)).is_err());
+    }
 }

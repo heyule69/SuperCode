@@ -121,6 +121,52 @@ impl Turn {
             .map_err(|e| e.to_string())
     }
 }
+fn tool_response(tool_name: &Value, input: &Value, result: &Value) -> Result<Value, String> {
+    if result["decision"] == "accept" {
+        return Ok(json!({"behavior":"allow","updatedInput":input}));
+    }
+    if let Some(answers) = result.get("answers") {
+        if tool_name != "AskUserQuestion" {
+            return Err("此请求不是用户提问".into());
+        }
+        let mut updated = input.clone();
+        let mut values = serde_json::Map::new();
+        for (index, question) in input["questions"]
+            .as_array()
+            .ok_or("问题格式无效")?
+            .iter()
+            .enumerate()
+        {
+            let answer = answers[index.to_string()]["answers"]
+                .as_array()
+                .ok_or("问题回答格式无效")?
+                .iter()
+                .filter_map(Value::as_str)
+                .filter(|a| !a.trim().is_empty())
+                .collect::<Vec<_>>()
+                .join(", ");
+            if answer.is_empty() {
+                return Err("请回答所有问题".into());
+            }
+            values.insert(question["question"].as_str().unwrap_or("").into(), json!(answer));
+        }
+        updated["answers"] = Value::Object(values);
+        return Ok(json!({"behavior":"allow","updatedInput":updated}));
+    }
+    let message = if tool_name == "ExitPlanMode" {
+        let feedback = result["feedback"].as_str().unwrap_or("").trim();
+        let instruction = "用户选择继续修改计划，暂不执行。请保持计划模式，完善计划后再次请求用户确认。";
+        if feedback.is_empty() {
+            instruction.to_owned()
+        } else {
+            format!("{instruction}\n用户的修改意见：{}", protocol::bounded(feedback, 16 * 1024))
+        }
+    } else {
+        "用户拒绝了本次操作".to_owned()
+    };
+    Ok(json!({"behavior":"deny","message":message}))
+}
+
 impl Runtime {
     pub async fn steer(
         &self,
@@ -237,41 +283,7 @@ impl Runtime {
             );
             return Ok(());
         }
-        let response = if result["decision"] == "accept" {
-            json!({"behavior":"allow","updatedInput":input})
-        } else if let Some(answers) = result.get("answers") {
-            if request["params"]["toolName"] != "AskUserQuestion" {
-                return Err("此请求不是用户提问".into());
-            }
-            let mut updated = input.clone();
-            let mut values = serde_json::Map::new();
-            for (index, question) in input["questions"]
-                .as_array()
-                .ok_or("问题格式无效")?
-                .iter()
-                .enumerate()
-            {
-                let answer = answers[index.to_string()]["answers"]
-                    .as_array()
-                    .ok_or("问题回答格式无效")?
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .filter(|a| !a.trim().is_empty())
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                if answer.is_empty() {
-                    return Err("请回答所有问题".into());
-                }
-                values.insert(
-                    question["question"].as_str().unwrap_or("").into(),
-                    json!(answer),
-                );
-            }
-            updated["answers"] = Value::Object(values);
-            json!({"behavior":"allow","updatedInput":updated})
-        } else {
-            json!({"behavior":"deny","message":"用户拒绝了本次操作"})
-        };
+        let response = tool_response(&request["params"]["toolName"], input, &result)?;
         turn.write(json!({"type":"control_response","response":{"subtype":"success","request_id":raw_id,"response":response}})).await?;
         requests.remove(key);
         publish(
@@ -619,6 +631,16 @@ pub async fn send(
                     event("agent/commands", &turn.native, &turn.id(), data),
                 );
             } else if message["type"] == "system" && message["subtype"] == "compact_boundary" {
+                stream.reset_context();
+                publish(
+                    &reader_app,
+                    event(
+                        "thread/tokenUsage/updated",
+                        &turn.native,
+                        &turn.id(),
+                        json!({"tokenUsage":stream.context_usage()}),
+                    ),
+                );
                 let item = json!({"type":"contextCompaction","id":format!("compact-{}",turn.id()),"status":"completed","text":"Claude 已完成原生上下文压缩。","metadata":message["compact_metadata"]});
                 publish(
                     &reader_app,
@@ -675,17 +697,21 @@ pub async fn send(
                 let result_slot = state.claude.client.lock().await;
                 let u = &message["usage"];
                 if u.is_object() {
-                    let window = message["modelUsage"]
-                        .as_object()
-                        .and_then(|v| v.values().find_map(|m| m["contextWindow"].as_u64()));
+                    stream.model_context_window = stream
+                        .context_window(&message)
+                        .or(stream.model_context_window);
                     let usage = turn.inputs.lock().unwrap().usage(&message);
+                    let mut data = stream.context_usage();
+                    data["total"] = usage["total"].clone();
+                    data["costUsd"] = usage["costUsd"].clone();
+                    data["nativeCumulativeCostUsd"] = message["total_cost_usd"].clone();
                     publish(
                         &reader_app,
                         event(
                             "thread/tokenUsage/updated",
                             &turn.native,
                             &turn.id(),
-                            json!({"tokenUsage":{"total":usage["total"],"last":usage["total"],"contextTokens":if stream.context_tokens>0{Some(stream.context_tokens)}else{None},"cumulative":false,"modelContextWindow":window,"costUsd":usage["costUsd"],"nativeCumulativeCostUsd":message["total_cost_usd"]}}),
+                            json!({"tokenUsage":data}),
                         ),
                     );
                 }
@@ -714,7 +740,11 @@ pub async fn send(
                 for notification in stream.partial(&turn.native, &turn.id()) {
                     publish(&reader_app, notification);
                 }
-                stream = Stream::default();
+                stream = Stream {
+                    model: stream.model.clone(),
+                    model_context_window: stream.model_context_window,
+                    ..Stream::default()
+                };
                 turn.requests.lock().await.clear();
                 let stopped = turn.stopped.load(Ordering::Acquire);
                 if stopped {
@@ -822,13 +852,75 @@ pub async fn send(
 
 #[derive(Default)]
 struct Stream {
-    context_tokens: u64,
+    context_tokens: Option<u64>,
+    output_tokens: u64,
+    last_usage: Value,
+    model: String,
+    model_context_window: Option<u64>,
     message_id: String,
     text: String,
     tools: HashMap<String, Value>,
     blocks: HashMap<usize, Value>,
 }
 impl Stream {
+    fn reset_context(&mut self) {
+        self.context_tokens = None;
+        self.output_tokens = 0;
+        self.last_usage = json!({});
+    }
+    fn observe_usage(&mut self, usage: &Value) -> bool {
+        let input = usage["input_tokens"].as_u64();
+        let output = usage["output_tokens"].as_u64();
+        if input.is_none() && output.is_none() {
+            return false;
+        }
+        if !self.last_usage.is_object() {
+            self.last_usage = json!({});
+        }
+        if let Some(input) = input {
+            let cached = usage["cache_read_input_tokens"]
+                .as_u64()
+                .or(self.last_usage["cachedInputTokens"].as_u64())
+                .unwrap_or(0);
+            let write = usage["cache_creation_input_tokens"]
+                .as_u64()
+                .or(self.last_usage["cacheWriteInputTokens"].as_u64())
+                .unwrap_or(0);
+            let input = input.saturating_add(cached).saturating_add(write);
+            self.context_tokens = Some(input);
+            self.last_usage["inputTokens"] = json!(input);
+            self.last_usage["cachedInputTokens"] = json!(cached);
+            self.last_usage["cacheWriteInputTokens"] = json!(write);
+        }
+        if let Some(output) = output {
+            self.output_tokens = output;
+            self.last_usage["outputTokens"] = json!(output);
+        }
+        if let Some(context) = self.context_tokens {
+            self.last_usage["totalTokens"] = json!(context.saturating_add(self.output_tokens));
+        }
+        true
+    }
+    fn context_window(&self, result: &Value) -> Option<u64> {
+        let models = result["modelUsage"].as_object()?;
+        let usage = models.get(&self.model).or_else(|| {
+            (models.len() == 1)
+                .then(|| models.values().next())
+                .flatten()
+        })?;
+        usage["contextWindow"].as_u64().filter(|n| *n > 0)
+    }
+    fn context_usage(&self) -> Value {
+        json!({"total":{},"last":self.last_usage.as_object().map(|_|self.last_usage.clone()).unwrap_or_else(||json!({})),"contextTokens":self.context_tokens.map(|input|input.saturating_add(self.output_tokens)),"modelContextWindow":self.model_context_window,"cumulative":false})
+    }
+    fn usage_event(&self, native: &str, turn: &str) -> Value {
+        event(
+            "thread/tokenUsage/updated",
+            native,
+            turn,
+            json!({"tokenUsage":self.context_usage()}),
+        )
+    }
     fn partial(&mut self, native: &str, turn: &str) -> Vec<Value> {
         if self.text.is_empty() {
             return vec![];
@@ -851,14 +943,22 @@ impl Stream {
             "stream_event" => {
                 let e = &message["event"];
                 if e["type"] == "message_start" {
-                    let u = &e["message"]["usage"];
-                    self.context_tokens = u["input_tokens"].as_u64().unwrap_or(0)
-                        + u["cache_read_input_tokens"].as_u64().unwrap_or(0)
-                        + u["cache_creation_input_tokens"].as_u64().unwrap_or(0);
+                    self.reset_context();
+                    if let Some(model) = e["message"]["model"].as_str() {
+                        if self.model != model {
+                            self.model_context_window = None;
+                        }
+                        self.model = model.into();
+                    }
+                    self.observe_usage(&e["message"]["usage"]);
+                    events.push(self.usage_event(native, turn));
                     events.extend(self.partial(native, turn));
                     self.message_id = e["message"]["id"].as_str().unwrap_or("").into();
                     self.text.clear();
                     self.blocks.clear();
+                }
+                if e["type"] == "message_delta" && self.observe_usage(&e["usage"]) {
+                    events.push(self.usage_event(native, turn));
                 }
                 let index = e["index"].as_u64().unwrap_or(0) as usize;
                 if e["type"] == "content_block_start" && self.blocks.len() < 200 {
@@ -956,6 +1056,19 @@ impl Stream {
             }
             "assistant" => {
                 let id = message["message"]["id"].as_str().unwrap_or("");
+                if self.message_id != id {
+                    self.reset_context();
+                    self.message_id = id.into();
+                }
+                if let Some(model) = message["message"]["model"].as_str() {
+                    if self.model != model {
+                        self.model_context_window = None;
+                    }
+                    self.model = model.into();
+                }
+                if self.observe_usage(&message["message"]["usage"]) {
+                    events.push(self.usage_event(native, turn));
+                }
                 if let Some(content) = message["message"]["content"].as_array() {
                     let text = content
                         .iter()
@@ -1051,6 +1164,88 @@ impl Stream {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn plan_confirmation_uses_native_approval_without_rewriting_the_plan_or_permissions() {
+        let input = json!({"plan":"# 完整计划\n\n1. 实现\n2. 验证","allowedPrompts":[{"tool":"Bash","prompt":"运行测试"}]});
+        let reply = tool_response(&json!("ExitPlanMode"), &input, &json!({"decision":"accept"})).unwrap();
+        assert_eq!(reply, json!({"behavior":"allow","updatedInput":input}));
+        let revised = tool_response(&json!("ExitPlanMode"), &input, &json!({"decision":"decline","feedback":"  先实现图片预览，视频稍后  "})).unwrap();
+        assert_eq!(revised["behavior"], "deny");
+        assert!(revised.get("updatedInput").is_none());
+        assert!(revised["message"].as_str().unwrap().contains("先实现图片预览，视频稍后"));
+        let empty = tool_response(&json!("ExitPlanMode"), &input, &json!({"decision":"decline"})).unwrap();
+        assert_eq!(empty["behavior"], "deny");
+        assert!(empty["message"].as_str().unwrap().contains("暂不执行"));
+    }
+
+    #[test]
+    fn plan_feedback_is_bounded_and_does_not_change_other_tool_responses() {
+        let reply = tool_response(&json!("ExitPlanMode"), &json!({}), &json!({"decision":"decline","feedback":"中".repeat(20000)})).unwrap();
+        assert!(reply["message"].as_str().unwrap().len() < 17 * 1024);
+        let ordinary = tool_response(&json!("Bash"), &json!({}), &json!({"decision":"decline","feedback":"修改意见"})).unwrap();
+        assert_eq!(ordinary, json!({"behavior":"deny","message":"用户拒绝了本次操作"}));
+        assert!(tool_response(&json!("ExitPlanMode"), &json!({}), &json!({"answers":{}})).is_err());
+        let questions = json!({"questions":[{"question":"显示方式？"}]});
+        let answered = tool_response(&json!("AskUserQuestion"), &questions, &json!({"answers":{"0":{"answers":["面板"]}}})).unwrap();
+        assert_eq!(answered["updatedInput"]["answers"]["显示方式？"], "面板");
+        assert!(tool_response(&json!("AskUserQuestion"), &questions, &json!({"answers":{"0":{"answers":[]}}})).is_err());
+    }
+
+    #[test]
+    fn context_updates_include_cache_and_latest_output_not_aggregate_turn_usage() {
+        let mut stream = Stream::default();
+        let start = |id: &str, usage: Value| json!({"type":"stream_event","event":{"type":"message_start","message":{"id":id,"model":"glm-fixture","usage":usage}}});
+        let updates = stream.translate(&start("one", json!({"input_tokens":10,"cache_read_input_tokens":100,"cache_creation_input_tokens":20,"output_tokens":1})), "n", "t");
+        assert_eq!(updates[0]["params"]["tokenUsage"]["contextTokens"], 131);
+        let updates = stream.translate(&json!({"type":"stream_event","event":{"type":"message_delta","usage":{"input_tokens":10,"output_tokens":15}}}), "n", "t");
+        assert_eq!(updates[0]["params"]["tokenUsage"]["contextTokens"], 145);
+        assert_eq!(
+            updates[0]["params"]["tokenUsage"]["last"]["inputTokens"],
+            130
+        );
+        let updates = stream.translate(
+            &start("two", json!({"input_tokens":20,"output_tokens":0})),
+            "n",
+            "t",
+        );
+        assert_eq!(updates[0]["params"]["tokenUsage"]["contextTokens"], 20);
+        assert_eq!(stream.context_usage()["last"]["cachedInputTokens"], 0);
+        assert_eq!(stream.context_usage()["total"], json!({}));
+    }
+    #[test]
+    fn completed_assistant_context_skips_subagents_and_resets_after_compaction() {
+        let mut stream = Stream::default();
+        let message = json!({"type":"assistant","message":{"id":"one","usage":{"input_tokens":12,"cache_read_input_tokens":8,"output_tokens":5},"content":[]}});
+        let events = stream.translate(&message, "n", "t");
+        assert_eq!(events[0]["params"]["tokenUsage"]["contextTokens"], 25);
+        let mut child = message;
+        child["parent_tool_use_id"] = json!("child");
+        child["message"]["usage"]["input_tokens"] = json!(999);
+        assert!(stream.translate(&child, "n", "t").is_empty());
+        assert_eq!(stream.context_usage()["contextTokens"], 25);
+        stream.translate(&json!({"type":"assistant","message":{"id":"two","usage":{"input_tokens":12,"output_tokens":1},"content":[]}}), "n", "t");
+        assert_eq!(stream.context_usage()["contextTokens"], 13);
+        assert_eq!(stream.context_usage()["last"]["cachedInputTokens"], 0);
+        stream.reset_context();
+        assert!(stream.context_usage()["contextTokens"].is_null());
+        stream.observe_usage(&json!({"input_tokens":0}));
+        assert_eq!(stream.context_usage()["contextTokens"], 0);
+    }
+    #[test]
+    fn context_capacity_matches_the_active_model_instead_of_first_subagent() {
+        let stream = Stream {
+            model: "glm-fixture".into(),
+            ..Stream::default()
+        };
+        let models = json!({"modelUsage":{"child-model":{"contextWindow":1000000},"glm-fixture":{"contextWindow":128000}}});
+        assert_eq!(stream.context_window(&models), Some(128000));
+        let unknown = Stream::default();
+        assert!(unknown.context_window(&models).is_none());
+        assert_eq!(
+            unknown.context_window(&json!({"modelUsage":{"one":{"contextWindow":128000}}})),
+            Some(128000)
+        );
+    }
     #[test]
     fn a_result_does_not_consume_a_still_queued_prompt() {
         let mut state = InputState::default();

@@ -1,6 +1,6 @@
 import { call } from './api';
 
-export interface Skill { name: string; description?: string; path: string; source?: string; sources?: string[]; namespace?: string | null; error?: string | null }
+export interface Skill { name: string; description?: string; path: string; paths?: string[]; source?: string; sources?: string[]; namespace?: string | null; error?: string | null }
 export interface SkillCatalog { skills: Skill[]; warnings?: string[] }
 const cache = new Map<string, { at: number; catalog: SkillCatalog }>();
 const pending = new Map<string, Promise<SkillCatalog>>();

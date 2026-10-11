@@ -1,7 +1,7 @@
 import { lazy, Suspense, useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { Sparkles, ArrowUp, ArrowUpRight, Folder, Globe, MessageSquare, MoreHorizontal, PanelLeftOpen, PanelRightClose, PanelRightOpen, RefreshCw, Search, Square, SquarePen, Terminal, X } from 'lucide-react';
 import { call, desktop, subscribe } from './api';
-import { isDisplayEvent, mergeEvent } from './events';
+import { isDisplayEvent, mergeEvent, reconcileMessages } from './events';
 import { Conversation, JumpToLatest } from './Conversation';
 import { isActive, type Agent, type Bootstrap, type Changes, type Message, type Model, type ModelCatalog, type ModelSource, type PermissionMode, type Project, type RpcEvent, type RuntimeInfo, type Session, type SidebarState } from './types';
 import { Sidebar } from './Sidebar';
@@ -77,7 +77,9 @@ export default function App() {
   const attachmentJobs = useRef(Promise.resolve());
   const pendingAttachments = useRef(0);
   const [effort, setEffort] = useState('');
-  const [usage, setUsage] = useState<TokenUsage>();
+  const [usage, updateUsage] = useState<TokenUsage>();
+  const usageRevision = useRef(0);
+  const setUsage = useCallback((value?: TokenUsage) => { usageRevision.current++; updateUsage(value); }, []);
   const [projects, setProjects] = useState<Project[]>([]);
   const [sessions, setSessions] = useState<Session[]>([]);
   const [sidebarState, setSidebarState] = useState<SidebarState>(emptySidebar);
@@ -163,7 +165,10 @@ export default function App() {
   const [runtime, setRuntime] = useState<RuntimeInfo | null>(null);
   const sessionsRef = useRef(sessions); sessionsRef.current=sessions;
   const current = useRef({ sessionId: '', projectId: '', nativeId: null as string | null });
-  const pendingSession = useRef('');
+  const pendingSession = useRef<string | null>(null);
+  const pendingUsers = useRef(new Set<string>());
+  const sendLock = useRef(false);
+  const messagesRevision = useRef(0);
   const queue = useRef<RpcEvent[]>([]);
   const flushTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const scrollArea = useRef<HTMLDivElement>(null);
@@ -274,21 +279,23 @@ export default function App() {
     return data;
   }, []);
   const loadMessages = useCallback(async (id: string, before?: number) => {
+    if (current.current.sessionId !== id) return;
+    const revision = ++messagesRevision.current;
     setMessagesLoading(true);
     try {
     const items = await call<Message[]>('list_messages', { sessionId: id, before: before ?? null });
-    if (current.current.sessionId !== id) return;
+    if (current.current.sessionId !== id || revision !== messagesRevision.current) return;
     if (before && scrollArea.current) prependScroll.current = { height: scrollArea.current.scrollHeight, top: scrollArea.current.scrollTop };
-    setMessages(old => before ? [...items.filter(m => !old.some(v => v.id === m.id)), ...old] : [...items.map(saved => {
-      const live = old.find(m => m.id === saved.id);
-      return live && live.text.length > saved.text.length && ['inProgress', 'preparing'].includes(String(live.data?.status)) && ['inProgress', 'preparing'].includes(String(saved.data?.status)) ? { ...live, seq: saved.seq } : saved;
-    }), ...old.filter(m => m.seq === 0 && m.role !== 'user' && !items.some(saved => saved.id === m.id))]); setHasMore(items.length === 100);
-    } finally { if (current.current.sessionId === id) setMessagesLoading(false); }
+    const pending = new Set(pendingUsers.current);
+    for (const message of items) if (message.role === 'user' && typeof message.data?.clientMessageId === 'string') pendingUsers.current.delete(message.data.clientMessageId);
+    setMessages(old => before ? [...items.filter(m => !old.some(v => v.id === m.id)), ...old] : reconcileMessages(old, items, pending)); setHasMore(items.length === 100);
+    } finally { if (current.current.sessionId === id && revision === messagesRevision.current) setMessagesLoading(false); }
   }, []);
   const refreshUsage = useCallback(async (id: string) => {
+    const revision = usageRevision.current;
     const result=await call<{records:UsageRecord[]}>('get_usage',{sessionId:id});
-    if(current.current.sessionId===id)setUsage(result.records[0]?.data);
-  }, []);
+    if(current.current.sessionId===id && revision===usageRevision.current)setUsage(result.records[0]?.data);
+  }, [setUsage]);
   const refreshChanges = useCallback(async (id: string) => {
     if (!id && !current.current.sessionId) return;
     const selectedSession = current.current.sessionId;
@@ -413,7 +420,7 @@ export default function App() {
   useEffect(() => {
     if (settingsOpen && settingsTab === 'resources' && desktop) void inspectRuntime();
   }, [settingsOpen, settingsTab]);
-  useEffect(() => { setUsage(undefined); if (!desktop || !sessionId) return; let disposed=false; void call<{records:UsageRecord[]}>('get_usage',{sessionId}).then(r=>{if(!disposed)setUsage(r.records[0]?.data);}).catch(report); return ()=>{disposed=true;}; }, [sessionId]);
+  useEffect(() => { setUsage(undefined); if (!desktop || !sessionId) return; let disposed=false; const revision=usageRevision.current; void call<{records:UsageRecord[]}>('get_usage',{sessionId}).then(r=>{if(!disposed && revision===usageRevision.current)setUsage(r.records[0]?.data);}).catch(report); return ()=>{disposed=true;}; }, [sessionId, setUsage]);
   useEffect(() => { const query = window.matchMedia('(max-width: 1100px)'); const changed = () => { setNarrow(query.matches); setContextOverlay(false); }; query.addEventListener('change', changed); return () => query.removeEventListener('change', changed); }, []);
   useEffect(() => { localStorage.setItem('supercode.agent', agentId); }, [agentId]);
   useEffect(() => { if (ready && !detached) { localStorage.setItem('supercode.session', sessionId); localStorage.setItem('supercode.project', projectId); } }, [ready, sessionId, projectId, detached]);
@@ -555,6 +562,7 @@ export default function App() {
     try{if(row)await changeFollowup(row.id,'pause');setContext(false);setContextOverlay(false);setSideDraft({key:crypto.randomUUID(),text:row?.payload.text??text,payload:row?.payload,sourceId:row?.id,projectId,agent:agentId,connectionId});}catch(e){report(e);}
   }
   async function send() {
+    if (sendLock.current) return;
     if (pendingAttachments.current) return;
     if (!input.trim() && !attachments.length) return;
     const command = parseCommand(input);
@@ -571,28 +579,49 @@ export default function App() {
     const originalInput = input;
     const text = commandSkill ? command!.argument || `请执行所选技能 ${commandSkill.name}。` : input.trim() || (attachments.some(a => a.kind === 'skill') ? '请执行所选技能。' : '请查看附件。'); let id = sessionId;
     const originDraft = draftKey.current;
+    const queued = anyBusy || followups.rows.length > 0;
+    const clientMessageId = queued ? undefined : crypto.randomUUID();
+    let submitted = false;
+    sendLock.current = true;
+    if (clientMessageId) {
+      pendingUsers.current.add(clientMessageId); pendingSession.current = id;
+      drafts.current.delete(originDraft); attachmentDrafts.current.delete(originDraft);
+      setInput(''); setAttachments([]); setError(''); stickToBottom.current = true;
+      setMessages(old => [...old, { seq: 0, id: clientMessageId, sessionId: id, role: 'user', text, kind: 'userMessage', data: { attachments: taskAttachments, clientMessageId } }]);
+    }
     setSending(true);
     try {
       await requireChatConnection(agentId, connectionId, id);
-      if (!id) { const s = await createChatSession({ projectId, model, agent: agentId, connectionId }); id = s.id; setSessions(old => [s, ...old]); if(current.current.projectId===projectId && draftKey.current===originDraft){setSessionId(id);current.current.sessionId=id;draftKey.current=id;} }
-      if (anyBusy || followups.rows.length) {
+      if (!id) { const s = await createChatSession({ projectId, model, agent: agentId, connectionId }); id = s.id; setSessions(old => [s, ...old]); if(current.current.projectId===projectId && draftKey.current===originDraft){setSessionId(id);current.current.sessionId=id;draftKey.current=id;setMessages(old => old.map(message => message.id === clientMessageId ? { ...message, sessionId: id } : message));} }
+      if (queued) {
         await call('enqueue_followup',{sessionId:id,payload:followupPayload(text,taskAttachments)});
         if(current.current.sessionId===id){setInput('');setAttachments([]);}
         drafts.current.delete(originDraft);drafts.current.delete(id);attachmentDrafts.current.delete(originDraft);attachmentDrafts.current.delete(id);
         await followups.reload();await refresh();return;
       }
       pendingSession.current = id; drafts.current.delete(originDraft); drafts.current.delete(id); draftModels.current.delete(originDraft); setError('');
-      const optimisticId = `optimistic-${crypto.randomUUID()}`;
-      if(current.current.sessionId===id){setInput('');stickToBottom.current=true;setMessages(old => [...old, { seq: 0, id: optimisticId, sessionId: id, role: 'user', text, kind: 'userMessage', data: {attachments:taskAttachments} }]);}
-      const result = await call<Session>('send_chat_message', { sessionId: id, text, model: model || null, readOnly, permissionMode, attachments: taskAttachments, effort: effort || null });
-      if (current.current.sessionId === id) setAttachments([]); attachmentDrafts.current.delete(originDraft); attachmentDrafts.current.delete(id);
+      const result = await call<Session>('send_chat_message', { sessionId: id, text, model: model || null, readOnly, permissionMode, attachments: taskAttachments, effort: effort || null, clientMessageId });
+      submitted = true;
       setSessions(old => old.map(s => s.id === id ? result : s));
       if (current.current.sessionId === id) { current.current.nativeId = result.nativeId; setModel(result.model ?? ''); }
       await loadMessages(id); await refresh();
-    } catch (e) { report(e); if (current.current.sessionId === id) setInput(originalInput); else drafts.current.set(id || originDraft, originalInput); await refresh().catch(report); if (id) await loadMessages(id).catch(report); }
-    finally { pendingSession.current = ''; setSending(false); }
+    } catch (e) {
+      report(e);
+      if (!submitted) {
+        if (clientMessageId) { pendingUsers.current.delete(clientMessageId); setMessages(old => old.filter(message => message.id !== clientMessageId)); }
+        if (current.current.sessionId === id && (id || draftKey.current === originDraft)) {
+          setInput(previous => previous || originalInput); setAttachments(previous => previous.length ? previous : taskAttachments);
+        } else {
+          const key = id || originDraft;
+          if (!drafts.current.get(key)) drafts.current.set(key, originalInput);
+          if (!attachmentDrafts.current.get(key)?.length) attachmentDrafts.current.set(key, taskAttachments);
+        }
+      }
+      await refresh().catch(report); if (id) await loadMessages(id).catch(report);
+    }
+    finally { pendingSession.current = null; sendLock.current = false; setSending(false); }
   }
-  async function handleCommand(command: string, argument: string) {
+  async function handleCommand(command: string, argument: string, preserveDraft = false) {
     setError(''); setCommandMessage('');
     if (command === '/stop') { if (busy) await stop(); else setCommandMessage('当前会话没有运行中的任务。'); setInput(''); return; }
     const goalControl = agentId === 'codex' && busy && (command === '/goal-status' || (command === '/goal' && ['', 'status', 'pause', 'resume', 'clear'].includes(argument)));
@@ -623,7 +652,7 @@ export default function App() {
         if (!id) { const s = await createChatSession({ projectId, model, agent: agentId, connectionId }); id = s.id; setSessionId(id); current.current.sessionId = id; }
         pendingSession.current = id;
         await call('send_message', { sessionId: id, text: `${command}${argument ? ` ${argument}` : ''}`, model: model || null, readOnly, permissionMode }); setInput(''); await refresh();
-      } catch (e) { report(e); } finally { pendingSession.current = ''; setSending(false); }
+      } catch (e) { report(e); } finally { pendingSession.current = null; setSending(false); }
       return;
     }
     if (command === '/compact' && ['opencode', 'pi'].includes(agentId)) {
@@ -633,7 +662,7 @@ export default function App() {
       catch (e) { report(e); } finally { setSending(false); }
       return;
     }
-    if (!['/goal', '/goal-status', '/compact'].includes(command) || agentId !== 'codex') { setError('当前 Agent 不支持此命令。输入 / 查看可用命令。'); return; }
+    if (!['/goal', '/goal-create', '/goal-status', '/compact'].includes(command) || agentId !== 'codex') { setError('当前 Agent 不支持此命令。输入 / 查看可用命令。'); return; }
     if (!desktop) { setError('原生命令需要在桌面版运行。'); return; }
     setSending(true);
     try {
@@ -642,8 +671,11 @@ export default function App() {
       if (!id) { const s = await createChatSession({ projectId, model, agent: agentId, connectionId }); id = s.id; setSessionId(id); current.current.sessionId = id; }
       pendingSession.current = id;
       const result = await call<{ text: string; session: Session }>('execute_agent_command', { sessionId: id, command: command.slice(1), argument, permissionMode });
-      current.current.nativeId = result.session.nativeId; setCommandMessage(result.text); setInput(''); await refresh(); await loadMessages(id);
-    } catch (e) { report(e); } finally { pendingSession.current = ''; setSending(false); }
+      if (current.current.sessionId === id) {
+        current.current.nativeId = result.session.nativeId; setCommandMessage(result.text); if (!preserveDraft) setInput(''); await loadMessages(id);
+      }
+      await refresh();
+    } catch (e) { report(e); } finally { pendingSession.current = null; setSending(false); }
   }
   async function connectionUpdated(_resetAgent?: string) {
     const data = await refresh();
@@ -880,7 +912,7 @@ export default function App() {
       {desktop ? <AppUpdateNotice open={() => { setSettingsTab('about'); openSettings(); }}/> : null}
       <header className="workspace-header"><div className="breadcrumbs">{!sidebar ? <button className="icon-button" title="展开侧栏" onClick={() => setSidebar(true)}><PanelLeftOpen size={18} /></button> : null}<Folder size={15} /><strong title={`${project?.name ?? '工作区'} · ${session?.title ?? '新会话'}`}>{session?.title ?? project?.name ?? '新聊天'}</strong>{!desktop ? <span className="preview-badge">界面预览</span> : null}</div><div className="header-actions"><button className={`icon-button ${showBrowser ? 'on' : ''}`} aria-label="打开内置浏览器" aria-pressed={showBrowser} title={showBrowser ? '收起浏览器' : '内置浏览器'} disabled={!desktop || !sessionId} onClick={()=>{setBrowserSession(showBrowser ? null : sessionId);setBrowserExpanded(false);}}><Globe size={16}/></button>{session ? <button className="icon-button" title="会话设置" onClick={() => { setRename(session.title); setModal('rename'); }}><MoreHorizontal size={18} /></button> : null}<button className={`icon-button ${logsOpen ? 'on' : ''}`} title="运行日志" onClick={() => setLogsOpen(v => !v)}><Terminal size={16} /></button><button className="icon-button" aria-label={showContext ? '收起工作空间' : '打开工作空间'} aria-pressed={showContext} title={showContext ? '收起工作空间' : '打开工作空间'} onClick={() => { if(narrow)setContextOverlay(v => !v);else setContext(v => !v); }}>{showContext ? <PanelRightClose size={17} /> : <PanelRightOpen size={17} />}</button></div></header>
       <div className="chat-scroll" aria-busy={!ready} ref={scrollArea} onClickCapture={e => { if ((e.target as Element).closest('.activity-row, .activity-group-summary, .activity-toggle-more, .turn-process-toggle')) stickToBottom.current = false; }} onScroll={() => { if (settingsOpenRef.current) return; const el = scrollArea.current; if (el) { stickToBottom.current = el.scrollHeight - el.scrollTop - el.clientHeight < 100; setShowJump(!stickToBottom.current); } }}>
-        {!ready ? <div className="startup-loading" role="status"><span className="pending-text">正在加载工作区…</span></div> : messages.length || busy || messagesLoading || currentRequests.length ? <div className="messages" aria-busy={messagesLoading}>{hasMore ? <button className="load-earlier" disabled={messagesLoading} onClick={() => void loadMessages(sessionId, messages.find(m => m.seq > 0)?.seq).catch(report)}>{messagesLoading ? '正在加载…' : '加载更早的消息'}</button> : null}{messagesLoading && !messages.length ? <div className="working-indicator"><span className="pending-text">正在加载会话…</span></div> : null}<Conversation messages={messages} agentName={agentName} autoExpand={autoExpand} showDiff={showDiff} openFile={showFile} openPath={openPath} projectId={projectId} sessionId={sessionId} />{handoffTarget ? <div className="working-indicator" role="status"><span className="pending-text">{handoffTarget === '@compact' ? '正在压缩上下文…' : `正在切换到 ${handoffTarget}…`}</span></div> : busy && !latest ? <div className="working-indicator"><span className="pending-text">{session?.status === 'starting' ? '正在启动 Agent…' : '正在思考…'}</span></div> : null}{currentRequests.filter(request => request.method !== 'item/tool/requestUserInput').map(request => <Suspense key={String(request.id)} fallback={<div className="working-indicator">正在加载确认请求…</div>}><RequestCard request={request} respond={result => respondRequest(request, result)} /></Suspense>)}</div>
+        {!ready ? <div className="startup-loading" role="status"><span className="pending-text">正在加载工作区…</span></div> : messages.length || busy || messagesLoading || currentRequests.length ? <div className="messages" aria-busy={messagesLoading}>{hasMore ? <button className="load-earlier" disabled={messagesLoading} onClick={() => void loadMessages(sessionId, messages.find(m => m.seq > 0)?.seq).catch(report)}>{messagesLoading ? '正在加载…' : '加载更早的消息'}</button> : null}{messagesLoading && !messages.length ? <div className="working-indicator"><span className="pending-text">正在加载会话…</span></div> : null}<Conversation messages={messages} agentName={agentName} autoExpand={autoExpand} showDiff={showDiff} openFile={showFile} openPath={openPath} projectId={projectId} sessionId={sessionId} />{handoffTarget ? <div className="working-indicator" role="status"><span className="pending-text">{handoffTarget === '@compact' ? '正在压缩上下文…' : `正在切换到 ${handoffTarget}…`}</span></div> : busy && !latest ? <div className="working-indicator"><span className="pending-text">{session?.status === 'starting' ? '正在启动 Agent…' : sending && pendingSession.current === sessionId && !isActive(session?.status) ? '正在发送…' : '正在思考…'}</span></div> : null}{currentRequests.filter(request => request.method !== 'item/tool/requestUserInput').map(request => <Suspense key={String(request.id)} fallback={<div className="working-indicator">正在加载确认请求…</div>}><RequestCard request={request} respond={result => respondRequest(request, result)} openFile={showFile} /></Suspense>)}</div>
           : <NewChat project={project} projects={projects} selectProject={selectProject} addProject={() => void addProject()}/>}
       </div>
       {showJump ? <JumpToLatest onClick={() => { stickToBottom.current = true; setShowJump(false); scrollToLatest(scrollArea.current, !prefs.animations || window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'instant' : 'smooth'); }} /> : null}
@@ -888,13 +920,16 @@ export default function App() {
         {commandMessage ? <div className="command-feedback" role="status"><pre>{commandMessage}</pre><button className="icon-button" title="关闭命令结果" onClick={() => setCommandMessage('')}><X size={14} /></button></div> : null}
         {questionPending ? <Suspense fallback={<div className="working-indicator">正在加载提问…</div>}><QuestionDock requests={currentRequests} respond={respondRequest} /></Suspense> : null}
         <FollowupQueue rows={followups.rows} agent={agentId} turnId={session?.turnId} steeringMode={followups.steeringMode} change={changeFollowup} steer={steerFollowup} openSide={row=>void openSide(row)}/>
-        {messages.some(message => message.kind === 'turnDiff') ? <Suspense fallback={null}><TurnChangesDock key={sessionId} messages={messages} activeTurnId={busy ? session?.turnId : undefined} showDiff={showDiff}/></Suspense> : null}
+        {busy && session?.turnId && messages.some(message => message.kind === 'turnDiff') ? <Suspense fallback={null}><TurnChangesDock key={sessionId} messages={messages} activeTurnId={session.turnId} showDiff={showDiff}/></Suspense> : null}
         <form className={`composer ${busy ? 'busy' : ''}`} onSubmit={e => { e.preventDefault(); void send(); }}>
           {slashOptions.length || composerFocused && skillQuery && !commandsDismissed && (skillsLoading || skillsError) ? <div className="slash-menu" id="agent-commands" role="listbox" aria-label="命令与技能" aria-busy={skillsLoading}>{slashOptions.map((c, index) => <button id={`agent-command-${index}`} className={index === slashIndex ? 'selected' : ''} type="button" role="option" aria-selected={index === slashIndex} key={c.name} onMouseDown={e => e.preventDefault()} onClick={() => selectCommand(index)}><span className="slash-option-name">{c.skill ? <Sparkles size={14}/> : <Terminal size={14}/>}<code>{c.name}</code></span><span className="slash-option-detail" title={c.detail}>{c.detail}{c.skill ? <small>{skillSource(c.skill)}</small> : null}</span>{c.skill ? <small className="slash-option-kind">技能</small> : null}</button>)}{skillsLoading ? <div className="slash-menu-status" role="status">读取技能…</div> : skillsError ? <div className="slash-menu-status error-text" role="alert">{skillsError}</div> : null}</div> : null}
           <AttachmentStrip attachments={attachments} loading={importingImages} remove={path => setAttachments(old => old.filter(a => a.path !== path))} />
           <div className="composer-input"><ComposerSkills attachments={attachments} remove={path => { setAttachments(old => old.filter(a => a.path !== path)); requestAnimationFrame(() => textarea.current?.focus()); }} /><textarea ref={textarea} disabled={!ready} onFocus={() => { setComposerFocused(true); setCommandsDismissed(false); }} onBlur={() => { setComposerFocused(false); setCommandsDismissed(true); }} value={input} onPaste={pasteImages} onChange={e => { setInput(e.target.value); setCommandsDismissed(false); setCommandSelection(0); }} aria-controls={slashOptions.length ? "agent-commands" : undefined} aria-expanded={!!slashOptions.length} aria-autocomplete="list" aria-activedescendant={slashOptions.length ? `agent-command-${slashIndex}` : undefined} placeholder={questionPending ? '随心输入' : attachments.some(a => a.kind === 'skill') ? '' : project ? '随心输入，输入 / 查看命令与技能' : '描述你的想法，或先选择一个项目…'} aria-label="消息" rows={questionPending ? 1 : 2} onKeyDown={e => { if (e.nativeEvent.isComposing) return; if (e.key === 'Backspace' && !e.repeat && !e.ctrlKey && !e.altKey && !e.metaKey && e.currentTarget.selectionStart === 0 && e.currentTarget.selectionEnd === 0) { const lastSkill = attachments.filter(a => a.kind === 'skill').at(-1); if (lastSkill) { e.preventDefault(); setAttachments(old => old.filter(a => a.path !== lastSkill.path)); return; } } if (slashOptions.length && ['ArrowDown','ArrowUp'].includes(e.key)) { e.preventDefault(); setCommandSelection(commandIndex(e.key, slashIndex, slashOptions.length)); } else if (slashOptions.length && e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); setCommandsDismissed(true); } else if (slashOptions.length && (e.key === 'Tab' || e.key === 'Enter' && !e.shiftKey)) { e.preventDefault(); selectCommand(slashIndex); } else if (skillsLoading && skillQuery && e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); } else if (e.key === 'Enter' && (prefs.enterSend || e.ctrlKey || e.metaKey) && !e.shiftKey && !e.nativeEvent.isComposing) { e.preventDefault(); void send(); } }} /></div>
           <div className="composer-toolbar"><div className="composer-options">
-            <AddMenu addAttachments={addAttachments} busy={sending || importingImages} project={() => void addProject()} openSkills={() => {setSettingsTab('skills');openSettings();}} />
+            <AddMenu key={`${projectId}:${agentId}`} projectId={projectId} agent={agentId} permissionMode={permissionMode} attachments={attachments}
+              addAttachments={addAttachments} busy={!ready || sending || importingImages} modeBusy={anyBusy || configuring} project={() => void addProject()}
+              onSkill={addSkill} onPlan={enabled => { setPermissionMode(enabled ? 'read' : 'ask'); requestAnimationFrame(() => textarea.current?.focus()); }}
+              onGoal={objective => void handleCommand('/goal-create', objective, true)} />
             <PermissionMenu value={permissionMode} agent={agentId} busy={anyBusy} onChange={mode => {setPermissionMode(mode);}} />
           </div><div className="composer-right">
             <AgentMenu value={agentId} agents={agents} busy={anyBusy} choose={switchAgent}/>

@@ -20,9 +20,9 @@ async function render(value: PermissionMode = 'ask', busy = false, agent = 'code
 async function click(selector: string) { await act(async () => container.querySelector<HTMLButtonElement>(selector)!.click()); }
 const option = (mode: string) => [...container.querySelectorAll<HTMLButtonElement>('[role="menuitemradio"]')].find(b => b.querySelector('strong')?.textContent === mode)!;
 
-it('shows the three Codex choices and sends the native automatic reviewer mode only when selected', async () => {
+it('shows Codex planning and approvals and sends the native automatic reviewer mode only when selected', async () => {
   await render(); await click('[aria-label="权限模式"]');
-  expect([...container.querySelectorAll('[role="menuitemradio"] strong')].map(b => b.textContent)).toEqual(['请求批准', '帮我批准', '完全访问权限']);
+  expect([...container.querySelectorAll('[role="menuitemradio"] strong')].map(b => b.textContent)).toEqual(['计划模式（只读）', '请求批准', '帮我批准', '完全访问权限']);
   expect(option('请求批准').getAttribute('aria-checked')).toBe('true');
   expect(document.activeElement).toBe(option('请求批准'));
   expect(container.querySelector('.permission-option-full .lucide-shield-alert')).not.toBeNull();
@@ -103,10 +103,10 @@ it('shows only supported choices for each Agent, including all six native Claude
   }
 });
 
-it('preserves legacy Codex read-only and manual approvals without silently enabling automatic review', async () => {
+it('restores Codex planning and manual approvals without silently enabling automatic review', async () => {
   await render('read'); await click('[aria-label="权限模式"]');
-  expect(container.querySelector('.permission-legacy-note')?.textContent).toContain('只读');
-  expect(option('只读')).toBeUndefined(); expect(change).not.toHaveBeenCalled();
+  expect(container.querySelector('.permission-legacy-note')).toBeNull();
+  expect(option('计划模式（只读）').getAttribute('aria-checked')).toBe('true'); expect(change).not.toHaveBeenCalled();
   await act(async () => document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true })));
   await render('strict'); await click('[aria-label="权限模式"]');
   expect(option('请求批准').getAttribute('aria-checked')).toBe('true');

@@ -27,6 +27,28 @@ it('counts only configured suppliers and confirmed official logins, with no CLI 
   expect(node.textContent).not.toContain('本机 CLI 配置');expect(node.textContent).not.toContain('Claude 官方账号');
   await act(async()=>tab('opencode').click());expect(node.textContent).toContain('暂无已配置连接');expect(node.querySelector('.provider-sort-row')).toBeNull();
 });
+it('passes the active Agent to CC Switch import and switches its scope with the provider tab',async()=>{
+  const original=mocks.call.getMockImplementation()!;
+  const path='C:\\Users\\全新用户\\.cc-switch\\cc-switch.db';
+  mocks.call.mockImplementation(async(command:string,args:any)=>command==='scan_ccswitch'?{path,warnings:[],profiles:[{id:`${args.agent}:own`,agent:args.agent,name:`${args.agent} 专用配置`,current:true}]}:original(command,args));
+  await render();await act(async()=>tab('codex').click());await act(async()=>button('CC Switch 导入').click());
+  await act(async()=>{await vi.dynamicImportSettled();});
+  expect(mocks.call).toHaveBeenCalledWith('scan_ccswitch',{path:null,agent:'codex'});
+  expect(node.querySelector('.provider-picker-heading h3')?.textContent).toBe('CC Switch 导入 · Codex');
+  expect(node.querySelector('.cc-source-list')?.textContent).toContain('codex 专用配置');
+  await act(async()=>tab('claude').click());
+  expect(mocks.call).toHaveBeenLastCalledWith('scan_ccswitch',{path,agent:'claude'});
+  expect(node.querySelector('.provider-picker-heading h3')?.textContent).toBe('CC Switch 导入 · Claude Code');
+  expect(node.querySelector('.cc-source-list')?.textContent).not.toContain('codex 专用配置');
+  expect(button('导入所选 (1)').disabled).toBe(false);
+  for (const agent of ['opencode', 'pi']) {
+    await act(async()=>tab(agent).click());
+    expect(mocks.call).toHaveBeenLastCalledWith('scan_ccswitch',{path,agent});
+    expect(node.querySelector('.provider-picker-heading h3')?.textContent).toBe(`CC Switch 导入 · ${agent==='pi'?'Pi':'OpenCode'}`);
+    expect(node.querySelector('.cc-source-list')?.textContent).toContain(`${agent} 专用配置`);
+    expect(button('导入所选 (1)').disabled).toBe(false);
+  }
+});
 it('leaves configured API connections visible while native login checks are pending',async()=>{
   let finish!:(value:unknown[])=>void;accounts=new Promise(resolve=>{finish=resolve;});
   await render();expect(node.querySelectorAll('.provider-sort-row')).toHaveLength(2);expect(tab('codex').textContent).toContain('0');

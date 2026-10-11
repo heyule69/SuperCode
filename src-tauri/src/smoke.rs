@@ -182,6 +182,7 @@ async fn verify_skills(
             name: "full-read-probe".into(),
         }]),
         None,
+        None,
         app.clone(),
     )
     .await?;
@@ -238,13 +239,13 @@ async fn verify(app: &AppHandle) -> Result<Value, String> {
         }
     }
     if imported {
-        let source = crate::ccswitch::scan_ccswitch(None)?;
+        let source = crate::ccswitch::scan_ccswitch(None, agent.clone())?;
         let selected = source
             .profiles
             .iter()
             .find(|p| p.agent == agent && p.current)
             .ok_or("CC Switch 没有此 Agent 的当前配置")?;
-        crate::ccswitch::import_ccswitch(None, vec![selected.id.clone()], app.clone())?;
+        crate::ccswitch::import_ccswitch(None, agent.clone(), vec![selected.id.clone()], app.clone())?;
         crate::ccswitch::select_agent_profile(
             agent.clone(),
             Some(selected.id.clone()),
@@ -606,6 +607,7 @@ async fn verify_client(
             mk("directory", &root, "测试目录"),
         ]),
         None,
+        None,
         app.clone(),
     )
     .await?;
@@ -624,7 +626,7 @@ async fn verify_client(
     }) {
         return Err("附件信息未持久化".into());
     }
-    commands::send_chat_message(session.id.clone(),format!("这是隔离的客户端集成测试。请使用{}将 {} 中 value = 10 改为 value = 20，只修改此文件，保留 UTF-8 无 BOM，然后回复 EDIT_DONE。",if agent=="claude"{"Read 和 Edit 工具"}else{"文件编辑工具"},sample.display()),model.clone(),false,Some("full".into()),None,None,app.clone()).await?;
+    commands::send_chat_message(session.id.clone(),format!("这是隔离的客户端集成测试。请使用{}将 {} 中 value = 10 改为 value = 20，只修改此文件，保留 UTF-8 无 BOM，然后回复 EDIT_DONE。",if agent=="claude"{"Read 和 Edit 工具"}else{"文件编辑工具"},sample.display()),model.clone(),false,Some("full".into()),None,None,None,app.clone()).await?;
     wait_idle(app, &session.id).await?;
     if features::read_utf8(&sample, 1024)? != "export const value = 20;\n" {
         return Err("完全访问模式的真实文件修改失败".into());

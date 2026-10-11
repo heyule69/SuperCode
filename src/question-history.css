@@ -1,0 +1,21 @@
+.question-history { max-width:680px; min-width:0; font-size:13px; line-height:1.5; color:var(--text); overflow-wrap:anywhere; }
+.question-history-item { padding:10px 0; }
+.question-history-item + .question-history-item { border-top:1px solid var(--line); }
+.question-history-meta { display:flex; flex-wrap:wrap; align-items:center; gap:8px; margin-bottom:6px; color:var(--muted); font-size:11px; }
+.question-history h4 { margin:0 0 8px; font-size:13px; font-weight:600; line-height:1.5; white-space:pre-wrap; }
+.question-history-options { list-style:none; margin:0; padding:0; display:grid; gap:3px; }
+.question-history-options li { display:flex; align-items:flex-start; gap:8px; padding:6px 8px; border-radius:7px; }
+.question-history-options li > div { min-width:0; flex:1; }
+.question-history-options li.is-selected { background:var(--hover); }
+.question-history-number { display:flex; align-items:center; justify-content:center; flex:none; width:20px; height:20px; border:1px solid var(--line); border-radius:5px; color:var(--muted); font-size:11px; }
+.question-history .is-selected .question-history-number { background:var(--text); border-color:var(--text); color:var(--bg); }
+.question-history-options strong { font-size:13px; font-weight:500; white-space:pre-wrap; }
+.question-history-options p { margin:3px 0 0; font-size:12px; color:var(--muted); white-space:pre-wrap; }
+.question-history-answer { display:flex; align-items:baseline; gap:10px; margin-top:9px; padding-top:8px; border-top:1px solid var(--line); }
+.question-history-answer > span, .question-history-result > span { flex:none; font-size:11px; color:var(--muted); }
+.question-history-answer p, .question-history-result p { margin:0; white-space:pre-wrap; }
+.question-history-result { margin:8px 0; }
+.question-history-result > span { display:block; margin-bottom:5px; }
+.question-history-placeholder { margin:8px 0; color:var(--muted); }
+.question-history > .text-button { margin-top:6px; font-size:11px; }
+@media (max-width:480px) { .question-history-answer { display:block; } .question-history-answer p { margin-top:4px; } }

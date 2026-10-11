@@ -53,7 +53,25 @@ pub fn routing_identity(profile: &Profile) -> Value {
         .or_else(|| config["env"]["ANTHROPIC_BASE_URL"].as_str())
         .or(endpoint)
         .unwrap_or("");
-    json!({"agent":profile.agent,"base":base.trim_end_matches('/'),"protocol":config["protocol"].as_str().unwrap_or(if profile.agent=="claude" {"anthropic"} else {"responses"}),"official":profile.is_official(),"accountId":profile.account_id()})
+    let protocol = config["protocol"].as_str().unwrap_or(if profile.agent == "claude" { "anthropic" } else { "responses" });
+    let mut model_routes = serde_json::Map::new();
+    if let Some(models) = config["piProvider"]["models"].as_array() {
+        for model in models {
+            let model_base = model["baseUrl"].as_str().unwrap_or(base).trim_end_matches('/');
+            let model_protocol = match model["api"].as_str() {
+                Some("anthropic-messages") => "anthropic",
+                Some("openai-responses") => "responses",
+                Some("openai-completions") => "chat",
+                _ => protocol,
+            };
+            if model_base != base.trim_end_matches('/') || model_protocol != protocol {
+                if let Some(id) = model["id"].as_str() {
+                    model_routes.insert(id.into(), json!({"base":model_base,"protocol":model_protocol}));
+                }
+            }
+        }
+    }
+    json!({"agent":profile.agent,"base":base.trim_end_matches('/'),"protocol":protocol,"modelRoutes":model_routes,"official":profile.is_official(),"accountId":profile.account_id()})
 }
 
 pub struct Route {

@@ -6,7 +6,8 @@ export function currentTurnChanges(messages: Message[], activeTurnId?: string | 
   const turn = conversationTurns(messages).at(-1);
   const turnId = String(turn?.run?.data?.turnId ?? '');
   const files = new Map<string, ReturnType<typeof diffFiles>[number]>();
-  if (!turn || activeTurnId && turnId !== activeTurnId) return { id: turn?.id ?? '', files: [], diff: '' };
+  if (!turn || !['inProgress', 'running', 'preparing'].includes(String(turn.run?.data?.status))
+    || activeTurnId && turnId !== activeTurnId) return { id: turn?.id ?? '', files: [], diff: '' };
   for (const message of turn.items) {
     if (message.kind !== 'turnDiff' || turnId && message.data?.turnId !== turnId) continue;
     // Native Codex notifications replace the complete turn snapshot. Other

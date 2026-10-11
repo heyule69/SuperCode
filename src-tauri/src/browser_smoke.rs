@@ -55,6 +55,7 @@ impl Adapter {
         Ok(value["result"].clone())
     }
     async fn tool(&mut self, name: &str, args: Value) -> Result<Value, String> {
+        println!("Browser fixture tool {}: {name}", self.id + 1);
         self.request("tools/call", json!({"name":name,"arguments":args}))
             .await
     }
@@ -190,10 +191,13 @@ async fn fixture() -> Result<(String, Fixture), String> {
         listener.local_addr().map_err(|e| e.to_string())?
     );
     let html="<!doctype html><meta charset=utf-8><meta http-equiv=Content-Security-Policy content=\"require-trusted-types-for 'script'\"><title>SuperCode Browser Test</title><style>body{font:16px sans-serif;padding:24px;background:#f8f9fb;color:#24272b;min-height:1200px}button,input{display:block;margin:18px 0;padding:14px;border:1px solid #bbc5d1;border-radius:8px}button{background:#e7f0fa}h1{font-size:24px}output{display:block}</style><h1>SuperCode Browser Test</h1><p id=status>WAITING</p><button onclick=\"document.querySelector('#status').textContent='CLICKED';document.querySelector('output').textContent=Number(document.querySelector('output').textContent)+1\">SC Browser Button</button><input aria-label=\"SC Browser Input\"><output>0</output>";
-    let router = axum::Router::new().route(
-        "/",
-        axum::routing::get(move || async move { axum::response::Html(html) }),
-    );
+    let router = axum::Router::new()
+        .route("/", axum::routing::get(move || async move { axum::response::Html(html) }))
+        .route("/dynamic", axum::routing::get(|| async { axum::response::Html(include_str!("browser_dynamic.html")) }))
+        .route("/image.svg", axum::routing::get(|| async {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            ([(axum::http::header::CONTENT_TYPE, "image/svg+xml")], "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"80\" height=\"80\"><rect width=\"80\" height=\"80\" fill=\"#8ab8de\"/></svg>")
+        }));
     Ok((
         url,
         Fixture(tokio::spawn(async move {
@@ -377,6 +381,14 @@ pub(super) async fn verify(app: &AppHandle) -> Result<Value, String> {
         {
             return Err("Browser scroll did not reach page".into());
         }
+        let dynamic = verify_dynamic_page(app, &tab, &mut adapter, &address).await?;
+        authorize_session(app, agent, &session.id);
+        runtime::publish_event(
+            app,
+            json!({"method":"turn/started","params":{"threadId":native,"turn":{"id":"fixture-after-dynamic"}}}),
+        );
+        // The new turn becomes active in the panel when its first tool runs.
+        read(&adapter.tool("browser_snapshot", json!({})).await?)?;
         // Exercise the actual React Escape handler, while browser-native focus is tested separately.
         evaluate(
             app,
@@ -512,7 +524,7 @@ pub(super) async fn verify(app: &AppHandle) -> Result<Value, String> {
             .lock()
             .unwrap()
             .remove(&session.id);
-        reports.push(json!({"agent":agent,"stdio":true,"visibleRightPane":true,"closedPanelContinues":true,"closedBeforeFirstTool":true,"samePageOnReopen":true,"hiddenEsc":true,"clickAndUnicode":true,"pointer":true,"scroll":true,"escAndLateCalls":true,"warmNextTurn":true,"nativeEscapeCallback":true}));
+        reports.push(json!({"agent":agent,"stdio":true,"visibleRightPane":true,"closedPanelContinues":true,"closedBeforeFirstTool":true,"samePageOnReopen":true,"hiddenEsc":true,"clickAndUnicode":true,"pointer":true,"scroll":true,"escAndLateCalls":true,"warmNextTurn":true,"nativeEscapeCallback":true,"dynamicPage":dynamic}));
     }
     let (endpoint, token) = state_endpoint(app)?;
     let bad = reqwest::Client::new()
@@ -527,6 +539,147 @@ pub(super) async fn verify(app: &AppHandle) -> Result<Value, String> {
         return Err("Invalid browser token accepted".into());
     }
     Ok(json!({"fixtureOnly":true,"agents":reports,"invalidTokenRejected":true}))
+}
+async fn verify_dynamic_page(
+    app: &AppHandle,
+    page: &Tab,
+    adapter: &mut Adapter,
+    address: &str,
+) -> Result<Value, String> {
+    let value = read(
+        &adapter
+            .tool(
+                "browser_navigate",
+                json!({"url":format!("{address}dynamic")}),
+            )
+            .await?,
+    )?;
+    if !value["images"].as_array().is_some_and(|images| {
+        images
+            .iter()
+            .any(|image| image["url"] == format!("{address}image.svg") && image["loaded"] == true)
+    }) {
+        return Err("Visible image URLs missing from the native DOM snapshot".into());
+    }
+    let mut cases = vec![];
+    for case in [
+        "shift",
+        "shiftDuringWait",
+        "replace",
+        "detach",
+        "cover",
+        "hoverShift",
+        "disable",
+        "duplicate",
+        "recycle",
+        "moving",
+        "focus",
+    ] {
+        println!("Dynamic browser regression: {case}");
+        evaluate(app, page, "window.fixture.reset();true".into(), None, None).await?;
+        cdp(
+            app,
+            page,
+            "Input.dispatchMouseEvent",
+            json!({"type":"mouseMoved","x":5,"y":5}),
+            None,
+        )
+        .await?;
+        let snapshot = read(&adapter.tool("browser_snapshot", json!({})).await?)?;
+        let name = match case {
+            "recycle" => "SC Dynamic Link",
+            "focus" => "SC Dynamic Input",
+            _ => "SC Dynamic Button",
+        };
+        let script = match case {
+            "shiftDuringWait" => "true",
+            "cover" => "window.fixture.cover(350);true",
+            "recycle" => "document.querySelector('#link').href='/different-image.svg';true",
+            "focus" => "window.fixture.stealFocus();true",
+            _ => match case {
+                "shift" => "window.fixture.shift();true",
+                "replace" => "window.fixture.replace();true",
+                "detach" => "window.fixture.detach();true",
+                "hoverShift" => "window.fixture.hoverShift();true",
+                "disable" => "window.fixture.disable();true",
+                "duplicate" => "window.fixture.duplicate();true",
+                _ => "window.fixture.moving();true",
+            },
+        };
+        evaluate(app, page, script.into(), None, None).await?;
+        let mut args =
+            json!({"snapshotId":snapshot["snapshotId"],"ref":reference(&snapshot,name)?});
+        if case == "focus" {
+            args["text"] = json!("MUST NOT TYPE");
+        }
+        let start = Instant::now();
+        let action = adapter.tool(
+            if case == "focus" {
+                "browser_fill"
+            } else {
+                "browser_click"
+            },
+            args,
+        );
+        let shift = async {
+            if case == "shiftDuringWait" {
+                tokio::time::sleep(Duration::from_millis(70)).await;
+                evaluate(app, page, "window.fixture.shift();true".into(), None, None).await?;
+            }
+            Ok::<(), String>(())
+        };
+        let (result, shifted) = tokio::join!(action, shift);
+        shifted?;
+        let result = result?;
+        let stats = evaluate(app, page, "window.fixture.stats()".into(), None, None).await?;
+        let blocked = matches!(case, "duplicate" | "recycle" | "moving" | "focus");
+        if result["isError"] != blocked
+            || stats["wrong"] != 0
+            || stats["clicked"] != if blocked { 0 } else { 1 }
+            || stats["field"] != ""
+            || stats["other"] != ""
+        {
+            return Err(format!(
+                "Dynamic page {case} failed: stats={stats}, result={}",
+                result["content"][0]["text"]
+            ));
+        }
+        if blocked {
+            let details: Value =
+                serde_json::from_str(result["content"][0]["text"].as_str().unwrap())
+                    .map_err(|e| e.to_string())?;
+            if details["actionMayHaveRun"] != (case == "focus")
+                || start.elapsed() > Duration::from_secs(4)
+            {
+                return Err(format!(
+                    "Dynamic {case} had an incorrect action status or unbounded wait"
+                ));
+            }
+        }
+        cases.push(case);
+    }
+    evaluate(app, page, "window.fixture.reset();true".into(), None, None).await?;
+    let snapshot = read(&adapter.tool("browser_snapshot", json!({})).await?)?;
+    evaluate(app, page, "window.fixture.cover(0);true".into(), None, None).await?;
+    let action = adapter.tool("browser_click", json!({"snapshotId":snapshot["snapshotId"],"ref":reference(&snapshot,"SC Dynamic Button")?}));
+    let escape = async {
+        tokio::time::sleep(Duration::from_millis(180)).await;
+        crate::browser_native::verify_escape_callback()
+    };
+    let start = Instant::now();
+    let (result, escaped) = tokio::join!(action, escape);
+    escaped?;
+    let result = read(&result?)?;
+    if result["code"] != "user_takeover"
+        || result["actionMayHaveRun"] != false
+        || start.elapsed() > Duration::from_millis(1500)
+        || evaluate(app, page, "window.fixture.clicked".into(), None, None).await? != 0
+    {
+        return Err("Escape did not cancel target readiness without clicking".into());
+    }
+    Ok(
+        json!({"cases":cases,"visibleImages":true,"escapeDuringWait":true,"noWrongOrDuplicateClicks":true}),
+    )
 }
 fn state_endpoint(app: &AppHandle) -> Result<(String, String), String> {
     app.state::<Browser>()

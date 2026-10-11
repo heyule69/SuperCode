@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { Bell, CheckCheck, CircleAlert, RefreshCw, ShieldCheck } from 'lucide-react';
+import { Bell, CheckCheck, CircleAlert, ExternalLink, RefreshCw, ShieldCheck } from 'lucide-react';
 import { call, desktop } from './api';
 import type { Preferences } from './preferences';
 import type { NotificationStatus } from './notifications';
@@ -15,6 +15,9 @@ const types = [
 export default function NotificationSettings({ prefs, setPrefs }: { prefs: Preferences; setPrefs: (p: Preferences) => void }) {
   const [status, setStatus] = useState<NotificationStatus>();
   const [checking, setChecking] = useState(false);
+  const [openingSettings, setOpeningSettings] = useState(false);
+  const [settingsError, setSettingsError] = useState('');
+  const opening = useRef(false);
   const request = useRef(0);
   const alive = useRef(true);
   const refresh = useCallback(async () => {
@@ -28,14 +31,25 @@ export default function NotificationSettings({ prefs, setPrefs }: { prefs: Prefe
     alive.current = true; void refresh(); window.addEventListener('focus', refresh);
     return () => { alive.current = false; request.current++; window.removeEventListener('focus', refresh); };
   }, [refresh]);
+  const openSettings = async () => {
+    if (!desktop || opening.current) return;
+    opening.current = true; setOpeningSettings(true); setSettingsError('');
+    try { await call('open_system_notification_settings'); }
+    catch { if (alive.current) setSettingsError('无法打开系统通知设置。请按 Win + I，进入“系统 → 通知”。'); }
+    finally { opening.current = false; if (alive.current) setOpeningSettings(false); }
+  };
   const update = <K extends keyof Preferences>(key: K, value: Preferences[K]) => setPrefs({ ...prefs, [key]: value });
   return <div className="notification-settings">
     <div className="settings-page-heading"><div><h2>通知</h2><p className="notification-subtitle">在需要你关注时提醒你。</p></div></div>
     <div className="notification-system-card">
       <span className="notification-system-icon"><Bell size={20} /></span>
-      <div className="notification-system-copy"><strong>系统通知</strong><span role="status">{!desktop ? '在桌面版中检查系统通知' : status?.message ?? '正在检查系统通知状态…'}</span></div>
-      <span className={`notification-status-badge ${status?.state === 'enabled' ? 'available' : ''}`}>{!desktop ? '桌面版可用' : status?.state === 'enabled' ? '可用' : status?.state === 'unavailable' || !status ? '待检查' : '已关闭'}</span>
-      <button className="icon-button" title="刷新系统通知状态" aria-label="刷新系统通知状态" disabled={!desktop || checking} onClick={() => void refresh()}><RefreshCw size={14} className={checking ? 'spin' : ''} /></button>
+      <div className="notification-system-copy"><strong>系统通知</strong><span role="status">{!desktop ? '在桌面版中检查系统通知' : status?.message ?? '正在检查系统通知状态…'}</span>{status?.state === 'appBlocked' || status?.state === 'systemBlocked' ? <span>在系统设置中开启通知，并允许 SuperCode 发送通知。</span> : null}</div>
+      <div className="notification-system-actions">
+        <span className={`notification-status-badge ${status?.state === 'enabled' ? 'available' : ''}`}>{!desktop ? '桌面版可用' : status?.state === 'enabled' ? '可用' : status?.state === 'unavailable' || !status ? '待检查' : '已关闭'}</span>
+        <button type="button" className="quiet-button notification-settings-button" aria-label="打开系统通知设置" title={desktop ? '打开 Windows 的系统通知设置' : '请在桌面版中打开系统通知设置'} disabled={!desktop || openingSettings} onClick={() => void openSettings()}><ExternalLink size={14} />{openingSettings ? '正在打开…' : '打开系统通知设置'}</button>
+        <button type="button" className="icon-button" title="刷新系统通知状态" aria-label="刷新系统通知状态" disabled={!desktop || checking} onClick={() => void refresh()}><RefreshCw size={14} className={checking ? 'spin' : ''} /></button>
+      </div>
+      {settingsError ? <p className="notification-system-error" role="alert">{settingsError}</p> : null}
     </div>
     <div className="notification-options">
       <SettingsGroup title="提醒方式">

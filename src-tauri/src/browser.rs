@@ -550,6 +550,21 @@ async fn cancelled(lease: &Lease) {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }
+async fn operation<'a>(
+    tab: &'a Tab,
+    lease: &Lease,
+) -> Result<tokio::sync::MutexGuard<'a, ()>, String> {
+    lease.check()?;
+    // React can submit a layout update between two tool calls. It holds this lock
+    // briefly even when bounds are unchanged; do not report that as a tool failure.
+    let guard = tokio::select! {
+        result = tokio::time::timeout(Duration::from_millis(250), tab.operation.lock()) =>
+            result.map_err(|_| "另一个浏览器操作正在进行，请等待返回结果".to_string())?,
+        _ = cancelled(lease) => return Err("user_takeover".into()),
+    };
+    lease.check()?;
+    Ok(guard)
+}
 #[cfg(windows)]
 async fn cdp(
     app: &AppHandle,
@@ -746,13 +761,126 @@ async fn point(
     context: i64,
     lease: &Lease,
 ) -> Result<Value, String> {
+    if observation(tab, &args["snapshotId"])? != context {
+        return Err("浏览器快照已过期，请重新读取后操作".into());
+    }
     let reference = json!(args["ref"].as_str().unwrap());
     let expression = format!("({})({reference})", include_str!("browser_target.js"));
     let value = evaluate(app, tab, expression, Some(context), Some(lease)).await?;
-    if value.is_null() {
-        return Err("控件已经变化或被遮挡，请重新读取快照".into());
+    observation(tab, &args["snapshotId"])?;
+    match value["status"].as_str() {
+        Some("changed") => return Err("控件内容或目标已经变化，请重新读取快照".into()),
+        Some("ambiguous") => {
+            return Err("页面出现多个相同目标，无法安全定位，请重新读取快照".into())
+        }
+        Some("ready" | "missing" | "hidden" | "disabled" | "blocked") => {}
+        _ => return Err("控件无法定位，请重新读取快照".into()),
     }
     Ok(value)
+}
+fn same_point(a: &Value, b: &Value) -> bool {
+    a["status"] == "ready"
+        && b["status"] == "ready"
+        && a["generation"] == b["generation"]
+        && ["x", "y", "width", "height"].iter().all(|key| {
+            a["rect"][key]
+                .as_f64()
+                .zip(b["rect"][key].as_f64())
+                .is_some_and(|(a, b)| (a - b).abs() <= 1.)
+        })
+        && ["x", "y"].iter().all(|key| {
+            a[key]
+                .as_f64()
+                .zip(b[key].as_f64())
+                .is_some_and(|(a, b)| (a - b).abs() <= 1.)
+        })
+}
+// Retry only observations/hover before mouse-down, never a dispatched click.
+async fn ready_point(
+    app: &AppHandle,
+    tab: &Tab,
+    args: &Value,
+    context: i64,
+    lease: &Lease,
+    fill: bool,
+) -> Result<Value, String> {
+    let mut stable: Option<(Value, Instant)> = None;
+    loop {
+        lease.check()?;
+        let current = point(app, tab, args, context, lease).await?;
+        if fill && current["status"] == "ready" && current["textField"] != true {
+            return Err("此控件不是文本输入框".into());
+        }
+        if current["status"] == "ready" && (!fill || current["editable"] == true) {
+            if let Some((previous, since)) = &stable {
+                if same_point(previous, &current) && since.elapsed() >= Duration::from_millis(120) {
+                    cdp(
+                        app,
+                        tab,
+                        "Input.dispatchMouseEvent",
+                        json!({"type":"mouseMoved","x":current["x"],"y":current["y"]}),
+                        Some(lease),
+                    )
+                    .await?;
+                    // Hover handlers can insert overlays or replace/move a control.
+                    let hovered = point(app, tab, args, context, lease).await?;
+                    if same_point(&current, &hovered) {
+                        cue(
+                            app,
+                            tab,
+                            Some(json!({"x":hovered["x"],"y":hovered["y"],"click":true})),
+                            true,
+                            Some(lease),
+                        )
+                        .await?;
+                        let checked = point(app, tab, args, context, lease).await?;
+                        if same_point(&hovered, &checked) && (!fill || checked["editable"] == true)
+                        {
+                            return Ok(checked);
+                        }
+                    }
+                    stable = None;
+                } else if !same_point(previous, &current) {
+                    stable = None;
+                }
+            }
+            if stable.is_none() {
+                cue(
+                    app,
+                    tab,
+                    Some(json!({"x":current["x"],"y":current["y"]})),
+                    true,
+                    Some(lease),
+                )
+                .await?;
+                stable = Some((current, Instant::now()));
+            }
+        } else {
+            stable = None;
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_millis(60)) => {},
+            _ = cancelled(lease) => return Err("user_takeover".into()),
+        }
+    }
+}
+async fn focused_field(
+    app: &AppHandle,
+    tab: &Tab,
+    args: &Value,
+    context: i64,
+    lease: &Lease,
+) -> Result<(), String> {
+    let expression = format!(
+        "({})({})",
+        include_str!("browser_target.js"),
+        json!(args["ref"].as_str().unwrap())
+    );
+    let target = evaluate(app, tab, expression, Some(context), Some(lease)).await?;
+    if target["status"] != "ready" || target["editable"] != true || target["focused"] != true {
+        return Err("点击后输入框或焦点已经变化；未继续输入，请读取新快照确认结果".into());
+    }
+    Ok(())
 }
 async fn key(app: &AppHandle, tab: &Tab, value: &str, lease: &Lease) -> Result<(), String> {
     let (key, code, vk, modifiers) = match value.to_uppercase().as_str() {
@@ -783,10 +911,7 @@ async fn execute(
 ) -> Result<Value, String> {
     browser_bridge::validate(name, &args)?;
     lease.check()?;
-    let _operation = tab
-        .operation
-        .try_lock()
-        .map_err(|_| "另一个浏览器操作正在进行，请等待返回结果")?;
+    let _operation = operation(tab, lease).await?;
     lease.check()?;
     if !tab.visible.load(Ordering::Acquire) {
         park_view(&app.get_webview(&tab.label).ok_or("浏览器已关闭")?)?;
@@ -816,22 +941,24 @@ async fn execute(
             if let Some(error)=navigation["errorText"].as_str(){return Err(format!("网页加载失败：{error}"));}
         }else{
             let context=observation(tab,&args["snapshotId"])?;
-            let point=if matches!(name,"browser_click"|"browser_fill"){Some(point(app,tab,&args,context,lease).await?)}else{None};
-            if name=="browser_fill" && point.as_ref().is_some_and(|p|p["editable"]!=true){return Err("此控件不是文本输入框".into());}
+            let point=if matches!(name,"browser_click"|"browser_fill"){
+                let ready=tokio::time::timeout(Duration::from_secs(2),ready_point(app,tab,&args,context,lease,name=="browser_fill")).await;
+                lease.check()?;
+                Some(ready.map_err(|_|"目标在等待期间持续移动、不可用或被遮挡；尚未点击，请重新读取快照".to_string())??)
+            }else{None};
             if name=="browser_press_key" && !["ENTER","TAB","ESC","BACKSPACE","DELETE","ARROWUP","ARROWDOWN","ARROWLEFT","ARROWRIGHT","HOME","END","CTRL+A"].contains(&args["key"].as_str().unwrap().to_uppercase().as_str()){return Err("不支持此浏览器按键".into());}
-            tab.observation.lock().unwrap().take();
             if let Some(point)=point {
-                cue(app,tab,Some(json!({"x":point["x"],"y":point["y"],"click":true})),true,Some(lease)).await?;
-                tokio::select!{_=tokio::time::sleep(Duration::from_millis(140))=>{},_=cancelled(lease)=>return Err("user_takeover".into())};
+                lease.check()?;
+                observation(tab,&args["snapshotId"])?;
+                tab.observation.lock().unwrap().take();
                 may_have_run=true;
-                cdp(app,tab,"Input.dispatchMouseEvent",json!({"type":"mouseMoved","x":point["x"],"y":point["y"]}),Some(lease)).await?;
                 for phase in ["mousePressed","mouseReleased"]{cdp(app,tab,"Input.dispatchMouseEvent",json!({"type":phase,"x":point["x"],"y":point["y"],"button":"left","clickCount":1}),Some(lease)).await?;}
-                if name=="browser_fill" {key(app,tab,"CTRL+A",lease).await?;cdp(app,tab,"Input.insertText",json!({"text":args["text"]}),Some(lease)).await?;}
+                if name=="browser_fill" {focused_field(app,tab,&args,context,lease).await?;key(app,tab,"CTRL+A",lease).await?;focused_field(app,tab,&args,context,lease).await?;cdp(app,tab,"Input.insertText",json!({"text":args["text"]}),Some(lease)).await?;}
             }else if name=="browser_scroll"{
                 let center=evaluate(app,tab,"({x:innerWidth/2,y:innerHeight/2})".into(),Some(context),Some(lease)).await?;
                 cue(app,tab,Some(center.clone()),true,Some(lease)).await?;
-                may_have_run=true;cdp(app,tab,"Input.dispatchMouseEvent",json!({"type":"mouseWheel","x":center["x"],"y":center["y"],"deltaY":args["deltaY"],"deltaX":args.get("deltaX").cloned().unwrap_or(json!(0))}),Some(lease)).await?;
-            }else{may_have_run=true;key(app,tab,args["key"].as_str().unwrap(),lease).await?;}
+                tab.observation.lock().unwrap().take();may_have_run=true;cdp(app,tab,"Input.dispatchMouseEvent",json!({"type":"mouseWheel","x":center["x"],"y":center["y"],"deltaY":args["deltaY"],"deltaX":args.get("deltaX").cloned().unwrap_or(json!(0))}),Some(lease)).await?;
+            }else{tab.observation.lock().unwrap().take();may_have_run=true;key(app,tab,args["key"].as_str().unwrap(),lease).await?;}
         }
         tokio::select!{_=tokio::time::sleep(Duration::from_millis(400))=>{},_=cancelled(lease)=>return Err("user_takeover".into())};
         match snapshot(app,tab,lease).await {
@@ -1370,6 +1497,53 @@ mod tests {
         assert!(observation(&tab, &json!("snap")).is_ok());
         tab.revision.fetch_add(1, Ordering::AcqRel);
         assert!(observation(&tab, &json!("snap")).is_err());
+    }
+    #[test]
+    fn target_stability_compares_current_geometry_and_replacement_generation() {
+        let point = json!({"status":"ready","x":40.,"y":90.,"generation":0,"rect":{"x":20.,"y":70.,"width":40.,"height":40.}});
+        assert!(same_point(&point, &point));
+        let mut moved = point.clone();
+        moved["rect"]["x"] = json!(21.5);
+        assert!(!same_point(&point, &moved));
+        let mut replaced = point.clone();
+        replaced["generation"] = json!(1);
+        assert!(!same_point(&point, &replaced));
+        let mut obscured = point.clone();
+        obscured["status"] = json!("blocked");
+        assert!(!same_point(&point, &obscured));
+        assert!(!same_point(&point, &json!({"status":"ready"})));
+    }
+    #[tokio::test]
+    async fn tool_waits_for_short_layout_updates_but_escape_cancels_waiting() {
+        let tab = test_tab("layout", true);
+        let lease = Lease {
+            session: "layout".into(),
+            agent: "codex".into(),
+            turn: None,
+            gate: Arc::new(AtomicBool::new(true)),
+            presented: Arc::new(AtomicBool::new(true)),
+        };
+        let layout = tab.operation.lock().await;
+        let release = async {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            drop(layout);
+        };
+        let (acquired, _) = tokio::join!(operation(&tab, &lease), release);
+        drop(acquired.unwrap());
+        let _layout = tab.operation.lock().await;
+        let escape = async {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            lease.gate.store(false, Ordering::Release);
+        };
+        let (cancelled, _) = tokio::join!(operation(&tab, &lease), escape);
+        assert_eq!(cancelled.unwrap_err(), "user_takeover");
+        lease.gate.store(true, Ordering::Release);
+        let start = Instant::now();
+        assert!(operation(&tab, &lease)
+            .await
+            .unwrap_err()
+            .contains("另一个浏览器操作"));
+        assert!(start.elapsed() < Duration::from_secs(1));
     }
     #[test]
     fn old_lease_cannot_be_reenabled_by_new_turn() {

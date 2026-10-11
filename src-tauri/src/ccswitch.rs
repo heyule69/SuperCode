@@ -6,6 +6,9 @@ use serde_json::{json, Value};
 use std::path::PathBuf;
 use tauri::{AppHandle, Emitter, Manager};
 
+#[path = "ccswitch_native.rs"]
+mod native;
+
 #[derive(Clone)]
 pub struct Profile {
     pub id: String,
@@ -47,12 +50,13 @@ impl Profile {
                 .as_str()
                 .is_none_or(str::is_empty);
         }
-        self.config["config"]
-            .as_str()
-            .and_then(|s| toml::from_str::<toml::Table>(s).ok())
-            .is_some_and(|t| {
-                t.get("model_provider").and_then(toml::Value::as_str) == Some("openai")
-            })
+        self.agent == "codex"
+            && self.config["config"]
+                .as_str()
+                .and_then(|s| toml::from_str::<toml::Table>(s).ok())
+                .is_some_and(|t| {
+                    t.get("model_provider").and_then(toml::Value::as_str) == Some("openai")
+                })
     }
     pub fn summary(&self, current: bool) -> Summary {
         Summary {
@@ -244,6 +248,9 @@ fn imported_base_url(value: &str) -> Result<String, String> {
     Ok(value.trim().trim_end_matches('/').into())
 }
 fn sanitize(agent: &str, raw: Value) -> Result<Value, String> {
+    sanitize_provider(agent, "", raw)
+}
+pub(crate) fn sanitize_provider(agent: &str, id: &str, raw: Value) -> Result<Value, String> {
     if !raw.is_object() {
         return Err("配置 JSON 必须是对象".into());
     }
@@ -251,6 +258,9 @@ fn sanitize(agent: &str, raw: Value) -> Result<Value, String> {
         let mut safe = json!({"env":claude_env(&raw),"model":raw["model"],"source":"ccswitch"});
         safe["model"] = json!(crate::providers::real_claude_model(&safe, None));
         return Ok(safe);
+    }
+    if matches!(agent, "opencode" | "pi") {
+        return native::sanitize(agent, id, &raw);
     }
     let cfg: toml::Table =
         toml::from_str(raw["config"].as_str().ok_or("Codex 配置缺少 config TOML")?)
@@ -412,23 +422,26 @@ pub struct ScanResult {
     pub profiles: Vec<Summary>,
     pub warnings: Vec<String>,
 }
-fn read(path: Option<String>) -> Result<ReadResult, String> {
+fn read(path: Option<String>, agent: &str) -> Result<ReadResult, String> {
+    if !matches!(agent, "claude" | "codex" | "opencode" | "pi") {
+        return Err("不支持的 Agent，请重新选择供应商标签".into());
+    }
     let path = database(path)?;
     if path
         .extension()
         .and_then(std::ffi::OsStr::to_str)
         .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
     {
-        return read_legacy(path);
+        return read_legacy(path, agent);
     }
     let connection = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)
         .map_err(|_| "无法以只读方式打开 CC Switch 数据库")?;
     connection
         .busy_timeout(std::time::Duration::from_secs(3))
         .map_err(|e| e.to_string())?;
-    let mut stmt=connection.prepare("SELECT id,app_type,name,settings_config,COALESCE(is_current,0) FROM providers WHERE app_type IN ('claude','codex') ORDER BY app_type,name LIMIT 500").map_err(|_|"数据库不是受支持的 CC Switch providers 格式")?;
+    let mut stmt=connection.prepare("SELECT id,app_type,name,settings_config,COALESCE(is_current,0) FROM providers WHERE app_type = ?1 ORDER BY name LIMIT 500").map_err(|_|"数据库不是受支持的 CC Switch providers 格式")?;
     let rows = stmt
-        .query_map([], |r| {
+        .query_map([agent], |r| {
             Ok((
                 r.get::<_, String>(0)?,
                 r.get::<_, String>(1)?,
@@ -460,7 +473,7 @@ fn read(path: Option<String>) -> Result<ReadResult, String> {
         }
         let config = serde_json::from_str::<Value>(&raw)
             .map_err(|_| "配置 JSON 无效".into())
-            .and_then(|raw| sanitize(&agent, raw));
+            .and_then(|raw| sanitize_provider(&agent, &id, raw));
         let config = match config {
             Ok(config) => config,
             Err(error) => {
@@ -484,7 +497,7 @@ fn read(path: Option<String>) -> Result<ReadResult, String> {
         warnings,
     })
 }
-fn read_legacy(path: PathBuf) -> Result<ReadResult, String> {
+fn read_legacy(path: PathBuf, selected_agent: &str) -> Result<ReadResult, String> {
     use std::io::Read;
     let file = std::fs::File::open(&path).map_err(|_| "无法只读打开 CC Switch 旧版配置")?;
     let mut bytes = Vec::new();
@@ -500,19 +513,26 @@ fn read_legacy(path: PathBuf) -> Result<ReadResult, String> {
         return Err("CC Switch 旧版配置含 BOM，未转换或修改原文件".into());
     }
     let value: Value = serde_json::from_str(text).map_err(|_| "CC Switch 旧版配置 JSON 无效")?;
-    if !value["claude"]["providers"].is_object() && !value["codex"]["providers"].is_object() {
+    if !crate::agents::IDS
+        .iter()
+        .any(|agent| value[*agent]["providers"].is_object())
+    {
         return Err("文件不是受支持的 CC Switch 旧版供应商配置".into());
     }
     let mut profiles = Vec::new();
     let mut warnings = Vec::new();
-    let total: usize = ["claude", "codex"]
+    let total: usize = crate::agents::IDS
         .into_iter()
+        .filter(|agent| *agent == selected_agent)
         .filter_map(|agent| value[agent]["providers"].as_object().map(|rows| rows.len()))
         .sum();
     if total > 500 {
         return Err("CC Switch 配置超过 500 个连接".into());
     }
-    for agent in ["claude", "codex"] {
+    for agent in crate::agents::IDS
+        .into_iter()
+        .filter(|agent| *agent == selected_agent)
+    {
         if let Some(rows) = value[agent]["providers"].as_object() {
             for (id, row) in rows {
                 let name = row["name"].as_str().unwrap_or(id);
@@ -520,7 +540,7 @@ fn read_legacy(path: PathBuf) -> Result<ReadResult, String> {
                     warnings.push(format!("{name}：配置超过 1 MB，已跳过"));
                     continue;
                 }
-                match sanitize(agent, row["settingsConfig"].clone()) {
+                match sanitize_provider(agent, id, row["settingsConfig"].clone()) {
                     Ok(config) => profiles.push((
                         Profile {
                             id: format!("{agent}:{id}"),
@@ -542,8 +562,8 @@ fn read_legacy(path: PathBuf) -> Result<ReadResult, String> {
     })
 }
 #[tauri::command]
-pub fn scan_ccswitch(path: Option<String>) -> Result<ScanResult, String> {
-    let result = read(path)?;
+pub fn scan_ccswitch(path: Option<String>, agent: String) -> Result<ScanResult, String> {
+    let result = read(path, &agent)?;
     Ok(ScanResult {
         path: result.path.to_string_lossy().into(),
         profiles: result
@@ -554,9 +574,36 @@ pub fn scan_ccswitch(path: Option<String>) -> Result<ScanResult, String> {
         warnings: result.warnings,
     })
 }
+fn selected_profiles(
+    result: ReadResult,
+    agent: &str,
+    ids: &[String],
+) -> Result<Vec<Profile>, String> {
+    if ids.is_empty() {
+        return Err("请选择要导入的配置".into());
+    }
+    let prefix = format!("{agent}:");
+    if ids.iter().any(|id| !id.starts_with(&prefix)) {
+        return Err("只能导入当前 Agent 的配置，请重新选择".into());
+    }
+    let selected: Vec<_> = result
+        .profiles
+        .into_iter()
+        .filter(|(p, _)| ids.contains(&p.id))
+        .map(|(p, _)| p)
+        .collect();
+    if selected.iter().any(|p| p.agent != agent) {
+        return Err("只能导入当前 Agent 的配置，请重新选择".into());
+    }
+    if selected.len() != ids.len() {
+        return Err("部分配置已变更，请重新扫描".into());
+    }
+    Ok(selected)
+}
 #[tauri::command]
 pub fn import_ccswitch(
     path: Option<String>,
+    agent: String,
     ids: Vec<String>,
     app: AppHandle,
 ) -> Result<usize, String> {
@@ -566,16 +613,7 @@ pub fn import_ccswitch(
     if ids.is_empty() {
         return Err("请选择要导入的配置".into());
     }
-    let all = read(path)?;
-    let selected = all
-        .profiles
-        .into_iter()
-        .filter(|(p, _)| ids.contains(&p.id))
-        .map(|(p, _)| p)
-        .collect::<Vec<_>>();
-    if selected.len() != ids.len() {
-        return Err("部分配置已变更，请重新扫描".into());
-    }
+    let selected = selected_profiles(read(path, &agent)?, &agent, &ids)?;
     app.state::<AppState>().store.import_profiles(&selected)?;
     Ok(selected.len())
 }
@@ -701,21 +739,28 @@ mod tests {
         let before = std::fs::read(&legacy).unwrap();
         let detected = locate_database(None, None, None, &home, None).unwrap();
         assert_eq!(detected, legacy);
-        let scan = scan_ccswitch(Some(detected.to_string_lossy().into())).unwrap();
-        assert_eq!(scan.profiles.len(), 2);
+        let scan = scan_ccswitch(Some(detected.to_string_lossy().into()), "claude".into()).unwrap();
+        assert_eq!(scan.profiles.len(), 1);
         assert_eq!(scan.warnings.len(), 1);
         assert!(scan.profiles.iter().all(|p| p.current));
         assert!(!serde_json::to_string(&scan)
             .unwrap()
             .contains("test-secret"));
         assert_eq!(before, std::fs::read(&legacy).unwrap());
+        let codex = scan_ccswitch(Some(legacy.to_string_lossy().into()), "codex".into()).unwrap();
+        assert_eq!(codex.profiles.len(), 1);
+        assert!(codex.warnings.is_empty());
+        assert_eq!(codex.profiles[0].agent, "codex");
+        assert!(!serde_json::to_string(&codex)
+            .unwrap()
+            .contains("test-secret"));
         // New releases add columns; only stable provider fields are read.
         let db = source.join("cc-switch.db");
         let c = Connection::open(&db).unwrap();
         c.execute_batch("CREATE TABLE providers(id TEXT,app_type TEXT,name TEXT,settings_config TEXT,is_current INTEGER,meta TEXT,provider_type TEXT,sort_index INTEGER); INSERT INTO providers VALUES('a','claude','新版 Claude','{\"env\":{\"ANTHROPIC_MODEL\":\"m\"}}',NULL,'{}',NULL,10)").unwrap();
         drop(c);
         assert_eq!(locate_database(None, None, None, &home, None).unwrap(), db);
-        let scan = scan_ccswitch(Some(source.to_string_lossy().into())).unwrap();
+        let scan = scan_ccswitch(Some(source.to_string_lossy().into()), "claude".into()).unwrap();
         assert_eq!(scan.profiles.len(), 1);
         assert!(scan.warnings.is_empty());
         assert!(!scan.profiles[0].current);
@@ -815,8 +860,8 @@ mod tests {
         .unwrap();
         drop(c);
         let before = std::fs::read(&path).unwrap();
-        let scan = scan_ccswitch(Some(path.to_string_lossy().into())).unwrap();
-        assert_eq!(scan.profiles.len(), 2);
+        let scan = scan_ccswitch(Some(path.to_string_lossy().into()), "codex".into()).unwrap();
+        assert_eq!(scan.profiles.len(), 1);
         assert_eq!(scan.warnings.len(), 3);
         assert!(scan
             .warnings
@@ -830,6 +875,9 @@ mod tests {
             .unwrap()
             .contains("test-secret"));
         assert_eq!(before, std::fs::read(&path).unwrap());
+        let claude = scan_ccswitch(Some(path.to_string_lossy().into()), "claude".into()).unwrap();
+        assert_eq!(claude.profiles.len(), 1);
+        assert!(claude.warnings.is_empty());
         std::fs::remove_dir_all(dir).unwrap();
     }
     #[test]
@@ -913,7 +961,7 @@ mod tests {
     #[test]
     #[ignore = "Read-only inspection of the current user's CC Switch database; run explicitly"]
     fn installed_database_is_automatically_detected_without_importing() {
-        let scan = scan_ccswitch(None).unwrap();
+        let scan = scan_ccswitch(None, "claude".into()).unwrap();
         assert!(!scan.profiles.is_empty(), "no supported connections found");
         println!(
             "Detected database: {}\nImportable connections: {}\nSkipped connections: {}",
@@ -944,19 +992,169 @@ mod tests {
         assert!(args.contains("env_key"));
     }
     #[test]
+    fn import_selection_rejects_other_agents_duplicates_and_missing_rows_before_writing() {
+        let rows = || ReadResult {
+            path: PathBuf::from("cc-switch.db"),
+            warnings: vec![],
+            profiles: vec![
+                (
+                    Profile {
+                        id: "claude:a".into(),
+                        agent: "claude".into(),
+                        name: "Claude".into(),
+                        config: json!({}),
+                    },
+                    true,
+                ),
+                (
+                    Profile {
+                        id: "codex:a".into(),
+                        agent: "codex".into(),
+                        name: "Codex".into(),
+                        config: json!({}),
+                    },
+                    true,
+                ),
+            ],
+        };
+        let own = selected_profiles(rows(), "claude", &["claude:a".into()]).unwrap();
+        assert_eq!(own.len(), 1);
+        assert_eq!(own[0].agent, "claude");
+        for ids in [
+            vec!["codex:a".into()],
+            vec!["claude:a".into(), "codex:a".into()],
+        ] {
+            assert!(selected_profiles(rows(), "claude", &ids)
+                .err()
+                .unwrap()
+                .contains("当前 Agent"));
+        }
+        for ids in [
+            vec![],
+            vec!["claude:missing".into()],
+            vec!["claude:a".into(), "claude:a".into()],
+        ] {
+            assert!(selected_profiles(rows(), "claude", &ids).is_err());
+        }
+        let mut invalid = rows();
+        invalid.profiles[0].0.agent = "codex".into();
+        assert!(selected_profiles(invalid, "claude", &["claude:a".into()]).is_err());
+        assert!(read(Some("missing.db".into()), "unknown")
+            .err()
+            .unwrap()
+            .contains("不支持的 Agent"));
+    }
+    #[test]
     fn sqlite_scan_and_import_are_read_only_and_filter_other_agents() {
         let dir = std::env::temp_dir().join(format!("supercode-cc-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("cc-switch.db");
         let c = Connection::open(&path).unwrap();
-        c.execute_batch("CREATE TABLE providers(id TEXT,app_type TEXT,name TEXT,settings_config TEXT,is_current INTEGER); INSERT INTO providers VALUES('a','claude','中文','{\"env\":{\"ANTHROPIC_MODEL\":\"m\"}}',1); INSERT INTO providers VALUES('b','pi','Pi','{}',1);").unwrap();
+        c.execute_batch("CREATE TABLE providers(id TEXT,app_type TEXT,name TEXT,settings_config TEXT,is_current INTEGER); INSERT INTO providers VALUES('a','claude','中文','{\"env\":{\"ANTHROPIC_MODEL\":\"m\"}}',1);").unwrap();
+        c.execute(
+            "INSERT INTO providers VALUES('a','codex','Codex',?1,1)",
+            [json!({"config": "model='m'"}).to_string()],
+        )
+        .unwrap();
+        for (agent, config) in [
+            (
+                "opencode",
+                json!({"npm":"@ai-sdk/anthropic","options":{"baseURL":"https://gateway.example/v1","apiKey":"test-secret"},"models":{"m":{"name":"模型"}}}),
+            ),
+            (
+                "pi",
+                json!({"api":"openai-completions","baseUrl":"http://localhost:11434/v1","apiKey":"test-secret","models":[{"id":"m","contextWindow":32768}]}),
+            ),
+        ] {
+            c.execute(
+                "INSERT INTO providers VALUES('a',?1,?1,?2,1)",
+                rusqlite::params![agent, config.to_string()],
+            )
+            .unwrap();
+        }
         drop(c);
         let before = std::fs::read(&path).unwrap();
-        let rows = read(Some(path.to_string_lossy().into())).unwrap();
+        let rows = read(Some(path.to_string_lossy().into()), "claude").unwrap();
         assert_eq!(rows.profiles.len(), 1);
         assert_eq!(rows.profiles[0].0.name, "中文");
         assert!(rows.profiles[0].1);
         assert!(rows.warnings.is_empty());
+        let codex = scan_ccswitch(Some(path.to_string_lossy().into()), "codex".into()).unwrap();
+        assert_eq!(codex.profiles.len(), 1);
+        assert_eq!(codex.profiles[0].id, "codex:a");
+        assert_eq!(codex.profiles[0].agent, "codex");
+        for agent in ["opencode", "pi"] {
+            let scan = scan_ccswitch(Some(path.to_string_lossy().into()), agent.into()).unwrap();
+            assert_eq!(scan.profiles.len(), 1);
+            assert_eq!(scan.profiles[0].id, format!("{agent}:a"));
+            assert_eq!(scan.profiles[0].model.as_deref(), Some("m"));
+            assert_eq!(scan.profiles[0].models, ["m"]);
+            assert!(scan.profiles[0].has_credential);
+            assert!(!scan.profiles[0].official_account);
+            assert!(!serde_json::to_string(&scan)
+                .unwrap()
+                .contains("test-secret"));
+            assert!(scan.warnings.is_empty());
+        }
+        assert_eq!(before, std::fs::read(&path).unwrap());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn native_import_on_a_fresh_device_survives_reopen_without_changing_ccswitch() {
+        let dir =
+            std::env::temp_dir().join(format!("supercode-原生导入 空格-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        let config = json!({
+            "opencode":{"providers":{"same":{"name":"OpenCode 连接","settingsConfig":{"provider":{"same":{"npm":"@ai-sdk/openai","options":{"baseURL":"https://open.example/v1","apiKey":"open-secret","headers":{"X-Project":"project-secret"}},"models":{"m":{"name":"测试模型","limit":{"context":200000,"output":8192}}}}},"model":"same/m"}}}},
+            "pi":{"providers":{"same":{"name":"Pi 连接","settingsConfig":{"baseUrl":"https://pi.example/v1","api":"openai-completions","apiKey":"pi-secret","models":[{"id":"m","reasoning":false,"input":["text"],"contextWindow":32768,"maxTokens":4096}]}}}}
+        });
+        std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let db = dir.join("supercode.db");
+        let store = crate::storage::Store::open(&db).unwrap();
+        for agent in ["opencode", "pi"] {
+            let rows = read(Some(path.to_string_lossy().into()), agent).unwrap();
+            assert!(rows.warnings.is_empty());
+            assert_eq!(rows.profiles.len(), 1);
+            let profiles = selected_profiles(rows, agent, &[format!("{agent}:same")]).unwrap();
+            store.import_profiles(&profiles).unwrap();
+            store.select_profile(agent, Some(&profiles[0].id)).unwrap();
+        }
+        let project = store.add_project(&dir).unwrap();
+        store.create_configured_session(&project.id, None, "pi", Some("pi:same")).unwrap();
+        let mut updated = store.active_profile("pi").unwrap().unwrap();
+        updated.config["piProvider"]["models"][0]["baseUrl"] = json!("https://changed.example/v1");
+        assert!(store.import_profiles(&[updated]).unwrap_err().contains("已绑定聊天"));
+        drop(store);
+        let store = crate::storage::Store::open(&db).unwrap();
+        let open = store.route("opencode", None).unwrap().config;
+        let pi = store.route("pi", None).unwrap().config;
+        assert_eq!(open["apiKey"], "open-secret");
+        assert_eq!(open["protocol"], "responses");
+        assert_eq!(
+            open["opencodeProvider"]["models"]["m"]["limit"]["context"],
+            200000
+        );
+        assert_eq!(pi["apiKey"], "pi-secret");
+        assert_eq!(pi["piProvider"]["models"][0]["contextWindow"], 32768);
+        for agent in ["opencode", "pi"] {
+            let profile = store.active_profile(agent).unwrap().unwrap();
+            assert!(!profile.is_official());
+            assert_eq!(
+                crate::providers::catalog_models(&profile.config)["data"][0]["id"],
+                "m"
+            );
+            assert!(!serde_json::to_string(&profile.summary(true))
+                .unwrap()
+                .contains("secret"));
+        }
+        drop(store);
+        #[cfg(windows)]
+        assert!(!std::fs::read(&db)
+            .unwrap()
+            .windows(b"pi-secret".len())
+            .any(|bytes| bytes == b"pi-secret"));
         assert_eq!(before, std::fs::read(&path).unwrap());
         std::fs::remove_dir_all(dir).unwrap();
     }

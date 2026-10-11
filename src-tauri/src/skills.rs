@@ -31,6 +31,7 @@ pub struct Skill {
     pub name: String,
     pub description: String,
     pub path: PathBuf,
+    pub paths: Vec<PathBuf>,
     pub source: String,
     pub sources: Vec<String>,
     pub namespace: Option<String>,
@@ -125,6 +126,7 @@ pub fn discover(roots: &[SkillRoot]) -> Catalog {
                 let key = path_key(&canonical);
                 if let Some(index) = files.get(&key) {
                     let skill = &mut catalog.skills[*index];
+                    if !skill.paths.contains(&path) { skill.paths.push(path); }
                     if !skill.sources.contains(&root.label) {
                         skill.sources.push(root.label.clone());
                     }
@@ -150,16 +152,22 @@ pub fn discover(roots: &[SkillRoot]) -> Catalog {
                 if let Some(index) = duplicate {
                     files.insert(key, index);
                     let skill = &mut catalog.skills[index];
+                    for copy in [canonical, path] {
+                        if !skill.paths.contains(&copy) { skill.paths.push(copy); }
+                    }
                     if !skill.sources.contains(&root.label) {
                         skill.sources.push(root.label.clone());
                     }
                     continue;
                 }
                 files.insert(key, catalog.skills.len());
+                let mut paths = vec![canonical.clone()];
+                if path != canonical { paths.push(path); }
                 catalog.skills.push(Skill {
                     name,
                     description,
                     path: canonical,
+                    paths,
                     source: root.label.clone(),
                     sources: vec![root.label.clone()],
                     namespace: root.namespace.clone(),
@@ -367,6 +375,11 @@ mod tests {
         let catalog = discover(&roots);
         assert_eq!(catalog.skills.len(), 2);
         assert_eq!(catalog.skills[0].sources, vec!["Codex", "Claude"]);
+        let copies = &catalog.skills[0].paths;
+        assert!(copies.iter().any(|path| path.ends_with("first/.system/recall/SKILL.md")));
+        assert!(copies.iter().any(|path| path.ends_with("second/recall/SKILL.md")));
+        let serialized = serde_json::to_value(&catalog.skills[0]).unwrap();
+        assert!(serialized["paths"].as_array().unwrap().len() >= 2);
         assert_eq!(
             read_selected(&catalog.skills[0].path, &roots).unwrap(),
             text

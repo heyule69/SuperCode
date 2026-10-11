@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { call, desktop } from './api';
 import type { ModelSource } from './types';
 
-export interface AllowanceWindow { label: string; remainingPercent: number; resetAt?: string | null }
+export interface AllowanceWindow { label: string; remainingPercent: number; resetAt?: string | null; windowDurationMins?: number | null; scope?: 'model' | 'tool' }
 export interface PlatformUsage {
   connectionId: string; agent: string; providerId?: string; providerName: string; connectionName: string; planName?: string | null;
   windows: AllowanceWindow[]; balances: { label: string; amount: number; currency: string }[]; queriedAt: number;
@@ -51,8 +51,24 @@ const queries = new UsageQueries((agent, connectionId, refresh) => call<Platform
 export function queryPlatformUsage(agent: string, connectionId: string, refresh = false, revision = '') {
   return queries.query(agent, connectionId, refresh, revision);
 }
+// Prefer the shortest model allowance actually returned by this connection. Tool
+// budgets (for example GLM MCP) must not replace the model's allowance.
+export function primaryAllowance(value: PlatformUsage) {
+  const valid = value.windows.filter(window => Number.isFinite(window.remainingPercent) && window.remainingPercent >= 0 && window.remainingPercent <= 100);
+  const models = valid.filter(window => window.scope !== 'tool' && !/MCP/i.test(window.label));
+  const duration = (window: AllowanceWindow) => {
+    if (window.windowDurationMins != null && Number.isFinite(window.windowDurationMins) && window.windowDurationMins > 0) return window.windowDurationMins;
+    // Compatibility with usage cached before duration metadata was introduced.
+    const hours = window.label.match(/([\d.]+)\s*(?:小时|h\b)/i);
+    const minutes = window.label.match(/([\d.]+)\s*分钟/);
+    const days = window.label.match(/([\d.]+)\s*天/);
+    return hours ? Number(hours[1]) * 60 : minutes ? Number(minutes[1]) : days ? Number(days[1]) * 1440 : /周|week/i.test(window.label) ? 10080 : /短周期/.test(window.label) ? 1440 : Infinity;
+  };
+  return (models.length ? models : valid).reduce<AllowanceWindow | undefined>((best, window) => !best || duration(window) < duration(best) ? window : best, undefined);
+}
 export function allowanceSummary(value: PlatformUsage) {
-  if (value.windows.length) return `剩余 ${Math.floor(Math.min(...value.windows.map(window => window.remainingPercent)))}%`;
+  const window = primaryAllowance(value);
+  if (window) return `${window.label} · 剩余 ${Math.floor(window.remainingPercent)}%`;
   const balance = value.balances[0];
   return balance ? `${balance.label} ${balance.currency === 'CNY' ? '¥' : balance.currency === 'USD' ? '$' : ''}${balance.amount.toFixed(2)}` : '';
 }

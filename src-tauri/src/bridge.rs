@@ -371,7 +371,7 @@ impl StreamState {
         let mut events = (0..self.next)
             .map(|index| json!({"type":"content_block_stop","index":index}))
             .collect::<Vec<_>>();
-        events.push(json!({"type":"message_delta","delta":{"stop_reason":stop_reason(&self.reason),"stop_sequence":null},"usage":{"output_tokens":self.output_tokens}}));
+        events.push(json!({"type":"message_delta","delta":{"stop_reason":stop_reason(&self.reason),"stop_sequence":null},"usage":{"input_tokens":self.input_tokens,"output_tokens":self.output_tokens}}));
         events.push(json!({"type":"message_stop"}));
         Ok(events)
     }
@@ -541,6 +541,14 @@ mod tests {
                 assert!(text.contains("input_json_delta"));
                 assert!(text.contains("tool_use"));
                 assert!(text.contains("message_stop"));
+                let usage = text
+                    .lines()
+                    .filter_map(|line| line.strip_prefix("data: "))
+                    .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                    .find(|value| value["type"] == "message_delta")
+                    .unwrap();
+                assert_eq!(usage["usage"]["input_tokens"], 10);
+                assert_eq!(usage["usage"]["output_tokens"], 8);
             } else {
                 let value = response.json::<Value>().await.unwrap();
                 assert_eq!(value["model"], "provider-real-model");

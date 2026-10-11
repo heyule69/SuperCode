@@ -122,6 +122,7 @@ pub struct Client {
     project: Option<std::path::PathBuf>,
     pub loaded_threads: Mutex<Vec<String>>,
     pub turn_settings: Mutex<Option<(String, String, String)>>,
+    pub planning_supported: Mutex<Option<bool>>,
     turns: Arc<TurnLifecycle>,
 }
 
@@ -404,6 +405,7 @@ impl Client {
             last_used,
             loaded_threads: Mutex::new(Vec::new()),
             turn_settings: Mutex::new(None),
+            planning_supported: Mutex::new(None),
             turns,
             pid,
             routing: route.fingerprint(),
@@ -577,8 +579,10 @@ pub(crate) fn persist_event(app: &AppHandle, message: &Value) {
             return;
         }
         usage["cumulative"] = json!(session.agent == "codex");
-        // ACP reports context occupancy separately; it is not billed token usage.
-        if usage["total"].as_object().is_none_or(|v| v.is_empty()) {
+        // Keep context-only ACP/stream updates, without counting them as billing.
+        if usage["total"].as_object().is_none_or(|v| v.is_empty())
+            && usage.get("contextTokens").is_none()
+        {
             return;
         }
         let turn = params["turnId"]

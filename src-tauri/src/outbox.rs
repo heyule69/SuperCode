@@ -237,6 +237,7 @@ async fn dispatch(app: &AppHandle, row: &Followup) -> Result<(), String> {
         p.permission_mode.clone(),
         Some(p.attachments.clone()),
         p.effort.clone(),
+        None,
         Some(row.id.clone()),
         app.clone(),
     )

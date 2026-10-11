@@ -5,6 +5,11 @@ import { defaults } from './preferences';
 import { notificationPreferences } from './notifications';
 
 describe('notification privacy and preferences', () => {
+  it('shows the OS settings entry as desktop-only in a browser preview', () => {
+    const html = renderToStaticMarkup(<NotificationSettings prefs={defaults} setPrefs={() => {}} />);
+    expect(html).toMatch(/<button[^>]*aria-label="打开系统通知设置"[^>]*disabled=""/);
+    expect(html).toContain('在桌面版中检查系统通知');
+  });
   it('keeps the task-name privacy preference in sync with the setting', () => {
     for (const details of [false, true]) {
       const prefs = { ...defaults, notificationDetails: details };

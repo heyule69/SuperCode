@@ -1,5 +1,5 @@
 import { lazy, memo, Suspense, useEffect, useMemo, useState } from 'react';
-import { ArrowDown, Brain, Check, ChevronDown, ChevronRight, Circle, FileCode2, FileDiff, FileSearch, Globe, ListChecks, Monitor, Network, Pencil, Shield, Square, SquareTerminal, Wrench, X } from 'lucide-react';
+import { ArrowDown, Brain, Check, ChevronDown, ChevronRight, Circle, FileCode2, FileDiff, FileSearch, Globe, ListChecks, MessageCircleQuestion, Monitor, Network, Pencil, Shield, Square, SquareTerminal, Wrench, X } from 'lucide-react';
 import { conversationTurns, isActivity, type ConversationTurn } from './events';
 import type { Message } from './types';
 import { diffFiles } from './diff';
@@ -11,6 +11,9 @@ import { AttachmentImage } from './AttachmentImage';
 import { MediaContext, MediaList } from './Media';
 import { messageMedia } from './mediaSources';
 import { presentTurn } from './turnPresentation';
+import { QuestionHistory } from './QuestionHistory';
+import { planText } from './planPresentation';
+const PlanDocument = lazy(() => import('./PlanDocument').then(module => ({ default: module.PlanDocument })));
 
 const Markdown = lazy(() => import('./Markdown'));
 const pending = (status: unknown) => ['inProgress', 'running', 'preparing'].includes(String(status));
@@ -24,8 +27,8 @@ export function activityTitle(m: Message) {
   if (m.kind === 'executionPlan') return { label: '执行计划', detail: '', icon: ListChecks };
   if (m.kind === 'claudeToolCall') {
     const args = (d.arguments ?? {}) as Record<string, unknown>;
-    const labels: Record<string, string> = { Read: '读取文件', Glob: '查找文件', Grep: '搜索代码', Edit: '编辑文件', Write: '写入文件', Bash: '执行命令', AskUserQuestion: '询问用户' };
-    return { label: labels[name] ?? (name || '调用工具'), detail: String(args.file_path ?? args.command ?? args.pattern ?? args.path ?? ''), icon: name === 'Bash' ? SquareTerminal : ['Read', 'Glob', 'Grep'].includes(name) ? FileSearch : ['Edit', 'Write'].includes(name) ? FileCode2 : Wrench };
+    const labels: Record<string, string> = { Read: '读取文件', Glob: '查找文件', Grep: '搜索代码', Edit: '编辑文件', Write: '写入文件', Bash: '执行命令', AskUserQuestion: '询问用户', EnterPlanMode: '开始规划', ExitPlanMode: '提交计划' };
+    return { label: labels[name] ?? (name || '调用工具'), detail: String(args.file_path ?? args.command ?? args.pattern ?? args.path ?? ''), icon: name === 'AskUserQuestion' ? MessageCircleQuestion : ['EnterPlanMode', 'ExitPlanMode'].includes(name) ? ListChecks : name === 'Bash' ? SquareTerminal : ['Read', 'Glob', 'Grep'].includes(name) ? FileSearch : ['Edit', 'Write'].includes(name) ? FileCode2 : Wrench };
   }
   if (m.kind === 'commandExecution') {
     const actions = d.commandActions as { type: string; path?: string; query?: string }[] | undefined;
@@ -55,15 +58,18 @@ const ActivityItem = memo(function ActivityItem({ message: m, autoExpand }: { me
   const { label, detail, icon: Icon } = activityTitle(m);
   const reasoning = m.kind === 'reasoning';
   const plan = m.kind === 'executionPlan';
+  const question = m.kind === 'claudeToolCall' && d.tool === 'AskUserQuestion';
+  const planSubmission = m.kind === 'claudeToolCall' && d.tool === 'ExitPlanMode';
+  const document = planSubmission && expanded ? planText(d.arguments) || planText(d.inputText) : '';
   const output = m.kind === 'commandExecution' ? m.text.slice(String(d.command ?? m.text.split('\n')[0]).length).replace(/^\n/, '') : m.kind === 'fileChange' ? String(d.output ?? '') : m.kind === 'claudeToolCall' ? m.text : stringify(d.result ?? d.contentItems ?? d.error);
-  const args = d.inputText && status === 'preparing' ? String(d.inputText) : stringify(d.arguments);
+  const args = question || planSubmission ? '' : d.inputText && status === 'preparing' ? String(d.inputText) : stringify(d.arguments);
   const changes = Array.isArray(d.changes) ? d.changes as { path: string; kind?: { type?: string } | string; diff?: string }[] : [];
   const steps = Array.isArray(d.plan) ? d.plan as { step: string; status: string }[] : [];
-  const stateText = status === 'preparing' ? '生成参数' : pending(status) ? reasoning ? '思考中' : '运行中' : status === 'failed' ? '失败' : status === 'interrupted' ? '已停止' : status === 'declined' ? '已拒绝' : '完成';
+  const stateText = status === 'preparing' ? question ? '生成问题' : '生成参数' : pending(status) ? reasoning ? '思考中' : '运行中' : status === 'failed' ? '失败' : status === 'interrupted' ? '已停止' : status === 'declined' ? '已拒绝' : '完成';
   const finishedLabels: Record<string, string> = { '执行命令': '运行了命令', '读取文件': '读取了文件', '编辑文件': '编辑了文件', '写入文件': '写入了文件', '修改文件': '修改了文件', '查找文件': '查找了文件', '搜索代码': '搜索了代码', '搜索网页': '搜索了网页', '查看图片': '查看了图片' };
   const rowLabel = pending(status) || ['failed', 'declined', 'interrupted'].includes(status) ? label : finishedLabels[label] ?? label;
-  const hasBody = reasoning || plan || !!(output || args || changes.length || d.progress || d.terminalInput || d.cwd || d.prompt || d.agentsStates || (m.kind === 'commandExecution' && detail));
-  const copyText = [detail, args, reasoning ? m.text : output, ...changes.map(c => `${c.path}\n${c.diff ?? ''}`)].filter(Boolean).join('\n\n');
+  const hasBody = question || planSubmission || reasoning || plan || !!(output || args || changes.length || d.progress || d.terminalInput || d.cwd || d.prompt || d.agentsStates || (m.kind === 'commandExecution' && detail));
+  const copyText = question ? '' : planSubmission ? document : [detail, args, reasoning ? m.text : output, ...changes.map(c => `${c.path}\n${c.diff ?? ''}`)].filter(Boolean).join('\n\n');
   const preview = label === '执行命令' ? '' : reasoning ? m.text.replace(/\s+/g, ' ').trim().slice(0, 160) : m.kind === 'fileChange' ? changes.map(c => concisePath(c.path)).join('、') || concisePath(detail) : ['读取文件', '编辑文件', '写入文件', '查找文件', '查看图片'].includes(label) ? concisePath(detail) : detail;
   return <section className={`activity-item ${reasoning ? 'reasoning' : ''} ${status}`} aria-label={`${label}：${stateText}`}>
     <button className="activity-row" type="button" aria-label={`${label}${preview ? ` · ${preview.slice(0, 160)}` : ''} · ${stateText}`} aria-expanded={hasBody && expanded} onClick={() => setExpanded(v => !v)} disabled={!hasBody}>
@@ -74,9 +80,13 @@ const ActivityItem = memo(function ActivityItem({ message: m, autoExpand }: { me
       {plan ? <><p className="plan-explanation">{m.text}</p><ol className="plan-steps">{steps.map((step, i) => <li key={i} className={step.status}>{step.status === 'completed' ? <Check size={14} /> : <Circle size={12} />}<span className={step.status === 'inProgress' && pending(status) ? 'pending-text' : undefined}>{step.step}</span><small>{step.status === 'completed' ? '完成' : step.status === 'inProgress' ? pending(status) ? '进行中' : '未完成' : '待处理'}</small></li>)}</ol></> : null}
       {d.cwd ? <div className="activity-meta">工作目录 <code>{String(d.cwd)}</code></div> : null}
       {m.kind === 'commandExecution' && detail ? <div className="activity-section"><span>命令</span><pre>{detail}</pre></div> : null}
-      {args ? <div className="activity-section"><span>输入参数{status === 'preparing' ? ' · 正在生成' : ''}</span><pre>{args}</pre></div> : null}
-      {output ? <div className="activity-section"><span>{m.kind === 'claudeToolCall' ? '工具结果' : '输出'}{pending(status) ? ' · 实时更新' : ''}</span><pre>{output}</pre></div> : null}
-      {pending(status) && !reasoning && !plan && !output ? <div className="activity-placeholder"><span className="pending-text">{status === 'preparing' ? '正在生成调用参数…' : '等待工具返回结果…'}</span></div> : null}
+      {question ? <QuestionHistory message={m} /> : planSubmission ? <>
+        {document ? <Suspense fallback={<p>正在加载计划文档…</p>}><PlanDocument text={document} /></Suspense> : <div className="activity-placeholder">{status === 'preparing' ? '正在生成计划…' : 'Agent 未提供可展示的计划文档。'}</div>}
+      </> : <>
+        {args ? <div className="activity-section"><span>输入参数{status === 'preparing' ? ' · 正在生成' : ''}</span><pre>{args}</pre></div> : null}
+        {output ? <div className="activity-section"><span>{m.kind === 'claudeToolCall' ? '工具结果' : '输出'}{pending(status) ? ' · 实时更新' : ''}</span><pre>{output}</pre></div> : null}
+        {pending(status) && !reasoning && !plan && !output ? <div className="activity-placeholder"><span className="pending-text">{status === 'preparing' ? '正在生成调用参数…' : '等待工具返回结果…'}</span></div> : null}
+      </>}
       {changes.map(c => <div className="activity-section file-operation" key={c.path}><span><FileCode2 size={13} />{c.path}<small>{typeof c.kind === 'string' ? c.kind : c.kind?.type ?? '修改'}</small></span>{c.diff ? <pre>{c.diff.split('\n').map((line, i) => <span key={i} className={line.startsWith('+') ? 'added-line' : line.startsWith('-') ? 'removed-line' : ''}>{line}{'\n'}</span>)}</pre> : null}</div>)}
       {d.progress ? <div className="activity-section"><span>进度</span><pre>{String(d.progress)}</pre></div> : null}
       {d.terminalInput ? <div className="activity-section"><span>终端输入</span><pre>{String(d.terminalInput)}</pre></div> : null}
@@ -127,9 +137,10 @@ function TurnView({ turn, agentName, autoExpand, showDiff, openFile }: { turn: C
   const [expandedProcess, setExpandedProcess] = useState<string | null>(null);
   const presentation = presentTurn(turn);
   const marker = turn.run;
+  const processKey = marker?.id ?? turn.id;
+  useEffect(() => { setExpandedProcess(null); }, [processKey, presentation.completed]);
   if (!turn.user && turn.items.length === 1 && turn.items[0].kind === 'modelSwitch') return <MessageView message={turn.items[0]} openFile={openFile} />;
   const completed = !!marker && !pending(marker.data?.status);
-  const processKey = marker?.id ?? turn.id;
   const processOpen = expandedProcess === processKey;
   const reply = (presentation.completed ? presentation.final : turn.items).filter(m => m.role === 'assistant' && m.text).map(m => m.text).join('\n\n');
   const diff = turn.items.filter(m=>m.kind==='turnDiff').map(m=>m.text).join('\n');

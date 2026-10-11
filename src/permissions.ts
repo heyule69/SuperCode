@@ -5,7 +5,7 @@ export const permissionNames: Record<PermissionMode, string> = {
   read: '只读', strict: '请求批准', ask: '请求批准', auto: '帮我批准', edit: '自动接受编辑', deny: '不询问', full: '完全访问权限',
 };
 export function permissionOrder(agent: string): PermissionMode[] {
-  if (agent === 'codex') return ['ask', 'auto', 'full'];
+  if (agent === 'codex') return ['read', 'ask', 'auto', 'full'];
   if (agent === 'claude') return ['read', 'ask', 'edit', 'auto', 'deny', 'full'];
   if (agent === 'opencode') return ['read', 'ask', 'full'];
   return ['read', 'strict', 'ask', 'full'];
@@ -15,7 +15,7 @@ export function visiblePermission(mode: PermissionMode, agent: string): Permissi
 }
 export function permissionName(mode: PermissionMode, agent: string, short = false) {
   if (mode === 'full' && short) return '完全访问';
-  if (agent === 'claude' && mode === 'read') return '计划模式（只读）';
+  if (['codex', 'claude'].includes(agent) && mode === 'read') return short ? '计划模式' : '计划模式（只读）';
   if (agent === 'claude' && mode === 'auto') return '自动模式';
   if (agent === 'pi' && mode === 'ask') return '读取自动批准';
   if (agent === 'pi' && mode === 'strict') return '逐项批准';
@@ -39,7 +39,7 @@ export function loadPermissionChoices(agent: string, defaultMode: unknown): Reco
 }
 
 export function permissionDescription(mode: PermissionMode, agent: string) {
-  if (mode === 'read') return '分析和读取文件，不修改工作区';
+  if (mode === 'read') return ['codex', 'claude'].includes(agent) ? '先分析和制定方案，确认后再执行；当前不修改工作区' : '分析和读取文件，不修改工作区';
   if (mode === 'full') return '可访问互联网和电脑上的文件，跳过工具审批';
   if (mode === 'edit') return '自动接受文件编辑，运行命令等操作仍按需确认';
   if (mode === 'deny') return '需要审批的操作直接拒绝，不弹出批准请求';

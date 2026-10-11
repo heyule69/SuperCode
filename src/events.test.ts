@@ -1,8 +1,75 @@
 import { describe, expect, it } from 'vitest';
-import { conversationTurns, mergeEvent } from './events';
-import type { RpcEvent } from './types';
+import { conversationTurns, mergeEvent, reconcileMessages } from './events';
+import type { Message, RpcEvent } from './types';
+
+describe('message acknowledgements', () => {
+  const user = (id: string, seq: number, clientMessageId?: string): Message => ({id,seq,sessionId:'s',role:'user',kind:'userMessage',text:'继续',data:clientMessageId ? {clientMessageId} : {}});
+  it('retains an unacknowledged user before newly persisted work instead of matching an older identical text', () => {
+    const older = user('older', 1), pending = user('pending', 0, 'client');
+    const run = mergeEvent([], {method:'turn/started',params:{turn:{id:'t'}}}, 's')[0];
+    const merged = reconcileMessages([older, pending, run], [older, {...run, seq:2}], new Set(['client']));
+    expect(merged.map(message => message.id)).toEqual(['older','pending','run-t']);
+    expect(conversationTurns(merged)[1].user).toBe(pending);
+    expect(conversationTurns(merged)[1].run?.id).toBe('run-t');
+  });
+  it('replaces a pending user exactly once on acknowledgement and keeps its turn identity', () => {
+    const pending = user('pending', 0, 'client'), saved = user('saved', 1, 'client');
+    const run = mergeEvent([], {method:'turn/started',params:{turn:{id:'t'}}}, 's')[0];
+    const merged = reconcileMessages([pending, run], [saved], new Set(['client']));
+    expect(merged.map(message => message.id)).toEqual(['saved','run-t']);
+    expect(conversationTurns(merged)[0].id).toBe(conversationTurns([pending, run])[0].id);
+    expect(reconcileMessages(merged, [saved, {...run,seq:2}], new Set()).map(message => message.id)).toEqual(['saved','run-t']);
+  });
+  it('places new submissions after history that was still loading and before matching live work', () => {
+    const older = user('older', 1), pending = user('pending', 0, 'client');
+    const run = mergeEvent([], {method:'turn/started',params:{turn:{id:'t'}}}, 's')[0];
+    expect(reconcileMessages([pending], [older], new Set(['client'])).map(message => message.id)).toEqual(['older','pending']);
+    expect(reconcileMessages([pending,run], [older,{...run,seq:2}], new Set(['client'])).map(message => message.id)).toEqual(['older','pending','run-t']);
+  });
+  it('removes failed local users and preserves streamed text until authoritative completion', () => {
+    const failed = user('failed', 0, 'client');
+    const live: Message = {id:'reply',seq:0,sessionId:'s',role:'assistant',text:'完整实时文本',kind:'agentMessage',data:{status:'inProgress'}};
+    expect(reconcileMessages([failed,live], [{...live,seq:1,text:'完整'}], new Set())).toEqual([{...live,seq:1}]);
+    expect(reconcileMessages([live], [{...live,seq:1,text:'最终',data:{status:'completed'}}], new Set())[0].text).toBe('最终');
+  });
+  it('does not let a delayed history read reopen a finished turn', () => {
+    const started = mergeEvent([], {method:'turn/started',params:{turn:{id:'t'}}}, 's')[0];
+    const saved = { ...started, seq:2 };
+    for (const status of ['completed', 'failed', 'interrupted']) {
+      const finished = mergeEvent([saved], {method:'turn/completed',params:{turn:{id:'t',status}}}, 's')[0];
+      // Native start time and the frontend's event receipt time differ slightly.
+      const delayed = { ...saved, data:{ ...saved.data, startedAt:Number(saved.data?.startedAt) - 50 } };
+      expect(reconcileMessages([finished], [delayed], new Set())[0]).toEqual(finished);
+    }
+    // A different run generation must still use the new history state.
+    const later = { ...saved, id:'run-t2', data:{ ...saved.data, turnId:'t2', startedAt:Number(saved.data?.startedAt) + 1000 } };
+    const finished = mergeEvent([saved], {method:'turn/completed',params:{turn:{id:'t',status:'completed'}}}, 's')[0];
+    expect(reconcileMessages([finished], [later], new Set())).toEqual([later]);
+  });
+  it('retains the run marker when a long turn exceeds the latest history page', () => {
+    const run = { ...mergeEvent([], {method:'turn/started',params:{turn:{id:'t'}}}, 's')[0], seq:2 };
+    const answer:Message = {id:'final',seq:150,sessionId:'s',role:'assistant',text:'完成',kind:'agentMessage',data:{turnId:'t',status:'completed'}};
+    const unrelated = { ...run, id:'run-old', seq:1, data:{turnId:'old',status:'completed'} };
+    const live = [unrelated, run, answer];
+    const merged = reconcileMessages(live, [answer], new Set());
+    expect(merged.map(message => message.id)).toEqual(['run-t', 'final']);
+    const finished = mergeEvent(merged, {method:'turn/completed',params:{turn:{id:'t',status:'completed'}}}, 's');
+    expect(conversationTurns(finished)[0].run?.data?.status).toBe('completed');
+    expect(reconcileMessages(finished, [answer], new Set()).map(message => message.id)).toEqual(['run-t', 'final']);
+  });
+});
 
 describe('Codex event replay', () => {
+  it('handles completion with a paginated-away start marker without attaching it to the next turn', () => {
+    const old:Message = {id:'old-final',seq:100,sessionId:'s',role:'assistant',text:'之前的结果',kind:'agentMessage',data:{turnId:'old',status:'completed'}};
+    const next:Message = {id:'next',seq:101,sessionId:'s',role:'user',text:'下一轮',kind:'userMessage',data:{}};
+    const finished = mergeEvent([old, next], {method:'turn/completed',params:{turn:{id:'old',status:'completed'}}}, 's');
+    const turns = conversationTurns(finished);
+    expect(turns[0].run?.data).toMatchObject({turnId:'old',status:'completed'});
+    expect(turns[0].run?.data?.durationMs).toBeUndefined();
+    expect(turns[1].run).toBeUndefined();
+    expect(mergeEvent(finished, {method:'turn/completed',params:{turn:{id:'unrelated',status:'completed'}}}, 's')).toEqual(finished);
+  });
   it('retains final phases and native content groups through metadata truncation and turn completion', () => {
     let messages = mergeEvent([], { method: 'turn/started', params: { turn: { id: 't' } } }, 's');
     messages = mergeEvent(messages, { method: 'item/completed', params: { turnId: 't', item: { id: 'reply', type: 'agentMessage', text: '最终结果', arguments: { details: 'x'.repeat(160000) }, phase: 'final_answer', messageId: 'native-message' } } }, 's');

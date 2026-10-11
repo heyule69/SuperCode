@@ -269,6 +269,7 @@ pub async fn send_message(
         permission_mode,
         None,
         None,
+        None,
         app,
     )
     .await
@@ -283,6 +284,7 @@ pub async fn send_chat_message(
     permission_mode: Option<String>,
     attachments: Option<Vec<crate::client_features::Attachment>>,
     effort: Option<String>,
+    client_message_id: Option<String>,
     app: AppHandle,
 ) -> Result<Session, String> {
     send_chat_message_inner(
@@ -293,6 +295,7 @@ pub async fn send_chat_message(
         permission_mode,
         attachments,
         effort,
+        client_message_id,
         None,
         app,
     )
@@ -306,6 +309,7 @@ pub(crate) async fn send_chat_message_inner(
     permission_mode: Option<String>,
     attachments: Option<Vec<crate::client_features::Attachment>>,
     effort: Option<String>,
+    client_message_id: Option<String>,
     followup_id: Option<String>,
     app: AppHandle,
 ) -> Result<Session, String> {
@@ -322,6 +326,7 @@ pub(crate) async fn send_chat_message_inner(
     if text.len() > 128 * 1024 {
         return Err("消息过长，请将内容保存为项目文件后引用".into());
     }
+    crate::client_features::validate_client_message_id(client_message_id.as_deref())?;
     let state = app.state::<AppState>();
     let session = state.store.session(&session_id)?;
     crate::chat_connection::check(&app, &session.agent, Some(&session_id), None).await?;
@@ -356,6 +361,9 @@ pub(crate) async fn send_chat_message_inner(
         };
     if let Some(id) = followup_id {
         prepared.metadata["followupId"] = json!(id);
+    }
+    if let Some(id) = client_message_id {
+        prepared.metadata["clientMessageId"] = json!(id);
     }
     if effort.as_deref().is_some_and(|v| {
         !matches!(
@@ -484,6 +492,19 @@ async fn send_inner(
     let mode = if read_only { "read" } else { permission };
     let (sandbox, approval, mut policy) = crate::client_features::permission(mode)?;
     let reviewer = crate::client_features::approvals_reviewer(mode);
+    // Read this capability only when the user requests planning, and cache it
+    // with the process. Older installations retain ordinary turn behavior.
+    let mut planning_supported = client.planning_supported.lock().await;
+    if mode == "read" && planning_supported.is_none() {
+        let presets = client.request("collaborationMode/list", json!({})).await
+            .map_err(|error| format!("无法启用 Codex 原生计划模式，请更新 Codex 后重试：{error}"))?;
+        *planning_supported = Some(crate::client_features::has_plan_preset(&presets));
+    }
+    if mode == "read" && *planning_supported != Some(true) {
+        return Err("本机 Codex 不支持原生计划模式，请更新 Codex 后重试".into());
+    }
+    let use_collaboration = *planning_supported == Some(true);
+    drop(planning_supported);
     let already_loaded = session.native_id.as_ref().is_some_and(|_| false);
     let already_loaded = if let Some(id) = &session.native_id {
         client.loaded_threads.lock().await.contains(id)
@@ -540,7 +561,14 @@ async fn send_inner(
     } else {
         prepared.codex
     };
-    let reply=client.request("turn/start",json!({"threadId":native,"input":inputs,"cwd":project.path,"model":model,"effort":effort,"summary":"auto","approvalPolicy":approval,"approvalsReviewer":reviewer,"sandboxPolicy":policy})).await?;
+    let collaboration = if use_collaboration {
+        crate::client_features::codex_collaboration_mode(
+            mode, model.as_deref().or_else(|| result["thread"]["model"].as_str()), effort.as_deref(),
+        )?
+    } else { None };
+    let mut turn = json!({"threadId":native,"input":inputs,"cwd":project.path,"model":model,"effort":effort,"summary":"auto","approvalPolicy":approval,"approvalsReviewer":reviewer,"sandboxPolicy":policy});
+    if let Some(collaboration) = collaboration { turn["collaborationMode"] = collaboration; }
+    let reply = client.request("turn/start", turn).await?;
     let turn_id = reply["turn"]["id"].as_str().ok_or("Codex 未返回任务 ID")?;
     client.expect_turn(native, turn_id).await;
     *client.turn_settings.lock().await = Some((

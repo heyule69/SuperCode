@@ -27,28 +27,32 @@ async function input(value: string) {
 }
 async function key(key: string, target: HTMLElement = node.querySelector('section')!) { await act(async () => target.dispatchEvent(new KeyboardEvent('keydown', { key, bubbles: true }))); }
 
-it('waits for an explicit selection, then submits the native answer shape', async () => {
-  await render();
+it.each(['codex','claude','opencode','pi'])('submits a single %s question directly on an explicit option click', async agent => {
+  await render(request({}, `${agent}:ask`));
   expect(button('发送').disabled).toBe(true); expect(respond).not.toHaveBeenCalled();
   await click('.question-request-option');
   expect(node.querySelector('[aria-pressed=true]')?.textContent).toContain('继续');
-  await act(async () => button('发送').click());
+  expect(button('已回答').disabled).toBe(true);
+  await click('.question-request-option');
   expect(respond).toHaveBeenCalledExactlyOnceWith({ answers: { next: { answers: ['继续'] } } });
 });
 it('lets custom text replace a single choice, without treating numbers in text as shortcuts', async () => {
-  await render(); await click('.question-request-option'); await input('请使用现有 MCP');
+  await render(request({questions:[...questions,{id:'details',question:'补充要求？'}]}));
+  await click('.question-request-option'); await click('[aria-label="上一题"]'); await input('请使用现有 MCP');
   expect(node.querySelector('[aria-pressed=true]')).toBeNull();
   await key('2', node.querySelector('textarea')!);
   await key('Enter', node.querySelector('textarea')!);
-  expect(respond).toHaveBeenCalledExactlyOnceWith({ answers: { next: { answers: ['请使用现有 MCP'] } } });
+  expect(respond).not.toHaveBeenCalled();
+  await input('只读取'); await key('Enter', node.querySelector('textarea')!);
+  expect(respond).toHaveBeenCalledExactlyOnceWith({ answers: { next: { answers: ['请使用现有 MCP'] }, details: {answers:['只读取']} } });
 });
-it('supports numbered shortcuts without sending merely by selecting an option', async () => {
-  await render(); await key('2'); expect(respond).not.toHaveBeenCalled(); await key('Enter');
+it('uses numbered shortcuts for the same direct answer flow as option clicks', async () => {
+  await render(); await key('2');
   expect(respond).toHaveBeenCalledExactlyOnceWith({ answers: { next: { answers: ['稍后'] } } });
 });
 it('keeps all answers while navigating multiple questions and supports multiple selections', async () => {
   await render(request({ questions: [...questions, { id: 'features', header: '功能', question: '选哪些？', multiSelect: true, options: [{ label: 'A' }, { label: 'B' }] }] }));
-  await key('1'); await act(async () => button('下一题').click());
+  await key('1');
   expect(node.textContent).toContain('2 / 2'); expect(respond).not.toHaveBeenCalled();
   await key('1'); await key('2'); await input('以及 C');
   await click('[aria-label="上一题"]'); expect(node.querySelector('[aria-pressed=true]')?.textContent).toContain('继续');
@@ -56,8 +60,9 @@ it('keeps all answers while navigating multiple questions and supports multiple 
   expect(respond).toHaveBeenCalledExactlyOnceWith({ answers: { next: { answers: ['继续'] }, features: { answers: ['A', 'B', '以及 C'] } } });
 });
 it('skips Codex questions with empty native answers even after selecting a choice', async () => {
-  await render(); await key('1'); await act(async () => button('跳过').click());
-  expect(respond).toHaveBeenCalledExactlyOnceWith({ answers: { next: { answers: [] } } });
+  await render(request({questions:[...questions,{id:'more',question:'还有吗？',options:[{label:'没有'}]}]}));
+  await key('1'); await act(async () => button('跳过').click());
+  expect(respond).toHaveBeenCalledExactlyOnceWith({ answers: { next: { answers: [] }, more: {answers:[]} } });
 });
 it('closes Claude questions through native denial without approving the tool or sending invalid empty answers', async () => {
   await render(request({ toolName: 'AskUserQuestion' }, 'claude:ask'));
@@ -69,6 +74,37 @@ it('restricts Pi select to its advertised options and preserves cancellation', a
   expect(node.querySelector('textarea')).toBeNull();
   await act(async () => button('跳过').click());
   expect(respond).toHaveBeenCalledExactlyOnceWith({ answers: { '0': { answers: [] } } });
+});
+it('advances four single questions on each click and sends every answer including the final click', async () => {
+  await render(request({questions:Array.from({length:4},(_,index)=>({id:`q${index}`,question:`第 ${index + 1} 题`,options:[{label:`选项 ${index + 1}`},{label:'其他'}]}))}));
+  for (let page = 0; page < 4; page++) {
+    expect(node.textContent).toContain(`${page + 1} / 4`);
+    expect(node.querySelector('h3')?.textContent).toBe(`第 ${page + 1} 题`);
+    await click('.question-request-option');
+    if (page < 3) { expect(respond).not.toHaveBeenCalled(); expect(document.activeElement).toBe(node.querySelector('section')); }
+  }
+  expect(respond).toHaveBeenCalledExactlyOnceWith({answers:{q0:{answers:['选项 1']},q1:{answers:['选项 2']},q2:{answers:['选项 3']},q3:{answers:['选项 4']}}});
+});
+it('uses the clicked final option instead of a stale custom answer', async () => {
+  await render(); await input('原来的自定义回复'); await click('.question-request-option');
+  expect(respond).toHaveBeenCalledExactlyOnceWith({answers:{next:{answers:['继续']}}});
+});
+it('keeps a multiple-choice question open until the user confirms all selected options', async () => {
+  await render(request({questions:[{...questions[0],multiSelect:true}]}));
+  await key('1'); await key('2'); await input('额外说明');
+  expect(respond).not.toHaveBeenCalled(); expect(node.querySelectorAll('[aria-pressed=true]')).toHaveLength(2);
+  await key('1'); expect(node.querySelectorAll('[aria-pressed=true]')).toHaveLength(1);
+  await act(async () => button('发送').click());
+  expect(respond).toHaveBeenCalledExactlyOnceWith({answers:{next:{answers:['稍后','额外说明']}}});
+});
+it('does not advance twice for a double click or a held numeric shortcut', async () => {
+  await render(request({questions:[...questions,{id:'more',question:'第二题',options:[{label:'继续'},{label:'稍后'}]}]}));
+  await click('.question-request-option');
+  await act(async () => node.querySelector('.question-request-option')!.dispatchEvent(new MouseEvent('click',{bubbles:true,detail:2})));
+  await act(async () => node.querySelector('section')!.dispatchEvent(new KeyboardEvent('keydown',{key:'1',repeat:true,bubbles:true})));
+  expect(respond).not.toHaveBeenCalled(); expect(node.querySelector('h3')?.textContent).toBe('第二题');
+  await key('2');
+  expect(respond).toHaveBeenCalledExactlyOnceWith({answers:{next:{answers:['继续']},more:{answers:['稍后']}}});
 });
 it('retains answers after a failed send and prevents duplicate submissions while pending', async () => {
   let reject!: (error: Error) => void;

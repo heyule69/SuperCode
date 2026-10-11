@@ -26,6 +26,29 @@ pub fn permission(mode: &str) -> Result<(&'static str, &'static str, Value), Str
     }
 }
 
+pub fn has_plan_preset(result: &Value) -> bool {
+    result["data"].as_array().is_some_and(|presets| {
+        presets.iter().any(|preset| preset["mode"] == "plan")
+    })
+}
+
+/// Select the native collaboration mode on every configured turn so leaving
+/// planning also clears the plan mode inherited by an already-loaded thread.
+pub fn codex_collaboration_mode(
+    permission: &str,
+    model: Option<&str>,
+    effort: Option<&str>,
+) -> Result<Option<Value>, String> {
+    let model = model.filter(|value| !value.trim().is_empty());
+    if permission == "read" && model.is_none() {
+        return Err("计划模式需要先选择一个可用模型".into());
+    }
+    Ok(model.map(|model| json!({
+        "mode": if permission == "read" { "plan" } else { "default" },
+        "settings": { "model": model, "reasoning_effort": effort, "developer_instructions": null }
+    })))
+}
+
 pub fn approvals_reviewer(mode: &str) -> &'static str {
     if mode == "auto" {
         "auto_review"
@@ -675,6 +698,15 @@ pub async fn agent_extensions(
 mod tests {
     use super::*;
     #[test]
+    fn client_message_identity_accepts_legacy_calls_and_rejects_malformed_ids() {
+        assert!(validate_client_message_id(None).is_ok());
+        let id = uuid::Uuid::new_v4().to_string();
+        assert!(validate_client_message_id(Some(&id)).is_ok());
+        for invalid in ["", "user-123", "00000000-0000-0000-0000-00000000000x"] {
+            assert!(validate_client_message_id(Some(invalid)).is_err());
+        }
+    }
+    #[test]
     fn native_steering_cannot_silently_change_active_permissions_or_reasoning() {
         for signature in [
             json!(["route", 42, "session", "cwd", "model", "read", null]),
@@ -761,6 +793,28 @@ mod tests {
         assert_eq!(permission("full").unwrap().1, "never");
         assert_eq!(permission("read").unwrap().2["type"], "readOnly");
         assert!(permission("bypass").is_err());
+    }
+    #[test]
+    fn codex_planning_uses_native_instructions_and_explicitly_exits_on_the_next_normal_turn() {
+        let plan = codex_collaboration_mode("read", Some("provider-model"), Some("high"))
+            .unwrap().unwrap();
+        assert_eq!(plan["mode"], "plan");
+        assert_eq!(plan["settings"]["model"], "provider-model");
+        assert_eq!(plan["settings"]["reasoning_effort"], "high");
+        assert!(plan["settings"]["developer_instructions"].is_null());
+        for permission in ["ask", "auto", "strict", "full"] {
+            let next = codex_collaboration_mode(permission, Some("another-model"), None)
+                .unwrap().unwrap();
+            assert_eq!(next["mode"], "default");
+            assert_eq!(next["settings"]["model"], "another-model");
+            assert!(next["settings"]["reasoning_effort"].is_null());
+        }
+        assert!(codex_collaboration_mode("read", None, None).is_err());
+        assert!(codex_collaboration_mode("read", Some(" "), None).is_err());
+        assert!(codex_collaboration_mode("ask", None, None).unwrap().is_none());
+        assert!(has_plan_preset(&json!({"data":[{"mode":"default"},{"mode":"plan"}]})));
+        assert!(!has_plan_preset(&json!({"data":[{"name":"plan","mode":"default"}]})));
+        assert!(!has_plan_preset(&json!({"data":null})));
     }
     #[test]
     fn codex_automatic_review_requires_an_explicit_mode_and_keeps_network_sandboxed() {
@@ -899,6 +953,13 @@ mod tests {
         assert!(canonical_target(&root.join("missing/../outside.ts")).is_none());
         std::fs::remove_dir_all(root).unwrap();
     }
+}
+
+pub fn validate_client_message_id(id: Option<&str>) -> Result<(), String> {
+    if id.is_some_and(|id| id.len() != 36 || uuid::Uuid::parse_str(id).is_err()) {
+        return Err("消息标识无效，请重新发送".into());
+    }
+    Ok(())
 }
 
 // Stable IDs keep retried follow-ups from duplicating the user message history.

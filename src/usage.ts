@@ -3,6 +3,16 @@ export interface TokenUsage { total: TokenBreakdown; last: TokenBreakdown; turn?
 export interface UsageRecord { sessionId: string; turnId: string; agent: string; model: string; data: TokenUsage; at: number; title: string }
 export const number = (n?: number | null) => n == null ? '—' : Intl.NumberFormat('zh-CN').format(n);
 export const compactNumber = (n: number) => n >= 1_000_000 ? `${(n / 1_000_000).toFixed(2)}M` : n >= 1000 ? `${(n / 1000).toFixed(1)}K` : number(n);
+export function contextUsage(usage?: TokenUsage) {
+  const valid = (n?: number | null) => typeof n === 'number' && Number.isFinite(n) && n >= 0 ? n : undefined;
+  // A non-cumulative total can contain many model calls in one turn. It must
+  // never stand in for the current context, even if the provider omits it.
+  const used = valid(usage?.contextTokens) ?? (usage?.contextTokens === undefined && usage?.cumulative !== false ? valid(usage?.last?.totalTokens) ?? valid(usage?.last?.inputTokens) : undefined);
+  const capacity = valid(usage?.modelContextWindow);
+  const window = capacity && capacity > 0 ? capacity : undefined;
+  const percent = used != null && window != null ? Math.min(100, Math.round(used / window * 100)) : undefined;
+  return { used, window, percent, label: percent != null ? `上下文 ${percent}%` : used != null ? `上下文 ${compactNumber(used)}` : '上下文 —' };
+}
 export function usageTotals(records: UsageRecord[]) {
   return records.reduce((sum, record) => {
     const t = record.data.turn ?? record.data.total;

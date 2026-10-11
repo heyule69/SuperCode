@@ -326,7 +326,10 @@ impl ActivityBuffer {
         while self.items.len() > 200
             || serde_json::to_vec(&self.items).map_or(0, |v| v.len()) > 2 * 1024 * 1024
         {
-            self.items.remove(0);
+            // The start marker is needed to persist completion and elapsed
+            // time even when streamed tool details exhaust the cache budget.
+            let index = self.items.iter().position(|item| item["type"] != "runMarker").unwrap_or(0);
+            self.items.remove(index);
         }
     }
     pub fn finish(&mut self, status: &str) -> Vec<Value> {
@@ -393,6 +396,26 @@ mod tests {
         assert_eq!(data["phase"], "final_answer");
         assert_eq!(data["messageId"], "native-message");
         assert_eq!(data["status"], "completed");
+    }
+    #[test]
+    fn activity_cache_pressure_keeps_the_turn_marker_for_completion() {
+        for large in [false, true] {
+            let mut buffer = ActivityBuffer::default();
+            buffer.update(&json!({"method":"turn/started","params":{"threadId":"n","turn":{"id":"t"}}}));
+            let text = if large { "x".repeat(TEXT_LIMIT) } else { String::new() };
+            for index in 0..205 {
+                buffer.update(&json!({"method":"item/started","params":{"threadId":"n","turnId":"t","item":{"id":format!("tool-{index}"),"type":"claudeToolCall","tool":"Read","arguments":{"content":text},"status":"inProgress"}}}));
+            }
+            let cached = buffer.snapshot("n");
+            assert!(cached.len() <= 200);
+            assert!(serde_json::to_vec(&cached).unwrap().len() <= 2 * 1024 * 1024);
+            assert_eq!(cached.iter().filter(|item| item["type"] == "runMarker").count(), 1);
+            let finished = buffer.finish("completed");
+            let marker = finished.iter().find(|item| item["type"] == "runMarker").unwrap();
+            assert_eq!(marker["status"], "completed");
+            assert_eq!(marker["turnId"], "t");
+            assert!(marker["durationMs"].is_u64());
+        }
     }
     #[test]
     fn activity_buffer_preserves_streamed_summary_and_interrupted_output() {

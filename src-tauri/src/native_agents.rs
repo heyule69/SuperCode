@@ -642,11 +642,32 @@ fn opencode_config(config: &Value, permission: &str) -> Value {
             Some("responses") => "@ai-sdk/openai",
             _ => "@ai-sdk/openai-compatible",
         };
+        let native = &config["opencodeProvider"];
         let models = crate::providers::model_ids(config)
             .into_iter()
-            .map(|m| (wire_model(config, &m), json!({"name":m})))
+            .map(|m| {
+                let definition = native["models"]
+                    .get(&m)
+                    .filter(|v| v.is_object())
+                    .cloned()
+                    .unwrap_or_else(|| json!({"name":m}));
+                (wire_model(config, &m), definition)
+            })
             .collect::<serde_json::Map<String, Value>>();
-        value["provider"] = json!({"supercode":{"npm":npm,"name":"SuperCode","options":{"baseURL":sdk_base(config),"apiKey":crate::providers::key(config).unwrap_or("")},"models":models}});
+        let mut options = native["options"].as_object().cloned().unwrap_or_default();
+        options.insert(
+            "baseURL".into(),
+            if native.is_object() {
+                config["baseUrl"].clone()
+            } else {
+                json!(sdk_base(config))
+            },
+        );
+        options.insert(
+            "apiKey".into(),
+            json!(crate::providers::key(config).unwrap_or("")),
+        );
+        value["provider"] = json!({"supercode":{"npm":npm,"name":native["name"].as_str().unwrap_or("SuperCode"),"options":options,"models":models}});
     }
     value
 }
@@ -663,6 +684,10 @@ fn sdk_base(config: &Value) -> String {
     }
 }
 fn wire_model(config: &Value, id: &str) -> String {
+    // Native declarations use literal model IDs, including any suffix.
+    if config["opencodeProvider"].is_object() || config["piProvider"].is_object() {
+        return id.to_owned();
+    }
     if config["protocol"] == "anthropic" {
         for suffix in ["[1m]", "[256k]"] {
             if id.to_ascii_lowercase().ends_with(suffix) {
@@ -671,6 +696,65 @@ fn wire_model(config: &Value, id: &str) -> String {
         }
     }
     id.to_owned()
+}
+fn pi_provider_config(config: &Value) -> Option<Value> {
+    let base = config["baseUrl"].as_str()?;
+    let native = &config["piProvider"];
+    let mut provider = native.as_object().cloned().unwrap_or_default();
+    let mut seen = std::collections::HashSet::new();
+    let models = crate::providers::model_ids(config)
+        .into_iter()
+        .filter_map(|m| {
+            let id = wire_model(config, &m);
+            if !seen.insert(id.clone()) {
+                return None;
+            }
+            let input = if native.is_object() {
+                json!(["text"])
+            } else {
+                json!(["text", "image"])
+            };
+            let context = if m.to_ascii_lowercase().ends_with("[1m]") {
+                1000000
+            } else {
+                128000
+            };
+            let mut definition = json!({
+                "id": id, "name": m, "reasoning": !native.is_object(), "input": input,
+                "contextWindow": context, "maxTokens": 8192,
+                "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0}
+            });
+            if let Some(saved) = native["models"]
+                .as_array()
+                .and_then(|models| models.iter().find(|model| model["id"] == m))
+                .and_then(Value::as_object)
+            {
+                let cost = definition["cost"].as_object().unwrap().clone();
+                definition.as_object_mut().unwrap().extend(saved.clone());
+                if let Some(saved_cost) = saved.get("cost").and_then(Value::as_object) {
+                    let mut cost = cost;
+                    cost.extend(saved_cost.clone());
+                    definition["cost"] = Value::Object(cost);
+                }
+            }
+            Some(definition)
+        })
+        .collect::<Vec<_>>();
+    provider.insert("baseUrl".into(), json!(base));
+    provider.insert(
+        "apiKey".into(),
+        json!(crate::providers::key(config).unwrap_or("")),
+    );
+    provider.insert(
+        "api".into(),
+        json!(match config["protocol"].as_str() {
+            Some("anthropic") => "anthropic-messages",
+            Some("responses") => "openai-responses",
+            _ => "openai-completions",
+        }),
+    );
+    provider.insert("models".into(), json!(models));
+    Some(Value::Object(provider))
 }
 const PI_EXTENSION: &str = r#"export default function(pi) {
   const config = JSON.parse(process.env.SUPERCODE_PI_CONFIG || '{}');
@@ -747,9 +831,8 @@ async fn start_for(
             args.push("--no-session".into());
         }
         let mut settings = json!({"permission":permission,"mcp":if permission=="summary"{json!({})}else{mcp(app,false)?}});
-        if let Some(base) = config["baseUrl"].as_str() {
-            let mut seen = std::collections::HashSet::new();
-            settings["provider"] = json!({"baseUrl":base,"apiKey":crate::providers::key(&config).unwrap_or(""),"api":match config["protocol"].as_str(){Some("anthropic")=>"anthropic-messages",Some("responses")=>"openai-responses",_=>"openai-completions"},"models":crate::providers::model_ids(&config).into_iter().filter_map(|m|{let id=wire_model(&config,&m);if !seen.insert(id.clone()){return None;}Some(json!({"id":id,"name":m,"reasoning":true,"input":["text","image"],"contextWindow":if m.to_ascii_lowercase().ends_with("[1m]"){1000000}else{128000},"maxTokens":8192,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0}}))}).collect::<Vec<_>>()});
+        if let Some(provider) = pi_provider_config(&config) {
+            settings["provider"] = provider;
         }
         env.push(("SUPERCODE_PI_CONFIG".into(), settings.to_string()));
     }
@@ -1727,6 +1810,52 @@ mod tests {
             )["provider"]["supercode"]["models"]["k3"]["name"],
             "k3[1M]"
         );
+    }
+    #[test]
+    fn imported_native_declarations_reach_runtime_without_losing_capabilities_or_permissions() {
+        let open = crate::ccswitch::sanitize_provider("opencode", "gateway", json!({
+            "npm":"@ai-sdk/anthropic", "name":"导入连接",
+            "options":{"baseURL":"https://gateway.example/coding","apiKey":"fixture-secret","headers":{"X-Project":"fixture-header"},"setCacheKey":true},
+            "models":{"m[1M]":{"name":"真实模型","reasoning":false,"limit":{"context":32768,"output":4096},"modalities":{"input":["text"],"output":["text"]}}},
+            "permission":"allow", "plugins":["unsafe"], "mcp":{"unsafe":{}}
+        })).unwrap();
+        let runtime = opencode_config(&open, "read");
+        let provider = &runtime["provider"]["supercode"];
+        assert_eq!(
+            provider["options"]["baseURL"],
+            "https://gateway.example/coding"
+        );
+        assert_eq!(provider["options"]["apiKey"], "fixture-secret");
+        assert_eq!(
+            provider["options"]["headers"]["X-Project"],
+            "fixture-header"
+        );
+        assert_eq!(provider["models"]["m[1M]"]["limit"]["context"], 32768);
+        assert_eq!(provider["models"]["m[1M]"]["reasoning"], false);
+        assert_eq!(runtime["permission"]["*"], "deny");
+        assert!(runtime.get("plugins").is_none());
+        assert!(runtime.get("mcp").is_none());
+        let pi = crate::ccswitch::sanitize_provider("pi", "gateway", json!({
+            "api":"openai-completions","baseUrl":"http://localhost:1234/v1","apiKey":"fixture-secret","headers":{"X-Project":"fixture-header"},
+            "models":[{"id":"m","name":"中文模型","reasoning":false,"input":["text"],"contextWindow":32768,"maxTokens":2048,"cost":{"input":1,"output":2},"compat":{"supportsDeveloperRole":false}},
+                {"id":"other","baseUrl":"https://other.example/v1","api":"openai-responses"}]
+        })).unwrap();
+        let provider = pi_provider_config(&pi).unwrap();
+        assert_eq!(provider["api"], "openai-completions");
+        assert_eq!(provider["apiKey"], "fixture-secret");
+        assert_eq!(provider["headers"]["X-Project"], "fixture-header");
+        assert_eq!(provider["models"][0]["id"], "m");
+        assert_eq!(provider["models"][0]["contextWindow"], 32768);
+        assert_eq!(provider["models"][0]["reasoning"], false);
+        assert_eq!(provider["models"][0]["input"], json!(["text"]));
+        assert_eq!(
+            provider["models"][0]["compat"]["supportsDeveloperRole"],
+            false
+        );
+        assert_eq!(provider["models"][0]["cost"]["cacheRead"], 0);
+        assert_eq!(provider["models"][1]["api"], "openai-responses");
+        assert_eq!(provider["models"][1]["baseUrl"], "https://other.example/v1");
+        assert!(pi_provider_config(&json!({})).is_none());
     }
     #[test]
     fn usage_accumulates_all_native_messages_but_never_claims_custom_models_are_free() {

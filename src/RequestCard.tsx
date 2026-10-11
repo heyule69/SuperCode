@@ -1,11 +1,14 @@
-import { useState } from 'react';
+import { lazy, Suspense, useState } from 'react';
 import { ShieldCheck } from 'lucide-react';
 import QuestionRequest from './QuestionRequest';
 import { fieldOptions, formContent, formDefaults, supportedForm, type ElicitationField } from './elicitation';
 import type { RpcEvent } from './types';
 import { CopyButton } from './CopyButton';
+import { isPlanRequest } from './planPresentation';
+const PlanRequest = lazy(() => import('./PlanRequest'));
 
-export default function RequestCard({ request, respond }: { request: RpcEvent; respond: (result: unknown) => Promise<void> }) {
+export default function RequestCard({ request, respond, openFile }: { request: RpcEvent; respond: (result: unknown) => Promise<void>; openFile?: (path: string, line?: number) => void }) {
+  if (isPlanRequest(request)) return <Suspense fallback={<div className="working-indicator">正在加载计划…</div>}><PlanRequest key={request.id} request={request} respond={respond} openFile={openFile} /></Suspense>;
   return request.method === 'item/tool/requestUserInput' ? <QuestionRequest key={request.id} request={request} respond={respond} /> : <ApprovalRequest request={request} respond={respond} />;
 }
 

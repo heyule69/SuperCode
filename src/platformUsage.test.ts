@@ -1,10 +1,23 @@
 import { describe, expect, it, vi } from 'vitest';
-import { allowanceSummary, resetLabel, UsageQueries, type PlatformUsage } from './platformUsage';
+import { allowanceSummary, primaryAllowance, resetLabel, UsageQueries, type PlatformUsage } from './platformUsage';
 const example: PlatformUsage = { agent: 'claude', connectionId: 'a', providerName: 'GLM', connectionName: 'GLM Coding', queriedAt: 1, windows: [], balances: [] };
 describe('platform allowance display', () => {
-  it('shows the tightest real window, including exhausted quota', () => {
-    expect(allowanceSummary({ ...example, windows: [{ label: '5h', remainingPercent: 80 }, { label: 'week', remainingPercent: 0 }] })).toBe('剩余 0%');
+  it('prioritizes the short model window over weekly and MCP quota, with matching meter data', () => {
+    const value = { ...example, windows: [{ label: '周额度', remainingPercent: 87, windowDurationMins: 10080 }, { label: 'MCP 额度', remainingPercent: 1, scope: 'tool' as const }, { label: '5 小时额度', remainingPercent: 97, windowDurationMins: 300 }] };
+    expect(allowanceSummary(value)).toBe('5 小时额度 · 剩余 97%');
+    expect(primaryAllowance(value)?.remainingPercent).toBe(97);
     expect(allowanceSummary(example)).toBe('');
+  });
+  it('uses actual provider durations and retains real zero short-window allowance', () => {
+    const value = { ...example, windows: [{ label: '日额度', remainingPercent: 12, windowDurationMins: 1440 }, { label: '2 小时额度', remainingPercent: 0, windowDurationMins: 120 }] };
+    expect(allowanceSummary(value)).toBe('2 小时额度 · 剩余 0%');
+    expect(allowanceSummary({ ...example, windows: [{ label: '周额度', remainingPercent: 35 }] })).toBe('周额度 · 剩余 35%');
+    expect(allowanceSummary({ ...example, windows: [{ label: '套餐额度', remainingPercent: 50 }] })).toBe('套餐额度 · 剩余 50%');
+  });
+  it('handles old cached labels and does not invent quota for invalid or balance-only responses', () => {
+    expect(allowanceSummary({ ...example, windows: [{ label: 'week', remainingPercent: 0 }, { label: '5h', remainingPercent: 80 }] })).toBe('5h · 剩余 80%');
+    expect(primaryAllowance({ ...example, windows: [{ label: '5 小时额度', remainingPercent: NaN }, { label: '周额度', remainingPercent: -1 }] })).toBeUndefined();
+    expect(primaryAllowance({ ...example, balances: [{ label: 'API 余额', amount: 5, currency: 'CNY' }] })).toBeUndefined();
   });
   it('keeps key budget distinct from the wallet and accepts a real zero balance', () => {
     expect(allowanceSummary({ ...example, balances: [{ label: 'Key 预算余额', amount: 0, currency: 'USD' }] })).toBe('Key 预算余额 $0.00');

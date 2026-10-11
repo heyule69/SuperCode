@@ -15,6 +15,8 @@ pub struct Window {
     label: String,
     remaining_percent: f64,
     reset_at: Option<String>,
+    window_duration_mins: Option<f64>,
+    scope: &'static str,
 }
 #[derive(Clone, Serialize)]
 pub struct Balance {
@@ -151,7 +153,33 @@ fn ratio(value: &Value, label: &str) -> Option<Window> {
         label: label.into(),
         remaining_percent: remaining / limit * 100.0,
         reset_at: reset(&value["resetTime"]),
+        window_duration_mins: None,
+        scope: "model",
     })
+}
+fn duration_label(minutes: f64) -> String {
+    if minutes == 10080.0 {
+        "周额度".into()
+    } else if minutes >= 1440.0 {
+        format!("{} 天额度", minutes / 1440.0)
+    } else if minutes < 60.0 {
+        format!("{minutes} 分钟额度")
+    } else {
+        format!("{} 小时额度", minutes / 60.0)
+    }
+}
+fn kimi_duration(window: &Value) -> Option<f64> {
+    let duration = number(&window["duration"])?;
+    let multiplier = match window["timeUnit"].as_str()? {
+        "TIME_UNIT_SECOND" => 1.0 / 60.0,
+        "TIME_UNIT_MINUTE" => 1.0,
+        "TIME_UNIT_HOUR" => 60.0,
+        "TIME_UNIT_DAY" => 1440.0,
+        "TIME_UNIT_WEEK" => 10080.0,
+        _ => return None,
+    };
+    let minutes = duration * multiplier;
+    (minutes.is_finite() && minutes > 0.0).then_some(minutes)
 }
 fn parse(kind: Adapter, v: &Value) -> (Vec<Window>, Vec<Balance>) {
     let mut windows = Vec::new();
@@ -163,12 +191,25 @@ fn parse(kind: Adapter, v: &Value) -> (Vec<Window>, Vec<Balance>) {
         Adapter::KimiCoding => {
             if let Some(items) = v["limits"].as_array() {
                 for item in items.iter().take(8) {
-                    if let Some(window) = ratio(&item["detail"], "短周期额度") {
+                    if let Some(mut window) = ratio(&item["detail"], "短周期额度") {
+                        window.window_duration_mins = kimi_duration(&item["window"]);
+                        if let Some(minutes) = window.window_duration_mins {
+                            window.label = duration_label(minutes);
+                        }
                         windows.push(window);
                     }
                 }
             }
-            if let Some(window) = ratio(&v["usage"], "周额度") {
+            // New and legacy memberships have different long-term pools. Do
+            // not label an untyped pool as weekly for every Kimi account.
+            if let Some(mut window) = ratio(&v["usage"], "套餐额度") {
+                window.window_duration_mins = kimi_duration(&v["usage"]["window"]);
+                if let Some(minutes) = window.window_duration_mins {
+                    window.label = duration_label(minutes);
+                }
+                windows.push(window);
+            }
+            if let Some(window) = ratio(&v["totalQuota"], "月总额度") {
                 windows.push(window);
             }
         }
@@ -199,6 +240,20 @@ fn parse(kind: Adapter, v: &Value) -> (Vec<Window>, Vec<Balance>) {
                         label: label.into(),
                         remaining_percent: 100.0 - used,
                         reset_at: reset(&item["nextResetTime"]),
+                        window_duration_mins: if kind == "TIME_LIMIT" {
+                            None
+                        } else if unit == Some(3.0) {
+                            Some(300.0)
+                        } else if unit == Some(6.0) {
+                            Some(10080.0)
+                        } else {
+                            None
+                        },
+                        scope: if kind == "TIME_LIMIT" {
+                            "tool"
+                        } else {
+                            "model"
+                        },
                     });
                 }
             }
@@ -219,6 +274,8 @@ fn parse(kind: Adapter, v: &Value) -> (Vec<Window>, Vec<Balance>) {
                         label: "5 小时额度".into(),
                         remaining_percent: remaining,
                         reset_at: reset(&item["end_time"]),
+                        window_duration_mins: Some(300.0),
+                        scope: "model",
                     });
                 }
                 if number(&item["current_weekly_status"]) == Some(1.0) {
@@ -227,6 +284,8 @@ fn parse(kind: Adapter, v: &Value) -> (Vec<Window>, Vec<Balance>) {
                             label: "周额度".into(),
                             remaining_percent: remaining,
                             reset_at: reset(&item["weekly_end_time"]),
+                            window_duration_mins: Some(10080.0),
+                            scope: "model",
                         });
                     }
                 }
@@ -295,22 +354,14 @@ fn codex_windows(v: &Value) -> Vec<Window> {
             };
             let duration = number(&value["windowDurationMins"]).filter(|n| *n > 0.0);
             let label = duration
-                .map(|m| {
-                    if m == 10080.0 {
-                        "周额度".into()
-                    } else if m >= 1440.0 {
-                        format!("{} 天额度", m / 1440.0)
-                    } else if m < 60.0 {
-                        format!("{m} 分钟额度")
-                    } else {
-                        format!("{} 小时额度", m / 60.0)
-                    }
-                })
+                .map(duration_label)
                 .unwrap_or_else(|| "账号额度".into());
             windows.push(Window {
                 label,
                 remaining_percent: 100.0 - used,
                 reset_at: reset(&value["resetsAt"]),
+                window_duration_mins: duration,
+                scope: "model",
             });
         }
     }
@@ -324,13 +375,24 @@ async fn query(agent: &str, route: &Route, app: &AppHandle) -> Option<Usage> {
             || route.profile.as_ref().is_some_and(|p| p.is_official()))
     {
         let limits = if let Some(id) = route.config["accountId"].as_str() {
-            if let Some(value) = app.state::<AppState>().runtime.existing_account_limits(route.fingerprint()).await { value }
-            else { crate::accounts::read_codex_limits_for(app, Some(id)).await.ok()? }
-        } else { app
-            .state::<AppState>()
-            .runtime
-            .account_limits(app, route.fingerprint())
-            .await? };
+            if let Some(value) = app
+                .state::<AppState>()
+                .runtime
+                .existing_account_limits(route.fingerprint())
+                .await
+            {
+                value
+            } else {
+                crate::accounts::read_codex_limits_for(app, Some(id))
+                    .await
+                    .ok()?
+            }
+        } else {
+            app.state::<AppState>()
+                .runtime
+                .account_limits(app, route.fingerprint())
+                .await?
+        };
         plan_name = limits["rateLimits"]["planType"]
             .as_str()
             .or_else(|| limits["rateLimitsByLimitId"]["codex"]["planType"].as_str())
@@ -431,15 +493,24 @@ fn connection(route: &Route, agent: &str) -> QuotaConnection {
 #[tauri::command]
 pub async fn get_quota_connections(app: AppHandle) -> Result<Vec<QuotaConnection>, String> {
     let handle = app.clone();
-    let candidates = tauri::async_runtime::spawn_blocking(move || quota_connections(&handle.state::<AppState>().store))
-        .await
-        .map_err(|e| e.to_string())??;
+    let candidates = tauri::async_runtime::spawn_blocking(move || {
+        quota_connections(&handle.state::<AppState>().store)
+    })
+    .await
+    .map_err(|e| e.to_string())??;
     let mut visible = Vec::new();
     for item in candidates {
         let official = item.connection_id == crate::session_config::OFFICIAL
-            || app.state::<AppState>().store.profile(&item.agent, &item.connection_id)?
+            || app
+                .state::<AppState>()
+                .store
+                .profile(&item.agent, &item.connection_id)?
                 .is_some_and(|p| p.is_official());
-        if !official || crate::chat_connection::check(&app, &item.agent, None, Some(&item.connection_id)).await.is_ok() {
+        if !official
+            || crate::chat_connection::check(&app, &item.agent, None, Some(&item.connection_id))
+                .await
+                .is_ok()
+        {
             visible.push(item);
         }
     }
@@ -464,7 +535,9 @@ fn quota_connections(store: &crate::storage::Store) -> Result<Vec<QuotaConnectio
     for agent in ["codex", "claude"] {
         if agent == "codex"
             && (store.official(agent)?
-                || profiles.iter().any(|p| p.agent == agent && p.is_official() && p.account_id().is_none()))
+                || profiles
+                    .iter()
+                    .any(|p| p.agent == agent && p.is_official() && p.account_id().is_none()))
             || agent != "codex"
                 && store.official(agent)?
                 && !profiles.iter().any(|p| p.agent == agent && p.is_official())
@@ -484,7 +557,9 @@ pub async fn get_platform_usage(
     refresh: bool,
     app: AppHandle,
 ) -> Result<Option<Usage>, String> {
-    let Some(route) = crate::chat_connection::available_route(&app, &agent, None, Some(&connection_id)).await? else {
+    let Some(route) =
+        crate::chat_connection::available_route(&app, &agent, None, Some(&connection_id)).await?
+    else {
         return Ok(None);
     };
     let cache_key = (agent.clone(), route.fingerprint());
@@ -504,10 +579,16 @@ mod tests {
     use serde_json::json;
     #[test]
     fn quota_candidates_exclude_hidden_native_routes_even_with_old_chat_history() {
-        let store = crate::storage::Store::from_connection(rusqlite::Connection::open_in_memory().unwrap()).unwrap();
-        let project = store.add_project(std::path::Path::new("D:/quota-empty-test")).unwrap();
+        let store =
+            crate::storage::Store::from_connection(rusqlite::Connection::open_in_memory().unwrap())
+                .unwrap();
+        let project = store
+            .add_project(std::path::Path::new("D:/quota-empty-test"))
+            .unwrap();
         for agent in ["claude", "codex", "opencode", "pi"] {
-            store.create_agent_session(&project.id, None, agent).unwrap();
+            store
+                .create_agent_session(&project.id, None, agent)
+                .unwrap();
         }
         assert!(store.profiles().unwrap().is_empty());
         assert!(quota_connections(&store).unwrap().iter().all(|item| {
@@ -604,6 +685,57 @@ mod tests {
             &json!({"is_available":false,"balance_infos":[{"currency":"CNY","total_balance":"0.00"}]}),
         );
         assert_eq!(b[0].amount, 0.0);
+    }
+    #[test]
+    fn kimi_windows_use_returned_durations_without_assuming_a_weekly_pool() {
+        let (windows, _) = parse(
+            Adapter::KimiCoding,
+            &json!({"limits":[
+            {"window":{"duration":300,"timeUnit":"TIME_UNIT_MINUTE"},"detail":{"limit":"100","remaining":"97"}},
+            {"window":{"duration":2,"timeUnit":"TIME_UNIT_HOUR"},"detail":{"limit":100,"remaining":80}}
+        ],"usage":{"limit":100,"remaining":87}}),
+        );
+        assert_eq!(windows[0].label, "5 小时额度");
+        assert_eq!(windows[0].window_duration_mins, Some(300.0));
+        assert_eq!(windows[1].label, "2 小时额度");
+        assert_eq!(windows[2].label, "套餐额度");
+        assert!(windows[2].window_duration_mins.is_none());
+        let (new_plan, _) = parse(
+            Adapter::KimiCoding,
+            &json!({"limits":[{"window":{"duration":300,"timeUnit":"TIME_UNIT_MINUTE"},"detail":{"limit":100,"remaining":0}}],"totalQuota":{"limit":100,"remaining":50}}),
+        );
+        assert_eq!(new_plan.len(), 2);
+        assert_eq!(new_plan[0].remaining_percent, 0.0);
+        assert_eq!(new_plan[1].label, "月总额度");
+        assert!(new_plan.iter().all(|window| window.label != "周额度"));
+        assert!(kimi_duration(&json!({"duration":300,"timeUnit":"unknown"})).is_none());
+    }
+    #[test]
+    fn provider_window_metadata_separates_mcp_and_respects_missing_weekly_limits() {
+        let (windows, _) = parse(
+            Adapter::Glm,
+            &json!({"data":{"limits":[
+                {"type":"TIME_LIMIT","percentage":99,"unit":3},
+                {"type":"CREDIT_LIMIT","percentage":13,"unit":6},
+                {"type":"TOKENS_LIMIT","percentage":3,"unit":3}
+            ]}}),
+        );
+        assert_eq!(windows[0].window_duration_mins, Some(300.0));
+        assert_eq!(windows[0].scope, "model");
+        assert_eq!(windows[2].scope, "tool");
+        assert!(windows[2].window_duration_mins.is_none());
+        let (windows, _) = parse(
+            Adapter::MiniMax,
+            &json!({"model_remains":[{"model_name":"general","current_interval_remaining_percent":97,"current_weekly_status":0,"current_weekly_remaining_percent":0}]}),
+        );
+        assert_eq!(windows.len(), 1);
+        assert_eq!(windows[0].window_duration_mins, Some(300.0));
+        let windows = codex_windows(
+            &json!({"rateLimits":{"primary":{"usedPercent":10,"windowDurationMins":120},"secondary":{"usedPercent":20,"windowDurationMins":1440}}}),
+        );
+        assert_eq!(windows[0].label, "2 小时额度");
+        assert_eq!(windows[0].window_duration_mins, Some(120.0));
+        assert_eq!(windows[1].window_duration_mins, Some(1440.0));
     }
     #[test]
     fn weekly_minimax_and_openrouter_budget_are_not_account_balance() {

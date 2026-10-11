@@ -1,0 +1,58 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="require-trusted-types-for 'script'">
+<title>SuperCode Dynamic Browser Fixture</title>
+<style>
+  body { margin: 0; min-height: 1300px; background: #f8f9fb; font: 16px sans-serif; }
+  button, input, a { position: absolute; left: 40px; width: 200px; height: 42px; box-sizing: border-box; }
+  #target { top: 80px; z-index: 3; }
+  #decoy { top: 80px; z-index: 1; }
+  #link { top: 300px; } #field { top: 370px; } #other { top: 440px; }
+  #cover { display: none; position: fixed; inset: 0; background: #cad9e8; z-index: 10; }
+  img { position: absolute; left: 260px; top: 350px; width: 80px; height: 80px; }
+  @keyframes moving { from { top: 140px; } to { top: 240px; } }
+</style>
+<fieldset id="group" style="border:0">
+  <button id="decoy" onclick="window.fixture.wrong++">SC Wrong Button</button>
+  <button id="target" onclick="window.fixture.clicked++">SC Dynamic Button</button>
+</fieldset>
+<a id="link" href="/image.svg" onclick="event.preventDefault();window.fixture.clicked++">SC Dynamic Link</a>
+<input id="field" aria-label="SC Dynamic Input">
+<input id="other" aria-label="SC Other Input">
+<img src="/image.svg" alt="SC visible image">
+<div id="cover"></div>
+<script>
+  window.fixture = {
+    clicked: 0, wrong: 0, timers: [],
+    later(fn, ms) { this.timers.push(setTimeout(fn, ms)); },
+    reset() {
+      this.timers.forEach(clearTimeout); this.timers = [];
+      this.clicked = this.wrong = 0;
+      document.querySelectorAll('#target').forEach((el, i) => { if (i) el.remove(); });
+      const el = document.querySelector('#target');
+      el.style.top = '80px'; el.style.animation = ''; el.onpointerover = null;
+      document.querySelector('#cover').style.display = 'none';
+      document.querySelector('#group').disabled = false;
+      document.querySelector('#link').href = '/image.svg';
+      document.querySelector('#field').onfocus = null;
+      document.querySelector('#field').value = document.querySelector('#other').value = '';
+      scrollTo(0, 0);
+    },
+    shift() { document.querySelector('#target').style.top = '210px'; },
+    replace() { const el = document.querySelector('#target'); el.replaceWith(el.cloneNode(true)); },
+    detach() {
+      const el = document.querySelector('#target'), parent = el.parentNode, clone = el.cloneNode(true);
+      el.remove(); this.later(() => parent.append(clone), 300);
+    },
+    duplicate() {
+      const el = document.querySelector('#target'), parent = el.parentNode;
+      parent.append(el.cloneNode(true), el.cloneNode(true)); el.remove();
+    },
+    cover(ms) { document.querySelector('#cover').style.display = 'block'; if (ms) this.later(() => document.querySelector('#cover').style.display = 'none', ms); },
+    moving() { document.querySelector('#target').style.animation = 'moving 0.6s linear infinite alternate'; },
+    hoverShift() { const el = document.querySelector('#target'); el.onpointerover = () => { el.onpointerover = null; this.shift(); }; },
+    disable() { document.querySelector('#group').disabled = true; this.later(() => document.querySelector('#group').disabled = false, 300); },
+    stealFocus() { document.querySelector('#field').onfocus = () => document.querySelector('#other').focus(); },
+    stats() { return { clicked: this.clicked, wrong: this.wrong, field: document.querySelector('#field').value, other: document.querySelector('#other').value }; }
+  };
+</script>

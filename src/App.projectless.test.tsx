@@ -6,6 +6,7 @@ import App from './App';
 import { call, subscribe } from './api';
 import type { Bootstrap, Message, Session, RpcEvent } from './types';
 import { PROVIDER_REQUIRED } from './chatConnection';
+import { mergeEvent } from './events';
 
 vi.mock('./api', () => ({ desktop:true, call:vi.fn(), subscribe:vi.fn(async()=>()=>{}) }));
 vi.mock('@tauri-apps/api/event', () => ({ listen:vi.fn(async()=>()=>{}) }));
@@ -34,6 +35,7 @@ beforeEach(() => {
     if (command==='get_usage') return { records:[] };
     if (command==='pending_requests') return pendingRequests;
     if (command==='list_local_skills') return { skills:[] };
+    if (command==='list_extensions') return { plugins:[], mcp:[], warnings:[] };
     if (command==='followup_capabilities') return {};
     if (command==='list_followups') return [];
     if (command==='workspace_changes') return { files:[],diff:'',branch:'',isGit:false };
@@ -44,7 +46,7 @@ beforeEach(() => {
     }
     if (command==='archive_session') { data.sessions = []; return null; }
     if (command==='send_chat_message') {
-      messages = [{ id:'saved',seq:1,sessionId:'standalone',role:'user',text:String(args.text),kind:'userMessage',data:{} }];
+      messages = [{ id:'saved',seq:1,sessionId:'standalone',role:'user',text:String(args.text),kind:'userMessage',data:{clientMessageId:args.clientMessageId} }];
       return data.sessions[0];
     }
     return null;
@@ -60,6 +62,151 @@ async function type(text: string) {
 async function send() {
   await act(async()=>{container.querySelector<HTMLFormElement>('.composer')!.dispatchEvent(new Event('submit',{bubbles:true,cancelable:true}));await new Promise(resolve=>setTimeout(resolve,30));});
 }
+
+it.each(['claude','codex','opencode','pi'])('shows the submitted %s message before connection checks, session creation and native startup finish', async agent => {
+  localStorage.setItem('supercode.agent', agent);
+  data.profiles = [{...data.profiles[0], id:`api:${agent}`, agent}];
+  let finishCheck!: () => void, finishCreate!: () => void, finishSend!: () => void;
+  const fallback = vi.mocked(call).getMockImplementation()!;
+  vi.mocked(call).mockImplementation(async (command, args) => {
+    if (command === 'check_chat_connection') return new Promise<void>(resolve => { finishCheck = resolve; });
+    if (command === 'create_session') { await new Promise<void>(resolve => { finishCreate = resolve; }); return fallback(command, args); }
+    if (command === 'send_chat_message') { await new Promise<void>(resolve => { finishSend = resolve; }); return fallback(command, args); }
+    return fallback(command, args);
+  });
+  await render(); await type('第一时间显示我'); await send();
+  const bubble = container.querySelector('[aria-label="你的消息"]')!;
+  expect(bubble.textContent).toContain('第一时间显示我');
+  expect(container.querySelector<HTMLTextAreaElement>('.composer textarea')?.value).toBe('');
+  const status = container.querySelector('.working-indicator')!;
+  expect(status.textContent).toBe('正在发送…');
+  expect(bubble.compareDocumentPosition(status) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  expect(call).not.toHaveBeenCalledWith('create_session', expect.anything());
+  await act(async () => finishCheck());
+  expect(container.querySelectorAll('[aria-label="你的消息"]')).toHaveLength(1);
+  expect(call).not.toHaveBeenCalledWith('send_chat_message', expect.anything());
+  await act(async () => finishCreate());
+  expect(container.querySelector('[aria-label="你的消息"]')?.textContent).toContain('第一时间显示我');
+  expect(call).toHaveBeenCalledWith('send_chat_message', expect.objectContaining({clientMessageId:expect.any(String)}));
+  // Preserve the bubble while native startup is pending; don't clear a new draft
+  // or submit it twice if another submit event arrives before a render.
+  await type('下一条草稿'); await send();
+  expect(vi.mocked(call).mock.calls.filter(([command]) => command === 'send_chat_message')).toHaveLength(1);
+  await act(async () => finishSend());
+  expect(container.querySelectorAll('[aria-label="你的消息"]')).toHaveLength(1);
+  expect(container.querySelector('[aria-label="你的消息"]')?.textContent).toContain('第一时间显示我');
+  expect(container.querySelector<HTMLTextAreaElement>('.composer textarea')?.value).toBe('下一条草稿');
+});
+
+it('keeps the new user before streamed work when a startup storage read has not saved the user yet', async () => {
+  localStorage.setItem('supercode.session', 'chat');
+  data.sessions = [{id:'chat',projectId:'existing',title:'慢启动',agent:'claude',connectionId:'api:claude',model:'test-model',nativeId:'native',status:'idle',turnId:null,updatedAt:1}];
+  let finish!: () => void;
+  let clientMessageId = '';
+  const fallback = vi.mocked(call).getMockImplementation()!;
+  vi.mocked(call).mockImplementation(async (command, args={}) => {
+    if (command === 'send_chat_message') {
+      clientMessageId = String(args.clientMessageId);
+      await new Promise<void>(resolve => { finish = resolve; }); return data.sessions[0];
+    }
+    return fallback(command, args);
+  });
+  await render(); await type('继续'); await send();
+  await act(async () => {
+    notify({method:'turn/started',params:{threadId:'native',turn:{id:'t'}}});
+    notify({method:'item/agentMessage/delta',params:{threadId:'native',turnId:'t',itemId:'a',delta:'正在处理'}});
+    await new Promise(resolve => setTimeout(resolve,80));
+  });
+  const bubble = container.querySelector('[aria-label="你的消息"]')!;
+  expect(bubble.textContent).toContain('继续');
+  expect(container.querySelectorAll('.conversation-turn')).toHaveLength(1);
+  messages = [{id:'saved-user',seq:1,sessionId:'chat',role:'user',text:'继续',kind:'userMessage',data:{clientMessageId}}];
+  await act(async () => finish());
+  expect(container.querySelectorAll('[aria-label="你的消息"]')).toHaveLength(1);
+  expect(container.querySelectorAll('.conversation-turn')).toHaveLength(1);
+  expect(container.querySelector('[aria-label="你的消息"]')).toBe(bubble);
+});
+
+it('restores a rejected send and removes its temporary bubble without overwriting a newer draft', async () => {
+  let reject!: (reason: string) => void;
+  const fallback = vi.mocked(call).getMockImplementation()!;
+  vi.mocked(call).mockImplementation(async (command, args) => command === 'check_chat_connection'
+    ? new Promise((_, fail) => { reject = fail; }) : fallback(command, args));
+  await render(); await type('失败后保留的消息'); await send();
+  expect(container.querySelector('[aria-label="你的消息"]')).not.toBeNull();
+  await act(async () => reject('连接失败'));
+  expect(container.querySelector('[aria-label="你的消息"]')).toBeNull();
+  expect(container.querySelector<HTMLTextAreaElement>('.composer textarea')?.value).toBe('失败后保留的消息');
+  await send(); await type('我新输入的草稿');
+  await act(async () => reject('连接失败'));
+  expect(container.querySelector('[aria-label="你的消息"]')).toBeNull();
+  expect(container.querySelector<HTMLTextAreaElement>('.composer textarea')?.value).toBe('我新输入的草稿');
+});
+
+it('ignores an older startup storage response that arrives after the acknowledgement', async () => {
+  localStorage.setItem('supercode.session','chat');
+  data.sessions = [{id:'chat',projectId:'existing',title:'乱序读取',agent:'claude',connectionId:'api:claude',model:'test-model',nativeId:'native',status:'idle',turnId:null,updatedAt:1}];
+  let finishSend!: () => void, finishOlderRead!: (result: Message[]) => void;
+  let holdNextRead = false, clientMessageId = '';
+  const fallback = vi.mocked(call).getMockImplementation()!;
+  vi.mocked(call).mockImplementation(async (command, args={}) => {
+    if (command === 'send_chat_message') { clientMessageId = String(args.clientMessageId); await new Promise<void>(resolve => { finishSend = resolve; }); return data.sessions[0]; }
+    if (command === 'list_messages' && holdNextRead) { holdNextRead = false; return new Promise<Message[]>(resolve => { finishOlderRead = resolve; }); }
+    return fallback(command,args);
+  });
+  await render(); await type('用户应当一直可见'); await send();
+  holdNextRead = true;
+  await act(async () => { notify({method:'turn/started',params:{threadId:'native',turn:{id:'t'}}}); });
+  messages = [{id:'saved-user',seq:1,sessionId:'chat',role:'user',text:'用户应当一直可见',kind:'userMessage',data:{clientMessageId}}];
+  await act(async () => { finishSend(); await new Promise(resolve => setTimeout(resolve,30)); });
+  const bubble = container.querySelector('[aria-label="你的消息"]')!;
+  await act(async () => finishOlderRead([]));
+  expect(container.querySelectorAll('[aria-label="你的消息"]')).toHaveLength(1);
+  expect(container.querySelector('[aria-label="你的消息"]')).toBe(bubble);
+  expect(bubble.textContent).toContain('用户应当一直可见');
+});
+
+it('does not turn an accepted send into a retry draft when the subsequent history refresh fails', async () => {
+  localStorage.setItem('supercode.session','chat');
+  data.sessions = [{id:'chat',projectId:'existing',title:'刷新失败',agent:'claude',connectionId:'api:claude',model:'test-model',nativeId:'native',status:'idle',turnId:null,updatedAt:1}];
+  let failNextRead = false;
+  const fallback = vi.mocked(call).getMockImplementation()!;
+  vi.mocked(call).mockImplementation(async (command,args={}) => {
+    if (command === 'send_chat_message') { messages = [{id:'saved-user',seq:1,sessionId:'chat',role:'user',text:String(args.text),kind:'userMessage',data:{clientMessageId:args.clientMessageId}}]; failNextRead = true; return data.sessions[0]; }
+    if (command === 'list_messages' && failNextRead) { failNextRead = false; throw '读取失败'; }
+    return fallback(command,args);
+  });
+  await render(); await type('已经发送的消息'); await send();
+  expect(container.querySelectorAll('[aria-label="你的消息"]')).toHaveLength(1);
+  expect(container.querySelector('[aria-label="你的消息"]')?.textContent).toContain('已经发送的消息');
+  expect(container.querySelector<HTMLTextAreaElement>('.composer textarea')?.value).toBe('');
+});
+it('shows persisted context tokens and keeps live and completed usage visible without a model capacity', async () => {
+  localStorage.setItem('supercode.session', 'context-chat');
+  data.sessions = [{ id: 'context-chat', projectId: 'existing', title: '上下文测试', agent: 'claude', connectionId: 'api:claude', model: 'test-model', nativeId: 'native-context', status: 'running', turnId: 'turn-context', updatedAt: 1 }];
+  let tokens = 12345;
+  const fallback = vi.mocked(call).getMockImplementation()!;
+  vi.mocked(call).mockImplementation(async (command, args) => command === 'get_usage' ? { records: [{ data: { total: {}, last: {}, contextTokens: tokens, cumulative: false } }] } : fallback(command, args));
+  await render();
+  expect(container.querySelector('.usage-trigger')?.textContent).toBe('上下文 12.3K');
+  tokens = 23456;
+  await act(async () => notify({ method: 'thread/tokenUsage/updated', params: { threadId: 'native-context', turnId: 'turn-context', tokenUsage: { total: {}, last: {}, contextTokens: tokens, cumulative: false } } }));
+  expect(container.querySelector('.usage-trigger')?.textContent).toBe('上下文 23.5K');
+  await act(async () => { notify({ method: 'turn/completed', params: { threadId: 'native-context', turn: { id: 'turn-context', status: 'completed' } } }); await new Promise(resolve => setTimeout(resolve, 30)); });
+  expect(container.querySelector('.usage-trigger')?.textContent).toBe('上下文 23.5K');
+});
+it('does not let a delayed usage load overwrite newer live context on a slow device', async () => {
+  localStorage.setItem('supercode.session', 'slow-context');
+  data.sessions = [{ id: 'slow-context', projectId: 'existing', title: '上下文测试', agent: 'claude', connectionId: 'api:claude', model: 'test-model', nativeId: 'native-context', status: 'running', turnId: 'turn-context', updatedAt: 1 }];
+  let resolve!: (value: unknown) => void;
+  const pending = new Promise(done => { resolve = done; });
+  const fallback = vi.mocked(call).getMockImplementation()!;
+  vi.mocked(call).mockImplementation(async (command, args) => command === 'get_usage' ? pending : fallback(command, args));
+  await render();
+  await act(async () => notify({ method: 'thread/tokenUsage/updated', params: { threadId: 'native-context', tokenUsage: { total: {}, last: {}, contextTokens: 23456 } } }));
+  await act(async () => { resolve({ records: [{ data: { total: {}, last: {}, contextTokens: 12345 } }] }); await pending; });
+  expect(container.querySelector('.usage-trigger')?.textContent).toBe('上下文 23.5K');
+});
 it('loads official models locally on startup, reuses the result, and explicitly refreshes without a CLI', async () => {
   localStorage.setItem('supercode.session','official-chat');
   const official = { id:'official', agent:'codex', name:'ChatGPT', officialAccount:true, model:'old', models:['old','older','oldest'], current:true, hasCredential:false };
@@ -133,6 +280,31 @@ it('shows turn changes above the composer while running and preserves the separa
   await act(async()=>{dock.querySelector<HTMLButtonElement>('[role="menuitem"]')!.click();await vi.dynamicImportSettled();});
   expect(container.querySelector('[aria-label="代码差异"] .change-code-line.added code')?.textContent).toBe('current');
 });
+it('hides the live changes dock and collapses the process as soon as completion arrives, even with stale history', async () => {
+  localStorage.setItem('supercode.session','chat');
+  data.sessions=[{id:'chat',projectId:'existing',title:'完成折叠',agent:'claude',connectionId:'api:claude',model:null,status:'running',nativeId:'native',turnId:'t',updatedAt:1}];
+  const diff='diff --git a/live.ts b/live.ts\n@@ -0,0 +1 @@\n+new';
+  messages=mergeEvent([{id:'u',seq:1,sessionId:'chat',role:'user',kind:'userMessage',text:'编辑文件',data:{}}], {method:'turn/started',params:{turn:{id:'t'}}}, 'chat');
+  messages.push(
+    {id:'progress',seq:3,sessionId:'chat',role:'assistant',kind:'agentMessage',text:'先检查文件',data:{turnId:'t',status:'completed'}},
+    {id:'final',seq:4,sessionId:'chat',role:'assistant',kind:'agentMessage',text:'修改完成',data:{turnId:'t',status:'completed'}},
+    {id:'diff-t',seq:5,sessionId:'chat',role:'activity',kind:'turnDiff',text:diff,data:{turnId:'t',status:'completed'}});
+  messages=messages.map((message,index)=>({...message,seq:index + 1}));
+  await render(); await act(async()=>{await vi.dynamicImportSettled();});
+  expect(container.querySelector('.turn-change-dock')).not.toBeNull();
+  expect(container.querySelector('.turn-live-content')?.textContent).toContain('先检查文件');
+  // Both IPC reads deliberately remain at their pre-completion snapshots.
+  await act(async()=>{notify({method:'turn/completed',params:{threadId:'native',turn:{id:'t',status:'completed'}}});await new Promise(resolve=>setTimeout(resolve,30));await vi.dynamicImportSettled();});
+  expect(container.querySelector('.composer-area .turn-change-dock')).toBeNull();
+  expect(container.querySelector('.turn-process-toggle')?.getAttribute('aria-expanded')).toBe('false');
+  expect(container.querySelector('.turn-process-content')).toBeNull();
+  expect(container.querySelector('.turn-final-result')?.textContent).toContain('修改完成');
+  expect(container.querySelector('[aria-label="本轮文件变更"]')?.textContent).toContain('已编辑 1 个文件');
+  await act(async()=>container.querySelector<HTMLButtonElement>('.turn-process-toggle')!.click());
+  expect(container.querySelector('.turn-process-content')?.textContent).toContain('先检查文件');
+  expect(container.querySelector('.composer-area .turn-change-dock')).toBeNull();
+});
+
 it('reloads persisted adapter edit snapshots during a turn without waiting for completion', async () => {
   localStorage.setItem('supercode.session','chat');
   data.sessions=[{id:'chat',projectId:'existing',title:'实时编辑',agent:'claude',connectionId:'api:claude',model:null,status:'running',nativeId:'native',turnId:'t',updatedAt:1}];
@@ -191,7 +363,6 @@ it('docks questions above the composer while keeping approvals in the conversati
   expect(container.querySelector<HTMLTextAreaElement>('.composer textarea')?.style.height).toBe('28px');
   expect(dock.compareDocumentPosition(container.querySelector('.composer')!) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
   await act(async () => dock.querySelector<HTMLButtonElement>('.question-request-option')!.click());
-  await act(async () => dock.querySelector<HTMLButtonElement>('.question-request-send')!.click());
   expect(call).toHaveBeenCalledWith('respond_request', { id: 'question', result: { answers: { '0': { answers: ['正常'] } } } });
   expect(container.querySelector('.question-dock')).toBeNull();
   expect(container.querySelector('.composer textarea')?.getAttribute('rows')).toBe('2');
@@ -352,6 +523,50 @@ it('displays models and platform allowance only for the current configured suppl
   expect(container.querySelector('.model-chip')?.textContent).toContain('test-model');
   expect(container.querySelector('[data-testid="platform-allowance"]')).not.toBeNull();
   expect(call).toHaveBeenCalledWith('get_model_source',expect.objectContaining({agent:'claude',connectionId:'api:claude',sessionId:null}));
+});
+
+it('selects an inline skill and toggles planning without losing the message draft or opening settings', async () => {
+  localStorage.setItem('supercode.agent', 'claude'); localStorage.setItem('supercode.project', 'inline-skills');
+  data.projects = [{ id: 'inline-skills', name: '技能项目', path: 'D:/skills-project' }];
+  const original = vi.mocked(call).getMockImplementation()!;
+  vi.mocked(call).mockImplementation(async (command, args) => command === 'list_local_skills'
+    ? { skills: [{ name: 'design', description: '界面设计', path: 'C:/skills/design/SKILL.md' }] } : original(command, args));
+  await render(); await type('保留这段消息');
+  await act(async () => container.querySelector<HTMLButtonElement>('[aria-label="添加附件"]')!.click());
+  const skill = [...container.querySelectorAll<HTMLButtonElement>('.add-skill-row')].find(button => button.textContent?.includes('design'))!;
+  await act(async () => skill.click());
+  expect(container.querySelector('.composer textarea')?.getAttribute('aria-label')).toBe('消息');
+  expect(container.querySelector<HTMLTextAreaElement>('.composer textarea')!.value).toBe('保留这段消息');
+  expect(container.querySelector('[aria-label="已选择技能"]')?.textContent).toContain('Design');
+  expect(container.querySelector('.settings-page')).toBeNull();
+  await act(async () => container.querySelector<HTMLButtonElement>('[aria-label="添加附件"]')!.click());
+  await act(async () => container.querySelector<HTMLButtonElement>('.add-actions [role="menuitemcheckbox"]')!.click());
+  expect(container.querySelector('[aria-label="权限模式"]')?.textContent).toContain('计划模式');
+  expect(container.querySelector<HTMLTextAreaElement>('.composer textarea')!.value).toBe('保留这段消息');
+  expect(call).not.toHaveBeenCalledWith('create_session', expect.anything());
+  expect(call).not.toHaveBeenCalledWith('send_chat_message', expect.anything());
+});
+
+it('starts an explicitly submitted native Codex goal with current permissions while preserving the normal draft', async () => {
+  localStorage.setItem('supercode.agent', 'codex');
+  data.profiles = [{ ...data.profiles[0], agent: 'codex', id: 'api:codex' }];
+  const original = vi.mocked(call).getMockImplementation()!;
+  vi.mocked(call).mockImplementation(async (command, args = {}) => {
+    if (command === 'execute_agent_command') return { text: '目标已设置', session: data.sessions[0] };
+    return original(command, args);
+  });
+  await render(); await type('尚未发送的草稿');
+  await act(async () => container.querySelector<HTMLButtonElement>('[aria-label="添加附件"]')!.click());
+  const goal = container.querySelector<HTMLButtonElement>('[data-goal-entry]')!;
+  await act(async () => goal.click());
+  expect(call).not.toHaveBeenCalledWith('execute_agent_command', expect.anything());
+  const input = container.querySelector<HTMLTextAreaElement>('.add-goal-panel textarea')!;
+  await act(async () => { Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')!.set!.call(input, 'clear'); input.dispatchEvent(new Event('input', { bubbles: true })); });
+  await act(async () => { container.querySelector<HTMLButtonElement>('.add-goal-actions button')!.click(); await new Promise(resolve => setTimeout(resolve, 30)); });
+  expect(call).toHaveBeenCalledWith('execute_agent_command', { sessionId: 'standalone', command: 'goal-create', argument: 'clear', permissionMode: 'ask' });
+  expect(container.querySelector<HTMLTextAreaElement>('.composer textarea')!.value).toBe('尚未发送的草稿');
+  expect(container.querySelector('.command-feedback')?.textContent).toContain('目标已设置');
+  expect(call).not.toHaveBeenCalledWith('send_chat_message', expect.anything());
 });
 
 it('ignores an earlier supplier response after switching to an unconfigured chat', async () => {

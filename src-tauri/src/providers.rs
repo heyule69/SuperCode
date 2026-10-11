@@ -202,8 +202,12 @@ pub async fn get_model_source(
     app: AppHandle,
 ) -> Result<Value, String> {
     let route = crate::chat_connection::available_route(
-        &app, &agent, session_id.as_deref(), connection_id.as_deref(),
-    ).await?;
+        &app,
+        &agent,
+        session_id.as_deref(),
+        connection_id.as_deref(),
+    )
+    .await?;
     Ok(crate::chat_connection::model_source(route.as_ref(), &agent))
 }
 
@@ -405,14 +409,20 @@ fn make_profile(mut s: Settings, previous: Option<&Profile>) -> Result<Profile, 
         return Err("API 协议无效".into());
     }
     if (s.agent == "codex" && s.protocol != "responses")
-        || (s.agent == "claude" && s.protocol != "anthropic" && !(s.protocol == "chat" && previous.is_some_and(|p| p.agent == "claude" && p.config["protocol"] == s.protocol)))
+        || (s.agent == "claude"
+            && s.protocol != "anthropic"
+            && !(s.protocol == "chat"
+                && previous
+                    .is_some_and(|p| p.agent == "claude" && p.config["protocol"] == s.protocol)))
         || !matches!(s.agent.as_str(), "claude" | "codex" | "opencode" | "pi")
     {
         return Err(
             "Claude Code 新连接需要 Anthropic Messages；Codex 需要 OpenAI Responses".into(),
         );
     }
-    if s.official && previous.is_none() { return Err("官方账号请通过官方登录添加".into()); }
+    if s.official && previous.is_none() {
+        return Err("官方账号请通过官方登录添加".into());
+    }
     if previous.is_some_and(|p| p.agent != s.agent) {
         return Err("编辑连接时不能更换 Agent，请新增连接".into());
     }
@@ -462,6 +472,17 @@ fn make_profile(mut s: Settings, previous: Option<&Profile>) -> Result<Profile, 
     }
     let base = validate_url(&s.base_url)?;
     let mut config = json!({"providerId":s.provider_id,"plan":s.plan,"protocol":s.protocol,"baseUrl":base,"model":s.model,"models":models,"source":"manual"});
+    // Editing a credential or model list must retain native model capabilities
+    // and request headers imported from CC Switch on the same API route.
+    if let Some(previous) =
+        previous.filter(|p| p.config["protocol"] == s.protocol && p.config["baseUrl"] == base)
+    {
+        for field in ["opencodeProvider", "piProvider"] {
+            if let Some(native) = previous.config.get(field) {
+                config[field] = native.clone();
+            }
+        }
+    }
     if s.protocol == "anthropic" {
         // Explicit IDs; aliases are used only by legacy CLI subagent internals, never by the selector.
         config["env"] = json!({"ANTHROPIC_BASE_URL":base,"ANTHROPIC_AUTH_TOKEN":secret,"ANTHROPIC_MODEL":s.model,"CLAUDE_CODE_SUBAGENT_MODEL":s.model,"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC":"1"});
@@ -479,8 +500,15 @@ fn make_profile(mut s: Settings, previous: Option<&Profile>) -> Result<Profile, 
         // changing the address to a gateway must not inherit that restriction.
         let preset = bundled_catalog().as_array().and_then(|providers| {
             providers.iter().find(|p| p["id"] == s.provider_id)?["presets"]
-                .as_array()?.iter().find(|p| p["id"] == s.plan && p["protocol"] == "responses"
-                    && p["baseUrl"].as_str().is_some_and(|url| url.trim_end_matches('/') == base.trim_end_matches('/')))
+                .as_array()?
+                .iter()
+                .find(|p| {
+                    p["id"] == s.plan
+                        && p["protocol"] == "responses"
+                        && p["baseUrl"].as_str().is_some_and(|url| {
+                            url.trim_end_matches('/') == base.trim_end_matches('/')
+                        })
+                })
         });
         if preset.is_some_and(|p| p["codex"]["webSearch"] == "disabled") {
             table.insert("web_search".into(), toml::Value::String("disabled".into()));
@@ -556,7 +584,8 @@ pub async fn delete_provider_profile(id: String, app: AppHandle) -> Result<(), S
 pub async fn fetch_provider_models(id: String, app: AppHandle) -> Result<Vec<String>, String> {
     let p = find(&app, &id)?;
     if p.is_official() {
-        let value = crate::commands::list_models(Some(p.agent), None, Some(p.id), Some(true), app).await?;
+        let value =
+            crate::commands::list_models(Some(p.agent), None, Some(p.id), Some(true), app).await?;
         if let Some(warning) = value["warning"].as_str() {
             return Err(warning.into());
         }
@@ -621,7 +650,10 @@ pub async fn test_provider_connection(id: String, app: AppHandle) -> Result<Valu
     let p = find(&app, &id)?;
     let s = settings(&p);
     if s.official {
-        let status = app.state::<crate::accounts::Accounts>().get_for(&p.agent, p.account_id(), true, &app).await?;
+        let status = app
+            .state::<crate::accounts::Accounts>()
+            .get_for(&p.agent, p.account_id(), true, &app)
+            .await?;
         if status["loggedIn"] != true {
             return Err("尚未检测到官方登录，请在供应商页登录官方账号".into());
         }
@@ -761,6 +793,40 @@ async fn test_coding_plan(app: &AppHandle, profile: &Profile) -> Result<Value, S
 mod tests {
     use super::*;
     #[test]
+    fn editing_imported_native_credentials_retains_metadata_only_on_the_same_route() {
+        for (agent, raw, native) in [
+            (
+                "opencode",
+                json!({"npm":"@ai-sdk/openai","options":{"baseURL":"https://api.example/v1","apiKey":"old-key","headers":{"X-Project":"project"}},"models":{"m":{"limit":{"context":200000}}}}),
+                "opencodeProvider",
+            ),
+            (
+                "pi",
+                json!({"baseUrl":"https://api.example/v1","api":"openai-completions","apiKey":"old-key","models":[{"id":"m","contextWindow":32768}]}),
+                "piProvider",
+            ),
+        ] {
+            let profile = Profile {
+                id: format!("{agent}:a"),
+                agent: agent.into(),
+                name: "导入连接".into(),
+                config: crate::ccswitch::sanitize_provider(agent, "a", raw).unwrap(),
+            };
+            let mut edit = settings(&profile);
+            edit.api_key = Some("new-key".into());
+            let saved = make_profile(edit, Some(&profile)).unwrap();
+            assert_eq!(key(&saved.config), Some("new-key"));
+            assert_eq!(saved.config[native], profile.config[native]);
+            let mut reroute = settings(&saved);
+            reroute.base_url = "https://new.example/v1".into();
+            assert!(make_profile(reroute, Some(&saved))
+                .unwrap()
+                .config
+                .get(native)
+                .is_none());
+        }
+    }
+    #[test]
     fn model_source_identifies_imported_provider_without_exposing_configuration() {
         for base in [
             "https://api.kimi.com/coding/",
@@ -898,40 +964,76 @@ mod tests {
     }
     #[test]
     fn new_provider_protocols_are_agent_specific_and_native_accounts_cannot_be_forged() {
-        let settings = |agent: &str, protocol: &str| serde_json::from_value::<Settings>(json!({
+        let settings = |agent: &str, protocol: &str| {
+            serde_json::from_value::<Settings>(json!({
             "name":"连接","agent":agent,"providerId":"custom","plan":protocol,"protocol":protocol,
             "baseUrl":"https://example.test/v1","model":"test-model","models":["test-model"],"apiKey":"test-key"
-        })).unwrap();
+        })).unwrap()
+        };
         for agent in ["claude", "codex", "opencode", "pi"] {
             for protocol in ["anthropic", "responses", "chat"] {
-                let allowed = match agent { "claude" => protocol == "anthropic", "codex" => protocol == "responses", _ => true };
-                assert_eq!(make_profile(settings(agent, protocol), None).is_ok(), allowed, "{agent}/{protocol}");
+                let allowed = match agent {
+                    "claude" => protocol == "anthropic",
+                    "codex" => protocol == "responses",
+                    _ => true,
+                };
+                assert_eq!(
+                    make_profile(settings(agent, protocol), None).is_ok(),
+                    allowed,
+                    "{agent}/{protocol}"
+                );
             }
         }
-        let mut fake_official = settings("claude", "anthropic"); fake_official.official = true;
+        let mut fake_official = settings("claude", "anthropic");
+        fake_official.official = true;
         assert!(make_profile(fake_official, None).is_err());
-        let legacy = Profile { id: "legacy-chat".into(), agent: "claude".into(), name: "旧连接".into(), config: json!({"protocol":"chat","baseUrl":"https://example.test/v1","apiKey":"test-key"}) };
+        let legacy = Profile {
+            id: "legacy-chat".into(),
+            agent: "claude".into(),
+            name: "旧连接".into(),
+            config: json!({"protocol":"chat","baseUrl":"https://example.test/v1","apiKey":"test-key"}),
+        };
         assert!(make_profile(settings("claude", "chat"), Some(&legacy)).is_ok());
     }
     #[test]
     fn all_bundled_responses_presets_generate_codex_api_routes_without_official_login() {
         for provider in bundled_catalog().as_array().unwrap() {
-            for preset in provider["presets"].as_array().unwrap().iter()
-                .filter(|p| p["protocol"] == "responses" && p["baseUrl"] != "") {
+            for preset in provider["presets"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|p| p["protocol"] == "responses" && p["baseUrl"] != "")
+            {
                 let model = preset["models"][0].as_str().unwrap_or("model-from-account");
                 let s = serde_json::from_value::<Settings>(json!({
                     "name":provider["name"], "agent":"codex", "providerId":provider["id"], "plan":preset["id"],
                     "protocol":"responses", "baseUrl":preset["baseUrl"], "model":model, "models":[model], "apiKey":"test-key"
                 })).unwrap();
                 let profile = make_profile(s, None).unwrap();
-                assert!(!profile.is_official(), "{} / {}", provider["id"], preset["id"]);
-                let table = toml::from_str::<toml::Table>(profile.config["config"].as_str().unwrap()).unwrap();
+                assert!(
+                    !profile.is_official(),
+                    "{} / {}",
+                    provider["id"],
+                    preset["id"]
+                );
+                let table =
+                    toml::from_str::<toml::Table>(profile.config["config"].as_str().unwrap())
+                        .unwrap();
                 let route = &table["model_providers"]["supercode_api"];
                 assert_eq!(route["wire_api"].as_str(), Some("responses"));
-                assert_eq!(route["base_url"].as_str().unwrap().trim_end_matches('/'), preset["baseUrl"].as_str().unwrap().trim_end_matches('/'));
-                assert_eq!(route["env_key"].as_str(), Some("SUPERCODE_PROVIDER_API_KEY"));
+                assert_eq!(
+                    route["base_url"].as_str().unwrap().trim_end_matches('/'),
+                    preset["baseUrl"].as_str().unwrap().trim_end_matches('/')
+                );
+                assert_eq!(
+                    route["env_key"].as_str(),
+                    Some("SUPERCODE_PROVIDER_API_KEY")
+                );
                 assert_eq!(route["requires_openai_auth"].as_bool(), Some(false));
-                assert!(!profile.config["config"].as_str().unwrap().contains("test-key"));
+                assert!(!profile.config["config"]
+                    .as_str()
+                    .unwrap()
+                    .contains("test-key"));
                 let roundtrip = settings(&profile);
                 assert_eq!(roundtrip.agent, "codex");
                 assert_eq!(roundtrip.provider_id, provider["id"].as_str().unwrap());
@@ -941,12 +1043,19 @@ mod tests {
     }
     #[test]
     fn hy3_search_requirement_is_endpoint_specific() {
-        for (base, disabled) in [("https://tokenhub.tencentmaas.com/v1/", true), ("https://gateway.example/v1", false)] {
+        for (base, disabled) in [
+            ("https://tokenhub.tencentmaas.com/v1/", true),
+            ("https://gateway.example/v1", false),
+        ] {
             let s = serde_json::from_value::<Settings>(json!({"name":"Hy3", "agent":"codex", "providerId":"tencent", "plan":"tokenhub-responses",
                 "protocol":"responses", "baseUrl":base, "model":"hy3", "models":["hy3"], "apiKey":"test-key"})).unwrap();
             let profile = make_profile(s, None).unwrap();
-            let table = toml::from_str::<toml::Table>(profile.config["config"].as_str().unwrap()).unwrap();
-            assert_eq!(table.get("web_search").and_then(toml::Value::as_str), disabled.then_some("disabled"));
+            let table =
+                toml::from_str::<toml::Table>(profile.config["config"].as_str().unwrap()).unwrap();
+            assert_eq!(
+                table.get("web_search").and_then(toml::Value::as_str),
+                disabled.then_some("disabled")
+            );
         }
     }
 }

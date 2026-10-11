@@ -127,6 +127,7 @@ async fn verify(app: &AppHandle) -> Result<Value, String> {
             Some(permission.into()),
             None,
             None,
+            None,
             app.clone(),
         )
         .await?;
@@ -141,6 +142,7 @@ async fn verify(app: &AppHandle) -> Result<Value, String> {
             current.model.clone(),
             permission == "read",
             Some(permission.into()),
+            None,
             None,
             None,
             app.clone(),
@@ -199,6 +201,7 @@ async fn verify(app: &AppHandle) -> Result<Value, String> {
             current.model.clone(),
             permission == "read",
             Some(permission.into()),
+            None,
             None,
             None,
             app.clone(),
@@ -349,6 +352,7 @@ async fn verify(app: &AppHandle) -> Result<Value, String> {
                     Some(permission.into()),
                     None,
                     None,
+                    None,
                     app.clone(),
                 )
                 .await?;
@@ -395,6 +399,7 @@ async fn verify(app: &AppHandle) -> Result<Value, String> {
                     current.model.clone(),
                     permission == "read",
                     Some(permission.into()),
+                    None,
                     None,
                     None,
                     app.clone(),
