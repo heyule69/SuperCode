@@ -103,6 +103,8 @@ impl TurnLifecycle {
 #[derive(Default)]
 pub struct Runtime {
     pub client: Mutex<Option<Arc<Client>>>,
+    sessions: crate::session_runtimes::Sessions<Runtime>,
+    startup: Mutex<()>,
     account_query: Mutex<()>,
     epoch: Arc<AtomicU64>,
 }
@@ -122,12 +124,28 @@ pub struct Client {
     project: Option<std::path::PathBuf>,
     pub loaded_threads: Mutex<Vec<String>>,
     pub turn_settings: Mutex<Option<(String, String, String)>>,
+    request_namespace: String,
     pub planning_supported: Mutex<Option<bool>>,
     turns: Arc<TurnLifecycle>,
 }
 
 impl Runtime {
+    pub fn for_session(&self, id: &str) -> Arc<Runtime> { self.sessions.get(id) }
+    pub async fn session_client(&self, id: &str) -> Option<Arc<Client>> {
+        self.sessions.existing(id)?.client.lock().await.clone()
+    }
+    pub async fn clients(&self) -> Vec<Arc<Client>> {
+        let mut clients = self.client.lock().await.iter().cloned().collect::<Vec<_>>();
+        for (_, runtime) in self.sessions.entries() {
+            clients.extend(runtime.client.lock().await.iter().cloned());
+        }
+        clients
+    }
     pub async fn shutdown(&self) {
+        for (_, runtime) in self.sessions.entries() { runtime.shutdown_local().await; }
+        self.shutdown_local().await;
+    }
+    async fn shutdown_local(&self) {
         self.epoch.fetch_add(1, Ordering::Relaxed);
         let client = self.client.lock().await.take();
         if let Some(client) = client {
@@ -145,13 +163,9 @@ impl Runtime {
     }
     /// Allowance queries reuse the matching live client without starting/switching an agent.
     pub async fn existing_account_limits(&self, routing: u64) -> Option<Value> {
-        let client = self
-            .client
-            .lock()
-            .await
-            .as_ref()
+        let client = self.clients().await.into_iter()
             .filter(|c| c.routing == routing && c.alive.load(Ordering::Relaxed))
-            .cloned()?;
+            .next()?;
         timeout(
             Duration::from_secs(10),
             client.request("account/rateLimits/read", json!({})),
@@ -161,9 +175,7 @@ impl Runtime {
         .ok()
     }
     pub async fn clear_for_agent_switch(&self) {
-        let mut slot = self.client.lock().await;
-        self.epoch.fetch_add(1, Ordering::Relaxed);
-        slot.take();
+        self.shutdown().await;
     }
     pub async fn get(&self, app: &AppHandle) -> Result<Arc<Client>, String> {
         self.get_for_session(app, None).await
@@ -181,6 +193,15 @@ impl Runtime {
         session_id: Option<&str>,
         connection_id: Option<&str>,
     ) -> Result<Arc<Client>, String> {
+        if let Some(id) = session_id {
+            return self.for_session(id).get_context(app, session_id, connection_id).await;
+        }
+        self.get_context(app, None, connection_id).await
+    }
+    async fn get_context(
+        &self, app: &AppHandle, session_id: Option<&str>, connection_id: Option<&str>,
+    ) -> Result<Arc<Client>, String> {
+        let _startup = self.startup.lock().await;
         crate::desktop_lifecycle::ensure_running(app)?;
         let route = app.state::<AppState>().store.route_with_connection(
             "codex",
@@ -211,14 +232,10 @@ impl Runtime {
         }) {
             return Ok(client.clone());
         }
-        let running = app.state::<AppState>().store.running()?;
-        let selected_is_starting = session_id.is_some_and(|id| {
-            app.state::<AppState>()
-                .store
-                .session(id)
-                .is_ok_and(|s| s.status == "starting")
+        let selected_is_active = session_id.is_some_and(|id| {
+            app.state::<AppState>().store.session(id).is_ok_and(|s| matches!(s.status.as_str(), "running" | "waiting"))
         });
-        if context_is_busy(running, selected_is_starting)
+        if selected_is_active
             && slot
                 .as_ref()
                 .is_some_and(|c| c.alive.load(Ordering::Relaxed))
@@ -235,14 +252,17 @@ impl Runtime {
                 &route,
                 tool_configuration,
                 project.as_deref(),
+                session_id.map(str::to_owned),
             )
             .await?,
         );
-        client.request("initialize",json!({"clientInfo":{"name":"supercode","title":"SuperCode","version":"0.1.0"},"capabilities":{"experimentalApi":true}})).await?;
-        client
-            .write(json!({"method":"initialized","params":{}}))
-            .await?;
         *slot = Some(client.clone());
+        drop(slot);
+        let initialized = async {
+            client.request("initialize",json!({"clientInfo":{"name":"supercode","title":"SuperCode","version":"0.1.0"},"capabilities":{"experimentalApi":true}})).await?;
+            client.write(json!({"method":"initialized","params":{}})).await
+        }.await;
+        if let Err(error) = initialized { self.shutdown_local().await; return Err(error); }
         Ok(client)
     }
 
@@ -250,10 +270,24 @@ impl Runtime {
         if app.state::<AppState>().store.running()? != 0 {
             return Err("仍有任务运行或等待审批，请先停止任务".into());
         }
-        let mut slot = self.client.lock().await;
-        self.epoch.fetch_add(1, Ordering::Relaxed);
-        slot.take();
+        self.shutdown().await;
         Ok(())
+    }
+
+    pub async fn release_idle(&self, app: &AppHandle) {
+        for (id, runtime) in self.sessions.entries() {
+            if app.state::<AppState>().store.session(&id).is_ok_and(|s| matches!(s.status.as_str(), "starting" | "running" | "waiting")) { continue; }
+            runtime.release_idle_local().await;
+            if runtime.client.lock().await.is_none() { self.sessions.remove_idle(&id, &runtime); }
+        }
+        self.release_idle_local().await;
+    }
+    async fn release_idle_local(&self) {
+        let mut slot = self.client.lock().await;
+        if slot.as_ref().is_some_and(|c| (storage::now() as u64).saturating_sub(c.last_used.load(Ordering::Relaxed)) >= 300) {
+            self.epoch.fetch_add(1, Ordering::Relaxed);
+            slot.take();
+        }
     }
 }
 
@@ -265,7 +299,10 @@ impl Client {
         route: &crate::session_config::Route,
         tool_configuration: u64,
         project: Option<&std::path::Path>,
+        session_id: Option<String>,
     ) -> Result<Self, String> {
+        crate::runtime_diagnostics::register_secrets(&app, &route.config);
+        if let Some(profile)=&route.profile { crate::runtime_diagnostics::register_secrets(&app, &profile.config); }
         let executable = crate::agents::resolve(&app, "codex")?.program;
         let mut overrides =
             process::codex_config_overrides(app.state::<AppState>().store.load_mcp()?)?;
@@ -301,6 +338,8 @@ impl Client {
         if let Some(key) = profile.as_ref().and_then(|p| p.config["apiKey"].as_str()) {
             command.env("SUPERCODE_PROVIDER_API_KEY", key);
         }
+        if let Some(id) = &session_id { command.env("SUPERCODE_SESSION_ID", id); }
+        else { command.env_remove("SUPERCODE_SESSION_ID"); }
         let mut child = command
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
@@ -309,6 +348,7 @@ impl Client {
             .map_err(|e| format!("Codex 启动失败：{e}"))?;
         let job = process::JobGuard::attach(&child)?;
         let pid = child.id().ok_or("Codex 进程已退出")?;
+        crate::runtime_diagnostics::record(&app, session_id.as_deref(), "agent_process_started", json!({"source":"codex","pid":pid}));
         let input = child.stdin.take().ok_or("无法连接 Codex stdin")?;
         let output = child.stdout.take().ok_or("无法连接 Codex stdout")?;
         let stderr = child.stderr.take().ok_or("无法连接 Codex stderr")?;
@@ -324,6 +364,9 @@ impl Client {
         let reader_app = app.clone();
         let turns = Arc::new(TurnLifecycle::default());
         let reader_turns = turns.clone();
+        let request_namespace = format!("codex:{}:", uuid::Uuid::new_v4());
+        let reader_namespace = request_namespace.clone();
+        let log_session = session_id.clone();
         tauri::async_runtime::spawn(async move {
             let mut reader = BufReader::new(output);
             loop {
@@ -331,15 +374,14 @@ impl Client {
                     Ok(Some(frame)) => frame,
                     Ok(None) => break,
                     Err(error) => {
-                        let _ = reader_app.emit("runtime-log", error);
+                        crate::runtime_diagnostics::message(&reader_app, session_id.as_deref(), "codex", "error", "protocol_read_error", &error);
                         break;
                     }
                 };
-                let message: Value = match serde_json::from_slice(&frame) {
+                let mut message: Value = match serde_json::from_slice(&frame) {
                     Ok(value) => value,
                     Err(error) => {
-                        let _ =
-                            reader_app.emit("runtime-log", format!("Codex 协议格式异常：{error}"));
+                        crate::runtime_diagnostics::message(&reader_app, session_id.as_deref(), "codex", "error", "protocol_parse_error", &error.to_string());
                         continue;
                     }
                 };
@@ -348,6 +390,8 @@ impl Client {
                     if let Some(id) = message["id"].as_u64() {
                         if let Some(sender) = reader_pending.lock().await.remove(&id) {
                             let result = if message.get("error").is_some() {
+                                crate::runtime_diagnostics::record(&reader_app,session_id.as_deref(),"agent_request_error",
+                                    json!({"source":"codex","code":message["error"]["code"],"message":message["error"]["message"]}));
                                 Err(message["error"]["message"]
                                     .as_str()
                                     .unwrap_or("Codex 请求失败")
@@ -360,6 +404,8 @@ impl Client {
                     }
                 } else {
                     reader_turns.observe(&message).await;
+                    if let Some(id) = &session_id { message["params"]["appSessionId"] = id.clone().into(); }
+                    namespace_request(&mut message, &reader_namespace);
                     if let Some(id) = message.get("id") {
                         reader_requests
                             .lock()
@@ -376,23 +422,39 @@ impl Client {
                 }
             }
             reader_alive.store(false, Ordering::Relaxed);
+            let exit_code = reader_child.lock().await.try_wait().ok().flatten().and_then(|s|s.code());
+            crate::runtime_diagnostics::record(&reader_app, session_id.as_deref(), "agent_process_output_closed", json!({"source":"codex","pid":pid,"exitCode":exit_code}));
             let _ = reader_child.lock().await.kill().await;
             for (_, sender) in reader_pending.lock().await.drain() {
                 let _ = sender.send(Err("Codex 连接已关闭，请重新发送消息".into()));
             }
             reader_requests.lock().await.clear();
             if epoch.load(Ordering::Relaxed) == generation {
-                reader_app.state::<AppState>().store.fail_active();
+                if let Some(id) = session_id {
+                    let state = reader_app.state::<AppState>();
+                    let active = state.store.session(&id).ok().is_some_and(|s| matches!(s.status.as_str(), "running" | "starting" | "waiting"));
+                    crate::runtime_diagnostics::record(&reader_app, Some(&id), "agent_connection_closed",
+                        json!({"active":active,"pid":pid,"exitCode":exit_code,"errorType":active.then_some("connection")}));
+                    if let Some(buffer) = state.activity.existing(&id) {
+                        if let Ok(mut activity) = buffer.lock() {
+                            for item in activity.finish("interrupted") {
+                                if let (Some(item_id), Some((role, text, kind, data))) = (item["id"].as_str(), protocol::item_message(&item)) {
+                                    let _ = state.store.save_message(item_id, &id, &role, &text, &kind, &data);
+                                }
+                            }
+                        }
+                        state.activity.remove_idle(&id, &buffer);
+                    }
+                    state.store.fail_session(&id);
+                    crate::outbox::kick(&reader_app);
+                    crate::desktop_lifecycle::refresh(&reader_app);
+                }
+                let _ = reader_app.emit("workspace-updated", ());
                 let _ = reader_app.emit("runtime-stopped", ());
             }
         });
         tauri::async_runtime::spawn(async move {
-            let mut reader = BufReader::new(stderr);
-            while let Ok(Some(frame)) = read_frame(&mut reader).await {
-                if let Ok(text) = String::from_utf8(frame) {
-                    let _ = app.emit("runtime-log", protocol::bounded(text.trim(), 4096));
-                }
-            }
+            crate::runtime_diagnostics::stderr(Some(app), log_session, "codex", stderr).await;
         });
         Ok(Self {
             input: Mutex::new(input),
@@ -400,6 +462,7 @@ impl Client {
             _job: job,
             pending,
             requests,
+            request_namespace,
             next: AtomicU64::new(1),
             alive,
             last_used,
@@ -480,10 +543,12 @@ impl Client {
         if !self.requests.lock().await.contains_key(&key) {
             return Err("该请求已结束，请刷新会话".into());
         }
+        let raw_id = id.as_str().and_then(|id| id.strip_prefix(&self.request_namespace)).ok_or("请求 ID 无效")?;
+        let raw_id: Value = serde_json::from_str(raw_id).map_err(|_| "请求 ID 无效")?;
         if result.is_null() {
-            self.write(json!({"id":id,"error":{"code":-32601,"message":"SuperCode does not support this request yet"}})).await?;
+            self.write(json!({"id":raw_id,"error":{"code":-32601,"message":"SuperCode does not support this request yet"}})).await?;
         } else {
-            self.write(json!({"id":id,"result":result})).await?;
+            self.write(json!({"id":raw_id,"result":result})).await?;
         }
         self.requests.lock().await.remove(&key);
         Ok(())
@@ -498,8 +563,13 @@ fn context_matches(
 ) -> bool {
     active_route == route && project.is_none_or(|path| active_project == Some(path))
 }
-fn context_is_busy(running: usize, selected_is_starting: bool) -> bool {
-    running > usize::from(selected_is_starting)
+fn namespace_request(message: &mut Value, namespace: &str) {
+    if let Some(id) = message.get("id").cloned() { message["id"] = format!("{namespace}{id}").into(); }
+    if message["method"] == "serverRequest/resolved" {
+        if let Some(id) = message["params"].get("requestId").cloned() {
+            message["params"]["requestId"] = format!("{namespace}{id}").into();
+        }
+    }
 }
 
 pub(crate) async fn read_frame<R: tokio::io::AsyncBufRead + Unpin>(
@@ -529,8 +599,14 @@ pub(crate) async fn read_frame<R: tokio::io::AsyncBufRead + Unpin>(
 }
 
 pub(crate) fn publish_event(app: &AppHandle, mut message: Value) {
+    if message["params"]["appSessionId"].is_null() {
+        if let Some(native) = message["params"]["threadId"].as_str() {
+            if let Ok(session) = app.state::<AppState>().store.for_native(native) { message["params"]["appSessionId"] = session.id.into(); }
+        }
+    }
     crate::media::normalize_event(app, &mut message);
     persist_event(app, &message);
+    crate::runtime_diagnostics::observe(app, &message);
     crate::desktop_control::observe(app, &message);
     crate::browser::observe(app, &message);
     if message["method"] == "turn/completed" {
@@ -570,7 +646,7 @@ pub(crate) fn persist_event(app: &AppHandle, message: &Value) {
     }
     if method == "turn/completed" {
         if let Ok(mut snapshots) = state.change_snapshots.lock() {
-            snapshots.clear();
+            snapshots.retain(|(owner, _), _| owner != &session.id);
         }
     }
     if method == "thread/tokenUsage/updated" {
@@ -618,7 +694,8 @@ pub(crate) fn persist_event(app: &AppHandle, message: &Value) {
         );
         return;
     }
-    let mut activity = match state.activity.lock() {
+    let session_activity = state.activity.get(&session.id);
+    let mut activity = match session_activity.lock() {
         Ok(a) => a,
         Err(_) => return,
     };
@@ -684,31 +761,23 @@ pub(crate) fn persist_event(app: &AppHandle, message: &Value) {
         ) || message.get("id").is_some()
         {
             drop(activity);
+            if method == "turn/completed" { state.activity.remove_idle(&session.id, &session_activity); }
             crate::desktop_lifecycle::refresh(app);
         }
     }
     if let Err(error) = result {
-        let _ = app.emit("runtime-log", format!("保存会话失败：{error}"));
+        crate::runtime_diagnostics::message(app, Some(&session.id), "storage", "error", "message_save_error", &error);
     }
 }
 
 pub async fn idle_watch(app: AppHandle) {
     loop {
         tokio::time::sleep(Duration::from_secs(30)).await;
+        crate::runtime_diagnostics::cleanup(&app);
         let state = app.state::<AppState>();
-        if state.store.running().unwrap_or(1) != 0 {
-            continue;
-        }
         state.claude.release_idle().await;
         state.native.release_idle().await;
-        let mut slot = state.runtime.client.lock().await;
-        if slot.as_ref().is_some_and(|c| {
-            (storage::now() as u64).saturating_sub(c.last_used.load(Ordering::Relaxed)) >= 300
-        }) {
-            state.runtime.epoch.fetch_add(1, Ordering::Relaxed);
-            slot.take();
-            let _ = app.emit("runtime-stopped", ());
-        }
+        state.runtime.release_idle(&app).await;
     }
 }
 
@@ -770,10 +839,20 @@ mod tests {
         assert!(!context_matches((1, 3), Some(a), (1, 4), Some(a)));
         // Inventory queries can reuse a matching live client without switching it.
         assert!(context_matches((1, 3), Some(a), (1, 3), None));
-        assert!(!context_is_busy(0, false));
-        assert!(!context_is_busy(1, true));
-        assert!(context_is_busy(1, false));
-        assert!(context_is_busy(2, true));
+    }
+    #[test]
+    fn request_ids_are_isolated_and_resolved_with_the_same_namespace() {
+        for raw in [json!(1), json!("one:two")] {
+            let mut a = json!({"method":"approval","id":raw});
+            let mut b = a.clone();
+            namespace_request(&mut a, "codex:a:");
+            namespace_request(&mut b, "codex:b:");
+            assert_ne!(a["id"], b["id"]);
+            assert_eq!(serde_json::from_str::<Value>(a["id"].as_str().unwrap().strip_prefix("codex:a:").unwrap()).unwrap(), raw);
+            let mut resolved = json!({"method":"serverRequest/resolved","params":{"requestId":raw}});
+            namespace_request(&mut resolved, "codex:a:");
+            assert_eq!(resolved["params"]["requestId"], a["id"]);
+        }
     }
     #[tokio::test]
     async fn jsonl_only_splits_at_lf_and_rejects_partial_frames() {

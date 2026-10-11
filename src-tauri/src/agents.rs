@@ -13,7 +13,7 @@ use std::{
     time::Duration,
 };
 use tauri::{AppHandle, Emitter, Manager};
-use tokio::{io::AsyncReadExt, sync::Mutex as AsyncMutex};
+use tokio::{io::AsyncReadExt, sync::RwLock};
 
 pub const IDS: [&str; 4] = ["codex", "claude", "opencode", "pi"];
 pub fn name(id: &str) -> &str {
@@ -282,7 +282,7 @@ pub fn status(app: &AppHandle, id: &str) -> AgentStatus {
 }
 #[derive(Default)]
 pub struct Agents {
-    pub(crate) operation: AsyncMutex<()>,
+    pub(crate) operation: RwLock<()>,
     tasks: Mutex<BTreeMap<String, (AgentStatus, Arc<AtomicBool>)>>,
 }
 pub(crate) fn progress(
@@ -396,7 +396,7 @@ pub async fn test_agent(id: String, app: AppHandle) -> Result<Vec<AgentStatus>, 
     let manager = app.state::<Agents>();
     let _lock = manager
         .operation
-        .try_lock()
+        .try_write()
         .map_err(|_| "正在安装或测试 Agent")?;
     if app.state::<AppState>().store.running()? > 0 {
         return Err("请先结束当前任务".into());
@@ -450,7 +450,7 @@ pub async fn install_agent(
     let manager = app.state::<Agents>();
     let _operation = manager
         .operation
-        .try_lock()
+        .try_write()
         .map_err(|_| "正在安装另一个 Agent")?;
     if app.state::<AppState>().store.running()? > 0 {
         return Err("请先完成或停止当前任务".into());
@@ -582,7 +582,7 @@ pub async fn configure_agent(
     let manager = app.state::<Agents>();
     let _operation = manager
         .operation
-        .try_lock()
+        .try_write()
         .map_err(|_| "正在安装或测试 Agent")?;
     if app.state::<AppState>().store.running()? > 0 {
         return Err("请先停止当前任务".into());
@@ -609,6 +609,18 @@ pub async fn configure_agent(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn concurrent_admission_is_shared_but_installation_stays_exclusive() {
+        let agents = Agents::default();
+        let a = agents.operation.try_read().unwrap();
+        let b = agents.operation.try_read().unwrap();
+        assert!(agents.operation.try_write().is_err());
+        drop(a); drop(b);
+        let install = agents.operation.try_write().unwrap();
+        assert!(agents.operation.try_read().is_err());
+        drop(install);
+        assert!(agents.operation.try_read().is_ok());
+    }
     #[test]
     fn normalizes_verbatim_paths() {
         assert_eq!(

@@ -29,6 +29,12 @@ impl Lease {
         }
     }
 }
+fn select_lease(leases: &HashMap<String, Lease>, agent: &str, session: Option<&str>) -> Option<Lease> {
+    if let Some(id) = session { return leases.get(id).filter(|l| l.agent == agent).cloned(); }
+    let mut matches = leases.values().filter(|l| l.agent == agent && l.gate.load(Ordering::Acquire));
+    let only = matches.next()?.clone();
+    matches.next().is_none().then_some(only)
+}
 struct Observation {
     id: String,
     context: i64,
@@ -42,6 +48,7 @@ pub(crate) struct Tab {
     pub visible: Arc<AtomicBool>,
     mount: Mutex<String>,
     pub focused: AtomicBool,
+    pub recovery_attempts: Mutex<Vec<Instant>>,
     pub hwnd: isize,
     pub scale: AtomicU64,
     pub rect: Mutex<(f64, f64, f64, f64)>,
@@ -58,7 +65,7 @@ pub(crate) struct Tab {
 pub struct Browser {
     tabs: Mutex<HashMap<String, Arc<Tab>>>,
     creating: tokio::sync::Mutex<()>,
-    lease: Mutex<Option<Lease>>,
+    leases: Mutex<HashMap<String, Lease>>,
     endpoint: Mutex<Option<(String, String)>>,
     listener: Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
     calls: Mutex<HashMap<(String, String), Arc<AtomicBool>>>,
@@ -153,11 +160,11 @@ pub fn wrap(app: &AppHandle, mut server: ToolServer, agent: &str) -> Result<Tool
 }
 pub fn authorize_session(app: &AppHandle, agent: &str, session: &str) {
     let state = app.state::<Browser>();
-    let mut slot = state.lease.lock().unwrap();
-    if let Some(old) = slot.as_ref() {
+    let mut slots = state.leases.lock().unwrap();
+    if let Some(old) = slots.get(session) {
         old.gate.store(false, Ordering::Release);
     }
-    *slot = Some(Lease {
+    slots.insert(session.into(), Lease {
         session: session.into(),
         agent: agent.into(),
         turn: None,
@@ -181,8 +188,8 @@ pub fn observe(app: &AppHandle, event: &Value) {
         return;
     };
     let state = app.state::<Browser>();
-    let mut owner = state.lease.lock().unwrap();
-    let Some(lease) = owner.as_mut().filter(|l| l.session == session.id) else {
+    let mut owners = state.leases.lock().unwrap();
+    let Some(lease) = owners.get_mut(&session.id) else {
         return;
     };
     let turn = event["params"]["turn"]["id"]
@@ -209,25 +216,21 @@ pub fn observe(app: &AppHandle, event: &Value) {
     }
 }
 pub(crate) fn active_tab(app: &AppHandle) -> Option<Arc<Tab>> {
-    let session = app
-        .state::<Browser>()
-        .lease
-        .lock()
-        .unwrap()
-        .as_ref()
-        .filter(|l| l.gate.load(Ordering::Acquire))
-        .map(|l| l.session.clone())?;
-    let tab = tab(app, &session).ok()?;
-    let active = matches!(tab.status.lock().unwrap().as_str(), "working" | "error");
-    active.then_some(tab)
+    let state = app.state::<Browser>();
+    let leases = state.leases.lock().unwrap();
+    let tabs = state.tabs.lock().unwrap();
+    tabs.values().filter(|tab| leases.get(&tab.session).is_some_and(|l| l.gate.load(Ordering::Acquire))
+        && matches!(tab.status.lock().unwrap().as_str(), "working" | "error"))
+        .max_by_key(|tab| *tab.used.lock().unwrap()).cloned()
 }
 pub fn stop(app: &AppHandle, session: &str, interrupt: bool) {
+    stop_with_reason(app, session, interrupt, "browser_control_revoked");
+}
+pub(crate) fn stop_with_reason(app: &AppHandle, session: &str, interrupt: bool, reason: &'static str) {
     let state = app.state::<Browser>();
     let had_owner = {
-        let lease = state.lease.lock().unwrap();
-        lease
-            .as_ref()
-            .is_some_and(|l| l.session == session && l.gate.swap(false, Ordering::AcqRel))
+        let leases = state.leases.lock().unwrap();
+        leases.get(session).is_some_and(|l| l.gate.swap(false, Ordering::AcqRel))
     };
     if let Ok(tab) = tab(app, session) {
         status(app, &tab, "stopped", "已由你接管");
@@ -240,13 +243,18 @@ pub fn stop(app: &AppHandle, session: &str, interrupt: bool) {
         let app = app.clone();
         let session = session.to_owned();
         tauri::async_runtime::spawn(async move {
+            crate::runtime_diagnostics::record(&app, Some(&session), "browser_takeover", json!({"reason":reason}));
             let _ = crate::commands::interrupt_turn(session, app).await;
         });
     }
 }
+pub(crate) fn invalidate_observation(tab: &Tab) {
+    tab.revision.fetch_add(1, Ordering::AcqRel);
+    tab.observation.lock().unwrap().take();
+}
 pub fn shutdown(app: &AppHandle) {
     let state = app.state::<Browser>();
-    if let Some(lease) = state.lease.lock().unwrap().as_ref() {
+    for lease in state.leases.lock().unwrap().values() {
         lease.gate.store(false, Ordering::Release);
     }
     if let Some(task) = state.listener.lock().unwrap().take() {
@@ -283,18 +291,17 @@ async fn ensure_tab(app: &AppHandle, session: &str, window: &str) -> Result<Arc<
         return Ok(tab);
     }
     if state.tabs.lock().unwrap().len() >= 8 {
-        let lease = state.lease.lock().unwrap();
+        let leases = state.leases.lock().unwrap();
         let mut tabs = state.tabs.lock().unwrap();
-        let candidate = inactive_hidden_tab(&tabs, lease.as_ref());
+        let owners = leases.values().cloned().collect::<Vec<_>>();
+        let candidate = inactive_hidden_tab(&tabs, &owners);
         let old = candidate.and_then(|id| tabs.remove(&id));
         drop(tabs);
-        drop(lease);
+        drop(leases);
         if let Some(old) = old {
             if let Some(view) = app.get_webview(&old.label) {
                 view.close().map_err(|e| e.to_string())?;
             }
-        } else {
-            return Err("浏览器会话已达上限（最多 8 个），请先收起其他页面".into());
         }
     }
     let parent = app.get_window(window).ok_or("浏览器所属窗口已关闭")?;
@@ -311,6 +318,7 @@ async fn ensure_tab(app: &AppHandle, session: &str, window: &str) -> Result<Arc<
         visible: Arc::new(AtomicBool::new(false)),
         mount: Mutex::new(String::new()),
         focused: AtomicBool::new(false),
+        recovery_attempts: Mutex::new(Vec::new()),
         hwnd,
         scale: AtomicU64::new(scale.to_bits()),
         rect: Mutex::new((10000., 0., 960., 640.)),
@@ -356,11 +364,11 @@ async fn ensure_tab(app: &AppHandle, session: &str, window: &str) -> Result<Arc<
         .insert(session.into(), tab.clone());
     Ok(tab)
 }
-fn inactive_hidden_tab(tabs: &HashMap<String, Arc<Tab>>, lease: Option<&Lease>) -> Option<String> {
+fn inactive_hidden_tab(tabs: &HashMap<String, Arc<Tab>>, leases: &[Lease]) -> Option<String> {
     tabs.iter()
         .filter(|(id, tab)| {
             !tab.visible.load(Ordering::Acquire)
-                && !lease.is_some_and(|lease| {
+                && !leases.iter().any(|lease| {
                     lease.session == **id && lease.gate.load(Ordering::Acquire)
                 })
                 && tab.operation.try_lock().is_ok()
@@ -375,11 +383,10 @@ fn hide_panel(app: &AppHandle, tab: &Tab) {
     // Mark this turn as presented so that call will not reopen the dismissed panel.
     if let Some(lease) = app
         .state::<Browser>()
-        .lease
+        .leases
         .lock()
         .unwrap()
-        .as_ref()
-        .filter(|lease| lease.session == tab.session)
+        .get(&tab.session)
     {
         lease.presented.store(true, Ordering::Release);
     }
@@ -473,7 +480,7 @@ pub async fn browser_layout(
 }
 #[tauri::command]
 pub fn browser_takeover(session_id: String, app: AppHandle) {
-    stop(&app, &session_id, true);
+    stop_with_reason(&app, &session_id, true, "takeover_button_or_escape");
 }
 #[tauri::command]
 pub async fn browser_close(
@@ -510,7 +517,7 @@ pub async fn browser_manual(
     if tab.window != webview.window().label() {
         return Err("浏览器不属于此窗口".into());
     }
-    stop(&app, &session_id, true);
+    stop_with_reason(&app, &session_id, true, "manual_browser_navigation");
     let _operation = tab.operation.lock().await;
     match action.as_str() {
         "navigate" => {
@@ -986,6 +993,8 @@ async fn execute(
 #[derive(Deserialize)]
 struct Request {
     agent: String,
+    #[serde(default)]
+    session: Option<String>,
     id: String,
     name: String,
     arguments: Value,
@@ -1043,11 +1052,11 @@ async fn cancel_request(
         drop(calls);
         gate.store(false, Ordering::Release);
         let session = state
-            .lease
+            .leases
             .lock()
             .unwrap()
-            .as_ref()
-            .filter(|l| Arc::ptr_eq(&l.gate, &gate))
+            .values()
+            .find(|l| Arc::ptr_eq(&l.gate, &gate))
             .map(|l| l.session.clone());
         if let Some(session) = session {
             stop(&app, &session, false);
@@ -1085,13 +1094,7 @@ async fn request(
     {
         return Err(axum::http::StatusCode::BAD_REQUEST);
     }
-    let lease = state
-        .lease
-        .lock()
-        .unwrap()
-        .as_ref()
-        .filter(|l| l.agent == request.agent)
-        .cloned();
+    let lease = select_lease(&state.leases.lock().unwrap(), &request.agent, request.session.as_deref());
     let Some(lease) = lease else {
         return Ok(axum::Json(browser_bridge::text_result(
             json!({"error":"No authorized user turn owns this browser"}),
@@ -1122,7 +1125,7 @@ async fn request(
                 false,
             )));
         }
-        if calls.len() >= 16 || calls.contains_key(&key) {
+        if calls.values().filter(|gate| Arc::ptr_eq(gate, &lease.gate)).count() >= 16 || calls.contains_key(&key) {
             return Err(axum::http::StatusCode::CONFLICT);
         }
         calls.insert(key.clone(), lease.gate.clone());
@@ -1391,6 +1394,19 @@ pub async fn smoke(app: AppHandle) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn browser_lease_is_selected_by_session_even_with_the_same_agent() {
+        let make = |id: &str, agent: &str| Lease { session:id.into(), agent:agent.into(), turn:None, gate:Arc::new(AtomicBool::new(true)), presented:Arc::new(AtomicBool::new(false)) };
+        let leases = [make("a", "codex"), make("b", "codex"), make("c", "claude")].into_iter().map(|l| (l.session.clone(), l)).collect::<HashMap<_, _>>();
+        assert_eq!(select_lease(&leases, "codex", Some("a")).unwrap().session, "a");
+        assert_eq!(select_lease(&leases, "codex", Some("b")).unwrap().session, "b");
+        assert!(select_lease(&leases, "codex", None).is_none());
+        assert!(select_lease(&leases, "codex", Some("c")).is_none());
+        leases["a"].gate.store(false, Ordering::Release);
+        assert!(select_lease(&leases, "codex", Some("a")).unwrap().check().is_err());
+        assert!(select_lease(&leases, "codex", Some("b")).unwrap().check().is_ok());
+        assert!(select_lease(&leases, "claude", Some("c")).unwrap().check().is_ok());
+    }
     fn test_tab(session: &str, visible: bool) -> Arc<Tab> {
         Arc::new(Tab {
             session: session.into(),
@@ -1399,6 +1415,7 @@ mod tests {
             visible: Arc::new(AtomicBool::new(visible)),
             mount: Mutex::new(String::new()),
             focused: AtomicBool::new(false),
+            recovery_attempts: Mutex::new(Vec::new()),
             hwnd: 0,
             scale: AtomicU64::new(1f64.to_bits()),
             rect: Mutex::new((0., 0., 500., 400.)),
@@ -1433,25 +1450,25 @@ mod tests {
             presented: Arc::new(AtomicBool::new(true)),
         };
         assert_eq!(
-            inactive_hidden_tab(&tabs, Some(&lease)),
+            inactive_hidden_tab(&tabs, std::slice::from_ref(&lease)),
             Some("older".into())
         );
         tabs.remove("older");
         assert_eq!(
-            inactive_hidden_tab(&tabs, Some(&lease)),
+            inactive_hidden_tab(&tabs, std::slice::from_ref(&lease)),
             Some("newer".into())
         );
         tabs.remove("newer");
-        assert_eq!(inactive_hidden_tab(&tabs, Some(&lease)), None);
+        assert_eq!(inactive_hidden_tab(&tabs, std::slice::from_ref(&lease)), None);
         drop(guard);
         assert_eq!(
-            inactive_hidden_tab(&tabs, Some(&lease)),
+            inactive_hidden_tab(&tabs, std::slice::from_ref(&lease)),
             Some("busy".into())
         );
         tabs.remove("busy");
         lease.gate.store(false, Ordering::Release);
         assert_eq!(
-            inactive_hidden_tab(&tabs, Some(&lease)),
+            inactive_hidden_tab(&tabs, std::slice::from_ref(&lease)),
             Some("active".into())
         );
     }
@@ -1477,6 +1494,7 @@ mod tests {
             visible: Arc::new(AtomicBool::new(true)),
             mount: Mutex::new(String::new()),
             focused: AtomicBool::new(false),
+            recovery_attempts: Mutex::new(Vec::new()),
             hwnd: 0,
             scale: AtomicU64::new(1f64.to_bits()),
             rect: Mutex::new((0., 0., 500., 400.)),

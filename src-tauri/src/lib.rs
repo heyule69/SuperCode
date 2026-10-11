@@ -1,3 +1,9 @@
+// Native diagnostics reference WebView/dialog code during unit tests. Reuse
+// Tauri's Common Controls v6 resource, which its build script only links to bins.
+#[cfg(all(test, target_os = "windows", target_env = "msvc"))]
+#[link(name = "resource", kind = "static", modifiers = "-bundle")]
+unsafe extern "C" {}
+
 mod accounts;
 mod agent_commands;
 mod agent_smoke;
@@ -33,6 +39,8 @@ mod image_attachments;
 mod installation_exit;
 mod installation_exit_protocol;
 mod links;
+mod log_files;
+mod log_redaction;
 mod media;
 mod native_agents;
 mod notifications;
@@ -44,13 +52,16 @@ mod process;
 mod protocol;
 mod providers;
 mod runtime;
+mod runtime_diagnostics;
 mod session_config;
+mod session_runtimes;
 mod sidebar;
 mod skills;
 mod smoke;
 mod storage;
 mod tray_popup;
 mod ui_recovery;
+mod usage_tokens;
 mod window_state;
 mod window_theme;
 
@@ -62,9 +73,9 @@ pub struct AppState {
     pub runtime: runtime::Runtime,
     pub claude: claude::Runtime,
     pub native: native_agents::Runtime,
-    pub activity: std::sync::Mutex<protocol::ActivityBuffer>,
+    pub activity: session_runtimes::Sessions<std::sync::Mutex<protocol::ActivityBuffer>>,
     pub change_snapshots:
-        std::sync::Mutex<std::collections::HashMap<String, (String, Option<String>)>>,
+        std::sync::Mutex<std::collections::HashMap<(String, String), (String, Option<String>)>>,
 }
 
 pub fn run() {
@@ -192,6 +203,7 @@ pub fn run() {
         .manage(notifications::Notifications::default())
         .manage(platform_usage::UsageCache::default())
         .manage(ui_recovery::UiRecovery::default())
+        .manage(runtime_diagnostics::Diagnostics::default())
         .manage(desktop_lifecycle::DesktopLifecycle::default())
         .manage(desktop_control::DesktopControl::default())
         .manage(browser::Browser::default())
@@ -220,17 +232,22 @@ pub fn run() {
                 app.path().app_data_dir()?
             };
             std::fs::create_dir_all(&dir)?;
+            runtime_diagnostics::initialize(app.handle(), &dir).map_err(std::io::Error::other)?;
+            let store = storage::Store::open(&dir.join("supercode.db")).inspect_err(|error| {
+                runtime_diagnostics::message(app.handle(), None, "storage", "error", "storage_open_error", &error.to_string());
+            })?;
             app.manage(AppState {
-                store: storage::Store::open(&dir.join("supercode.db"))?,
+                store,
                 data_dir: dir.clone(),
                 runtime: runtime::Runtime::default(),
                 claude: claude::Runtime::default(),
                 native: native_agents::Runtime::default(),
-                activity: std::sync::Mutex::new(protocol::ActivityBuffer::default()),
+                activity: session_runtimes::Sessions::default(),
                 change_snapshots: std::sync::Mutex::new(std::collections::HashMap::new()),
             });
+            runtime_diagnostics::record(app.handle(), None, "app_started", serde_json::json!({}));
             if let Err(error) = desktop_control::install(app.handle()) {
-                eprintln!("电脑操作提示不可用：{error}");
+                runtime_diagnostics::message(app.handle(),None,"desktop_control","warn","desktop_control_install_error",&error.to_string());
             }
             browser::install(app.handle())?;
             if !std::env::args().any(|arg| arg == "--legacy-installation-exit-test") {
@@ -279,7 +296,7 @@ pub fn run() {
                 window_state::restore(app, &dir)?;
                 if let Err(error) = desktop_lifecycle::install(app.handle()) {
                     // Keep ordinary close available if the OS has no tray.
-                    eprintln!("系统托盘不可用：{error}");
+                    runtime_diagnostics::message(app.handle(),None,"tray","warn","tray_install_error",&error.to_string());
                 }
                 let update_handle = handle.clone();
                 tauri::async_runtime::spawn(async move { app_updates::watch(update_handle).await });
@@ -346,6 +363,9 @@ pub fn run() {
             tray_popup::tray_menu_action,
             sidebar::copy_chat_transcript,
             sidebar::save_chat_export,
+            runtime_diagnostics::save_runtime_diagnostics,
+            runtime_diagnostics::open_runtime_log_folder,
+            runtime_diagnostics::report_frontend_error,
             commands::configure_codex,
             commands::add_project,
             commands::create_session,
@@ -357,6 +377,8 @@ pub fn run() {
             outbox::list_followups,
             outbox::followup_capabilities,
             outbox::change_followup,
+            outbox::begin_followup_edit,
+            outbox::finish_followup_edit,
             outbox::steer_followup,
             image_attachments::import_image_attachment,
             image_attachments::read_image_attachment,
@@ -423,6 +445,7 @@ pub fn run() {
                 window_state::flush(app);
             }
             if matches!(event, tauri::RunEvent::Exit) {
+                runtime_diagnostics::record(app, None, "app_exited", serde_json::json!({}));
                 desktop_control::shutdown(app);
                 browser::shutdown(app);
                 let state = app.state::<AppState>();

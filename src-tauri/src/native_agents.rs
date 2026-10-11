@@ -20,6 +20,7 @@ use tokio::{
 };
 type Reply = oneshot::Sender<Result<Value, String>>;
 struct Client {
+    diagnostics: Option<(AppHandle, String, Option<String>)>,
     pid: u32,
     input: Mutex<ChildStdin>,
     child: Mutex<Child>,
@@ -37,8 +38,13 @@ impl Client {
         cwd: &Path,
         env: &[(String, String)],
         pi: bool,
+        diagnostics: Option<(AppHandle, String, Option<String>)>,
     ) -> Result<(Arc<Self>, mpsc::Receiver<Value>), String> {
         let mut command = launch.command(&[]);
+        if let Some((app,_,_))=&diagnostics {
+            let values=env.iter().map(|(key,value)|(key.clone(),Value::String(value.clone()))).collect::<serde_json::Map<_,_>>();
+            crate::runtime_diagnostics::register_secrets(app,&Value::Object(values));
+        }
         command
             .args(args)
             .current_dir(cwd)
@@ -54,6 +60,7 @@ impl Client {
         let output = child.stdout.take().ok_or("Agent 无输出管道")?;
         let stderr = child.stderr.take().ok_or("Agent 无错误管道")?;
         let client = Arc::new(Self {
+            diagnostics: diagnostics.clone(),
             pid: child.id().unwrap_or(0),
             input: Mutex::new(input),
             child: Mutex::new(child),
@@ -66,13 +73,14 @@ impl Client {
         });
         let reader = client.clone();
         let (tx, rx) = mpsc::channel(16);
-        // Always drain diagnostics, but never log raw provider credentials or unbounded terminal output.
+        if let Some((app, source, session))=&diagnostics {
+            crate::runtime_diagnostics::record(app,session.as_deref(),"agent_process_started",json!({"source":source,"pid":client.pid}));
+        }
+        // Drain diagnostics without retaining unbounded output in memory.
         tokio::spawn(async move {
-            let mut lines = BufReader::new(stderr);
-            while runtime::read_frame(&mut lines)
-                .await
-                .is_ok_and(|v| v.is_some())
-            {}
+            let (app,source,session)=diagnostics.map(|(app,source,session)|(Some(app),source,session))
+                .unwrap_or((None,if pi {"pi"} else {"opencode"}.into(),None));
+            crate::runtime_diagnostics::stderr(app,session,&source,stderr).await;
         });
         tokio::spawn(async move {
             let mut lines = BufReader::new(output);
@@ -80,9 +88,10 @@ impl Client {
                 let value = match runtime::read_frame(&mut lines).await {
                     Ok(Some(line)) => match serde_json::from_slice::<Value>(&line) {
                         Ok(v) => v,
-                        Err(_) => continue,
+                        Err(error) => { reader.log("protocol_parse_error", &error.to_string()); continue; },
                     },
-                    _ => break,
+                    Ok(None) => break,
+                    Err(error) => {reader.log("protocol_read_error", &error); break;},
                 };
                 if is_response(&value, pi) {
                     let key = value["id"]
@@ -90,7 +99,9 @@ impl Client {
                         .map(str::to_owned)
                         .unwrap_or_else(|| value["id"].to_string());
                     if let Some(reply) = reader.pending.lock().await.remove(&key) {
-                        let _ = reply.send(response(&value, pi));
+                        let result=response(&value,pi);
+                        if let Err(error)=&result {reader.log("agent_request_error",error);}
+                        let _ = reply.send(result);
                     }
                     continue;
                 }
@@ -98,13 +109,22 @@ impl Client {
                     break;
                 }
             }
-            reader.alive.store(false, Ordering::Release);
+            let intentional = !reader.alive.swap(false, Ordering::AcqRel);
+            let exit_code = reader.child.lock().await.try_wait().ok().flatten().and_then(|s|s.code());
+            if let Some((app,source,session))=&reader.diagnostics {
+                crate::runtime_diagnostics::record(app,session.as_deref(),"agent_process_output_closed",json!({"source":source,"pid":reader.pid,"exitCode":exit_code,"intentional":intentional}));
+            }
             for (_, reply) in reader.pending.lock().await.drain() {
                 let _ = reply.send(Err("Agent 连接已关闭".into()));
             }
             let _ = tx.send(json!({"type":"supercode_disconnected"})).await;
         });
         Ok((client, rx))
+    }
+    fn log(&self,event:&str,text:&str) {
+        if let Some((app,source,session))=&self.diagnostics {
+            crate::runtime_diagnostics::message(app,session.as_deref(),source,"error",event,text);
+        }
     }
     async fn write(&self, value: Value) -> Result<(), String> {
         let mut bytes = serde_json::to_vec(&value).map_err(|e| e.to_string())?;
@@ -208,7 +228,7 @@ pub async fn probe_cancel(
             } else {
                 vec!["acp".into()]
             };
-            let (client, mut events) = Client::start(launch, &args, cwd, &[], pi).await?;
+            let (client, mut events) = Client::start(launch, &args, cwd, &[], pi, None).await?;
             let drain = tokio::spawn(async move {
                 while let Some(v) = events.recv().await {
                     if v["type"] == "supercode_disconnected" {
@@ -250,6 +270,7 @@ async fn wait_cancel(cancel: &AtomicBool) {
 pub struct Runtime {
     pub client: Mutex<Option<Arc<Turn>>>,
     warm: Mutex<Option<Warm>>,
+    sessions: crate::session_runtimes::Sessions<Runtime>,
 }
 struct Warm {
     client: Arc<Client>,
@@ -299,8 +320,20 @@ fn event(t: &Turn, method: &str, mut p: Value) -> Value {
     json!({"method":method,"params":p})
 }
 impl Runtime {
+    pub fn for_session(&self, id: &str) -> Arc<Runtime> { self.sessions.get(id) }
+    pub async fn clients(&self) -> Vec<Arc<Turn>> {
+        let mut clients = self.client.lock().await.iter().cloned().collect::<Vec<_>>();
+        for (_, runtime) in self.sessions.entries() { clients.extend(runtime.client.lock().await.iter().cloned()); }
+        clients
+    }
+    pub async fn warm_pids(&self) -> Vec<u32> {
+        let mut pids = self.warm_pid().await.into_iter().collect::<Vec<_>>();
+        for (_, runtime) in self.sessions.entries() { pids.extend(runtime.warm_pid().await); }
+        pids
+    }
     pub async fn steering_mode(&self, session: &str) -> &'static str {
-        let slot = self.client.lock().await;
+        let runtime = self.for_session(session);
+        let slot = runtime.client.lock().await;
         if let Some(t) = slot.as_ref().filter(|t| t.session == session) {
             if t.agent == "pi" || t.client.concurrent_prompt.load(Ordering::Acquire) {
                 return "native";
@@ -312,6 +345,13 @@ impl Runtime {
         self.warm.lock().await.as_ref().map(|c| c.client.pid)
     }
     pub async fn release_idle(&self) {
+        for (id, runtime) in self.sessions.entries() {
+            runtime.release_idle_local().await;
+            if runtime.client.lock().await.is_none() && runtime.warm.lock().await.is_none() { self.sessions.remove_idle(&id, &runtime); }
+        }
+        self.release_idle_local().await;
+    }
+    async fn release_idle_local(&self) {
         let mut warm = self.warm.lock().await;
         if warm
             .as_ref()
@@ -332,7 +372,8 @@ impl Runtime {
         permission: &str,
         effort: Option<&str>,
     ) -> Result<(), String> {
-        let slot = self.client.lock().await;
+        let runtime = self.for_session(session);
+        let slot = runtime.client.lock().await;
         let t = slot.as_ref().cloned().ok_or("Agent 尚未启动")?;
         if t.session != session
             || t.turn != expected
@@ -388,6 +429,10 @@ impl Runtime {
         Ok(())
     }
     pub async fn shutdown(&self) {
+        for (_, runtime) in self.sessions.entries() { runtime.shutdown_local().await; }
+        self.shutdown_local().await;
+    }
+    async fn shutdown_local(&self) {
         if let Some(c) = self.warm.lock().await.take() {
             c.client.close().await;
         }
@@ -397,7 +442,8 @@ impl Runtime {
         }
     }
     pub async fn interrupt(&self, session: &str) -> Result<(), String> {
-        let slot = self.client.lock().await;
+        let runtime = self.for_session(session);
+        let slot = runtime.client.lock().await;
         let t = slot.clone().ok_or("Agent 尚未启动")?;
         if t.session != session {
             return Err("此会话没有运行中的任务".into());
@@ -469,8 +515,10 @@ impl Runtime {
         Ok(())
     }
     pub async fn respond(&self, app: &AppHandle, id: Value, result: Value) -> Result<(), String> {
-        let t = self.client.lock().await.clone().ok_or("Agent 连接已关闭")?;
         let id = id.as_str().ok_or("请求 ID 无效")?;
+        let mut selected = None;
+        for turn in self.clients().await { if turn.requests.lock().await.contains_key(id) { selected = Some(turn); break; } }
+        let t = selected.ok_or("该请求已结束")?;
         let request = t
             .requests
             .lock()
@@ -536,8 +584,9 @@ fn permission_reply(request: &Value, result: &Value, agent: &str) -> Result<Valu
 fn user_request(t: &Turn, raw: Value) -> Option<Value> {
     let rawid = raw.get("id")?;
     let id = format!(
-        "{}:{}",
+        "{}:{}:{}",
         t.agent,
+        t.session,
         rawid
             .as_str()
             .map(str::to_owned)
@@ -784,6 +833,7 @@ async fn start_for(
         .route(agent, session.map(|s| s.id.as_str()))?
         .config;
     let mut env = vec![];
+    if let Some(session) = session { env.push(("SUPERCODE_SESSION_ID".into(), session.id.clone())); }
     let mut args = vec![];
     if agent == "opencode" {
         args.push("acp".into());
@@ -836,7 +886,9 @@ async fn start_for(
         }
         env.push(("SUPERCODE_PI_CONFIG".into(), settings.to_string()));
     }
-    let (client, events) = Client::start(&launch, &args, cwd, &env, agent == "pi").await?;
+    crate::runtime_diagnostics::register_secrets(app, &config);
+    let (client, events) = Client::start(&launch, &args, cwd, &env, agent == "pi",
+        Some((app.clone(),agent.to_owned(),session.map(|s|s.id.clone())))).await?;
     Ok((client, events, config))
 }
 pub async fn send(
@@ -851,7 +903,8 @@ pub async fn send(
     effort: Option<String>,
 ) -> Result<Session, String> {
     let state = app.state::<AppState>();
-    let mut slot = state.native.client.lock().await;
+    let session_runtime = state.native.for_session(&s.id);
+    let mut slot = session_runtime.client.lock().await;
     if slot.is_some() {
         return Err("上一任务尚未结束".into());
     }
@@ -866,7 +919,7 @@ pub async fn send(
         effort
     ])
     .to_string();
-    let cached = state.native.warm.lock().await.take();
+    let cached = session_runtime.warm.lock().await.take();
     let cached = if let Some(c) = cached {
         if c.session == s.id && c.signature == signature && c.client.alive.load(Ordering::Acquire) {
             Some(c)
@@ -964,7 +1017,7 @@ pub async fn send(
         Ok(v) => v,
         Err(e) => {
             client.close().await;
-            state.native.client.lock().await.take();
+            session_runtime.client.lock().await.take();
             publish(
                 app,
                 event(
@@ -1042,7 +1095,7 @@ pub async fn send(
     .await;
     if let Err(e) = configure {
         client.close().await;
-        state.native.client.lock().await.take();
+        session_runtime.client.lock().await.take();
         publish(
             app,
             event(
@@ -1102,7 +1155,7 @@ pub async fn send(
     } else {
         "session/prompt"
     };
-    let mut slot = state.native.client.lock().await;
+    let mut slot = session_runtime.client.lock().await;
     if boot.stopped.load(Ordering::Acquire) {
         client.close().await;
         slot.take();
@@ -1180,8 +1233,7 @@ pub async fn send(
                 && turn.stop_done.load(Ordering::Acquire)
                 && (protocol_finished || turn.settled.load(Ordering::Acquire))
             {
-                let state = app.state::<AppState>();
-                let slot = state.native.client.lock().await;
+                let slot = session_runtime.client.lock().await;
                 turn.accepting.store(false, Ordering::Release);
                 if turn.agent == "pi" {
                     let state_request = client.request("get_state", json!({}), 30);
@@ -1240,8 +1292,7 @@ pub async fn send(
             mapped.failed,
             failure.or(mapped.failure),
         );
-        let state = app.state::<AppState>();
-        let mut slot = state.native.client.lock().await;
+        let mut slot = session_runtime.client.lock().await;
         if slot.as_ref().is_some_and(|v| Arc::ptr_eq(v, &turn)) {
             slot.take();
             if drained
@@ -1251,7 +1302,7 @@ pub async fn send(
                 )
                 && client.alive.load(Ordering::Acquire)
             {
-                *state.native.warm.lock().await = Some(Warm {
+                *session_runtime.warm.lock().await = Some(Warm {
                     client: client.clone(),
                     rx,
                     native: turn.native.clone(),
@@ -1429,6 +1480,20 @@ impl Mapper {
                 "message_start" if v["message"]["role"] == "assistant" => self.message += 1,
                 "message_update" => {
                     let e = &v["assistantMessageEvent"];
+                    let usage = v
+                        .get("usage")
+                        .filter(|u| u.is_object())
+                        .or_else(|| v["message"].get("usage").filter(|u| u.is_object()))
+                        .or_else(|| e["partial"].get("usage").filter(|u| u.is_object()));
+                    if let Some(usage) = usage {
+                        if self.observe_pi_usage(usage) {
+                            out.push(event(
+                                t,
+                                "thread/tokenUsage/updated",
+                                json!({"tokenUsage":self.usage}),
+                            ));
+                        }
+                    }
                     let index = e["contentIndex"].as_u64().unwrap_or(0);
                     let id = format!("{}-msg-{}-{index}", t.turn, self.message);
                     match e["type"].as_str().unwrap_or("") {
@@ -1514,6 +1579,18 @@ impl Mapper {
                     )
                 }
                 "compaction_end" => {
+                    if v["aborted"] != true && v["errorMessage"].is_null() {
+                        if !self.usage.is_object() {
+                            self.usage = json!({"total":{},"last":{}});
+                        }
+                        self.usage["contextTokens"] = Value::Null;
+                        self.usage["last"] = json!({});
+                        out.push(event(
+                            t,
+                            "thread/tokenUsage/updated",
+                            json!({"tokenUsage":self.usage}),
+                        ));
+                    }
                     item = Some(
                         json!({"id":format!("{}-compact",t.turn),"type":"contextCompaction","status":"completed"}),
                     )
@@ -1636,7 +1713,9 @@ impl Mapper {
                     )
                 }
                 "usage_update" => {
-                    out.push(event(t,"thread/tokenUsage/updated",json!({"tokenUsage":{"total":{},"last":{},"contextTokens":u["used"],"modelContextWindow":u["size"]}})));
+                    let used = crate::usage_tokens::count(&u["used"]);
+                    let size = crate::usage_tokens::count(&u["size"]).filter(|n| *n > 0);
+                    out.push(event(t,"thread/tokenUsage/updated",json!({"tokenUsage":{"total":{},"last":{},"contextTokens":used,"modelContextWindow":size,"cumulative":false}})));
                 }
                 _ => {}
             }
@@ -1672,10 +1751,14 @@ impl Mapper {
             .collect()
     }
     fn add_usage(&mut self, native: &Value) -> Value {
-        let last = pi_usage(native);
+        let last = crate::usage_tokens::pi_usage(native);
         if !self.usage.is_object() {
-            self.usage = json!({"total":{},"last":{},"contextTokens":0});
+            self.usage = json!({"total":{},"last":{},"contextTokens":null,"cumulative":false});
         }
+        if crate::usage_tokens::pi_context(&last).is_none() {
+            return self.usage.clone();
+        }
+        self.observe_pi_usage(native);
         for key in [
             "inputTokens",
             "outputTokens",
@@ -1688,18 +1771,29 @@ impl Mapper {
                 .unwrap_or(0)
                 .saturating_add(last[key].as_u64().unwrap_or(0)));
         }
-        self.usage["last"] = last;
-        self.usage["contextTokens"] = json!(
-            native["input"].as_u64().unwrap_or(0)
-                + native["cacheRead"].as_u64().unwrap_or(0)
-                + native["cacheWrite"].as_u64().unwrap_or(0)
-        );
         if self.priced {
-            if let Some(cost) = native["cost"]["total"].as_f64() {
+            if let Some(cost) = native["cost"]["total"]
+                .as_f64()
+                .filter(|n| n.is_finite() && *n >= 0.0)
+            {
                 self.usage["costUsd"] = json!(self.usage["costUsd"].as_f64().unwrap_or(0.0) + cost);
             }
         }
         self.usage.clone()
+    }
+    fn observe_pi_usage(&mut self, native: &Value) -> bool {
+        let last = crate::usage_tokens::pi_usage(native);
+        let context = crate::usage_tokens::pi_context(&last);
+        let Some(context) = context else {
+            return false;
+        };
+        if !self.usage.is_object() {
+            self.usage = json!({"total":{},"cumulative":false});
+        }
+        let changed = self.usage["last"] != last || self.usage["contextTokens"] != json!(context);
+        self.usage["last"] = last;
+        self.usage["contextTokens"] = json!(context);
+        changed
     }
 }
 fn acp_tool(v: &Value) -> &str {
@@ -1722,9 +1816,6 @@ fn blocks_text(v: &Value) -> String {
         })
         .unwrap_or_default();
     protocol::bounded(&text, protocol::TEXT_LIMIT)
-}
-fn pi_usage(v: &Value) -> Value {
-    json!({"inputTokens":v["input"],"outputTokens":v["output"],"cachedInputTokens":v["cacheRead"],"cacheWriteInputTokens":v["cacheWrite"],"totalTokens":v["totalTokens"]})
 }
 fn pi_tool(name: &str) -> &str {
     match name {
@@ -1751,6 +1842,37 @@ fn tool_args(v: &Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn independent_protocol_processes_do_not_block_or_cancel_each_other() {
+        let Some(program) = process::find_program("node") else { return; };
+        // Controlled protocol peers, not real Agent runs or provider requests.
+        let script = r#"const rl=require('readline').createInterface({input:process.stdin});
+const write=v=>process.stdout.write(JSON.stringify(v)+'\n');
+rl.on('line',line=>{const v=JSON.parse(line);const method=v.method||v.type;
+if(method==='approval')write(v.type?{type:'extension_ui_request',method:'confirm',id:1,title:'Confirm'}:{jsonrpc:'2.0',method:'session/request_permission',id:1,params:{options:[],toolCall:{title:'Confirm'}}});
+if(method==='hold')return;
+if(method==='exit')process.exit(0);
+write(v.type?{type:'response',command:method,id:v.id,success:true,data:{session:process.env.SUPERCODE_SESSION_ID}}:{jsonrpc:'2.0',id:v.id,result:{session:process.env.SUPERCODE_SESSION_ID}});
+});"#;
+        let launch = Launch { program, prefix:vec!["-e".into(),script.into()], source:"protocol-test".into() };
+        for pi in [false, true] {
+            let (a, mut events_a) = Client::start(&launch,&[],Path::new("."),&[("SUPERCODE_SESSION_ID".into(),"a".into())],pi,None).await.unwrap();
+            let (b, mut events_b) = Client::start(&launch,&[],Path::new("."),&[("SUPERCODE_SESSION_ID".into(),"b".into())],pi,None).await.unwrap();
+            assert_ne!(a.pid,b.pid);
+            let (_, held) = a.begin_request("hold",json!({})).await.unwrap();
+            let reply = b.request("ping",json!({}),5).await.unwrap();
+            assert_eq!(reply["session"],"b");
+            a.request("approval",json!({}),5).await.unwrap();
+            b.request("approval",json!({}),5).await.unwrap();
+            let raw_a = tokio::time::timeout(Duration::from_secs(5),events_a.recv()).await.unwrap().unwrap();
+            let raw_b = tokio::time::timeout(Duration::from_secs(5),events_b.recv()).await.unwrap().unwrap();
+            assert_eq!(raw_a["id"],raw_b["id"]);
+            a.close().await;
+            assert!(held.await.unwrap().is_err());
+            assert_eq!(b.request("ping",json!({}),5).await.unwrap()["session"],"b");
+            b.close().await;
+        }
+    }
     #[test]
     fn concurrency_requires_the_audited_opencode_release() {
         assert!(verified_concurrent_prompt(Some("1.18.23")));
@@ -1865,8 +1987,9 @@ mod tests {
         let total = m.add_usage(&usage);
         assert_eq!(total["total"]["totalTokens"], 42);
         assert_eq!(total["total"]["cacheWriteInputTokens"], 4);
-        assert_eq!(total["last"]["inputTokens"], 10);
-        assert_eq!(total["contextTokens"], 17);
+        assert_eq!(total["last"]["inputTokens"], 17);
+        assert_eq!(total["contextTokens"], 21);
+        assert_eq!(total["total"]["inputTokens"], 34);
         assert!(total.get("costUsd").is_none());
         let mut native = Mapper {
             priced: true,
@@ -1874,6 +1997,23 @@ mod tests {
         };
         native.add_usage(&usage);
         assert_eq!(native.add_usage(&usage)["costUsd"], 0.02);
+    }
+    #[test]
+    fn streaming_usage_updates_context_without_accumulating_billing_or_erasing_it_with_zero() {
+        let mut mapper = Mapper::default();
+        assert!(!mapper.observe_pi_usage(&json!({"input":0,"output":0,"totalTokens":0})));
+        assert!(mapper
+            .observe_pi_usage(&json!({"input":100,"cacheRead":50,"output":5,"totalTokens":0})));
+        assert_eq!(mapper.usage["contextTokens"], 155);
+        assert_eq!(mapper.usage["total"], json!({}));
+        assert!(mapper.observe_pi_usage(&json!({"input":100,"cacheRead":50,"output":10})));
+        assert_eq!(mapper.usage["contextTokens"], 160);
+        assert!(!mapper.observe_pi_usage(&json!({"input":100,"cacheRead":50,"output":10})));
+        assert!(!mapper.observe_pi_usage(&json!({"input":0,"output":0,"totalTokens":0})));
+        assert_eq!(mapper.usage["contextTokens"], 160);
+        let data = mapper.add_usage(&json!({"input":100,"cacheRead":50,"output":10}));
+        assert_eq!(data["total"]["totalTokens"], 160);
+        assert_eq!(data["total"]["inputTokens"], 150);
     }
     #[test]
     fn native_tool_paths_and_interrupted_items_survive_normalization() {

@@ -171,11 +171,12 @@ pub fn list_messages(
     before: Option<i64>,
     state: State<'_, AppState>,
 ) -> Result<Vec<Message>, String> {
-    let activity = state.activity.lock().map_err(|e| e.to_string())?;
+    let session_activity = state.activity.existing(&session_id);
+    let activity = session_activity.as_ref().map(|slot| slot.lock().map_err(|e| e.to_string())).transpose()?;
     let mut messages = state.store.messages(&session_id, before)?;
     if before.is_none() {
         if let Some(native) = state.store.session(&session_id)?.native_id {
-            for item in activity.snapshot(&native) {
+            for item in activity.as_ref().map(|buffer| buffer.snapshot(&native)).unwrap_or_default() {
                 if let Some(message) = messages.iter_mut().find(|m| item["id"] == m.id) {
                     if let Some((role, text, kind, data)) = protocol::item_message(&item) {
                         message.role = role;
@@ -317,7 +318,7 @@ pub(crate) async fn send_chat_message_inner(
     let agents = app.state::<crate::agents::Agents>();
     let _agent_operation = agents
         .operation
-        .try_lock()
+        .try_read()
         .map_err(|_| "Agent 正在安装、更新或测试，请稍后发送")?;
     let text = text.trim().to_string();
     if text.is_empty() {
@@ -336,9 +337,6 @@ pub(crate) async fn send_chat_message_inner(
             .is_some_and(|m| session.model.as_deref() != Some(m))
     {
         return Err("请先在模型菜单中切换，切换完成后再发送消息".into());
-    }
-    if state.store.running()? > 0 {
-        return Err("当前已有任务运行。第一版默认同时运行一个任务，请先完成或停止它。".into());
     }
     state.store.claim(&session_id)?;
     // The persisted starting state now blocks installation. Release before native
@@ -425,14 +423,12 @@ async fn send_inner(
     crate::browser::authorize_session(app, &session.agent, session_id);
     if crate::desktop_control::authorize_session(app, &session.agent, session_id)? {
         match session.agent.as_str() {
-            "codex" => state.runtime.shutdown().await,
-            "claude" => state.claude.shutdown().await,
-            _ => state.native.shutdown().await,
+            "codex" => state.runtime.for_session(session_id).shutdown().await,
+            "claude" => state.claude.for_session(session_id).shutdown().await,
+            _ => state.native.for_session(session_id).shutdown().await,
         }
     }
     if matches!(session.agent.as_str(), "opencode" | "pi") {
-        state.claude.shutdown().await;
-        state.runtime.clear_for_agent_switch().await;
         return crate::native_agents::send(
             app,
             &session,
@@ -447,8 +443,6 @@ async fn send_inner(
         .await;
     }
     if session.agent == "claude" {
-        state.native.shutdown().await;
-        state.runtime.clear_for_agent_switch().await;
         return crate::claude::send(
             app,
             &session,
@@ -463,8 +457,6 @@ async fn send_inner(
         )
         .await;
     }
-    state.claude.shutdown().await;
-    state.native.shutdown().await;
     let route = state.store.route("codex", Some(session_id))?;
     let client = state.runtime.get_for_session(app, Some(session_id)).await?;
     let profile_model = route.config["model"].as_str().map(str::to_owned);
@@ -585,15 +577,14 @@ pub async fn interrupt_turn(session_id: String, app: AppHandle) -> Result<(), St
     crate::browser::stop(&app, &session_id, false);
     let state = app.state::<AppState>();
     let session = state.store.session(&session_id)?;
+    crate::runtime_diagnostics::record(&app, Some(&session_id), "interrupt_requested", json!({"turnId":session.turn_id}));
     if matches!(session.agent.as_str(), "opencode" | "pi") {
         return state.native.interrupt(&session_id).await;
     }
     if session.agent == "claude" {
         return state.claude.interrupt(&app, &session_id).await;
     }
-    let slot = state.runtime.client.lock().await;
-    let client = slot.as_ref().cloned().ok_or("当前没有运行中的 agent")?;
-    drop(slot);
+    let client = state.runtime.session_client(&session_id).await.ok_or("当前没有运行中的 agent")?;
     let native = session.native_id.ok_or("会话尚未启动，请稍后再试")?;
     let turn = session.turn_id.ok_or("任务正在启动，请稍后再试")?;
     client.interrupt_turn(&native, &turn).await?;
@@ -625,15 +616,12 @@ pub async fn respond_request(id: Value, result: Value, app: AppHandle) -> Result
     if id.as_str().is_some_and(|id| id.starts_with("claude:")) {
         return state.claude.respond(&app, id, result).await;
     }
-    let client = state
-        .runtime
-        .client
-        .lock()
-        .await
-        .as_ref()
-        .cloned()
-        .ok_or("Agent 连接已关闭")?;
-    client.respond(id, result).await
+    for client in state.runtime.clients().await {
+        if client.requests.lock().await.contains_key(&id.to_string()) {
+            return client.respond(id, result).await;
+        }
+    }
+    Err("该请求已结束，请刷新会话".into())
 }
 
 #[tauri::command]
@@ -1050,35 +1038,16 @@ pub fn read_project_file(
 #[tauri::command]
 pub async fn runtime_info(app: AppHandle) -> Result<Value, String> {
     let state = app.state::<AppState>();
-    let slot = state.runtime.client.lock().await;
-    let client = slot.as_ref().cloned();
-    drop(slot);
-    let mut requests = if let Some(c) = &client {
-        c.requests
-            .lock()
-            .await
-            .values()
-            .cloned()
-            .collect::<Vec<_>>()
-    } else {
-        vec![]
-    };
-    let claude_client = state.claude.client.lock().await.as_ref().cloned();
-    let native_client = state.native.client.lock().await.as_ref().cloned();
-    if let Some(c) = &native_client {
-        requests.extend(c.requests.lock().await.values().cloned());
-    }
-    if let Some(c) = &claude_client {
-        requests.extend(c.requests.lock().await.values().cloned());
-    }
+    let requests = pending_requests(app.clone()).await?;
+    let mut agent_pids = state.native.warm_pids().await;
+    agent_pids.extend(state.runtime.clients().await.into_iter().filter(|c| c.alive.load(Ordering::Relaxed)).map(|c| c.pid));
+    agent_pids.extend(state.claude.clients().await.into_iter().map(|c| c.pid));
+    agent_pids.extend(state.native.clients().await.into_iter().map(|c| c.pid()));
+    agent_pids.sort_unstable(); agent_pids.dedup();
     let pid = std::process::id();
-    let warm_pid = state.native.warm_pid().await;
-    let agent_pid = claude_client
-        .as_ref()
-        .map(|c| c.pid)
-        .or_else(|| native_client.as_ref().map(|c| c.pid()))
-        .or(warm_pid)
-        .or_else(|| client.as_ref().map(|c| c.pid));
+    let agent_pid = agent_pids.first().copied();
+    let running = !agent_pids.is_empty();
+    let process_count = agent_pids.len();
     let memory = tauri::async_runtime::spawn_blocking(move || {
         let mut system = sysinfo::System::new();
         system.refresh_processes_specifics(
@@ -1096,7 +1065,7 @@ pub async fn runtime_info(app: AppHandle) -> Result<Value, String> {
                 let Some(current) = cursor else {
                     break;
                 };
-                if Some(current.as_u32()) == agent_pid {
+                if agent_pids.contains(&current.as_u32()) {
                     is_agent = true;
                 }
                 if current.as_u32() == pid {
@@ -1118,7 +1087,7 @@ pub async fn runtime_info(app: AppHandle) -> Result<Value, String> {
     .await
     .map_err(|e| e.to_string())?;
     Ok(
-        json!({"running":warm_pid.is_some() || native_client.is_some() || claude_client.is_some() || client.as_ref().is_some_and(|c|c.alive.load(Ordering::Relaxed)),"pid":agent_pid,"shellBytes":memory.0,"agentBytes":memory.1,"requests":requests,"idleReleaseSeconds":300,"memoryMetric":"workingSet"}),
+        json!({"running":running,"pid":agent_pid,"processCount":process_count,"shellBytes":memory.0,"agentBytes":memory.1,"requests":requests,"idleReleaseSeconds":300,"memoryMetric":"workingSet"}),
     )
 }
 
@@ -1220,16 +1189,14 @@ mod tests {
 #[tauri::command]
 pub async fn pending_requests(app: AppHandle) -> Result<Vec<Value>, String> {
     let state = app.state::<AppState>();
-    let codex = state.runtime.client.lock().await.clone();
-    let claude = state.claude.client.lock().await.clone();
     let mut requests = vec![];
-    if let Some(client) = codex {
+    for client in state.runtime.clients().await {
         requests.extend(client.requests.lock().await.values().cloned());
     }
-    if let Some(client) = claude {
+    for client in state.claude.clients().await {
         requests.extend(client.requests.lock().await.values().cloned());
     }
-    if let Some(client) = state.native.client.lock().await.clone() {
+    for client in state.native.clients().await {
         requests.extend(client.requests.lock().await.values().cloned());
     }
     Ok(requests)

@@ -92,6 +92,7 @@ fn renderer() -> Tab {
         visible: Arc::new(AtomicBool::new(true)),
         mount: Mutex::new(String::new()),
         focused: AtomicBool::new(false),
+        recovery_attempts: Mutex::new(Vec::new()),
         hwnd: 0,
         scale: AtomicU64::new(1f64.to_bits()),
         rect: Mutex::new((0., 0., 1400., 900.)),
@@ -498,11 +499,11 @@ pub(super) async fn verify(app: &AppHandle) -> Result<Value, String> {
         }
         if app
             .state::<Browser>()
-            .lease
+            .leases
             .lock()
             .unwrap()
-            .as_ref()
-            .is_some_and(|l| l.gate.load(Ordering::Acquire))
+            .values()
+            .any(|l| l.gate.load(Ordering::Acquire))
         {
             return Err("Native Escape callback did not revoke control synchronously".into());
         }

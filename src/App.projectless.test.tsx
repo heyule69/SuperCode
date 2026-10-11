@@ -7,6 +7,7 @@ import { call, subscribe } from './api';
 import type { Bootstrap, Message, Session, RpcEvent } from './types';
 import { PROVIDER_REQUIRED } from './chatConnection';
 import { mergeEvent } from './events';
+import type { Followup } from './Followups';
 
 vi.mock('./api', () => ({ desktop:true, call:vi.fn(), subscribe:vi.fn(async()=>()=>{}) }));
 vi.mock('@tauri-apps/api/event', () => ({ listen:vi.fn(async()=>()=>{}) }));
@@ -62,6 +63,156 @@ async function type(text: string) {
 async function send() {
   await act(async()=>{container.querySelector<HTMLFormElement>('.composer')!.dispatchEvent(new Event('submit',{bubbles:true,cancelable:true}));await new Promise(resolve=>setTimeout(resolve,30));});
 }
+
+function queuedMessages() {
+  localStorage.setItem('supercode.session','running');
+  data.sessions=[{id:'running',projectId:'existing',title:'正在工作',agent:'claude',connectionId:'api:claude',model:'test-model',status:'running',nativeId:'native',turnId:'turn',updatedAt:1}];
+  const rows:Followup[]=['first','second'].map((id,index)=>({id,sessionId:'running',status:'queued',error:null,payload:{text:index?'第二条':'第一条原文',model:'test-model',readOnly:false,permissionMode:'ask',effort:'high',attachments:index?[]:[{kind:'skill',name:'Recall',path:'D:/skills/recall/SKILL.md'}]}}));
+  const base=vi.mocked(call).getMockImplementation()!;
+  vi.mocked(call).mockImplementation(async(command,args={})=>{
+    if(command==='list_followups')return structuredClone(rows.filter(row=>row.sessionId===args.sessionId));
+    if(command==='begin_followup_edit'){const row=rows.find(row=>row.id===args.id)!;const original=structuredClone(row);row.status='editing';return {row:original,token:'edit-token'};}
+    if(command==='finish_followup_edit'){const row=rows.find(row=>row.id===args.id)!;if(args.payload)row.payload=structuredClone(args.payload) as Followup['payload'];row.status='queued';return null;}
+    return base(command,args);
+  });
+  return rows;
+}
+async function editFirstQueuedMessage(){
+  await act(async()=>container.querySelector<HTMLButtonElement>('[data-followup-id="first"] [aria-label="排队消息更多操作"]')!.click());
+  await act(async()=>{[...document.querySelectorAll<HTMLButtonElement>('.followup-menu button')].find(button=>button.textContent==='编辑消息')!.click();await new Promise(resolve=>setTimeout(resolve,30));});
+}
+it('edits a queued message in the main composer, saves in place, and restores its unsent draft',async()=>{
+  const rows=queuedMessages();await render();await type('原来没发的草稿');await editFirstQueuedMessage();
+  const input=container.querySelector<HTMLTextAreaElement>('.composer textarea')!;
+  expect(input.value).toBe('第一条原文');expect(document.activeElement).toBe(input);
+  expect(container.querySelector('.composer-skills')?.textContent).toContain('Recall');
+  expect(container.querySelector('.followup-queue textarea')).toBeNull();
+  expect([...container.querySelectorAll('.followup-row')].map(row=>row.getAttribute('data-followup-id'))).toEqual(['second']);
+  expect(container.querySelector('.composer .send-button')?.getAttribute('aria-label')).toBe('发送修改');
+  await type('/stop');vi.mocked(call).mockClear();await send();
+  expect(call).toHaveBeenCalledWith('finish_followup_edit',{id:'first',token:'edit-token',payload:expect.objectContaining({text:'/stop',effort:'high',attachments:rows[0].payload.attachments})});
+  expect(call).not.toHaveBeenCalledWith('enqueue_followup',expect.anything());
+  expect(call).not.toHaveBeenCalledWith('interrupt_turn',expect.anything());
+  expect(input.value).toBe('原来没发的草稿');
+  expect([...container.querySelectorAll('.followup-row')].map(row=>row.getAttribute('data-followup-id'))).toEqual(['first','second']);
+  expect(container.querySelector('.composer-editing')).toBeNull();
+});
+it('retains failed edits and their attachments, then cancels back to the original queued message and draft',async()=>{
+  const rows=queuedMessages();await render();await type('自己的草稿');await editFirstQueuedMessage();await type('修改后暂时无法发送');
+  const base=vi.mocked(call).getMockImplementation()!;
+  vi.mocked(call).mockImplementation(async(command,args={})=>{if(command==='finish_followup_edit'&&args.payload)throw new Error('连接暂不可用');return base(command,args);});
+  await send();
+  expect(container.querySelector<HTMLTextAreaElement>('.composer textarea')?.value).toBe('修改后暂时无法发送');
+  expect(container.querySelector('.composer-editing')).not.toBeNull();
+  expect(rows[0].payload.text).toBe('第一条原文');expect(rows[0].status).toBe('editing');
+  expect(container.querySelector('.error-banner')?.textContent).toContain('连接暂不可用');
+  await act(async()=>[...container.querySelectorAll<HTMLButtonElement>('.composer button')].find(button=>button.textContent==='取消编辑')!.click());
+  expect(call).toHaveBeenCalledWith('finish_followup_edit',{id:'first',token:'edit-token',payload:null});
+  expect(container.querySelector<HTMLTextAreaElement>('.composer textarea')?.value).toBe('自己的草稿');
+  expect(rows[0].payload.text).toBe('第一条原文');expect(rows[0].status).toBe('queued');
+});
+it('releases only its edit reservation when the editor closes so the queue is not left blocked',async()=>{
+  const rows=queuedMessages();await render();await editFirstQueuedMessage();
+  expect(rows[0].status).toBe('editing');vi.mocked(call).mockClear();
+  await act(async()=>root.unmount());
+  expect(call).toHaveBeenCalledWith('finish_followup_edit',{id:'first',token:'edit-token',payload:null});
+  expect(rows[0].status).toBe('queued');expect(rows[1].payload.text).toBe('第二条');
+});
+it('releases a delayed edit reservation that arrives after the window has already closed',async()=>{
+  const rows=queuedMessages();const base=vi.mocked(call).getMockImplementation()!;
+  let release!:()=>void;const delayed=new Promise<void>(resolve=>{release=resolve;});
+  vi.mocked(call).mockImplementation(async(command,args={})=>{const result=await base(command,args);if(command==='begin_followup_edit')await delayed;return result;});
+  await render();await editFirstQueuedMessage();expect(rows[0].status).toBe('editing');
+  await act(async()=>root.unmount());await act(async()=>{release();await new Promise(resolve=>setTimeout(resolve,10));});
+  expect(call).toHaveBeenCalledWith('finish_followup_edit',{id:'first',token:'edit-token',payload:null});
+  expect(rows[0].status).toBe('queued');
+});
+
+it.each(['claude', 'codex', 'opencode', 'pi'])('starts two %s sessions before either startup finishes without queuing or crossing events', async agent => {
+  localStorage.setItem('supercode.session', 'a');
+  data.profiles = [{ ...data.profiles[0], id:`api:${agent}`, agent }];
+  data.sessions = ['a', 'b'].map(id => ({ id, projectId:'existing', title:`会话 ${id}`, agent, connectionId:`api:${agent}`, model:'test-model', nativeId:null, status:'idle', turnId:null, updatedAt:1 }));
+  const finish = new Map<string, () => void>();
+  const saved = new Map<string, Message[]>();
+  const fallback = vi.mocked(call).getMockImplementation()!;
+  vi.mocked(call).mockImplementation(async (command, args={}) => {
+    const id = String(args.sessionId);
+    if (command === 'list_messages') return saved.get(id) ?? [];
+    if (command === 'send_chat_message') {
+      await new Promise<void>(resolve => finish.set(id, resolve));
+      saved.set(id, [{ id:`user-${id}`, seq:1, sessionId:id, role:'user', text:String(args.text), kind:'userMessage', data:{clientMessageId:args.clientMessageId} }]);
+      return data.sessions.find(s => s.id === id)!;
+    }
+    return fallback(command, args);
+  });
+  await render(); await type('A 同时工作'); await send();
+  await act(async () => container.querySelector<HTMLButtonElement>('[title="会话 b"]')!.click());
+  await type('B 同时工作'); await send();
+  expect(finish.size).toBe(2);
+  expect(call).not.toHaveBeenCalledWith('enqueue_followup', expect.anything());
+  expect(container.querySelector('[aria-label="你的消息"]')?.textContent).toBe('B 同时工作');
+  await act(async () => {
+    data.sessions = data.sessions.map(s => ({ ...s, nativeId:`native-${s.id}`, status:'running', turnId:`turn-${s.id}` }));
+    notify({method:'turn/started', params:{appSessionId:'a', threadId:'native-a', turn:{id:'turn-a'}}});
+    notify({method:'turn/started', params:{appSessionId:'b', threadId:'native-b', turn:{id:'turn-b'}}});
+    notify({method:'item/agentMessage/delta', params:{appSessionId:'a', threadId:'native-a', turnId:'turn-a', itemId:'item-a', delta:'A 私有输出'}});
+    notify({method:'item/agentMessage/delta', params:{appSessionId:'b', threadId:'native-b', turnId:'turn-b', itemId:'item-b', delta:'B 私有输出'}});
+    await new Promise(resolve => setTimeout(resolve,80));
+  });
+  expect(container.textContent).not.toContain('A 私有输出');
+  expect(container.textContent).toContain('B 私有输出');
+  await act(async () => finish.get('b')!());
+  expect(container.querySelector('[aria-label="停止生成"]')).not.toBeNull();
+  await act(async () => container.querySelector<HTMLButtonElement>('[aria-label="停止生成"]')!.click());
+  expect(call).toHaveBeenCalledWith('interrupt_turn', {sessionId:'b'});
+  expect(call).not.toHaveBeenCalledWith('interrupt_turn', {sessionId:'a'});
+  await act(async () => finish.get('a')!());
+});
+
+it('allows a new conversation and Agent selection while other conversations are running or waiting', async () => {
+  localStorage.setItem('supercode.session', 'a');
+  data.agents = ['claude','codex','opencode','pi'].map(id => ({id, name:id, installed:true, path:'agent.exe', connected:true}));
+  data.profiles = data.agents.map(a => ({ ...data.profiles[0], id:`api:${a.id}`, agent:a.id }));
+  data.sessions = ['a','b'].map((id, n) => ({id,projectId:'existing',title:`运行中的 ${id}`,agent:'claude',connectionId:'api:claude',model:'test-model',nativeId:`native-${id}`,status:n?'waiting':'running',turnId:`t-${id}`,updatedAt:1}));
+  await render();
+  await act(async () => container.querySelector<HTMLButtonElement>('[aria-label="新建任务"]')!.click());
+  expect(container.querySelector('[aria-label="停止生成"]')).toBeNull();
+  const agent = container.querySelector<HTMLButtonElement>('[aria-label="Agent"]')!;
+  expect(agent.disabled).toBe(false);
+  await act(async () => agent.click());
+  await act(async () => container.querySelectorAll<HTMLButtonElement>('[aria-label="选择 Agent"] [role="menuitemradio"]')[1].click());
+  expect(container.querySelector('[aria-label="Agent"]')?.textContent).toContain('codex');
+  await type('第三个会话立即发送'); await send();
+  expect(call).toHaveBeenCalledWith('create_session', expect.objectContaining({agent:'codex'}));
+  expect(call).toHaveBeenCalledWith('send_chat_message', expect.objectContaining({sessionId:'standalone'}));
+  expect(call).not.toHaveBeenCalledWith('enqueue_followup', expect.anything());
+  expect(call).not.toHaveBeenCalledWith('interrupt_turn', expect.anything());
+});
+
+it('starts fresh chats concurrently and restores a pending bubble when returning to its chat', async () => {
+  let count = 0;
+  const finish = new Map<string, () => void>();
+  const fallback = vi.mocked(call).getMockImplementation()!;
+  vi.mocked(call).mockImplementation(async (command, args={}) => {
+    if (command === 'create_session') {
+      const s: Session = {id:`new-${++count}`,projectId:'',title:`新聊天 ${count}`,agent:String(args.agent),connectionId:String(args.connectionId),model:'test-model',nativeId:null,status:'idle',turnId:null,updatedAt:count};
+      data.sessions.push(s); return s;
+    }
+    if (command === 'send_chat_message') { await new Promise<void>(resolve => finish.set(String(args.sessionId),resolve)); return data.sessions.find(s => s.id === args.sessionId)!; }
+    if (command === 'list_messages') return [];
+    return fallback(command,args);
+  });
+  await render(); await type('新的第一个聊天'); await send();
+  expect(finish.has('new-1')).toBe(true);
+  await act(async () => container.querySelector<HTMLButtonElement>('[aria-label="新建任务"]')!.click());
+  await type('新的第二个聊天'); await send();
+  expect(finish.has('new-2')).toBe(true);
+  expect(call).not.toHaveBeenCalledWith('enqueue_followup',expect.anything());
+  await act(async () => container.querySelector<HTMLButtonElement>('[title="新聊天 1"]')!.click());
+  expect(container.querySelector('[aria-label="你的消息"]')?.textContent).toBe('新的第一个聊天');
+  expect(container.textContent).not.toContain('新的第二个聊天');
+  await act(async () => { finish.get('new-1')!(); finish.get('new-2')!(); });
+});
 
 it.each(['claude','codex','opencode','pi'])('shows the submitted %s message before connection checks, session creation and native startup finish', async agent => {
   localStorage.setItem('supercode.agent', agent);
@@ -181,9 +332,9 @@ it('does not turn an accepted send into a retry draft when the subsequent histor
   expect(container.querySelector('[aria-label="你的消息"]')?.textContent).toContain('已经发送的消息');
   expect(container.querySelector<HTMLTextAreaElement>('.composer textarea')?.value).toBe('');
 });
-it('shows persisted context tokens and keeps live and completed usage visible without a model capacity', async () => {
+it.each(['claude', 'codex', 'opencode', 'pi'] as const)('shows persisted, live and completed context without a guessed model capacity for %s', async agent => {
   localStorage.setItem('supercode.session', 'context-chat');
-  data.sessions = [{ id: 'context-chat', projectId: 'existing', title: '上下文测试', agent: 'claude', connectionId: 'api:claude', model: 'test-model', nativeId: 'native-context', status: 'running', turnId: 'turn-context', updatedAt: 1 }];
+  data.sessions = [{ id: 'context-chat', projectId: 'existing', title: '上下文测试', agent, connectionId: `api:${agent}`, model: 'provider-specific-model', nativeId: 'native-context', status: 'running', turnId: 'turn-context', updatedAt: 1 }];
   let tokens = 12345;
   const fallback = vi.mocked(call).getMockImplementation()!;
   vi.mocked(call).mockImplementation(async (command, args) => command === 'get_usage' ? { records: [{ data: { total: {}, last: {}, contextTokens: tokens, cumulative: false } }] } : fallback(command, args));
@@ -303,6 +454,47 @@ it('hides the live changes dock and collapses the process as soon as completion 
   await act(async()=>container.querySelector<HTMLButtonElement>('.turn-process-toggle')!.click());
   expect(container.querySelector('.turn-process-content')?.textContent).toContain('先检查文件');
   expect(container.querySelector('.composer-area .turn-change-dock')).toBeNull();
+});
+
+it('folds a restored long legacy conversation before any completion event and keeps pagination working', async () => {
+  localStorage.setItem('supercode.session', 'chat');
+  data.sessions = [{id:'chat',projectId:'existing',title:'旧历史记录',agent:'claude',connectionId:'api:claude',model:null,status:'idle',nativeId:'native',turnId:null,updatedAt:1}];
+  const marker: Message = {id:'run-old',seq:2,sessionId:'chat',role:'activity',kind:'runMarker',text:'',data:{turnId:'old',status:'inProgress'}};
+  const history: Message[] = [{id:'u',seq:1,sessionId:'chat',role:'user',kind:'userMessage',text:'制作插件',data:{}}, marker,
+    ...Array.from({length:125}, (_, index): Message => ({id:`old-${index}`,seq:index + 3,sessionId:'chat',role:index === 124 ? 'assistant' : index % 2 ? 'tool' : 'assistant',kind:index % 2 ? 'commandExecution' : 'agentMessage',text:index === 124 ? '插件开发完成。' : `旧执行过程 ${index}`,data:{turnId:'old',status:'completed'}}))];
+  const original = vi.mocked(call).getMockImplementation()!;
+  vi.mocked(call).mockImplementation(async (command, args = {}) => {
+    if (command !== 'list_messages') return original(command, args);
+    const page = history.filter(message => message.seq < Number(args.before ?? Infinity)).slice(-100).map(message => ({...message}));
+    if (page[0]?.seq > marker.seq) page[0].historyRun = {id:marker.id,turnKey:'u',data:marker.data};
+    return page;
+  });
+  await render();
+  expect(container.querySelector('.turn-process-toggle')?.getAttribute('aria-expanded')).toBe('false');
+  expect(container.textContent).not.toContain('旧执行过程');
+  expect(container.querySelector('.turn-final-result')?.textContent).toContain('插件开发完成');
+  const final = container.querySelector('.turn-final-result .message');
+  await act(async () => container.querySelector<HTMLButtonElement>('.turn-process-toggle')!.click());
+  expect(container.querySelector('.turn-process-content')?.textContent).toContain('旧执行过程 26');
+  await act(async () => { container.querySelector<HTMLButtonElement>('.load-earlier')!.click(); await vi.dynamicImportSettled(); });
+  expect(vi.mocked(call).mock.calls.some(([command,args]) => command === 'list_messages' && args?.before === 28)).toBe(true);
+  expect(container.querySelector('.load-earlier')).toBeNull();
+  expect(container.querySelector('.turn-process-content')?.textContent).toContain('旧执行过程 0');
+  expect(container.querySelector('.turn-final-result .message')).toBe(final);
+  expect(container.querySelectorAll('[aria-label="你的消息"]')).toHaveLength(1);
+});
+
+it('keeps restored active, failed and interrupted legacy conversations expanded', async () => {
+  localStorage.setItem('supercode.session', 'chat');
+  messages = [{id:'progress',seq:1,sessionId:'chat',role:'assistant',kind:'agentMessage',text:'部分过程',data:null}, {id:'partial',seq:2,sessionId:'chat',role:'assistant',kind:'agentMessage',text:'还未完成的输出',data:null}];
+  for (const status of ['starting','running','waiting','failed','interrupted']) {
+    data.sessions = [{id:'chat',projectId:'existing',title:'恢复会话',agent:'claude',connectionId:'api:claude',model:null,status,nativeId:'native',turnId:status === 'running' ? 'active' : null,updatedAt:1}];
+    await render();
+    expect(container.querySelector('.turn-process-toggle')).toBeNull();
+    expect(container.textContent).toContain('部分过程');
+    await act(async () => root.unmount());
+    root = createRoot(container);
+  }
 });
 
 it('reloads persisted adapter edit snapshots during a turn without waiting for completion', async () => {

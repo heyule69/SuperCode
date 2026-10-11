@@ -33,7 +33,16 @@ mod platform {
                         && tab.visible.load(Ordering::Acquire)
                         && tab.focused.load(Ordering::Acquire))
                 {
-                    browser::stop(app, &tab.session, true);
+                    browser::stop_with_reason(
+                        app,
+                        &tab.session,
+                        true,
+                        if key == 27 {
+                            "escape_key"
+                        } else {
+                            "browser_keyboard_input"
+                        },
+                    );
                 }
             }
         }
@@ -71,7 +80,12 @@ mod platform {
                             && (point.x as f64) < origin.x as f64 + (x + width) * scale
                             && (point.y as f64) < origin.y as f64 + (y + height) * scale
                         {
-                            browser::stop(app, &tab.session, true);
+                            browser::stop_with_reason(
+                                app,
+                                &tab.session,
+                                true,
+                                "browser_mouse_input",
+                            );
                         }
                     }
                 }
@@ -112,6 +126,33 @@ mod platform {
             .map_err(|e| e.to_string())?;
         rx.recv_timeout(std::time::Duration::from_secs(3))
             .map_err(|_| "浏览器接管监听启动超时".to_string())?
+    }
+    #[derive(Debug, PartialEq)]
+    enum Recovery {
+        Automatic,
+        Reload,
+        PageError,
+    }
+    fn recovery(
+        kind: webview2_com::Microsoft::Web::WebView2::Win32::COREWEBVIEW2_PROCESS_FAILED_KIND,
+    ) -> Recovery {
+        use webview2_com::Microsoft::Web::WebView2::Win32::*;
+        match kind {
+            COREWEBVIEW2_PROCESS_FAILED_KIND_RENDER_PROCESS_EXITED => Recovery::Reload,
+            COREWEBVIEW2_PROCESS_FAILED_KIND_BROWSER_PROCESS_EXITED
+            | COREWEBVIEW2_PROCESS_FAILED_KIND_FRAME_RENDER_PROCESS_EXITED
+            | COREWEBVIEW2_PROCESS_FAILED_KIND_RENDER_PROCESS_UNRESPONSIVE => Recovery::PageError,
+            // GPU and utility exits recover inside WebView2. They are not user stop requests.
+            _ => Recovery::Automatic,
+        }
+    }
+    fn admit_reload(attempts: &mut Vec<std::time::Instant>, now: std::time::Instant) -> bool {
+        attempts.retain(|at| now.duration_since(*at) < std::time::Duration::from_secs(60));
+        if attempts.len() >= 2 {
+            return false;
+        }
+        attempts.push(now);
+        true
     }
     pub fn attach(view: &Webview, tab: &Arc<browser::Tab>) {
         use webview2_com::Microsoft::Web::WebView2::Win32::{
@@ -155,7 +196,7 @@ mod platform {
                             .is_some_and(|active| Arc::ptr_eq(&active, &escape_tab))
                     {
                         args.SetHandled(true)?;
-                        browser::stop(&escape_app, &escape_tab.session, true);
+                        browser::stop_with_reason(&escape_app, &escape_tab.session, true, "browser_escape_key");
                     }
                 }
                 Ok(())
@@ -163,18 +204,83 @@ mod platform {
             let _ = controller.add_AcceleratorKeyPressed(&escape, &mut token);
             if let Ok(core) = controller.CoreWebView2() {
                 let failed =
-                    webview2_com::ProcessFailedEventHandler::create(Box::new(move |_, _| {
-                        browser::stop(&app, &failed_tab.session, true);
-                        browser::failure(
-                            &app,
-                            &failed_tab,
-                            "网页进程已退出，请刷新网页后再发起任务",
-                        );
+                    webview2_com::ProcessFailedEventHandler::create(Box::new(move |sender, args| {
+                        use webview2_com::Microsoft::Web::WebView2::Win32::*;
+                        use windows::core::Interface;
+                        let Some(args) = args else { return Ok(()); };
+                        let mut kind = COREWEBVIEW2_PROCESS_FAILED_KIND::default();
+                        args.ProcessFailedKind(&mut kind)?;
+                        let mut reason = COREWEBVIEW2_PROCESS_FAILED_REASON::default();
+                        let mut exit = 0;
+                        if let Ok(details) = args.cast::<ICoreWebView2ProcessFailedEventArgs2>() {
+                            let _ = details.Reason(&mut reason); let _ = details.ExitCode(&mut exit);
+                        }
+                        let policy = recovery(kind);
+                        let restored = if policy == Recovery::Reload {
+                            browser::invalidate_observation(&failed_tab);
+                            let allowed = failed_tab.recovery_attempts.lock()
+                                .is_ok_and(|mut attempts| admit_reload(&mut attempts, std::time::Instant::now()));
+                            allowed && sender.as_ref().is_some_and(|core| core.Reload().is_ok())
+                        } else { false };
+                        if policy != Recovery::Automatic {
+                            let message = if restored { "网页进程已恢复，请重新获取页面" }
+                                else if kind == COREWEBVIEW2_PROCESS_FAILED_KIND_RENDER_PROCESS_UNRESPONSIVE { "网页暂时无响应，当前浏览器操作可能超时" }
+                                else { "网页进程异常，当前浏览器操作可能失败" };
+                            browser::failure(&app, &failed_tab, message);
+                        }
+                        // A browser failure only affects browser tools. Do not revoke the lease or
+                        // interrupt the entire agent, and do not label it as user takeover.
+                        let log_app = app.clone(); let session = failed_tab.session.clone();
+                        tauri::async_runtime::spawn(async move {
+                            crate::runtime_diagnostics::record(&log_app, Some(&session), "browser_process_failed",
+                                serde_json::json!({"kind":kind.0,"reasonCode":reason.0,"exitCode":exit,
+                                    "recovery":if restored { "reloaded" } else if policy == Recovery::Automatic { "automatic" } else { "browser_tool_error" }}));
+                        });
                         Ok(())
                     }));
                 let _ = core.add_ProcessFailed(&failed, &mut token);
             }
         });
+    }
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use webview2_com::Microsoft::Web::WebView2::Win32::*;
+        #[test]
+        fn gpu_and_utility_recovery_are_not_agent_interrupts() {
+            assert_eq!(
+                recovery(COREWEBVIEW2_PROCESS_FAILED_KIND_GPU_PROCESS_EXITED),
+                Recovery::Automatic
+            );
+            assert_eq!(
+                recovery(COREWEBVIEW2_PROCESS_FAILED_KIND_UTILITY_PROCESS_EXITED),
+                Recovery::Automatic
+            );
+            assert_eq!(
+                recovery(COREWEBVIEW2_PROCESS_FAILED_KIND_RENDER_PROCESS_EXITED),
+                Recovery::Reload
+            );
+            for kind in [
+                COREWEBVIEW2_PROCESS_FAILED_KIND_BROWSER_PROCESS_EXITED,
+                COREWEBVIEW2_PROCESS_FAILED_KIND_FRAME_RENDER_PROCESS_EXITED,
+                COREWEBVIEW2_PROCESS_FAILED_KIND_RENDER_PROCESS_UNRESPONSIVE,
+            ] {
+                assert_eq!(recovery(kind), Recovery::PageError);
+            }
+        }
+        #[test]
+        fn repeated_renderer_failures_cannot_cause_an_infinite_reload_loop() {
+            let now = std::time::Instant::now();
+            let mut attempts = Vec::new();
+            assert!(admit_reload(&mut attempts, now));
+            assert!(admit_reload(&mut attempts, now));
+            assert!(!admit_reload(&mut attempts, now));
+            assert!(admit_reload(
+                &mut attempts,
+                now + std::time::Duration::from_secs(61)
+            ));
+            assert_eq!(attempts.len(), 1);
+        }
     }
 }
 #[cfg(windows)]

@@ -400,7 +400,7 @@ async fn change_session_model(
     let agents = app.state::<crate::agents::Agents>();
     let _agent_operation = agents
         .operation
-        .try_lock()
+        .try_read()
         .map_err(|_| "Agent 正在安装、更新或测试，请稍后切换模型")?;
     let state = app.state::<AppState>();
     let session = state.store.session(&session_id)?;

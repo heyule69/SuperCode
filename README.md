@@ -4,7 +4,7 @@
 
 把 Codex、Claude Code、OpenCode 和 Pi 放进一个桌面工作台，管理项目、模型连接和工具，直接用对话完成开发任务。
 
-当前版本 **0.1.9**，主要支持 **Windows**。基于 Tauri 2、Rust、React + TypeScript 和 SQLite。
+当前版本 **0.2.0**，主要支持 **Windows**。基于 Tauri 2、Rust、React + TypeScript 和 SQLite。
 
 [下载 Windows 安装包](https://github.com/heyule69/SuperCode/releases/latest) · [版本记录](https://github.com/heyule69/SuperCode/releases)
 
@@ -21,7 +21,7 @@
 - **桌面体验**：深浅主题、系统通知、托盘和多窗口。聊天保存在本机，Agent 按需启动，空闲后释放。
 - **软件更新**：自动检查 GitHub Releases，在「设置 → 关于」下载更新并重启安装，保留聊天与配置。
 
-各 Agent 的权限和引导能力按原生协议提供；目前同一时间运行一个 Agent 任务。
+Codex、Claude Code、OpenCode、Pi 均支持多个聊天同时运行，同一种 Agent 也可并行开启多个会话，没有应用设置的 Agent 数量或任务并发上限。各聊天独立处理停止、审批和输出；向同一个活动聊天追加消息时，按原生能力引导或按该聊天的顺序发送。
 
 ## 开始使用
 
@@ -38,6 +38,14 @@
 **Agent 管理**
 
 ![Agent 管理：版本检查、安装、更新与测试](.github/assets/agents.jpg)
+
+## 排查异常
+
+软件启动后自动保存诊断日志，无需手动开启。在「查看 → 运行日志」或聊天顶部的终端图标打开日志面板，点击「打开文件夹」查看文件，或「导出诊断日志」收集最近 30 天的记录。「清空显示」只清空面板，不删除文件。
+
+Windows 日志目录为 `%APPDATA%\dev.supercode.desktop\logs`。日志按日期保存为 UTF-8 JSONL，每个分段最多 4 MiB，启动时及运行期间每小时清理超过 30 天的日志。记录包含版本、时间、会话 ID、Agent、任务状态、进程退出、错误输出、上下文压缩和浏览器/界面异常；API 密钥、认证令牌等会在写入前脱敏，不主动记录对话正文。
+
+如果另一台设备出现自动停止，请在该设备导出日志，并告知出现问题的大致时间，以便对应任务和进程记录。
 
 ## 从源码运行
 

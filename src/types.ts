@@ -1,6 +1,6 @@
 export interface Project { id: string; name: string; path: string }
 export interface Session { id: string; projectId: string; workspacePath?: string | null; title: string; agent: string; model: string | null; connectionId?: string | null; nativeId: string | null; status: string; updatedAt: number; turnId: string | null }
-export interface Message { seq: number; id: string; sessionId: string; role: string; text: string; kind: string; data: Record<string, unknown> | null }
+export interface Message { seq: number; id: string; sessionId: string; role: string; text: string; kind: string; data: Record<string, unknown> | null; historyRun?: { id: string; turnKey: string; data: Record<string, unknown> | null } }
 export interface Agent { id: string; name: string; installed: boolean; path: string | null; connected: boolean }
 export interface ModelSource { providerId: string; providerName: string; mark: string; planName?: string | null; connectionName?: string | null; modelFamily?: string | null; available?: boolean }
 export interface ModelCatalog { data: Model[]; source?: ModelSource; origin?: 'preset' | 'saved' | 'officialApi'; warning?: string; notice?: string }

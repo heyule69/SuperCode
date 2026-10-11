@@ -1,6 +1,6 @@
 import type { ConversationTurn } from './events';
 import { messageMedia } from './mediaSources';
-import type { Message } from './types';
+import { isActive, type Message } from './types';
 
 const visibleReply = (message: Message) => message.role === 'assistant' && (!!message.text.trim() || messageMedia(message).length > 0);
 
@@ -16,8 +16,18 @@ export function finalReply(items: Message[]): Message[] {
   return typeof group === 'string' && group ? replies.filter(message => message.data?.messageId === group && message.data?.phase !== 'commentary') : [last];
 }
 
-export function presentTurn(turn: ConversationTurn) {
-  const completed = turn.run?.data?.status === 'completed';
+export interface TurnLifecycle { sessionStatus?: string; activeTurnId?: string | null; latest?: boolean }
+
+export function presentTurn(turn: ConversationTurn, lifecycle: TurnLifecycle = {}) {
+  const status = turn.run?.data?.status;
+  const turnId = turn.run?.data?.turnId ?? turn.items.find(message => message.data?.turnId)?.data?.turnId;
+  // Legacy history may have no marker, or a marker evicted before completion
+  // was persisted. An idle session is authoritative for its finished history.
+  // During a run, only a different, identified older turn can use this fallback.
+  const inactive = lifecycle.sessionStatus === 'idle' || lifecycle.latest === false
+    && isActive(lifecycle.sessionStatus) && !!turnId && !!lifecycle.activeTurnId && turnId !== lifecycle.activeTurnId;
+  const completed = status === 'completed' || !['failed', 'interrupted'].includes(String(status))
+    && inactive && finalReply(turn.items).length > 0;
   const final = completed ? finalReply(turn.items) : [];
   const resultIds = new Set(final.map(message => message.id));
   const notices = turn.items.filter(message => message.role === 'system' && message.kind !== 'turnDiff');

@@ -2,6 +2,17 @@ import { describe, expect, it } from 'vitest';
 import { conversationTurns, mergeEvent, reconcileMessages } from './events';
 import type { Message, RpcEvent } from './types';
 
+it('keeps paginated lifecycle context through native item updates and a later completion', () => {
+  const historyRun = {id:'run-old',turnKey:'client-u',data:{turnId:'old',status:'inProgress'}};
+  const page: Message[] = [{id:'item',seq:101,sessionId:'s',role:'assistant',kind:'agentMessage',text:'进度',data:{turnId:'old'},historyRun}];
+  const updated = mergeEvent(page, {method:'item/completed',params:{turnId:'old',item:{id:'item',type:'agentMessage',text:'最终回复',status:'completed'}}}, 's');
+  expect(updated[0].historyRun).toBe(historyRun);
+  expect(conversationTurns(updated)[0]).toMatchObject({id:'client-u',run:{id:'run-old',data:{status:'inProgress'}}});
+  const completed = mergeEvent(updated, {method:'turn/completed',params:{turn:{id:'old',status:'completed'}}}, 's');
+  expect(conversationTurns(completed)[0]).toMatchObject({id:'client-u',run:{id:'run-old',data:{status:'completed'}}});
+  expect(completed.filter(message => message.role === 'assistant')).toHaveLength(1);
+});
+
 describe('message acknowledgements', () => {
   const user = (id: string, seq: number, clientMessageId?: string): Message => ({id,seq,sessionId:'s',role:'user',kind:'userMessage',text:'继续',data:clientMessageId ? {clientMessageId} : {}});
   it('retains an unacknowledged user before newly persisted work instead of matching an older identical text', () => {

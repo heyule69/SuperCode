@@ -16,7 +16,8 @@ it('updates visible tokens while running and explains a missing capacity without
   expect(button.textContent).toBe('上下文 12.3K');
   await act(async () => button.click());
   expect(host.textContent).toContain('12,345');
-  expect(host.textContent).toContain('已显示实际用量');
+  expect(host.textContent).toContain('已显示最近一次实际用量');
+  expect(button.title).toBe('最近一次上下文 12,345 Token');
   expect(host.textContent).not.toContain('尚未提供上下文用量');
   await act(async () => root.render(<UsageIndicator {...props} busy={false} usage={{ total: {}, last: {}, contextTokens: 24000, modelContextWindow: 128000 }}/>));
   expect(button.textContent).toBe('上下文 19%');

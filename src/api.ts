@@ -2,6 +2,7 @@ import { invoke, isTauri } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import type { Bootstrap, Project, Session, Message, RpcEvent } from './types';
 import { emptySidebar } from './sidebarState';
+import { reportFrontendError } from './frontendDiagnostics';
 
 export const desktop = isTauri();
 const sidebarQa = typeof location !== 'undefined' && location.pathname.endsWith('/sidebar-qa.html');
@@ -29,7 +30,10 @@ function readPreview(): Bootstrap {
 }
 function writePreview(data: Bootstrap) { localStorage.setItem(previewKey, JSON.stringify(data)); }
 export async function call<T>(command: string, args: Record<string, unknown> = {}): Promise<T> {
-  if (desktop) return invoke<T>(command, args);
+  if (desktop) {
+    try { return await invoke<T>(command, args); }
+    catch (error) { reportFrontendError('ipc', error, command); throw error; }
+  }
   const data = readPreview();
   data.sidebar ??= structuredClone(emptySidebar);
   let result: unknown;

@@ -30,4 +30,26 @@ describe('final reply selection', () => {
     }
     expect(presentTurn({ id: 'u', items }).completed).toBe(false);
   });
+  it('folds loaded legacy history with missing or stale lifecycle metadata using the idle session', () => {
+    const items = [reply('progress', '先检查文件'), reply('final', '已完成')];
+    for (const run of [undefined, { ...reply('run', ''), kind: 'runMarker', data: { status: 'inProgress', turnId: 'old' } }]) {
+      expect(presentTurn({ id: 'u', items, run }, { sessionStatus: 'idle', latest: true }))
+        .toMatchObject({ completed: true, final: [items[1]], process: [items[0]] });
+    }
+    expect(presentTurn({ id: 'u', items: [reply('commentary', '还在处理', { phase: 'commentary' })] }, { sessionStatus: 'idle' }).completed).toBe(false);
+  });
+  it('does not fold active, failed or interrupted history based on a completed individual tool or an idle fallback', () => {
+    const items = [reply('progress', '进度'), reply('partial', '部分结果')];
+    for (const sessionStatus of ['starting', 'running', 'waiting', 'failed', 'interrupted', undefined]) {
+      expect(presentTurn({ id: 'u', items }, { sessionStatus, latest: true }).completed).toBe(false);
+    }
+    for (const status of ['failed', 'interrupted']) {
+      const run = { ...reply('run', ''), kind: 'runMarker', data: { status } };
+      expect(presentTurn({ id: 'u', items, run }, { sessionStatus: 'idle' }).completed).toBe(false);
+    }
+    const old = { id: 'u', items, run: { ...reply('run', ''), kind: 'runMarker', data: { status: 'inProgress', turnId: 'old' } } };
+    expect(presentTurn(old, { sessionStatus: 'running', activeTurnId: 'new', latest: false }).completed).toBe(true);
+    expect(presentTurn(old, { sessionStatus: 'running', activeTurnId: 'old', latest: false }).completed).toBe(false);
+    expect(presentTurn(old, { sessionStatus: 'starting', latest: false }).completed).toBe(false);
+  });
 });

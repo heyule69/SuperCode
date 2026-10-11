@@ -378,6 +378,7 @@ impl Store {
                     text: r.get(4)?,
                     kind: r.get(5)?,
                     data: Value::Null,
+                    history_run: None,
                 })
             })
             .map_err(|e| e.to_string())?;
@@ -935,6 +936,7 @@ mod tests {
             text: "<script>alert('x')</script> 中文".into(),
             kind: "agentMessage".into(),
             data: Value::Null,
+            history_run: None,
         }];
         let html = export_content("<test>", &messages, "html").unwrap();
         assert!(!html.contains("<script>"));

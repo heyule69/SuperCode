@@ -367,6 +367,22 @@ fn millis() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn interleaved_session_output_and_completion_keep_separate_buffers() {
+        let sessions = crate::session_runtimes::Sessions::<std::sync::Mutex<ActivityBuffer>>::default();
+        let a = sessions.get("a"); let b = sessions.get("b");
+        for (buffer, native) in [(&a, "native-a"), (&b, "native-b")] {
+            buffer.lock().unwrap().update(&json!({"method":"item/started","params":{"threadId":native,"item":{"id":"same-id","type":"agentMessage","text":"","status":"inProgress"}}}));
+        }
+        for (buffer, native, delta) in [(&a, "native-a", "A1"), (&b, "native-b", "B1"), (&a, "native-a", "A2")] {
+            buffer.lock().unwrap().update(&json!({"method":"item/agentMessage/delta","params":{"threadId":native,"itemId":"same-id","delta":delta}}));
+        }
+        assert_eq!(a.lock().unwrap().snapshot("native-a")[0]["text"], "A1A2");
+        a.lock().unwrap().finish("completed");
+        b.lock().unwrap().update(&json!({"method":"item/agentMessage/delta","params":{"threadId":"native-b","itemId":"same-id","delta":"B2"}}));
+        assert_eq!(b.lock().unwrap().snapshot("native-b")[0]["text"], "B1B2");
+        assert_eq!(b.lock().unwrap().snapshot("native-b")[0]["status"], "inProgress");
+    }
     use serde_json::json;
     #[test]
     fn utf8_limits_do_not_split_chinese_or_emoji() {

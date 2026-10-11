@@ -8,6 +8,7 @@ import { Sidebar } from './Sidebar';
 import { emptySidebar } from './sidebarState';
 import { commandMatches, parseCommand, slashCommands } from './slashCommands';
 import { AddMenu, AttachmentStrip, ComposerSkills, ModelMenu, PermissionMenu, type Attachment } from './ComposerMenus';
+import { ComposerTextarea } from './ComposerTextarea';
 import { UsageIndicator } from './UsageIndicator';
 import { PlatformUsageIndicator } from './PlatformUsageView';
 import type { TokenUsage, UsageRecord } from './usage';
@@ -18,6 +19,7 @@ import { listen } from '@tauri-apps/api/event';
 import { watchWindowTheme } from './windowTheme';
 import { commandIndex, decodeDrafts, encodeDrafts, restoreWorkspace, type DraftModel } from './workspaceState';
 import { CopyButton } from './CopyButton';
+import { exportRuntimeDiagnostics, openRuntimeLogFolder } from './runtimeDiagnostics';
 import { diffFiles } from './diff';
 import { revealScrollItem, scrollToLatest } from './chatScroll';
 import { systemDocument } from './links';
@@ -32,6 +34,7 @@ import type { SettingsTab } from './SettingsPage';
 import { createChatSession } from './chatSession';
 import { isProviderRequired, requireChatConnection } from './chatConnection';
 import { FollowupQueue, useFollowups, type Followup, type FollowupPayload } from './Followups';
+import { useFollowupEditor } from './useFollowupEditor';
 import { SelectionActions } from './SelectionActions';
 import type { SideDraft } from './SideChat';
 const SideChat=lazy(()=>import('./SideChat'));
@@ -57,7 +60,6 @@ const QuestionDock = lazy(() => import('./QuestionDock'));
 const ProviderSettings = lazy(() => import('./ProviderSettings'));
 const emptyChanges: Changes = { isGit: false, branch: '', files: [], diff: '' };
 const statusText: Record<string, string> = { idle: '已就绪', starting: '正在启动', running: '正在工作', waiting: '等待确认', failed: '运行失败', interrupted: '已停止' };
-function lastMessage(items: Message[], match: (m: Message) => boolean) { for (let i = items.length - 1; i >= 0; i--) if (match(items[i])) return items[i]; }
 
 export default function App() {
   const [prefs, setPrefs] = useState(loadPreferences);
@@ -121,7 +123,7 @@ export default function App() {
   const [skillsLoading, setSkillsLoading] = useState(false);
   const [skillsError, setSkillsError] = useState('');
   const [loadingModels, setLoadingModels] = useState(false);
-  const [sending, setSending] = useState(false);
+  const [pendingSends, setPendingSends] = useState<Set<string>>(new Set());
   const [sidebar, setSidebar] = useState(() => localStorage.getItem('supercode.sidebar') !== 'false');
   const [context, setContext] = useState(() => localStorage.getItem('supercode.context') === 'true');
   const [narrow, setNarrow] = useState(() => window.matchMedia('(max-width: 1100px)').matches);
@@ -147,6 +149,13 @@ export default function App() {
   const [messagesLoading, setMessagesLoading] = useState(false);
   const [stopping, setStopping] = useState(false);
   const [logsOpen, setLogsOpen] = useState(false);
+  const [exportingLogs, setExportingLogs] = useState(false);
+  async function exportLogs() {
+    setExportingLogs(true);
+    try { const path = await exportRuntimeDiagnostics(); if (path) setCommandMessage(`诊断日志已保存：${path}`); }
+    catch (error) { report(error); }
+    finally { setExportingLogs(false); }
+  }
   const [logs, setLogs] = useState<string[]>([]);
   const [changes, setChanges] = useState<Changes>(emptyChanges);
   const [changesLoading, setChangesLoading] = useState(false);
@@ -165,9 +174,9 @@ export default function App() {
   const [runtime, setRuntime] = useState<RuntimeInfo | null>(null);
   const sessionsRef = useRef(sessions); sessionsRef.current=sessions;
   const current = useRef({ sessionId: '', projectId: '', nativeId: null as string | null });
-  const pendingSession = useRef<string | null>(null);
   const pendingUsers = useRef(new Set<string>());
-  const sendLock = useRef(false);
+  const pendingMessages = useRef(new Map<string, Message>());
+  const sendLocks = useRef(new Set<string>());
   const messagesRevision = useRef(0);
   const queue = useRef<RpcEvent[]>([]);
   const flushTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -191,17 +200,34 @@ export default function App() {
   const browserDock = useBrowserDock(showBrowser, browserExpanded);
   useChatReadReceipt({ sessionId, status: session?.status, unread: !!sidebarState.sessions[sessionId]?.unread, throughSeq: messages.reduce((seq, message) => Math.max(seq, message.seq), 0), loading: messagesLoading, settingsOpen,
     onRead: id => setSidebarState(old => ({ ...old, sessions: { ...old.sessions, [id]: { ...old.sessions[id], unread: false } } })), onError: report });
-  const busy = (sending && pendingSession.current === sessionId) || isActive(session?.status);
-  const anyBusy = sending || sessions.some(s => isActive(s.status));
+  const sending = pendingSends.has(sessionId || draftKey.current);
+  const busy = sending || isActive(session?.status);
+  const anyBusy = pendingSends.size > 0 || sessions.some(s => isActive(s.status));
+  function beginSending() {
+    const keys = new Set<string>();
+    const track = (key: string) => { for (const previous of keys) sendLocks.current.delete(previous); keys.clear(); keys.add(key); sendLocks.current.add(key); setPendingSends(new Set(sendLocks.current)); };
+    track(sessionId || draftKey.current);
+    return { track, finish: () => { for (const key of keys) sendLocks.current.delete(key); setPendingSends(new Set(sendLocks.current)); } };
+  }
   const hasDraft = !!input.trim() || attachments.length > 0;
-  const stopMode = busy && !hasDraft;
+  const followups=useFollowups(sessionId,report);
+  const followupEditor=useFollowupEditor(sessionId, {
+    getDraft:()=>followupPayload(inputRef.current,attachmentsRef.current),
+    setDraft:(draft,id)=>{
+      drafts.current.set(id,draft.text);attachmentDrafts.current.set(id,draft.attachments);
+      if(current.current.sessionId!==id)return;
+      setInput(draft.text);setAttachments(draft.attachments);setEffort(draft.effort??'');setPermissionMode(draft.permissionMode as PermissionMode);setModel(draft.model??'');setCommandsDismissed(true);
+    },
+    reload:followups.reload,report,focus:()=>textarea.current?.focus(),
+  });
+  const stopMode = busy && !hasDraft && !followupEditor.editingId;
   const connectionId = session?.connectionId ?? draftConnectionId ?? profiles.find(p => p.agent === agentId && p.current)?.id ?? (officialAgents.includes(agentId) ? '@official' : '@local');
   const activeProfile = profiles.find(p => p.agent === agentId && p.id === connectionId);
   const [handoffTarget, setHandoffTarget] = useState('');
   const profileRevision = `${agentId}:${sessionId}:${connectionId}:${JSON.stringify(activeProfile ?? null)}:${officialAgents.join(',')}:${connectionRevision}`;
   const currentModelSource = modelSourceRevision === profileRevision ? modelSource : undefined;
-  const skillQuery = input.startsWith('/');
-  const slashOptions = commandsDismissed || !composerFocused ? [] : commandMatches(input, agentId, nativeCommands, skillCatalog.skills);
+  const skillQuery = !followupEditor.editingId && input.startsWith('/');
+  const slashOptions = followupEditor.editingId || commandsDismissed || !composerFocused ? [] : commandMatches(input, agentId, nativeCommands, skillCatalog.skills);
   const slashIndex = Math.min(commandSelection, Math.max(0, slashOptions.length - 1));
   useEffect(() => {
     const capabilities = messages.find(m => m.kind === 'agentCapabilities');
@@ -257,7 +283,6 @@ export default function App() {
   const newChat = ready && !messages.length && !busy && !messagesLoading && !currentRequests.length;
   const activeElsewhere = sessions.find(s => isActive(s.status) && s.id !== sessionId);
 
-  const latest = lastMessage(messages, m => m.kind !== 'runMarker' && m.role !== 'user' && (!session?.turnId || m.data?.turnId === session.turnId));
   const agentName = agents.find(a => a.id === agentId)?.name ?? agentId;
   newSessionRef.current = () => { void newSession(); };
 
@@ -287,8 +312,9 @@ export default function App() {
     if (current.current.sessionId !== id || revision !== messagesRevision.current) return;
     if (before && scrollArea.current) prependScroll.current = { height: scrollArea.current.scrollHeight, top: scrollArea.current.scrollTop };
     const pending = new Set(pendingUsers.current);
-    for (const message of items) if (message.role === 'user' && typeof message.data?.clientMessageId === 'string') pendingUsers.current.delete(message.data.clientMessageId);
-    setMessages(old => before ? [...items.filter(m => !old.some(v => v.id === m.id)), ...old] : reconcileMessages(old, items, pending)); setHasMore(items.length === 100);
+    for (const message of items) if (message.role === 'user' && typeof message.data?.clientMessageId === 'string') { pendingUsers.current.delete(message.data.clientMessageId); pendingMessages.current.delete(message.data.clientMessageId); }
+    const optimistic = [...pendingMessages.current.values()].filter(message => message.sessionId === id);
+    setMessages(old => before ? [...items.filter(m => !old.some(v => v.id === m.id)), ...old] : reconcileMessages([...old, ...optimistic.filter(message => !old.some(m => m.id === message.id))], items, pending)); setHasMore(items.length === 100);
     } finally { if (current.current.sessionId === id && revision === messagesRevision.current) setMessagesLoading(false); }
   }, []);
   const refreshUsage = useCallback(async (id: string) => {
@@ -346,9 +372,10 @@ export default function App() {
         setCommandMessage(goal ? `目标：${goal.objective}\n状态：${names[goal.status ?? ''] ?? goal.status}\n已用 Token：${goal.tokensUsed ?? 0}` : '目标已清除。');
         return;
       }
-      if (pendingSession.current && native && ['thread/started', 'turn/started'].includes(event.method)) {
-        if (current.current.sessionId === pendingSession.current) current.current.nativeId = native;
-        setSessions(old => old.map(s => s.id === pendingSession.current ? { ...s, nativeId: native } : s));
+      const owner = p.appSessionId ?? sessionsRef.current.find(s => s.nativeId === native)?.id;
+      if (owner && native && ['thread/started', 'turn/started'].includes(event.method)) {
+        if (current.current.sessionId === owner) current.current.nativeId = native;
+        setSessions(old => old.map(s => s.id === owner ? { ...s, nativeId: native } : s));
       }
       const matches = native === current.current.nativeId;
       if (matches && event.method === 'thread/tokenUsage/updated') setUsage(p.tokenUsage);
@@ -375,7 +402,7 @@ export default function App() {
         }, 200);
       }
     }, text => setLogs(old => [...old.slice(-199), text]), () => {
-      setRequests([]); setRuntime(old => old ? { ...old, running: false } : old); flush(); void refresh().then(() => current.current.sessionId ? loadMessages(current.current.sessionId) : undefined).catch(report);
+      void call<RpcEvent[]>('pending_requests').then(setRequests).catch(report); void inspectRuntime(); flush(); void refresh().then(() => current.current.sessionId ? loadMessages(current.current.sessionId) : undefined).catch(report);
     }, () => { void sidebarUpdateRef.current().catch(report); }).then(cleanup => { if (disposed) cleanup(); else off = cleanup; }).catch(report);
     return () => { disposed = true; off?.(); if (changeTimer) clearTimeout(changeTimer); if (flushTimer.current) clearTimeout(flushTimer.current); queue.current = []; };
   }, [refresh, loadMessages, refreshChanges, refreshUsage, flush]);
@@ -526,7 +553,8 @@ export default function App() {
   async function selectSession(s: Session) {
     setSettingsOpen(false);
     drafts.current.set(draftKey.current, inputRef.current);
-    attachmentDrafts.current.set(draftKey.current, attachmentsRef.current); setAttachments(attachmentDrafts.current.get(s.id) ?? []); setEffort('');
+    attachmentDrafts.current.set(draftKey.current, attachmentsRef.current); setAttachments(attachmentDrafts.current.get(s.id) ?? []);
+    const editingPayload=followupEditor.payloadFor(s.id);setEffort(editingPayload?.effort??'');if(editingPayload)setPermissionMode(editingPayload.permissionMode as PermissionMode,s.agent);
     setDraftConnectionId(undefined);
     draftKey.current = s.id; setInput(drafts.current.get(s.id) ?? ''); setHasMore(false); setShowJump(false);
     flush(); setSessionId(s.id); setProjectId(s.projectId); setMessages([]); setPreview(null); setAgentId(s.agent); setModels([]); setModelCatalogRevision(''); setModelSource(profiles.find(p => p.id === s.connectionId)?.modelSource); setModel(s.model ?? ''); setUsage(undefined); setError(''); stickToBottom.current = true;
@@ -546,14 +574,15 @@ export default function App() {
     else if (request.newChat) await newSession();
   };
   async function newSession(target?: Project) {
-    if (anyBusy || configuring) return;
+    if (configuring) return;
+    const freshPendingDraft = !sessionId && sendLocks.current.has(draftKey.current);
     // Repeated clicks keep the same unsent draft, including its model and attachments.
-    if (sessionId || projectId !== (target?.id ?? '')) { selectProject(target, prefsRef.current.defaultAgent); setPermissionMode(compatiblePermission(prefsRef.current.defaultPermission, prefsRef.current.defaultAgent), prefsRef.current.defaultAgent); }
+    if (sessionId || projectId !== (target?.id ?? '') || freshPendingDraft) { selectProject(target, prefsRef.current.defaultAgent); setPermissionMode(compatiblePermission(prefsRef.current.defaultPermission, prefsRef.current.defaultAgent), prefsRef.current.defaultAgent); }
+    if (freshPendingDraft) { draftKey.current = `${target?.id ?? ''}:${prefsRef.current.defaultAgent}:${crypto.randomUUID()}`; setInput(''); setAttachments([]); }
     if (target) setCollapsedProjects(old => { const next = new Set(old); next.delete(target.id); return next; });
     setModal(null); setError('');
     requestAnimationFrame(() => textarea.current?.focus());
   }
-  const followups=useFollowups(sessionId,report);
   function followupPayload(text:string,taskAttachments=attachments):FollowupPayload { return {text,model:model||null,readOnly,permissionMode,attachments:taskAttachments,effort:effort||null}; }
   async function changeFollowup(id:string,action:string,text?:string){try{await call('change_followup',{id,action,text:text??null});await followups.reload();}catch(e){report(e);throw e;}}
   async function steerFollowup(id:string){try{await call('steer_followup',{id,expectedTurnId:session?.turnId});await followups.reload();await refresh();await loadMessages(sessionId);}catch(e){report(e);}}
@@ -562,9 +591,11 @@ export default function App() {
     try{if(row)await changeFollowup(row.id,'pause');setContext(false);setContextOverlay(false);setSideDraft({key:crypto.randomUUID(),text:row?.payload.text??text,payload:row?.payload,sourceId:row?.id,projectId,agent:agentId,connectionId});}catch(e){report(e);}
   }
   async function send() {
-    if (sendLock.current) return;
+    if (sendLocks.current.has(sessionId || draftKey.current)) return;
     if (pendingAttachments.current) return;
     if (!input.trim() && !attachments.length) return;
+    if(followupEditor.busy)return;
+    if(followupEditor.editingId){await followupEditor.save(followupPayload(input.trim()||(attachments.some(a=>a.kind==='skill')?'请执行所选技能。':'请查看附件。')));return;}
     const command = parseCommand(input);
     let availableSkills = skillCatalog.skills;
     if (command && desktop && !slashCommands.some(c => c.name === command.command && (!c.agent || c.agent === agentId))) {
@@ -579,27 +610,28 @@ export default function App() {
     const originalInput = input;
     const text = commandSkill ? command!.argument || `请执行所选技能 ${commandSkill.name}。` : input.trim() || (attachments.some(a => a.kind === 'skill') ? '请执行所选技能。' : '请查看附件。'); let id = sessionId;
     const originDraft = draftKey.current;
-    const queued = anyBusy || followups.rows.length > 0;
+    const queued = busy || followups.rows.some(row => row.sessionId === id);
     const clientMessageId = queued ? undefined : crypto.randomUUID();
     let submitted = false;
-    sendLock.current = true;
+    const flight = beginSending();
     if (clientMessageId) {
-      pendingUsers.current.add(clientMessageId); pendingSession.current = id;
+      pendingUsers.current.add(clientMessageId);
       drafts.current.delete(originDraft); attachmentDrafts.current.delete(originDraft);
       setInput(''); setAttachments([]); setError(''); stickToBottom.current = true;
-      setMessages(old => [...old, { seq: 0, id: clientMessageId, sessionId: id, role: 'user', text, kind: 'userMessage', data: { attachments: taskAttachments, clientMessageId } }]);
+      const optimistic: Message = { seq: 0, id: clientMessageId, sessionId: id, role: 'user', text, kind: 'userMessage', data: { attachments: taskAttachments, clientMessageId } };
+      pendingMessages.current.set(clientMessageId, optimistic);
+      setMessages(old => [...old, optimistic]);
     }
-    setSending(true);
     try {
       await requireChatConnection(agentId, connectionId, id);
-      if (!id) { const s = await createChatSession({ projectId, model, agent: agentId, connectionId }); id = s.id; setSessions(old => [s, ...old]); if(current.current.projectId===projectId && draftKey.current===originDraft){setSessionId(id);current.current.sessionId=id;draftKey.current=id;setMessages(old => old.map(message => message.id === clientMessageId ? { ...message, sessionId: id } : message));} }
+      if (!id) { const s = await createChatSession({ projectId, model, agent: agentId, connectionId }); id = s.id; setSessions(old => [s, ...old]); if(clientMessageId){const optimistic=pendingMessages.current.get(clientMessageId);if(optimistic)pendingMessages.current.set(clientMessageId,{...optimistic,sessionId:id});} if(current.current.projectId===projectId && draftKey.current===originDraft){setSessionId(id);current.current.sessionId=id;draftKey.current=id;setMessages(old => old.map(message => message.id === clientMessageId ? { ...message, sessionId: id } : message));} }
       if (queued) {
         await call('enqueue_followup',{sessionId:id,payload:followupPayload(text,taskAttachments)});
         if(current.current.sessionId===id){setInput('');setAttachments([]);}
         drafts.current.delete(originDraft);drafts.current.delete(id);attachmentDrafts.current.delete(originDraft);attachmentDrafts.current.delete(id);
         await followups.reload();await refresh();return;
       }
-      pendingSession.current = id; drafts.current.delete(originDraft); drafts.current.delete(id); draftModels.current.delete(originDraft); setError('');
+      flight.track(id); drafts.current.delete(originDraft); drafts.current.delete(id); draftModels.current.delete(originDraft); setError('');
       const result = await call<Session>('send_chat_message', { sessionId: id, text, model: model || null, readOnly, permissionMode, attachments: taskAttachments, effort: effort || null, clientMessageId });
       submitted = true;
       setSessions(old => old.map(s => s.id === id ? result : s));
@@ -608,7 +640,7 @@ export default function App() {
     } catch (e) {
       report(e);
       if (!submitted) {
-        if (clientMessageId) { pendingUsers.current.delete(clientMessageId); setMessages(old => old.filter(message => message.id !== clientMessageId)); }
+        if (clientMessageId) { pendingUsers.current.delete(clientMessageId); pendingMessages.current.delete(clientMessageId); setMessages(old => old.filter(message => message.id !== clientMessageId)); }
         if (current.current.sessionId === id && (id || draftKey.current === originDraft)) {
           setInput(previous => previous || originalInput); setAttachments(previous => previous.length ? previous : taskAttachments);
         } else {
@@ -619,13 +651,13 @@ export default function App() {
       }
       await refresh().catch(report); if (id) await loadMessages(id).catch(report);
     }
-    finally { pendingSession.current = null; sendLock.current = false; setSending(false); }
+    finally { flight.finish(); }
   }
   async function handleCommand(command: string, argument: string, preserveDraft = false) {
     setError(''); setCommandMessage('');
     if (command === '/stop') { if (busy) await stop(); else setCommandMessage('当前会话没有运行中的任务。'); setInput(''); return; }
     const goalControl = agentId === 'codex' && busy && (command === '/goal-status' || (command === '/goal' && ['', 'status', 'pause', 'resume', 'clear'].includes(argument)));
-    if (anyBusy && !goalControl) { setError('请先停止或完成当前任务，再使用命令。'); return; }
+    if (busy && !goalControl && !['/new', '/clear'].includes(command)) { setError('请先停止或完成当前会话的任务，再使用命令。'); return; }
     if (['/new', '/clear'].includes(command)) { setInput(''); await newSession(); return; }
     if (command === '/compact') {
       if (!sessionId || !session?.model) { setError('先发送一条消息，再压缩上下文'); return; }
@@ -645,37 +677,37 @@ export default function App() {
     if (command === '/help') { setCommandMessage(commandMatches('/', agentId, nativeCommands, skillCatalog.skills).map(c => `${c.name} — ${c.skill ? '技能 · ' : ''}${c.detail}`).join('\n')); setInput(''); return; }
     if ((agentId === 'claude' || ['opencode', 'pi'].includes(agentId) && command !== '/compact' && !slashCommands.some(c => c.name === command && (!c.agent || c.agent === agentId))) && commandMatches('/', agentId, nativeCommands).some(c => c.name === command)) {
       if (!desktop) { setError('原生命令需要在桌面版运行。'); return; }
-        setSending(true);
+      const flight = beginSending();
       try {
         await requireChatConnection(agentId, connectionId, sessionId);
         let id = sessionId;
         if (!id) { const s = await createChatSession({ projectId, model, agent: agentId, connectionId }); id = s.id; setSessionId(id); current.current.sessionId = id; }
-        pendingSession.current = id;
+        flight.track(id);
         await call('send_message', { sessionId: id, text: `${command}${argument ? ` ${argument}` : ''}`, model: model || null, readOnly, permissionMode }); setInput(''); await refresh();
-      } catch (e) { report(e); } finally { pendingSession.current = null; setSending(false); }
+      } catch (e) { report(e); } finally { flight.finish(); }
       return;
     }
     if (command === '/compact' && ['opencode', 'pi'].includes(agentId)) {
       if (!sessionId || !desktop) { setError('先发送一条消息，再压缩上下文。'); return; }
-      setSending(true);
+      const flight = beginSending();
       try { await call('compact_session_context', { sessionId }); setInput(''); await refresh(); await loadMessages(sessionId); }
-      catch (e) { report(e); } finally { setSending(false); }
+      catch (e) { report(e); } finally { flight.finish(); }
       return;
     }
     if (!['/goal', '/goal-create', '/goal-status', '/compact'].includes(command) || agentId !== 'codex') { setError('当前 Agent 不支持此命令。输入 / 查看可用命令。'); return; }
     if (!desktop) { setError('原生命令需要在桌面版运行。'); return; }
-    setSending(true);
+    const flight = beginSending();
     try {
       await requireChatConnection(agentId, connectionId, sessionId);
       let id = sessionId;
       if (!id) { const s = await createChatSession({ projectId, model, agent: agentId, connectionId }); id = s.id; setSessionId(id); current.current.sessionId = id; }
-      pendingSession.current = id;
+      flight.track(id);
       const result = await call<{ text: string; session: Session }>('execute_agent_command', { sessionId: id, command: command.slice(1), argument, permissionMode });
       if (current.current.sessionId === id) {
         current.current.nativeId = result.session.nativeId; setCommandMessage(result.text); if (!preserveDraft) setInput(''); await loadMessages(id);
       }
       await refresh();
-    } catch (e) { report(e); } finally { pendingSession.current = null; setSending(false); }
+    } catch (e) { report(e); } finally { flight.finish(); }
   }
   async function connectionUpdated(_resetAgent?: string) {
     const data = await refresh();
@@ -696,7 +728,7 @@ export default function App() {
     });
   }
   async function chooseModel(option: ModelOption) {
-    if (anyBusy || configuring) return;
+    if (busy || configuring) return;
     if (option.connectionId === connectionId && option.model === model) return;
     setConfiguring(true);
     setHandoffTarget(option.source.providerName || option.displayName);
@@ -912,38 +944,39 @@ export default function App() {
       {desktop ? <AppUpdateNotice open={() => { setSettingsTab('about'); openSettings(); }}/> : null}
       <header className="workspace-header"><div className="breadcrumbs">{!sidebar ? <button className="icon-button" title="展开侧栏" onClick={() => setSidebar(true)}><PanelLeftOpen size={18} /></button> : null}<Folder size={15} /><strong title={`${project?.name ?? '工作区'} · ${session?.title ?? '新会话'}`}>{session?.title ?? project?.name ?? '新聊天'}</strong>{!desktop ? <span className="preview-badge">界面预览</span> : null}</div><div className="header-actions"><button className={`icon-button ${showBrowser ? 'on' : ''}`} aria-label="打开内置浏览器" aria-pressed={showBrowser} title={showBrowser ? '收起浏览器' : '内置浏览器'} disabled={!desktop || !sessionId} onClick={()=>{setBrowserSession(showBrowser ? null : sessionId);setBrowserExpanded(false);}}><Globe size={16}/></button>{session ? <button className="icon-button" title="会话设置" onClick={() => { setRename(session.title); setModal('rename'); }}><MoreHorizontal size={18} /></button> : null}<button className={`icon-button ${logsOpen ? 'on' : ''}`} title="运行日志" onClick={() => setLogsOpen(v => !v)}><Terminal size={16} /></button><button className="icon-button" aria-label={showContext ? '收起工作空间' : '打开工作空间'} aria-pressed={showContext} title={showContext ? '收起工作空间' : '打开工作空间'} onClick={() => { if(narrow)setContextOverlay(v => !v);else setContext(v => !v); }}>{showContext ? <PanelRightClose size={17} /> : <PanelRightOpen size={17} />}</button></div></header>
       <div className="chat-scroll" aria-busy={!ready} ref={scrollArea} onClickCapture={e => { if ((e.target as Element).closest('.activity-row, .activity-group-summary, .activity-toggle-more, .turn-process-toggle')) stickToBottom.current = false; }} onScroll={() => { if (settingsOpenRef.current) return; const el = scrollArea.current; if (el) { stickToBottom.current = el.scrollHeight - el.scrollTop - el.clientHeight < 100; setShowJump(!stickToBottom.current); } }}>
-        {!ready ? <div className="startup-loading" role="status"><span className="pending-text">正在加载工作区…</span></div> : messages.length || busy || messagesLoading || currentRequests.length ? <div className="messages" aria-busy={messagesLoading}>{hasMore ? <button className="load-earlier" disabled={messagesLoading} onClick={() => void loadMessages(sessionId, messages.find(m => m.seq > 0)?.seq).catch(report)}>{messagesLoading ? '正在加载…' : '加载更早的消息'}</button> : null}{messagesLoading && !messages.length ? <div className="working-indicator"><span className="pending-text">正在加载会话…</span></div> : null}<Conversation messages={messages} agentName={agentName} autoExpand={autoExpand} showDiff={showDiff} openFile={showFile} openPath={openPath} projectId={projectId} sessionId={sessionId} />{handoffTarget ? <div className="working-indicator" role="status"><span className="pending-text">{handoffTarget === '@compact' ? '正在压缩上下文…' : `正在切换到 ${handoffTarget}…`}</span></div> : busy && !latest ? <div className="working-indicator"><span className="pending-text">{session?.status === 'starting' ? '正在启动 Agent…' : sending && pendingSession.current === sessionId && !isActive(session?.status) ? '正在发送…' : '正在思考…'}</span></div> : null}{currentRequests.filter(request => request.method !== 'item/tool/requestUserInput').map(request => <Suspense key={String(request.id)} fallback={<div className="working-indicator">正在加载确认请求…</div>}><RequestCard request={request} respond={result => respondRequest(request, result)} openFile={showFile} /></Suspense>)}</div>
+        {!ready ? <div className="startup-loading" role="status"><span className="pending-text">正在加载工作区…</span></div> : messages.length || busy || messagesLoading || currentRequests.length ? <div className="messages" aria-busy={messagesLoading}>{hasMore ? <button className="load-earlier" disabled={messagesLoading} onClick={() => void loadMessages(sessionId, messages.find(m => m.seq > 0)?.seq).catch(report)}>{messagesLoading ? '正在加载…' : '加载更早的消息'}</button> : null}{messagesLoading && !messages.length ? <div className="working-indicator"><span className="pending-text">正在加载会话…</span></div> : null}<Conversation messages={messages} agentName={agentName} autoExpand={autoExpand} showDiff={showDiff} openFile={showFile} openPath={openPath} projectId={projectId} sessionId={sessionId} sessionStatus={sending && !isActive(session?.status) ? 'starting' : session?.status} pendingLabel={sending && !isActive(session?.status) ? '正在发送…' : undefined} activeTurnId={session?.turnId} />{handoffTarget ? <div className="working-indicator" role="status"><span className="pending-text">{handoffTarget === '@compact' ? '正在压缩上下文…' : `正在切换到 ${handoffTarget}…`}</span></div> : null}{currentRequests.filter(request => request.method !== 'item/tool/requestUserInput').map(request => <Suspense key={String(request.id)} fallback={<div className="working-indicator">正在加载确认请求…</div>}><RequestCard request={request} respond={result => respondRequest(request, result)} openFile={showFile} /></Suspense>)}</div>
           : <NewChat project={project} projects={projects} selectProject={selectProject} addProject={() => void addProject()}/>}
       </div>
       {showJump ? <JumpToLatest onClick={() => { stickToBottom.current = true; setShowJump(false); scrollToLatest(scrollArea.current, !prefs.animations || window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'instant' : 'smooth'); }} /> : null}
       <div className={`composer-area${questionPending ? ' has-question' : ''}`}>{error ? <div className="error-banner" role="alert"><span>{error}</span><button className="icon-button" title="关闭提示" onClick={() => setError('')}><X size={15} /></button></div> : null}{activeElsewhere && !busy ? <button className="active-elsewhere" onClick={() => void selectSession(activeElsewhere)}><span className="pending-text">另一会话正在运行：{activeElsewhere.title}</span><ArrowUpRight size={13} /></button> : null}
         {commandMessage ? <div className="command-feedback" role="status"><pre>{commandMessage}</pre><button className="icon-button" title="关闭命令结果" onClick={() => setCommandMessage('')}><X size={14} /></button></div> : null}
         {questionPending ? <Suspense fallback={<div className="working-indicator">正在加载提问…</div>}><QuestionDock requests={currentRequests} respond={respondRequest} /></Suspense> : null}
-        <FollowupQueue rows={followups.rows} agent={agentId} turnId={session?.turnId} steeringMode={followups.steeringMode} change={changeFollowup} steer={steerFollowup} openSide={row=>void openSide(row)}/>
         {busy && session?.turnId && messages.some(message => message.kind === 'turnDiff') ? <Suspense fallback={null}><TurnChangesDock key={sessionId} messages={messages} activeTurnId={session.turnId} showDiff={showDiff}/></Suspense> : null}
+        <FollowupQueue rows={followups.rows.filter(row=>row.sessionId===sessionId)} agent={agentId} turnId={session?.turnId} steeringMode={followups.steeringMode} change={changeFollowup} steer={steerFollowup} openSide={row=>void openSide(row)} edit={followupEditor.begin} editingId={followupEditor.editingId}/>
         <form className={`composer ${busy ? 'busy' : ''}`} onSubmit={e => { e.preventDefault(); void send(); }}>
+          {followupEditor.editingId?<div className="composer-editing"><span>编辑排队消息</span><button type="button" disabled={followupEditor.busy} onClick={()=>void followupEditor.cancel()}>取消编辑</button></div>:null}
           {slashOptions.length || composerFocused && skillQuery && !commandsDismissed && (skillsLoading || skillsError) ? <div className="slash-menu" id="agent-commands" role="listbox" aria-label="命令与技能" aria-busy={skillsLoading}>{slashOptions.map((c, index) => <button id={`agent-command-${index}`} className={index === slashIndex ? 'selected' : ''} type="button" role="option" aria-selected={index === slashIndex} key={c.name} onMouseDown={e => e.preventDefault()} onClick={() => selectCommand(index)}><span className="slash-option-name">{c.skill ? <Sparkles size={14}/> : <Terminal size={14}/>}<code>{c.name}</code></span><span className="slash-option-detail" title={c.detail}>{c.detail}{c.skill ? <small>{skillSource(c.skill)}</small> : null}</span>{c.skill ? <small className="slash-option-kind">技能</small> : null}</button>)}{skillsLoading ? <div className="slash-menu-status" role="status">读取技能…</div> : skillsError ? <div className="slash-menu-status error-text" role="alert">{skillsError}</div> : null}</div> : null}
           <AttachmentStrip attachments={attachments} loading={importingImages} remove={path => setAttachments(old => old.filter(a => a.path !== path))} />
-          <div className="composer-input"><ComposerSkills attachments={attachments} remove={path => { setAttachments(old => old.filter(a => a.path !== path)); requestAnimationFrame(() => textarea.current?.focus()); }} /><textarea ref={textarea} disabled={!ready} onFocus={() => { setComposerFocused(true); setCommandsDismissed(false); }} onBlur={() => { setComposerFocused(false); setCommandsDismissed(true); }} value={input} onPaste={pasteImages} onChange={e => { setInput(e.target.value); setCommandsDismissed(false); setCommandSelection(0); }} aria-controls={slashOptions.length ? "agent-commands" : undefined} aria-expanded={!!slashOptions.length} aria-autocomplete="list" aria-activedescendant={slashOptions.length ? `agent-command-${slashIndex}` : undefined} placeholder={questionPending ? '随心输入' : attachments.some(a => a.kind === 'skill') ? '' : project ? '随心输入，输入 / 查看命令与技能' : '描述你的想法，或先选择一个项目…'} aria-label="消息" rows={questionPending ? 1 : 2} onKeyDown={e => { if (e.nativeEvent.isComposing) return; if (e.key === 'Backspace' && !e.repeat && !e.ctrlKey && !e.altKey && !e.metaKey && e.currentTarget.selectionStart === 0 && e.currentTarget.selectionEnd === 0) { const lastSkill = attachments.filter(a => a.kind === 'skill').at(-1); if (lastSkill) { e.preventDefault(); setAttachments(old => old.filter(a => a.path !== lastSkill.path)); return; } } if (slashOptions.length && ['ArrowDown','ArrowUp'].includes(e.key)) { e.preventDefault(); setCommandSelection(commandIndex(e.key, slashIndex, slashOptions.length)); } else if (slashOptions.length && e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); setCommandsDismissed(true); } else if (slashOptions.length && (e.key === 'Tab' || e.key === 'Enter' && !e.shiftKey)) { e.preventDefault(); selectCommand(slashIndex); } else if (skillsLoading && skillQuery && e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); } else if (e.key === 'Enter' && (prefs.enterSend || e.ctrlKey || e.metaKey) && !e.shiftKey && !e.nativeEvent.isComposing) { e.preventDefault(); void send(); } }} /></div>
+          <div className="composer-input"><ComposerSkills attachments={attachments} remove={path => { setAttachments(old => old.filter(a => a.path !== path)); requestAnimationFrame(() => textarea.current?.focus()); }} /><ComposerTextarea ref={textarea} disabled={!ready||followupEditor.busy} onFocus={() => { setComposerFocused(true); setCommandsDismissed(false); }} onBlur={() => { setComposerFocused(false); setCommandsDismissed(true); }} value={input} onPaste={pasteImages} onChange={e => { setInput(e.target.value); setCommandsDismissed(false); setCommandSelection(0); }} aria-controls={slashOptions.length ? "agent-commands" : undefined} aria-expanded={!!slashOptions.length} aria-autocomplete="list" aria-activedescendant={slashOptions.length ? `agent-command-${slashIndex}` : undefined} placeholder={questionPending ? '随心输入' : attachments.some(a => a.kind === 'skill') ? '' : project ? '随心输入，输入 / 查看命令与技能' : '描述你的想法，或先选择一个项目…'} aria-label="消息" rows={questionPending ? 1 : 2} onKeyDown={e => { if (e.nativeEvent.isComposing) return; if (e.key === 'Backspace' && !e.repeat && !e.ctrlKey && !e.altKey && !e.metaKey && e.currentTarget.selectionStart === 0 && e.currentTarget.selectionEnd === 0) { const lastSkill = attachments.filter(a => a.kind === 'skill').at(-1); if (lastSkill) { e.preventDefault(); setAttachments(old => old.filter(a => a.path !== lastSkill.path)); return; } } if (slashOptions.length && ['ArrowDown','ArrowUp'].includes(e.key)) { e.preventDefault(); setCommandSelection(commandIndex(e.key, slashIndex, slashOptions.length)); } else if (slashOptions.length && e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); setCommandsDismissed(true); } else if (slashOptions.length && (e.key === 'Tab' || e.key === 'Enter' && !e.shiftKey)) { e.preventDefault(); selectCommand(slashIndex); } else if (skillsLoading && skillQuery && e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); } else if (e.key === 'Enter' && (prefs.enterSend || e.ctrlKey || e.metaKey) && !e.shiftKey && !e.nativeEvent.isComposing) { e.preventDefault(); void send(); } }} /></div>
           <div className="composer-toolbar"><div className="composer-options">
             <AddMenu key={`${projectId}:${agentId}`} projectId={projectId} agent={agentId} permissionMode={permissionMode} attachments={attachments}
-              addAttachments={addAttachments} busy={!ready || sending || importingImages} modeBusy={anyBusy || configuring} project={() => void addProject()}
+              addAttachments={addAttachments} busy={!ready || sending || importingImages} modeBusy={busy || configuring} project={() => void addProject()}
               onSkill={addSkill} onPlan={enabled => { setPermissionMode(enabled ? 'read' : 'ask'); requestAnimationFrame(() => textarea.current?.focus()); }}
               onGoal={objective => void handleCommand('/goal-create', objective, true)} />
-            <PermissionMenu value={permissionMode} agent={agentId} busy={anyBusy} onChange={mode => {setPermissionMode(mode);}} />
+            <PermissionMenu value={permissionMode} agent={agentId} busy={busy} onChange={mode => {setPermissionMode(mode);}} />
           </div><div className="composer-right">
-            <AgentMenu value={agentId} agents={agents} busy={anyBusy} choose={switchAgent}/>
-            <ModelMenu value={model} models={modelSourceRevision === profileRevision ? models : []} catalogLoaded={modelCatalogRevision === profileRevision} catalogWarning={modelCatalogRevision === profileRevision ? modelCatalogWarning : ''} profiles={profiles} activeProfile={activeProfile} connectionId={connectionId} order={connectionOrder} source={currentModelSource} busy={anyBusy || configuring} loading={loadingModels} agent={agentId} choose={chooseModel} reload={force => void loadModels(force)} manage={() => {setProviderSettingsAgent(agentId);setSettingsTab('providers');openSettings();}} effort={effort} setEffort={setEffort} hasConversation={!!session?.nativeId} />
-            <button className={`send-button${stopMode ? ' stop-button' : ''}`} type={stopMode ? 'button' : 'submit'} disabled={stopMode ? !session?.turnId || stopping : !hasDraft || sending || importingImages} onClick={stopMode ? () => void stop() : undefined} aria-label={stopMode ? '停止生成' : anyBusy ? '加入队列' : '发送消息'} title={stopMode ? '停止生成' : anyBusy ? '加入队列，当前任务完成后发送' : '发送消息'}>{stopMode ? <Square size={14} fill="currentColor" /> : <ArrowUp size={18} />}</button></div></div>
-        </form><div className="composer-footnote"><span /><div>{currentModelSource?.available === true ? <PlatformUsageIndicator key={`${agentId}:${connectionId}`} agent={agentId} connectionId={agentId === 'codex' && connectionId === '@local' ? '@official' : connectionId} revision={profileRevision} openStats={() => {setSettingsTab('quota');openSettings();}} /> : null}<UsageIndicator usage={usage} busy={anyBusy || !session?.nativeId} compact={() => void handleCommand('/compact','')} openStats={() => {setSettingsTab('usage');openSettings();}} /><span>{prefs.enterSend ? 'Enter 发送' : 'Ctrl Enter 发送'} · Shift Enter 换行</span></div></div>
+            <AgentMenu value={agentId} agents={agents} busy={configuring} choose={switchAgent}/>
+            <ModelMenu value={model} models={modelSourceRevision === profileRevision ? models : []} catalogLoaded={modelCatalogRevision === profileRevision} catalogWarning={modelCatalogRevision === profileRevision ? modelCatalogWarning : ''} profiles={profiles} activeProfile={activeProfile} connectionId={connectionId} order={connectionOrder} source={currentModelSource} busy={busy || configuring} loading={loadingModels} agent={agentId} choose={chooseModel} reload={force => void loadModels(force)} manage={() => {setProviderSettingsAgent(agentId);setSettingsTab('providers');openSettings();}} effort={effort} setEffort={setEffort} hasConversation={!!session?.nativeId} />
+            <button className={`send-button${stopMode ? ' stop-button' : ''}`} type={stopMode ? 'button' : 'submit'} disabled={stopMode ? !session?.turnId || stopping : !hasDraft || sending || importingImages || followupEditor.busy} onClick={stopMode ? () => void stop() : undefined} aria-label={stopMode ? '停止生成' : followupEditor.editingId ? '发送修改' : busy ? '加入队列' : '发送消息'} title={stopMode ? '停止生成' : followupEditor.editingId ? '发送修改，保留原来的顺序' : busy ? '加入队列，当前任务完成后发送' : '发送消息'}>{stopMode ? <Square size={14} fill="currentColor" /> : <ArrowUp size={18} />}</button></div></div>
+        </form><div className="composer-footnote"><span /><div>{currentModelSource?.available === true ? <PlatformUsageIndicator key={`${agentId}:${connectionId}`} agent={agentId} connectionId={agentId === 'codex' && connectionId === '@local' ? '@official' : connectionId} revision={profileRevision} openStats={() => {setSettingsTab('quota');openSettings();}} /> : null}<UsageIndicator usage={usage} busy={busy || !session?.nativeId} compact={() => void handleCommand('/compact','')} openStats={() => {setSettingsTab('usage');openSettings();}} /><span>{prefs.enterSend ? 'Enter 发送' : 'Ctrl Enter 发送'} · Shift Enter 换行</span></div></div>
       </div>
-      {logsOpen ? <section className="logs-panel"><div><span><Terminal size={14} />运行日志</span><button className="quiet-button" onClick={() => setLogs([])}>清空</button><button className="icon-button" title="关闭日志" onClick={() => setLogsOpen(false)}><X size={15} /></button></div><pre>{logs.length ? logs.join('\n') : '暂无运行日志。Agent 会在发送消息时启动。'}</pre></section> : null}
+      {logsOpen ? <section className="logs-panel"><div><span title="自动保存到文件，保留 30 天"><Terminal size={14} />运行日志 · 保留 30 天</span><button className="quiet-button" disabled={!desktop} onClick={() => void openRuntimeLogFolder().catch(report)}>打开文件夹</button><button className="quiet-button" disabled={!desktop || exportingLogs} onClick={() => void exportLogs()}>{exportingLogs ? '正在导出…' : '导出诊断日志'}</button><button className="quiet-button" title="仅清空当前显示，保留日志文件" onClick={() => setLogs([])}>清空显示</button><button className="icon-button" title="关闭日志" onClick={() => setLogsOpen(false)}><X size={15} /></button></div><pre>{logs.length ? logs.join('\n') : '日志已自动保存到文件。可打开文件夹查看，或导出最近 30 天的诊断日志。'}</pre></section> : null}
     </main>
     {showBrowser ? <Suspense fallback={<aside className="browser-panel">正在打开浏览器…</aside>}><BrowserPanel key={sessionId} sessionId={sessionId} visible={!settingsOpen && !modal && !sidebarDialog && !selectionDetail && !(narrow && (showContext || sideDraft))} close={()=>{setBrowserSession(null);setBrowserExpanded(false);}} resizeHandle={<div {...browserDock.handle}/>} expanded={browserExpanded} expand={()=>setBrowserExpanded(v=>!v)}/></Suspense> : null}
     </div>
 
     <SelectionActions key={sessionId} area={scrollArea} add={text=>{setInput(old=>[old,text.split('\n').map(line=>`> ${line}`).join('\n')].filter(Boolean).join('\n\n'));requestAnimationFrame(()=>textarea.current?.focus());}} details={setSelectionDetail} ask={text=>void openSide(undefined,`关于下面这段内容：\n\n${text}\n\n请帮我进一步解释。`)}/>
-    {sideDraft && !settingsOpen ? <Suspense fallback={<aside className="side-chat">正在打开侧边聊天…</aside>}><SideChat key={sideDraft.key} draft={sideDraft} projectId={sideDraft.projectId??projectId} agent={sideDraft.agent??agentId} connectionId={sideDraft.connectionId??connectionId} defaults={followupPayload('')} close={()=>setSideDraft(null)} opened={()=>void refresh()} openFile={showFile} showDiff={showDiff} providerRequired={(agent,draft)=>{setSideDraft(draft);showProviderRequired(agent);}} resizeHandle={<div {...panels.handle('right')}/>}/></Suspense> : null}
+    {sideDraft && !settingsOpen ? <Suspense fallback={<aside className="side-chat">正在打开侧边聊天…</aside>}><SideChat key={sideDraft.key} draft={sideDraft} projectId={sideDraft.projectId??projectId} agent={sideDraft.agent??agentId} connectionId={sideDraft.connectionId??connectionId} defaults={followupPayload('')} profiles={profiles} enterSend={prefs.enterSend} manageProviders={(agent,draft)=>{setSideDraft(draft);setProviderSettingsAgent(agent);setSettingsTab('providers');openSettings();}} close={()=>setSideDraft(null)} opened={()=>void refresh()} openFile={showFile} showDiff={showDiff} providerRequired={(agent,draft)=>{setSideDraft(draft);showProviderRequired(agent);}} resizeHandle={<div {...panels.handle('right')}/>}/></Suspense> : null}
     {selectionDetail?<div className="modal-backdrop" onClick={()=>setSelectionDetail('')}><section className="modal" role="dialog" aria-modal="true" aria-label="选中内容" onClick={e=>e.stopPropagation()}><div className="modal-heading"><h2>选中内容</h2><button className="icon-button" aria-label="关闭选中内容" onClick={()=>setSelectionDetail('')}><X size={16}/></button></div><pre className="selection-detail">{selectionDetail}</pre><CopyButton text={selectionDetail} label="复制选中内容"/></section></div>:null}
     <aside className={`context-panel workspace-panel ${showContext && !sideDraft ? '' : 'pane-collapsed'}`} aria-label={showContext && !sideDraft ? '工作空间' : undefined} aria-hidden={!showContext || !!sideDraft} hidden={settingsOpen || !!sideDraft} inert={!showContext || !!modal || sidebarDialog}>
       {!settingsOpen && showContext && !workspaceExpanded ? <div {...panels.handle('right')}/> : null}

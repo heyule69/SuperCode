@@ -12,7 +12,14 @@ use axum::{
 };
 use futures_util::StreamExt;
 use serde_json::{json, Value};
-use std::{collections::BTreeMap, convert::Infallible, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    convert::Infallible,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+};
 use tokio::sync::watch;
 
 pub struct Bridge {
@@ -27,6 +34,7 @@ struct Connection {
     token: String,
     http: reqwest::Client,
     cancel: watch::Receiver<bool>,
+    stream_usage: Arc<AtomicBool>,
 }
 impl Drop for Bridge {
     fn drop(&mut self) {
@@ -51,6 +59,7 @@ impl Bridge {
             token: token.clone(),
             http: crate::providers::client()?,
             cancel: rx,
+            stream_usage: Arc::new(AtomicBool::new(true)),
         });
         let router = Router::new()
             .route("/v1/messages", post(messages))
@@ -173,6 +182,9 @@ pub fn to_chat(body: &Value) -> Result<Value, String> {
         }
     }
     let mut out = json!({"model":body["model"],"messages":messages,"stream":body["stream"].as_bool().unwrap_or(false)});
+    if out["stream"] == true {
+        out["stream_options"] = json!({"include_usage":true});
+    }
     if let Some(max) = body["max_tokens"].as_u64() {
         out["max_tokens"] = json!(max.min(32768));
     }
@@ -237,7 +249,7 @@ fn from_chat(value: Value, model: &str) -> Result<Value, String> {
         }
     }
     Ok(
-        json!({"id":value["id"].as_str().unwrap_or("supercode-message"),"type":"message","role":"assistant","model":value["model"].as_str().unwrap_or(model),"content":blocks,"stop_reason":stop_reason(choice["finish_reason"].as_str().unwrap_or("stop")),"stop_sequence":null,"usage":{"input_tokens":value["usage"]["prompt_tokens"].as_u64().unwrap_or(0),"output_tokens":value["usage"]["completion_tokens"].as_u64().unwrap_or(0)}}),
+        json!({"id":value["id"].as_str().unwrap_or("supercode-message"),"type":"message","role":"assistant","model":value["model"].as_str().unwrap_or(model),"content":blocks,"stop_reason":stop_reason(choice["finish_reason"].as_str().unwrap_or("stop")),"stop_sequence":null,"usage":crate::usage_tokens::chat_usage(&value["usage"])}),
     )
 }
 fn sse(value: Value) -> Event {
@@ -260,8 +272,7 @@ struct StreamState {
     text: Option<usize>,
     thinking: Option<usize>,
     tools: BTreeMap<usize, Tool>,
-    output_tokens: u64,
-    input_tokens: u64,
+    usage: Value,
     reason: String,
     total: usize,
 }
@@ -272,11 +283,14 @@ impl StreamState {
         }
         let mut events = Vec::new();
         let delta = &value["choices"][0]["delta"];
-        if let Some(n) = value["usage"]["completion_tokens"].as_u64() {
-            self.output_tokens = n;
-        }
-        if let Some(n) = value["usage"]["prompt_tokens"].as_u64() {
-            self.input_tokens = n;
+        let usage = crate::usage_tokens::chat_usage(&value["usage"]);
+        if let Some(fields) = usage.as_object().filter(|fields| !fields.is_empty()) {
+            if !self.usage.is_object() {
+                self.usage = json!({});
+            }
+            for (key, value) in fields {
+                self.usage[key] = value.clone();
+            }
         }
         if let Some(reason) = value["choices"][0]["finish_reason"].as_str() {
             self.reason = reason.into();
@@ -371,7 +385,7 @@ impl StreamState {
         let mut events = (0..self.next)
             .map(|index| json!({"type":"content_block_stop","index":index}))
             .collect::<Vec<_>>();
-        events.push(json!({"type":"message_delta","delta":{"stop_reason":stop_reason(&self.reason),"stop_sequence":null},"usage":{"input_tokens":self.input_tokens,"output_tokens":self.output_tokens}}));
+        events.push(json!({"type":"message_delta","delta":{"stop_reason":stop_reason(&self.reason),"stop_sequence":null},"usage":self.usage.as_object().map(|_|self.usage.clone()).unwrap_or_else(||json!({}))}));
         events.push(json!({"type":"message_stop"}));
         Ok(events)
     }
@@ -390,7 +404,7 @@ async fn messages(
     if *state.cancel.borrow() {
         return error(StatusCode::GONE, "Agent turn stopped");
     }
-    let chat = match to_chat(&body) {
+    let mut chat = match to_chat(&body) {
         Ok(v) => v,
         Err(e) => return error(StatusCode::BAD_REQUEST, &e),
     };
@@ -402,12 +416,36 @@ async fn messages(
             .unwrap_or("")
             .trim_end_matches('/')
     );
-    let mut request = state.http.post(url).json(&chat);
-    if let Some(key) = crate::providers::key(&state.config) {
-        request = request.bearer_auth(key);
+    if !state.stream_usage.load(Ordering::Relaxed) {
+        chat.as_object_mut().unwrap().remove("stream_options");
     }
     let mut cancellation = state.cancel.clone();
-    let response = tokio::select! {_=cancellation.changed()=>return error(StatusCode::GONE,"Agent turn stopped"), result=request.send()=>match result{Ok(v)=>v,Err(_)=>return error(StatusCode::BAD_GATEWAY,"连接供应商失败或超时")}};
+    let response = loop {
+        let mut request = state.http.post(&url).json(&chat);
+        if let Some(key) = crate::providers::key(&state.config) {
+            request = request.bearer_auth(key);
+        }
+        let response = tokio::select! {_=cancellation.changed()=>return error(StatusCode::GONE,"Agent turn stopped"), result=request.send()=>match result{Ok(v)=>v,Err(_)=>return error(StatusCode::BAD_GATEWAY,"连接供应商失败或超时")}};
+        let status = response.status();
+        if matches!(status.as_u16(), 400 | 422) && chat.get("stream_options").is_some() {
+            let details = tokio::select! {_=cancellation.changed()=>return error(StatusCode::GONE,"Agent turn stopped"), result=read_option_error(response)=>result};
+            if details.as_ref().is_ok_and(unsupported_stream_usage) {
+                // Retry only an explicit validation rejection, never a failed
+                // generation or a generic API error. Remember it for this route.
+                state.stream_usage.store(false, Ordering::Relaxed);
+                chat.as_object_mut().unwrap().remove("stream_options");
+                continue;
+            }
+            return error(
+                status,
+                &format!(
+                    "供应商返回 HTTP {}，请检查 API 地址、Key 与模型权限",
+                    status.as_u16()
+                ),
+            );
+        }
+        break response;
+    };
     if !response.status().is_success() {
         return error(
             response.status(),
@@ -456,6 +494,51 @@ async fn messages(
         .into_response()
 }
 
+fn unsupported_stream_usage(value: &Value) -> bool {
+    let error = value.get("error").unwrap_or(value);
+    let text = format!(
+        "{} {}",
+        error["param"].as_str().unwrap_or(""),
+        error["message"].as_str().unwrap_or("")
+    )
+    .to_ascii_lowercase();
+    let unsupported = (text.contains("stream_options") || text.contains("include_usage"))
+        && [
+            "unsupported",
+            "not supported",
+            "unknown",
+            "unrecognized",
+            "unexpected",
+            "extra inputs",
+            "not permitted",
+        ]
+        .iter()
+        .any(|term| text.contains(term));
+    unsupported
+        || value["detail"].as_array().is_some_and(|errors| {
+            errors.iter().take(16).any(|error| {
+                error["type"] == "extra_forbidden"
+                    && error["loc"].as_array().is_some_and(|loc| {
+                        loc.iter()
+                            .any(|part| part == "stream_options" || part == "include_usage")
+                    })
+            })
+        })
+}
+
+async fn read_option_error(response: reqwest::Response) -> Result<Value, ()> {
+    let mut stream = response.bytes_stream();
+    let mut bytes = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|_| ())?;
+        if bytes.len().saturating_add(chunk.len()) > 64 * 1024 {
+            return Err(());
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&bytes).map_err(|_| ())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -464,10 +547,63 @@ mod tests {
         let input = json!({"model":"kimi-k2.5","max_tokens":1024,"stream":true,"system":[{"type":"text","text":"system"}],"tools":[{"name":"Read","input_schema":{"type":"object"}}],"messages":[{"role":"assistant","content":[{"type":"thinking","thinking":"summary"},{"type":"tool_use","id":"t1","name":"Read","input":{"file_path":"README.md"}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"file text"},{"type":"text","text":"continue"}]}]});
         let chat = to_chat(&input).unwrap();
         assert_eq!(chat["model"], "kimi-k2.5");
+        assert_eq!(chat["stream_options"]["include_usage"], true);
+        let mut nonstream = input;
+        nonstream["stream"] = json!(false);
+        assert!(to_chat(&nonstream).unwrap().get("stream_options").is_none());
         assert_eq!(chat["messages"][1]["reasoning_content"], "summary");
         assert_eq!(chat["messages"][2]["role"], "tool");
         assert_eq!(chat["messages"][2]["tool_call_id"], "t1");
         assert_eq!(chat["messages"][3]["content"], "continue");
+    }
+    #[test]
+    fn usage_only_chunks_and_missing_usage_are_distinguished_for_any_chat_model() {
+        let mut state = StreamState::default();
+        state.delta(&json!({"choices":[{"delta":{"content":"reply"},"finish_reason":"stop"}],"usage":null})).unwrap();
+        assert_eq!(
+            state
+                .finish()
+                .unwrap()
+                .iter()
+                .find(|e| e["type"] == "message_delta")
+                .unwrap()["usage"],
+            json!({})
+        );
+        state.delta(&json!({"choices":[],"usage":{"prompt_tokens":12000,"completion_tokens":300,"prompt_tokens_details":{"cached_tokens":11000},"completion_tokens_details":{"reasoning_tokens":100}}})).unwrap();
+        let usage = &state
+            .finish()
+            .unwrap()
+            .into_iter()
+            .find(|e| e["type"] == "message_delta")
+            .unwrap()["usage"];
+        assert_eq!(usage["input_tokens"], 1000);
+        assert_eq!(usage["cache_read_input_tokens"], 11000);
+        assert_eq!(usage["output_tokens"], 300);
+        assert_eq!(usage["output_tokens_details"]["thinking_tokens"], 100);
+        let missing = from_chat(
+            json!({"choices":[{"message":{"content":"reply"},"finish_reason":"stop"}]}),
+            "any-model",
+        )
+        .unwrap();
+        assert_eq!(missing["usage"], json!({}));
+    }
+    #[test]
+    fn compatibility_retry_is_limited_to_explicit_unsupported_usage_options() {
+        assert!(unsupported_stream_usage(
+            &json!({"error":{"param":"stream_options","message":"Unknown parameter"}})
+        ));
+        assert!(unsupported_stream_usage(
+            &json!({"error":{"message":"include_usage is not supported"}})
+        ));
+        assert!(!unsupported_stream_usage(
+            &json!({"error":{"message":"Invalid model"}})
+        ));
+        assert!(!unsupported_stream_usage(
+            &json!({"error":{"message":"stream_options: quota exceeded"}})
+        ));
+        assert!(unsupported_stream_usage(
+            &json!({"detail":[{"type":"extra_forbidden","loc":["body","stream_options"],"msg":"Extra inputs are not permitted"}]})
+        ));
     }
     #[test]
     fn streaming_reasoning_text_and_fragmented_tools_are_distinct() {
@@ -497,15 +633,55 @@ mod tests {
         assert!(client.post(url).json(&json!({})).send().await.is_err());
     }
     #[tokio::test]
+    async fn older_chat_endpoints_retry_without_stream_options_once_and_still_report_usage() {
+        use std::sync::atomic::AtomicUsize;
+        let rejected = Arc::new(AtomicUsize::new(0));
+        let observed = rejected.clone();
+        let router = Router::new().route("/v1/chat/completions", post(move |Json(body): Json<Value>| {
+            let rejected = observed.clone();
+            async move {
+                if body.get("stream_options").is_some() {
+                    rejected.fetch_add(1, Ordering::Relaxed);
+                    return (StatusCode::BAD_REQUEST, Json(json!({"error":{"param":"stream_options","message":"Unsupported parameter"}}))).into_response();
+                }
+                let chunk = json!({"choices":[{"delta":{"content":"reply"},"finish_reason":"stop"}],"usage":{"prompt_tokens":200,"completion_tokens":10}});
+                ([("content-type","text/event-stream")], format!("data: {chunk}\n\ndata: [DONE]\n\n")).into_response()
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        let bridge = Bridge::start(json!({"baseUrl":format!("http://{address}/v1")}))
+            .await
+            .unwrap();
+        let client = reqwest::Client::new();
+        for _ in 0..2 {
+            let response = client.post(format!("{}/v1/messages", bridge.base_url)).header("x-api-key", &bridge.token).json(&json!({"model":"any-model","stream":true,"messages":[{"role":"user","content":"hi"}]})).send().await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert!(response
+                .text()
+                .await
+                .unwrap()
+                .contains("\"input_tokens\":200"));
+        }
+        assert_eq!(rejected.load(Ordering::Relaxed), 1);
+        drop(bridge);
+        server.abort();
+    }
+    #[tokio::test]
     async fn http_roundtrip_stream_and_nonstream_preserve_model_auth_and_tools() {
         async fn upstream(headers: HeaderMap, Json(body): Json<Value>) -> Response {
             assert_eq!(headers.get("authorization").unwrap(), "Bearer fixture-key");
             assert_eq!(body["model"], "provider-real-model");
             assert_eq!(body["tools"][0]["function"]["name"], "Read");
             if body["stream"] == true {
+                assert_eq!(body["stream_options"]["include_usage"], true);
                 let chunks = [
                     json!({"choices":[{"delta":{"reasoning_content":"检查项目"}}]}),
-                    json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-1","function":{"name":"Read","arguments":"{\"file_path\":\"README.md\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":10,"completion_tokens":8}}),
+                    json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-1","function":{"name":"Read","arguments":"{\"file_path\":\"README.md\"}"}}]},"finish_reason":"tool_calls"}],"usage":null}),
+                    json!({"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":8}}),
                 ];
                 let text = chunks
                     .into_iter()

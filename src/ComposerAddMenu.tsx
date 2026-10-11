@@ -12,7 +12,7 @@ import './composer-add-menu.css';
 interface Props {
   projectId: string; agent: string; permissionMode: PermissionMode;
   attachments: Attachment[]; busy: boolean; modeBusy: boolean;
-  addAttachments: (items: Attachment[]) => Promise<void>; project: () => void;
+  addAttachments: (items: Attachment[]) => Promise<void>; project?: () => void;
   onSkill: (skill: Skill) => boolean; onPlan: (enabled: boolean) => void;
   onGoal: (objective: string) => void;
 }
@@ -164,7 +164,7 @@ export function AddMenu({ projectId, agent, permissionMode, attachments, busy, m
           {catalogError ? <p className="add-menu-error" role="alert">{catalogError}</p> : null}
           {!loading && (skills.warnings?.length || extensions.warnings.length) ? <p className="add-menu-status" title={[...(skills.warnings ?? []), ...extensions.warnings].join('\n')}>部分目录未能读取，可刷新后重试。</p> : null}
         </div>
-        <div className="add-menu-footer"><button type="button" role="menuitem" onClick={() => { layer.dismiss(); project(); }}><Plus size={14}/>添加项目</button><small>技能会添加到当前消息</small></div>
+        <div className="add-menu-footer">{project ? <button type="button" role="menuitem" onClick={() => { layer.dismiss(); project(); }}><Plus size={14}/>添加项目</button> : null}<small>技能会添加到当前消息</small></div>
       </>}
     </div> : null}
     {error ? <div className="attachment-error" role="alert"><span>{error}</span><button type="button" className="icon-button" aria-label="关闭附件提示" onClick={() => setError('')}><X size={13}/></button></div> : null}

@@ -33,7 +33,9 @@ function metadata(value: Record<string, any>): Record<string, any> {
 
 function upsert(messages: Message[], message: Message): Message[] {
   const index = messages.findIndex(m => m.id === message.id);
-  return index < 0 ? [...messages, message] : messages.map((m, i) => i === index ? message : m);
+  // A native item update does not contain the page's read-only turn context.
+  // Retain it until an earlier page supplies the actual marker/user boundary.
+  return index < 0 ? [...messages, message] : messages.map((m, i) => i === index ? { ...message, historyRun: message.historyRun ?? m.historyRun } : m);
 }
 
 export function isDisplayEvent(event: RpcEvent) {
@@ -187,6 +189,10 @@ export function conversationTurns(messages: Message[]): ConversationTurn[] {
     if (m.kind === 'agentCapabilities') continue;
     if (m.role === 'user' || m.kind === 'modelSwitch' || !turns.length) turns.push({ id: m.role === 'user' && typeof m.data?.clientMessageId === 'string' ? m.data.clientMessageId : m.id, user: m.role === 'user' ? m : undefined, items: [] });
     const turn = turns[turns.length - 1];
+    if (m.historyRun) {
+      if (!turn.user) turn.id = m.historyRun.turnKey;
+      if (!turn.run) turn.run = { seq: 0, id: m.historyRun.id, sessionId: m.sessionId, role: 'activity', text: '', kind: 'runMarker', data: m.historyRun.data };
+    }
     if (m.kind === 'runMarker') turn.run = m;
     else if (m.role !== 'user') turn.items.push(m);
   }

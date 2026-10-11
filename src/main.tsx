@@ -2,6 +2,7 @@ import React from 'react';
 import ReactDOM from 'react-dom/client';
 import App from './App';
 import { AppBoundary } from './AppBoundary';
+import { installFrontendDiagnostics } from './frontendDiagnostics';
 import './styles.css';
 import './settings.css';
 import './client.css';
@@ -16,5 +17,8 @@ import './permission-menu.css';
 import './followups.css';
 import './new-chat.css';
 import './workspace-layout.css';
+import './chat-layout.css';
 
+const disposeDiagnostics = installFrontendDiagnostics();
+if (import.meta.hot) import.meta.hot.dispose(disposeDiagnostics);
 ReactDOM.createRoot(document.getElementById('root')!).render(<React.StrictMode><AppBoundary><App /></AppBoundary></React.StrictMode>);

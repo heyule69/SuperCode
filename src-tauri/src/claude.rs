@@ -9,7 +9,7 @@ use std::{
         Arc,
     },
 };
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::{AppHandle, Manager};
 use tokio::{
     io::{AsyncWriteExt, BufReader},
     process::{Child, ChildStdin},
@@ -19,6 +19,7 @@ use tokio::{
 #[derive(Default)]
 pub struct Runtime {
     pub client: Mutex<Option<Arc<Turn>>>,
+    sessions: crate::session_runtimes::Sessions<Runtime>,
 }
 pub struct Turn {
     input: Mutex<ChildStdin>,
@@ -68,13 +69,11 @@ impl InputState {
     fn usage(&mut self, message: &Value) -> Value {
         let u = &message["usage"];
         let current = [
-            u["input_tokens"].as_u64().unwrap_or(0),
-            u["cache_read_input_tokens"].as_u64().unwrap_or(0),
-            u["cache_creation_input_tokens"].as_u64().unwrap_or(0),
-            u["output_tokens"].as_u64().unwrap_or(0),
-            u["output_tokens_details"]["thinking_tokens"]
-                .as_u64()
-                .unwrap_or(0),
+            crate::usage_tokens::count(&u["input_tokens"]).unwrap_or(0),
+            crate::usage_tokens::count(&u["cache_read_input_tokens"]).unwrap_or(0),
+            crate::usage_tokens::count(&u["cache_creation_input_tokens"]).unwrap_or(0),
+            crate::usage_tokens::count(&u["output_tokens"]).unwrap_or(0),
+            crate::usage_tokens::count(&u["output_tokens_details"]["thinking_tokens"]).unwrap_or(0),
         ];
         for (total, next) in self.usage.iter_mut().zip(current) {
             *total = total.saturating_add(next);
@@ -100,6 +99,23 @@ impl InputState {
 
 fn publish(app: &AppHandle, event: Value) {
     runtime::publish_event(app, event);
+}
+
+fn result_failure(message: &Value) -> Option<String> {
+    let subtype = message["subtype"].as_str().unwrap_or("");
+    if message["is_error"] != true && !subtype.starts_with("error_") { return None; }
+    // SDK error results carry an `errors` array, often without `result` text.
+    let errors = message["errors"].as_array().map(|errors| errors.iter()
+        .filter_map(Value::as_str).map(str::trim).filter(|s| !s.is_empty()).take(8)
+        .map(|s| protocol::bounded(s, 512)).collect::<Vec<_>>()).unwrap_or_default();
+    if !errors.is_empty() { return Some(protocol::bounded(&errors.join("\n"), 4096)); }
+    let fallback = match subtype {
+        "error_max_turns" => "Claude 达到原生任务轮次上限，任务未完成",
+        "error_max_budget_usd" => "Claude 达到原生费用上限，任务未完成",
+        _ => "Claude 任务执行失败，原生进程未返回错误详情",
+    };
+    Some(protocol::bounded(message["result"].as_str().map(str::trim)
+        .filter(|s| !s.is_empty()).unwrap_or(fallback), 4096))
 }
 fn event(method: &str, native: &str, turn: &str, mut params: Value) -> Value {
     params["threadId"] = json!(native);
@@ -148,18 +164,25 @@ fn tool_response(tool_name: &Value, input: &Value, result: &Value) -> Result<Val
             if answer.is_empty() {
                 return Err("请回答所有问题".into());
             }
-            values.insert(question["question"].as_str().unwrap_or("").into(), json!(answer));
+            values.insert(
+                question["question"].as_str().unwrap_or("").into(),
+                json!(answer),
+            );
         }
         updated["answers"] = Value::Object(values);
         return Ok(json!({"behavior":"allow","updatedInput":updated}));
     }
     let message = if tool_name == "ExitPlanMode" {
         let feedback = result["feedback"].as_str().unwrap_or("").trim();
-        let instruction = "用户选择继续修改计划，暂不执行。请保持计划模式，完善计划后再次请求用户确认。";
+        let instruction =
+            "用户选择继续修改计划，暂不执行。请保持计划模式，完善计划后再次请求用户确认。";
         if feedback.is_empty() {
             instruction.to_owned()
         } else {
-            format!("{instruction}\n用户的修改意见：{}", protocol::bounded(feedback, 16 * 1024))
+            format!(
+                "{instruction}\n用户的修改意见：{}",
+                protocol::bounded(feedback, 16 * 1024)
+            )
         }
     } else {
         "用户拒绝了本次操作".to_owned()
@@ -168,6 +191,12 @@ fn tool_response(tool_name: &Value, input: &Value, result: &Value) -> Result<Val
 }
 
 impl Runtime {
+    pub fn for_session(&self, id: &str) -> Arc<Runtime> { self.sessions.get(id) }
+    pub async fn clients(&self) -> Vec<Arc<Turn>> {
+        let mut clients = self.client.lock().await.iter().cloned().collect::<Vec<_>>();
+        for (_, runtime) in self.sessions.entries() { clients.extend(runtime.client.lock().await.iter().cloned()); }
+        clients
+    }
     pub async fn steer(
         &self,
         session: &str,
@@ -178,7 +207,8 @@ impl Runtime {
         effort: Option<&str>,
     ) -> Result<(), String> {
         // Serialize admission with the result handler: a late click must never land in a different turn.
-        let slot = self.client.lock().await;
+        let runtime = self.for_session(session);
+        let slot = runtime.client.lock().await;
         let turn = slot.as_ref().ok_or("Claude 连接已关闭")?;
         if turn.session != session
             || turn.id() != expected
@@ -197,6 +227,13 @@ impl Runtime {
         result
     }
     pub async fn release_idle(&self) {
+        for (id, runtime) in self.sessions.entries() {
+            runtime.release_idle_local().await;
+            if runtime.client.lock().await.is_none() { self.sessions.remove_idle(&id, &runtime); }
+        }
+        self.release_idle_local().await;
+    }
+    async fn release_idle_local(&self) {
         let mut slot = self.client.lock().await;
         if slot.as_ref().is_some_and(|c| {
             !c.active.load(Ordering::Acquire)
@@ -209,13 +246,18 @@ impl Runtime {
         }
     }
     pub async fn shutdown(&self) {
+        for (_, runtime) in self.sessions.entries() { runtime.shutdown_local().await; }
+        self.shutdown_local().await;
+    }
+    async fn shutdown_local(&self) {
         if let Some(turn) = self.client.lock().await.take() {
             turn.stopped.store(true, Ordering::Relaxed);
             let _ = turn.child.lock().await.start_kill();
         }
     }
     pub async fn interrupt(&self, _app: &AppHandle, session: &str) -> Result<(), String> {
-        let turn = self
+        let runtime = self.for_session(session);
+        let turn = runtime
             .client
             .lock()
             .await
@@ -257,17 +299,13 @@ impl Runtime {
         Ok(())
     }
     pub async fn respond(&self, app: &AppHandle, id: Value, result: Value) -> Result<(), String> {
-        let turn = self
-            .client
-            .lock()
-            .await
-            .as_ref()
-            .cloned()
-            .ok_or("Claude 连接已关闭")?;
         let key = id.as_str().ok_or("请求 ID 无效")?;
+        let mut selected = None;
+        for turn in self.clients().await { if turn.requests.lock().await.contains_key(key) { selected = Some(turn); break; } }
+        let turn = selected.ok_or("该请求已结束")?;
         let mut requests = turn.requests.lock().await;
         let request = requests.get(key).ok_or("该请求已结束")?;
-        let raw_id = key.strip_prefix("claude:").ok_or("请求 ID 无效")?;
+        let raw_id = key.strip_prefix(&format!("claude:{}:", turn.session)).ok_or("请求 ID 无效")?;
         let input = &request["params"]["input"];
         if request["params"]["subtype"] != "can_use_tool" {
             turn.write(json!({"type":"control_response","response":{"subtype":"error","request_id":raw_id,"error":"SuperCode does not support this request yet"}})).await?;
@@ -312,9 +350,11 @@ pub async fn send(
     effort: Option<String>,
 ) -> Result<Session, String> {
     let state = app.state::<AppState>();
+    let session_runtime = state.claude.for_session(&session.id);
     let route = state.store.route("claude", Some(&session.id))?;
     let fingerprint = route.fingerprint();
     let mut config = route.config;
+    crate::runtime_diagnostics::register_secrets(app, &config);
     let model = crate::providers::real_claude_model(&config, model.as_deref());
     let signature = json!([
         fingerprint,
@@ -327,7 +367,7 @@ pub async fn send(
         effort
     ])
     .to_string();
-    let mut slot = state.claude.client.lock().await;
+    let mut slot = session_runtime.client.lock().await;
     if let Some(c) = slot.as_ref() {
         if c.active.load(Ordering::Acquire) {
             return Err("Claude 的上一任务尚未结束".into());
@@ -379,6 +419,7 @@ pub async fn send(
     };
 
     let executable = crate::agents::resolve(app, "claude")?.program;
+    crate::runtime_diagnostics::register_secrets(app, &config);
     let native = session
         .native_id
         .clone()
@@ -420,6 +461,7 @@ pub async fn send(
     }
     args.extend(plugin_args);
     let mcp = crate::client_features::claude_mcp(app, native_mcp)?;
+    crate::runtime_diagnostics::register_secrets(app, &mcp);
     if mcp["mcpServers"].as_object().is_some_and(|v| !v.is_empty()) {
         args.extend(["--mcp-config".into(), mcp.to_string()]);
     }
@@ -473,6 +515,7 @@ pub async fn send(
         }
     }
     crate::official_accounts::configure(&mut command, app, "claude", &config)?;
+    command.env("SUPERCODE_SESSION_ID", &session.id);
     let mut child = command
         .current_dir(cwd)
         .stdin(std::process::Stdio::piped())
@@ -510,13 +553,10 @@ pub async fn send(
         _bridge: bridge,
     });
     let log_app = app.clone();
+    let log_session = session.id.clone();
+    crate::runtime_diagnostics::record(app, Some(&session.id), "agent_process_started", json!({"source":"claude","pid":turn.pid,"model":model}));
     tauri::async_runtime::spawn(async move {
-        let mut reader = BufReader::new(stderr);
-        while let Ok(Some(frame)) = runtime::read_frame(&mut reader).await {
-            if let Ok(text) = String::from_utf8(frame) {
-                let _ = log_app.emit("runtime-log", protocol::bounded(text.trim(), 4096));
-            }
-        }
+        crate::runtime_diagnostics::stderr(Some(log_app), Some(log_session), "claude", stderr).await;
     });
     let mut reader = BufReader::new(output);
     turn.write(json!({"type":"control_request","request_id":"supercode-init","request":{"subtype":"initialize","hooks":{},"skills":[]}})).await?;
@@ -652,7 +692,7 @@ pub async fn send(
                     ),
                 );
             } else if message["type"] == "control_request" {
-                let id = format!("claude:{}", message["request_id"].as_str().unwrap_or(""));
+                let id = format!("claude:{}:{}", turn.session, message["request_id"].as_str().unwrap_or(""));
                 let request = &message["request"];
                 let mut params = json!({"subtype":request["subtype"],"toolName":request["tool_name"],"input":request["input"],"reason":request["decision_reason"]});
                 let method = if request["subtype"] == "can_use_tool"
@@ -681,7 +721,7 @@ pub async fn send(
                 turn.requests.lock().await.insert(id, notification.clone());
                 publish(&reader_app, notification);
             } else if message["type"] == "control_cancel_request" {
-                let id = format!("claude:{}", message["request_id"].as_str().unwrap_or(""));
+                let id = format!("claude:{}:{}", turn.session, message["request_id"].as_str().unwrap_or(""));
                 turn.requests.lock().await.remove(&id);
                 publish(
                     &reader_app,
@@ -693,18 +733,10 @@ pub async fn send(
                     ),
                 );
             } else if message["type"] == "result" {
-                let state = reader_app.state::<AppState>();
-                let result_slot = state.claude.client.lock().await;
+                let result_slot = session_runtime.client.lock().await;
                 let u = &message["usage"];
                 if u.is_object() {
-                    stream.model_context_window = stream
-                        .context_window(&message)
-                        .or(stream.model_context_window);
-                    let usage = turn.inputs.lock().unwrap().usage(&message);
-                    let mut data = stream.context_usage();
-                    data["total"] = usage["total"].clone();
-                    data["costUsd"] = usage["costUsd"].clone();
-                    data["nativeCumulativeCostUsd"] = message["total_cost_usd"].clone();
+                    let data = stream.result_usage(&message, &mut turn.inputs.lock().unwrap());
                     publish(
                         &reader_app,
                         event(
@@ -729,20 +761,14 @@ pub async fn send(
                         );
                     }
                 }
-                failure = if message["is_error"] == true {
-                    Some(protocol::bounded(
-                        message["result"].as_str().unwrap_or("Claude 任务执行失败"),
-                        4096,
-                    ))
-                } else {
-                    None
-                };
+                failure = result_failure(&message);
                 for notification in stream.partial(&turn.native, &turn.id()) {
                     publish(&reader_app, notification);
                 }
                 stream = Stream {
                     model: stream.model.clone(),
                     model_context_window: stream.model_context_window,
+                    last_context: stream.context_usage(),
                     ..Stream::default()
                 };
                 turn.requests.lock().await.clear();
@@ -804,9 +830,15 @@ pub async fn send(
         for notification in stream.partial(&turn.native, &turn.id()) {
             publish(&reader_app, notification);
         }
+        let exit = turn.child.lock().await.try_wait().ok().flatten();
+        let active = turn.active.load(Ordering::Acquire);
+        let stopped = turn.stopped.load(Ordering::Acquire);
+        crate::runtime_diagnostics::record(&reader_app, Some(&turn.session), "agent_connection_closed",
+            json!({"turnId":turn.id(),"active":active,
+                "stopRequested":stopped,"pid":turn.pid,"exitCode":exit.and_then(|s| s.code()),"error":failure,
+                "errorType":if active && !stopped { failure.as_deref().map(crate::runtime_diagnostics::error_type) } else { None }}));
         let _ = turn.child.lock().await.kill().await;
-        let state = reader_app.state::<AppState>();
-        let mut slot = state.claude.client.lock().await;
+        let mut slot = session_runtime.client.lock().await;
         if slot.as_ref().is_some_and(|c| c.pid == turn.pid) {
             slot.take();
         }
@@ -853,8 +885,12 @@ pub async fn send(
 #[derive(Default)]
 struct Stream {
     context_tokens: Option<u64>,
+    uncached_input_tokens: Option<u64>,
+    cached_input_tokens: Option<u64>,
+    cache_write_input_tokens: Option<u64>,
     output_tokens: u64,
     last_usage: Value,
+    last_context: Value,
     model: String,
     model_context_window: Option<u64>,
     message_id: String,
@@ -864,42 +900,72 @@ struct Stream {
 }
 impl Stream {
     fn reset_context(&mut self) {
+        self.last_context = Value::Null;
+        self.clear_request_usage();
+    }
+    fn clear_request_usage(&mut self) {
         self.context_tokens = None;
+        self.uncached_input_tokens = None;
+        self.cached_input_tokens = None;
+        self.cache_write_input_tokens = None;
         self.output_tokens = 0;
         self.last_usage = json!({});
     }
+    fn begin_message(&mut self) {
+        self.last_context = self.context_usage();
+        self.clear_request_usage();
+    }
+    fn observe_model(&mut self, model: &str) {
+        if self.model != model {
+            self.model_context_window = None;
+            self.last_context = Value::Null;
+        }
+        self.model = model.into();
+    }
     fn observe_usage(&mut self, usage: &Value) -> bool {
-        let input = usage["input_tokens"].as_u64();
-        let output = usage["output_tokens"].as_u64();
-        if input.is_none() && output.is_none() {
+        let input = crate::usage_tokens::count(&usage["input_tokens"]);
+        let cached = crate::usage_tokens::count(&usage["cache_read_input_tokens"]);
+        let write = crate::usage_tokens::count(&usage["cache_creation_input_tokens"]);
+        let output = crate::usage_tokens::count(&usage["output_tokens"]);
+        let counts = [input, cached, write, output];
+        if counts.iter().all(Option::is_none) {
             return false;
+        }
+        let reported = counts.iter().flatten().any(|n| *n > 0);
+        let input_reported = [input, cached, write].iter().flatten().any(|n| *n > 0);
+        // Compatible providers and the SDK may emit zero placeholders. Keep
+        // fields independent: cache counts can arrive only in message_delta.
+        for (old, new) in [
+            (&mut self.uncached_input_tokens, input),
+            (&mut self.cached_input_tokens, cached),
+            (&mut self.cache_write_input_tokens, write),
+        ] {
+            if new.is_some() && (input_reported || old.is_none()) {
+                *old = new;
+            }
         }
         if !self.last_usage.is_object() {
             self.last_usage = json!({});
         }
-        if let Some(input) = input {
-            let cached = usage["cache_read_input_tokens"]
-                .as_u64()
-                .or(self.last_usage["cachedInputTokens"].as_u64())
-                .unwrap_or(0);
-            let write = usage["cache_creation_input_tokens"]
-                .as_u64()
-                .or(self.last_usage["cacheWriteInputTokens"].as_u64())
-                .unwrap_or(0);
+        if let Some(input) = self.uncached_input_tokens {
+            let cached = self.cached_input_tokens.unwrap_or(0);
+            let write = self.cache_write_input_tokens.unwrap_or(0);
             let input = input.saturating_add(cached).saturating_add(write);
-            self.context_tokens = Some(input);
+            self.context_tokens = (input > 0).then_some(input);
             self.last_usage["inputTokens"] = json!(input);
             self.last_usage["cachedInputTokens"] = json!(cached);
             self.last_usage["cacheWriteInputTokens"] = json!(write);
         }
         if let Some(output) = output {
-            self.output_tokens = output;
-            self.last_usage["outputTokens"] = json!(output);
+            // Per-message output is cumulative. Completed SDK assistant
+            // snapshots can contain a smaller placeholder than the stream.
+            self.output_tokens = self.output_tokens.max(output);
+            self.last_usage["outputTokens"] = json!(self.output_tokens);
         }
         if let Some(context) = self.context_tokens {
             self.last_usage["totalTokens"] = json!(context.saturating_add(self.output_tokens));
         }
-        true
+        reported
     }
     fn context_window(&self, result: &Value) -> Option<u64> {
         let models = result["modelUsage"].as_object()?;
@@ -908,10 +974,35 @@ impl Stream {
                 .then(|| models.values().next())
                 .flatten()
         })?;
-        usage["contextWindow"].as_u64().filter(|n| *n > 0)
+        crate::usage_tokens::count(&usage["contextWindow"]).filter(|n| *n > 0)
     }
     fn context_usage(&self) -> Value {
-        json!({"total":{},"last":self.last_usage.as_object().map(|_|self.last_usage.clone()).unwrap_or_else(||json!({})),"contextTokens":self.context_tokens.map(|input|input.saturating_add(self.output_tokens)),"modelContextWindow":self.model_context_window,"cumulative":false})
+        let known = self
+            .context_tokens
+            .map(|input| input.saturating_add(self.output_tokens));
+        let last = if known.is_some() {
+            self.last_usage.clone()
+        } else {
+            self.last_context["last"]
+                .as_object()
+                .map(|_| self.last_context["last"].clone())
+                .unwrap_or_else(|| json!({}))
+        };
+        json!({"total":{},"last":last,"contextTokens":known.or_else(||self.last_context["contextTokens"].as_u64()),"modelContextWindow":self.model_context_window,"cumulative":false})
+    }
+    fn result_usage(&mut self, result: &Value, inputs: &mut InputState) -> Value {
+        self.model_context_window = self.context_window(result).or(self.model_context_window);
+        // Result usage sums all calls in the turn. It describes current context
+        // only when the native runner confirms there was a single model call.
+        if self.context_tokens.is_none() && result["num_turns"] == 1 {
+            self.observe_usage(&result["usage"]);
+        }
+        let total = inputs.usage(result);
+        let mut data = self.context_usage();
+        data["total"] = total["total"].clone();
+        data["costUsd"] = total["costUsd"].clone();
+        data["nativeCumulativeCostUsd"] = result["total_cost_usd"].clone();
+        data
     }
     fn usage_event(&self, native: &str, turn: &str) -> Value {
         event(
@@ -943,12 +1034,9 @@ impl Stream {
             "stream_event" => {
                 let e = &message["event"];
                 if e["type"] == "message_start" {
-                    self.reset_context();
+                    self.begin_message();
                     if let Some(model) = e["message"]["model"].as_str() {
-                        if self.model != model {
-                            self.model_context_window = None;
-                        }
-                        self.model = model.into();
+                        self.observe_model(model);
                     }
                     self.observe_usage(&e["message"]["usage"]);
                     events.push(self.usage_event(native, turn));
@@ -1057,14 +1145,11 @@ impl Stream {
             "assistant" => {
                 let id = message["message"]["id"].as_str().unwrap_or("");
                 if self.message_id != id {
-                    self.reset_context();
+                    self.begin_message();
                     self.message_id = id.into();
                 }
                 if let Some(model) = message["message"]["model"].as_str() {
-                    if self.model != model {
-                        self.model_context_window = None;
-                    }
-                    self.model = model.into();
+                    self.observe_model(model);
                 }
                 if self.observe_usage(&message["message"]["usage"]) {
                     events.push(self.usage_event(native, turn));
@@ -1165,30 +1250,81 @@ impl Stream {
 mod tests {
     use super::*;
     #[test]
+    fn sdk_error_arrays_and_limit_reasons_are_not_lost() {
+        let result = json!({"type":"result","subtype":"error_during_execution","is_error":true,
+            "errors":["context window exceeded", "provider request failed"]});
+        assert_eq!(result_failure(&result).unwrap(), "context window exceeded\nprovider request failed");
+        assert!(result_failure(&json!({"subtype":"error_max_turns","is_error":true})).unwrap().contains("轮次上限"));
+        assert_eq!(result_failure(&json!({"is_error":true,"result":"network disconnected"})), Some("network disconnected".into()));
+        assert!(result_failure(&json!({"type":"result","subtype":"success","result":"done"})).is_none());
+        assert!(result_failure(&json!({"is_error":true,"errors":["中文".repeat(10000)]})).unwrap().len() <= 4096);
+    }
+    #[test]
     fn plan_confirmation_uses_native_approval_without_rewriting_the_plan_or_permissions() {
         let input = json!({"plan":"# 完整计划\n\n1. 实现\n2. 验证","allowedPrompts":[{"tool":"Bash","prompt":"运行测试"}]});
-        let reply = tool_response(&json!("ExitPlanMode"), &input, &json!({"decision":"accept"})).unwrap();
+        let reply = tool_response(
+            &json!("ExitPlanMode"),
+            &input,
+            &json!({"decision":"accept"}),
+        )
+        .unwrap();
         assert_eq!(reply, json!({"behavior":"allow","updatedInput":input}));
-        let revised = tool_response(&json!("ExitPlanMode"), &input, &json!({"decision":"decline","feedback":"  先实现图片预览，视频稍后  "})).unwrap();
+        let revised = tool_response(
+            &json!("ExitPlanMode"),
+            &input,
+            &json!({"decision":"decline","feedback":"  先实现图片预览，视频稍后  "}),
+        )
+        .unwrap();
         assert_eq!(revised["behavior"], "deny");
         assert!(revised.get("updatedInput").is_none());
-        assert!(revised["message"].as_str().unwrap().contains("先实现图片预览，视频稍后"));
-        let empty = tool_response(&json!("ExitPlanMode"), &input, &json!({"decision":"decline"})).unwrap();
+        assert!(revised["message"]
+            .as_str()
+            .unwrap()
+            .contains("先实现图片预览，视频稍后"));
+        let empty = tool_response(
+            &json!("ExitPlanMode"),
+            &input,
+            &json!({"decision":"decline"}),
+        )
+        .unwrap();
         assert_eq!(empty["behavior"], "deny");
         assert!(empty["message"].as_str().unwrap().contains("暂不执行"));
     }
 
     #[test]
     fn plan_feedback_is_bounded_and_does_not_change_other_tool_responses() {
-        let reply = tool_response(&json!("ExitPlanMode"), &json!({}), &json!({"decision":"decline","feedback":"中".repeat(20000)})).unwrap();
+        let reply = tool_response(
+            &json!("ExitPlanMode"),
+            &json!({}),
+            &json!({"decision":"decline","feedback":"中".repeat(20000)}),
+        )
+        .unwrap();
         assert!(reply["message"].as_str().unwrap().len() < 17 * 1024);
-        let ordinary = tool_response(&json!("Bash"), &json!({}), &json!({"decision":"decline","feedback":"修改意见"})).unwrap();
-        assert_eq!(ordinary, json!({"behavior":"deny","message":"用户拒绝了本次操作"}));
+        let ordinary = tool_response(
+            &json!("Bash"),
+            &json!({}),
+            &json!({"decision":"decline","feedback":"修改意见"}),
+        )
+        .unwrap();
+        assert_eq!(
+            ordinary,
+            json!({"behavior":"deny","message":"用户拒绝了本次操作"})
+        );
         assert!(tool_response(&json!("ExitPlanMode"), &json!({}), &json!({"answers":{}})).is_err());
         let questions = json!({"questions":[{"question":"显示方式？"}]});
-        let answered = tool_response(&json!("AskUserQuestion"), &questions, &json!({"answers":{"0":{"answers":["面板"]}}})).unwrap();
+        let answered = tool_response(
+            &json!("AskUserQuestion"),
+            &questions,
+            &json!({"answers":{"0":{"answers":["面板"]}}}),
+        )
+        .unwrap();
         assert_eq!(answered["updatedInput"]["answers"]["显示方式？"], "面板");
-        assert!(tool_response(&json!("AskUserQuestion"), &questions, &json!({"answers":{"0":{"answers":[]}}})).is_err());
+        assert!(tool_response(
+            &json!("AskUserQuestion"),
+            &questions,
+            &json!({"answers":{"0":{"answers":[]}}})
+        )
+        .is_err());
     }
 
     #[test]
@@ -1229,7 +1365,50 @@ mod tests {
         stream.reset_context();
         assert!(stream.context_usage()["contextTokens"].is_null());
         stream.observe_usage(&json!({"input_tokens":0}));
-        assert_eq!(stream.context_usage()["contextTokens"], 0);
+        assert!(stream.context_usage()["contextTokens"].is_null());
+    }
+    #[test]
+    fn late_cache_counts_and_sdk_placeholders_do_not_zero_measured_context() {
+        let mut stream = Stream::default();
+        let start = |id: &str| json!({"type":"stream_event","event":{"type":"message_start","message":{"id":id,"model":"provider-model","usage":{"input_tokens":0,"cache_read_input_tokens":0,"output_tokens":0}}}});
+        let events = stream.translate(&start("one"), "n", "t");
+        assert!(events[0]["params"]["tokenUsage"]["contextTokens"].is_null());
+        let delta = json!({"type":"stream_event","event":{"type":"message_delta","usage":{"cache_read_input_tokens":"24000","cache_creation_input_tokens":100,"output_tokens":300}}});
+        let events = stream.translate(&delta, "n", "t");
+        assert_eq!(events[0]["params"]["tokenUsage"]["contextTokens"], 24400);
+        stream.translate(&json!({"type":"assistant","message":{"id":"one","model":"provider-model","usage":{"input_tokens":0,"output_tokens":0},"content":[]}}), "n", "t");
+        assert_eq!(stream.context_usage()["contextTokens"], 24400);
+        stream.observe_usage(&json!({"input_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"output_tokens":1}));
+        assert_eq!(stream.context_usage()["contextTokens"], 24400);
+        let events = stream.translate(&start("two"), "n", "t");
+        assert_eq!(events[0]["params"]["tokenUsage"]["contextTokens"], 24400);
+        stream.observe_usage(&json!({"input_tokens":12000,"output_tokens":1}));
+        assert_eq!(stream.context_usage()["contextTokens"], 12001);
+        stream.observe_usage(&json!({"output_tokens":300}));
+        stream.observe_usage(&json!({"input_tokens":12000,"output_tokens":1}));
+        assert_eq!(stream.context_usage()["contextTokens"], 12300);
+        stream.begin_message();
+        stream.observe_model("different-model");
+        assert!(stream.context_usage()["contextTokens"].is_null());
+    }
+    #[test]
+    fn result_only_usage_is_context_only_for_a_single_request() {
+        let mut stream = Stream::default();
+        let mut inputs = InputState::default();
+        let mut result = json!({"num_turns":1,"usage":{"input_tokens":647,"cache_read_input_tokens":31232,"output_tokens":348},"modelUsage":{"provider-model":{"contextWindow":128000}}});
+        let data = stream.result_usage(&result, &mut inputs);
+        assert_eq!(data["contextTokens"], 32227);
+        assert_eq!(data["modelContextWindow"], 128000);
+        assert_eq!(data["total"]["inputTokens"], 31879);
+        stream.reset_context();
+        result["num_turns"] = json!(4);
+        let data = stream.result_usage(&result, &mut inputs);
+        assert!(data["contextTokens"].is_null());
+        assert_eq!(data["total"]["inputTokens"], 63758);
+        stream.observe_usage(&json!({"input_tokens":15000,"output_tokens":12}));
+        let data = stream.result_usage(&result, &mut inputs);
+        assert_eq!(data["contextTokens"], 15012);
+        assert_eq!(data["last"]["inputTokens"], 15000);
     }
     #[test]
     fn context_capacity_matches_the_active_model_instead_of_first_subagent() {

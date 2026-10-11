@@ -1,4 +1,4 @@
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 use serde_json::Value;
 use std::{path::Path, sync::Mutex};
@@ -31,6 +31,14 @@ pub struct Session {
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct HistoryRun {
+    pub id: String,
+    pub turn_key: String,
+    pub data: Value,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Message {
     pub seq: i64,
     pub id: String,
@@ -39,6 +47,8 @@ pub struct Message {
     pub text: String,
     pub kind: String,
     pub data: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub history_run: Option<HistoryRun>,
 }
 
 pub struct Store(pub(crate) Mutex<Connection>);
@@ -66,9 +76,12 @@ impl Store {
               CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY,project_id TEXT REFERENCES projects(id),title TEXT NOT NULL,agent TEXT NOT NULL,model TEXT,native_id TEXT UNIQUE,status TEXT NOT NULL,updated_at INTEGER NOT NULL,turn_id TEXT,archived INTEGER NOT NULL DEFAULT 0);
              CREATE TABLE IF NOT EXISTS messages(seq INTEGER PRIMARY KEY AUTOINCREMENT,id TEXT NOT NULL,session_id TEXT NOT NULL REFERENCES sessions(id),role TEXT NOT NULL,text TEXT NOT NULL,kind TEXT NOT NULL,data TEXT NOT NULL,UNIQUE(session_id,id));
              CREATE INDEX IF NOT EXISTS messages_page ON messages(session_id,seq);
+             CREATE INDEX IF NOT EXISTS messages_turn_context ON messages(session_id,seq) WHERE role='user' OR kind IN ('runMarker','modelSwitch');
              CREATE TABLE IF NOT EXISTS followups(seq INTEGER PRIMARY KEY AUTOINCREMENT,id TEXT UNIQUE NOT NULL,session_id TEXT NOT NULL REFERENCES sessions(id),payload TEXT NOT NULL,status TEXT NOT NULL,error TEXT);
              CREATE INDEX IF NOT EXISTS followups_order ON followups(session_id,seq);
-             UPDATE followups SET status='paused',error='上次未发送完，请确认后继续' WHERE status IN ('queued','sending','steering');
+             CREATE TABLE IF NOT EXISTS followup_edits(followup_id TEXT PRIMARY KEY REFERENCES followups(id) ON DELETE CASCADE,token TEXT NOT NULL,previous_status TEXT NOT NULL);
+             UPDATE followups SET status='paused',error='上次未发送完，请确认后继续' WHERE status IN ('queued','sending','steering','editing');
+             DELETE FROM followup_edits;
              CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT NOT NULL);
              CREATE TABLE IF NOT EXISTS sidebar_sections(id TEXT PRIMARY KEY,name TEXT NOT NULL,position INTEGER NOT NULL);
              CREATE TABLE IF NOT EXISTS sidebar_items(kind TEXT NOT NULL,id TEXT NOT NULL,pinned INTEGER NOT NULL DEFAULT 0,unread INTEGER NOT NULL DEFAULT 0,section_id TEXT REFERENCES sidebar_sections(id) ON DELETE SET NULL,removed INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(kind,id));
@@ -568,16 +581,6 @@ impl Store {
 
     pub fn claim(&self, id: &str) -> Result<()> {
         let conn = self.0.lock().map_err(|e| e.to_string())?;
-        let active: usize = conn
-            .query_row(
-                "SELECT count(*) FROM sessions WHERE status IN ('starting','running','waiting')",
-                [],
-                |r| r.get(0),
-            )
-            .map_err(|e| e.to_string())?;
-        if active > 0 {
-            return Err("当前已有任务运行，请先完成或停止它".into());
-        }
         let changed=conn.execute("UPDATE sessions SET status='starting',turn_id=NULL,updated_at=?2 WHERE id=?1 AND archived=0 AND status NOT IN ('starting','running','waiting')",params![id,now()]).map_err(|e|e.to_string())?;
         if changed != 1 {
             return Err("该会话已有运行中的任务，或已归档".into());
@@ -731,12 +734,72 @@ impl Store {
                     text: r.get(4)?,
                     kind: r.get(5)?,
                     data: serde_json::from_str(&raw).unwrap_or(Value::Null),
+                    history_run: None,
                 })
             })
             .map_err(|e| e.to_string())?
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(|e| e.to_string())?;
         items.reverse();
+        // A page can begin inside a long turn, after its lifecycle marker. Carry
+        // that marker as context, not an extra row: row count and cursor must still
+        // describe exactly the 100 persisted messages requested by pagination.
+        if let Some(first) = items
+            .first_mut()
+            .filter(|m| m.role != "user" && m.kind != "modelSwitch")
+        {
+            let context = if first.kind == "runMarker" {
+                Some((
+                    first.seq,
+                    first.id.clone(),
+                    first.kind.clone(),
+                    first.data.to_string(),
+                ))
+            } else {
+                conn.query_row(
+                "SELECT seq,id,kind,data FROM messages WHERE session_id=?1 AND seq<?2 AND (role='user' OR kind IN ('runMarker','modelSwitch')) ORDER BY seq DESC LIMIT 1",
+                params![id, first.seq],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?)),
+            ).optional().map_err(|e| e.to_string())?
+            };
+            if let Some((seq, marker_id, _, raw)) =
+                context.filter(|(_, _, kind, _)| kind == "runMarker")
+            {
+                let data: Value = serde_json::from_str(&raw).unwrap_or(Value::Null);
+                let same_turn = first.data["turnId"]
+                    .as_str()
+                    .filter(|id| !id.is_empty())
+                    .map(|id| data["turnId"].as_str() == Some(id))
+                    .unwrap_or(true);
+                if same_turn {
+                    // Match the same UI turn key used when its user message is
+                    // eventually loaded, preserving manually expanded details.
+                    let boundary = conn.query_row(
+                        "SELECT id,role,data FROM messages WHERE session_id=?1 AND seq<?2 AND (role='user' OR kind IN ('runMarker','modelSwitch')) AND kind<>'runMarker' ORDER BY seq DESC LIMIT 1",
+                        params![id, seq],
+                        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)),
+                    ).optional().map_err(|e| e.to_string())?;
+                    let turn_key = boundary
+                        .map(|(id, role, raw)| {
+                            let metadata: Value = serde_json::from_str(&raw).unwrap_or(Value::Null);
+                            if role == "user" {
+                                metadata["clientMessageId"]
+                                    .as_str()
+                                    .map(str::to_owned)
+                                    .unwrap_or(id)
+                            } else {
+                                id
+                            }
+                        })
+                        .unwrap_or_else(|| marker_id.clone());
+                    first.history_run = Some(HistoryRun {
+                        id: marker_id,
+                        turn_key,
+                        data,
+                    });
+                }
+            }
+        }
         Ok(items)
     }
 
@@ -756,6 +819,13 @@ impl Store {
         if let Ok(conn) = self.0.lock() {
             let _=conn.execute("UPDATE messages SET data=json_set(data,'$.status','interrupted') WHERE json_valid(data) AND json_extract(data,'$.status') IN ('inProgress','running','preparing') AND session_id IN (SELECT id FROM sessions WHERE status IN ('starting','running','waiting'))",[]);
             let _=conn.execute("UPDATE sessions SET status='interrupted',turn_id=NULL WHERE status IN ('starting','running','waiting')",[]);
+        }
+    }
+
+    pub fn fail_session(&self, id: &str) {
+        if let Ok(conn) = self.0.lock() {
+            let _ = conn.execute("UPDATE messages SET data=json_set(data,'$.status','interrupted') WHERE session_id=?1 AND json_valid(data) AND json_extract(data,'$.status') IN ('inProgress','running','preparing') AND EXISTS(SELECT 1 FROM sessions WHERE id=?1 AND status IN ('starting','running','waiting'))", [id]);
+            let _ = conn.execute("UPDATE sessions SET status='interrupted',turn_id=NULL WHERE id=?1 AND status IN ('starting','running','waiting')", [id]);
         }
     }
 
@@ -813,18 +883,17 @@ impl Store {
     pub fn record_usage(&self, session: &Session, turn: &str, mut data: Value) -> Result<()> {
         use rusqlite::OptionalExtension;
         let conn = self.0.lock().map_err(|e| e.to_string())?;
+        let existing: Option<String> = conn
+            .query_row(
+                "SELECT data FROM usage_records WHERE session_id=?1 AND turn_id=?2",
+                params![session.id, turn],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        let existing = existing.and_then(|text| serde_json::from_str::<Value>(&text).ok());
         if data["total"].as_object().is_none_or(|v| v.is_empty()) {
-            let existing: Option<String> = conn
-                .query_row(
-                    "SELECT data FROM usage_records WHERE session_id=?1 AND turn_id=?2",
-                    params![session.id, turn],
-                    |r| r.get(0),
-                )
-                .optional()
-                .map_err(|e| e.to_string())?;
-            if let Some(mut existing) =
-                existing.and_then(|text| serde_json::from_str::<Value>(&text).ok())
-            {
+            if let Some(mut existing) = existing {
                 for key in ["contextTokens", "modelContextWindow"] {
                     if let Some(value) = data.get(key) {
                         existing[key] = value.clone();
@@ -843,6 +912,22 @@ impl Store {
             }
             conn.execute("INSERT INTO usage_records VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT(session_id,turn_id) DO UPDATE SET data=excluded.data,updated_at=excluded.updated_at", params![session.id,turn,session.agent,session.model.as_deref().unwrap_or(""),data.to_string(),now()]).map_err(|e|e.to_string())?;
             return Ok(());
+        }
+        // Billing and context can arrive in separate events. Missing metadata
+        // does not erase the latest measured context; explicit null still resets it.
+        if let Some(existing) = existing {
+            for key in ["contextTokens", "modelContextWindow"] {
+                if data.get(key).is_none() {
+                    if let Some(value) = existing.get(key) {
+                        data[key] = value.clone();
+                    }
+                }
+            }
+            if data["last"].as_object().is_none_or(|last| last.is_empty())
+                && !data["contextTokens"].is_null()
+            {
+                data["last"] = existing["last"].clone();
+            }
         }
         if data["cumulative"] == true {
             let prior: Option<String> = conn.query_row("SELECT data FROM usage_records WHERE session_id=?1 AND rowid<COALESCE((SELECT rowid FROM usage_records WHERE session_id=?1 AND turn_id=?2),9223372036854775807) ORDER BY rowid DESC LIMIT 1", params![session.id,turn], |r| r.get(0)).optional().map_err(|e| e.to_string())?;
@@ -865,7 +950,7 @@ impl Store {
         } else {
             data["turn"] = data["total"].clone();
         }
-        conn.execute("INSERT INTO usage_records VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT(session_id,turn_id) DO UPDATE SET data=excluded.data,model=excluded.model", params![session.id,turn,session.agent,session.model.as_deref().unwrap_or(""),data.to_string(),now()]).map_err(|e| e.to_string())?;
+        conn.execute("INSERT INTO usage_records VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT(session_id,turn_id) DO UPDATE SET data=excluded.data,model=excluded.model,updated_at=CASE WHEN usage_records.data=excluded.data THEN usage_records.updated_at ELSE excluded.updated_at END", params![session.id,turn,session.agent,session.model.as_deref().unwrap_or(""),data.to_string(),now()]).map_err(|e| e.to_string())?;
         Ok(())
     }
     pub fn usage_records(&self, session_id: Option<&str>) -> Result<Vec<Value>> {
@@ -968,6 +1053,42 @@ mod tests {
     }
 
     use super::*;
+    #[test]
+    fn all_agents_can_claim_multiple_sessions_and_failure_is_local() {
+        let store = std::sync::Arc::new(Store::from_connection(Connection::open_in_memory().unwrap()).unwrap());
+        let project = store.add_project(Path::new("D:/并发会话")).unwrap();
+        let mut sessions = Vec::new();
+        for agent in ["codex", "claude", "opencode", "pi"] {
+            for _ in 0..2 { sessions.push(store.create_agent_session(&project.id, None, agent).unwrap()); }
+        }
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(sessions.len()));
+        let tasks = sessions.iter().map(|session| {
+            let (store, barrier, id) = (store.clone(), barrier.clone(), session.id.clone());
+            std::thread::spawn(move || { barrier.wait(); store.claim(&id) })
+        }).collect::<Vec<_>>();
+        for task in tasks { task.join().unwrap().unwrap(); }
+        assert_eq!(store.running().unwrap(), 8);
+        for session in &sessions { assert!(store.claim(&session.id).is_err()); }
+        store.set_status(&sessions[1].id, "waiting", Some("approval")).unwrap();
+        store.fail_session(&sessions[0].id);
+        assert_eq!(store.session(&sessions[0].id).unwrap().status, "interrupted");
+        assert_eq!(store.session(&sessions[1].id).unwrap().status, "waiting");
+        assert_eq!(store.running().unwrap(), 7);
+        store.claim(&sessions[0].id).unwrap();
+        assert_eq!(store.running().unwrap(), 8);
+    }
+    #[test]
+    fn concurrent_duplicate_sends_claim_a_session_only_once() {
+        let store = std::sync::Arc::new(Store::from_connection(Connection::open_in_memory().unwrap()).unwrap());
+        let project = store.add_project(Path::new("D:/重复发送")).unwrap();
+        let id = store.create_session(&project.id, None).unwrap().id;
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let tasks = (0..2).map(|_| {
+            let (store, barrier, id) = (store.clone(), barrier.clone(), id.clone());
+            std::thread::spawn(move || { barrier.wait(); store.claim(&id).is_ok() })
+        }).collect::<Vec<_>>();
+        assert_eq!(tasks.into_iter().filter_map(|task| task.join().ok()).filter(|claimed| *claimed).count(), 1);
+    }
     #[test]
     fn agent_update_never_switches_selection_during_an_active_turn() {
         let store = Store::from_connection(Connection::open_in_memory().unwrap()).unwrap();
@@ -1139,6 +1260,37 @@ mod tests {
             40
         );
     }
+    #[test]
+    fn separately_reported_context_and_billing_restore_for_every_agent() {
+        let store = Store::from_connection(Connection::open_in_memory().unwrap()).unwrap();
+        let project = store.add_project(Path::new("D:/usage-fixture")).unwrap();
+        for agent in ["claude", "codex", "opencode", "pi"] {
+            let session = store
+                .create_configured_session(&project.id, None, agent, Some("@local"))
+                .unwrap();
+            let context = serde_json::json!({"total":{},"last":{"inputTokens":12000,"outputTokens":300,"totalTokens":12300},"contextTokens":12300,"modelContextWindow":128000});
+            store.record_usage(&session, "turn", context).unwrap();
+            let bill = serde_json::json!({"total":{"inputTokens":60000,"outputTokens":900},"last":{},"cumulative":agent=="codex"});
+            store.record_usage(&session, "turn", bill.clone()).unwrap();
+            let record = store.usage_records(Some(&session.id)).unwrap().remove(0);
+            assert_eq!(record["data"]["contextTokens"], 12300);
+            assert_eq!(record["data"]["modelContextWindow"], 128000);
+            assert_eq!(record["data"]["last"]["totalTokens"], 12300);
+            assert_eq!(record["data"]["total"]["inputTokens"], 60000);
+            store.record_usage(&session, "other", bill.clone()).unwrap();
+            assert!(
+                store.usage_records(Some(&session.id)).unwrap()[0]["data"]["contextTokens"]
+                    .is_null()
+            );
+            let mut reset = bill;
+            reset["contextTokens"] = Value::Null;
+            store.record_usage(&session, "turn", reset).unwrap();
+            let records = store.usage_records(Some(&session.id)).unwrap();
+            let record = records.iter().find(|r| r["turnId"] == "turn").unwrap();
+            assert!(record["data"]["contextTokens"].is_null());
+            assert_eq!(record["data"]["last"], serde_json::json!({}));
+        }
+    }
     #[cfg(windows)]
     #[test]
     fn old_plaintext_connections_migrate_without_losing_credentials() {
@@ -1234,6 +1386,156 @@ mod tests {
         assert!(store.profiles().unwrap().is_empty());
     }
     #[test]
+    fn long_history_pages_carry_lifecycle_without_changing_rows_or_cursor() {
+        let store = Store::from_connection(Connection::open_in_memory().unwrap()).unwrap();
+        let project = store.add_project(Path::new("D:/历史/长对话")).unwrap();
+        let session = store.create_session(&project.id, None).unwrap();
+        store
+            .save_message(
+                "u",
+                &session.id,
+                "user",
+                "构建页面",
+                "userMessage",
+                &serde_json::json!({"clientMessageId":"client-u"}),
+            )
+            .unwrap();
+        let marker = serde_json::json!({"turnId":"long","status":"completed","durationMs":123400});
+        store
+            .save_message(
+                "run-long",
+                &session.id,
+                "activity",
+                "",
+                "runMarker",
+                &marker,
+            )
+            .unwrap();
+        for n in 0..225 {
+            store
+                .save_message(
+                    &format!("m{n}"),
+                    &session.id,
+                    "assistant",
+                    "执行过程",
+                    "agentMessage",
+                    &serde_json::json!({"turnId":"long"}),
+                )
+                .unwrap();
+        }
+        let newest = store.messages(&session.id, None).unwrap();
+        assert_eq!(newest.len(), 100);
+        assert_eq!(newest[0].id, "m125");
+        let context = newest[0].history_run.as_ref().unwrap();
+        assert_eq!(context.id, "run-long");
+        assert_eq!(context.turn_key, "client-u");
+        assert_eq!(context.data, marker);
+        assert!(newest[1..]
+            .iter()
+            .all(|message| message.history_run.is_none()));
+        let middle = store.messages(&session.id, Some(newest[0].seq)).unwrap();
+        assert_eq!(middle.len(), 100);
+        assert_eq!(middle[0].id, "m25");
+        assert_eq!(middle[0].history_run.as_ref().unwrap().data, marker);
+        let oldest = store.messages(&session.id, Some(middle[0].seq)).unwrap();
+        assert_eq!(oldest.len(), 27);
+        assert_eq!(oldest[0].id, "u");
+        assert!(oldest.iter().all(|message| message.history_run.is_none()));
+        let combined = oldest
+            .iter()
+            .chain(&middle)
+            .chain(&newest)
+            .collect::<Vec<_>>();
+        assert_eq!(combined.len(), 227);
+        assert!(combined.windows(2).all(|rows| rows[0].seq < rows[1].seq));
+        // The metadata is read-only context, not a rewrite of old JSON records.
+        let raw: String = store
+            .0
+            .lock()
+            .unwrap()
+            .query_row("SELECT data FROM messages WHERE id='m125'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&raw).unwrap(),
+            serde_json::json!({"turnId":"long"})
+        );
+        // The marker itself may be the first row of another page, with its
+        // initiating user on the previous page. The logical turn key stays stable.
+        let start_page = store
+            .messages(&session.id, Some(oldest[0].seq + 101))
+            .unwrap();
+        assert_eq!(start_page[0].id, "run-long");
+        assert_eq!(
+            start_page[0].history_run.as_ref().unwrap().turn_key,
+            "client-u"
+        );
+    }
+
+    #[test]
+    fn page_context_preserves_terminal_errors_and_respects_user_and_model_boundaries() {
+        let store = Store::from_connection(Connection::open_in_memory().unwrap()).unwrap();
+        let project = store.add_project(Path::new("D:/历史/运行状态")).unwrap();
+        let session = store.create_session(&project.id, None).unwrap();
+        for status in ["failed", "interrupted", "inProgress"] {
+            store
+                .save_message(
+                    "run-old",
+                    &session.id,
+                    "activity",
+                    "",
+                    "runMarker",
+                    &serde_json::json!({"turnId":"old","status":status}),
+                )
+                .unwrap();
+            for n in 0..101 {
+                store
+                    .save_message(
+                        &format!("m{n}"),
+                        &session.id,
+                        "assistant",
+                        "部分输出",
+                        "agentMessage",
+                        &serde_json::json!({"turnId":"old"}),
+                    )
+                    .unwrap();
+            }
+            let page = store.messages(&session.id, None).unwrap();
+            assert_eq!(page[0].history_run.as_ref().unwrap().data["status"], status);
+        }
+        for (role, kind) in [("user", "userMessage"), ("system", "modelSwitch")] {
+            store
+                .save_message(
+                    &format!("boundary-{kind}"),
+                    &session.id,
+                    role,
+                    "新一轮",
+                    kind,
+                    &Value::Null,
+                )
+                .unwrap();
+            for n in 0..101 {
+                store
+                    .save_message(
+                        &format!("{kind}-{n}"),
+                        &session.id,
+                        "assistant",
+                        "新的进度",
+                        "agentMessage",
+                        &Value::Null,
+                    )
+                    .unwrap();
+            }
+            assert!(store
+                .messages(&session.id, None)
+                .unwrap()
+                .iter()
+                .all(|message| message.history_run.is_none()));
+        }
+    }
+
+    #[test]
     fn pagination_and_duplicate_completion_keep_order() {
         let store = Store::from_connection(Connection::open_in_memory().unwrap()).unwrap();
         let project = store.add_project(Path::new("D:/项目/测试 空间")).unwrap();
@@ -1290,7 +1592,16 @@ mod tests {
             let client_id = uuid::Uuid::new_v4().to_string();
             crate::client_features::validate_client_message_id(Some(&client_id)).unwrap();
             let metadata = serde_json::json!({"clientMessageId": client_id});
-            store.save_message(&crate::client_features::user_message_id(&metadata), &session.id, "user", "继续", "userMessage", &metadata).unwrap();
+            store
+                .save_message(
+                    &crate::client_features::user_message_id(&metadata),
+                    &session.id,
+                    "user",
+                    "继续",
+                    "userMessage",
+                    &metadata,
+                )
+                .unwrap();
             identities.push(client_id);
         }
         let messages = store.messages(&session.id, None).unwrap();

@@ -5,6 +5,7 @@ import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { Conversation } from './Conversation';
 import { mergeEvent, reconcileMessages } from './events';
 import type { Message } from './types';
+import type { TurnLifecycle } from './turnPresentation';
 
 vi.mock('./api', () => ({ desktop: true, call: vi.fn(async () => ({ token: 'full', previewToken: 'small' })) }));
 vi.mock('@tauri-apps/api/core', () => ({ convertFileSrc: (token: string) => `http://supercode-media.localhost/${token}` }));
@@ -21,14 +22,15 @@ beforeEach(async () => {
   await act(async () => { await import('./Markdown'); });
 });
 afterEach(async () => { await act(async () => root.unmount()); node.remove(); vi.unstubAllGlobals(); });
-async function render(messages: Message[], autoExpand = false) { await act(async () => root.render(<Conversation messages={messages} agentName="Codex" autoExpand={autoExpand} showDiff={() => {}} openFile={() => {}}/>)); }
+async function render(messages: Message[], autoExpand = false, lifecycle: TurnLifecycle = {}) { await act(async () => root.render(<Conversation messages={messages} agentName="Codex" autoExpand={autoExpand} sessionStatus={lifecycle.sessionStatus} activeTurnId={lifecycle.activeTurnId} showDiff={() => {}} openFile={() => {}}/>)); }
 async function toggle() { await act(async () => node.querySelector<HTMLButtonElement>('.turn-process-toggle')!.click()); }
 
 it('streams the full process, collapses at completion, and expands the original chronology without duplicating the final answer', async () => {
   await render([...items, run('inProgress')]);
   expect(node.textContent).toContain('我会先检查布局');
   expect(node.querySelector('.activity-group-summary')).not.toBeNull();
-  const final = node.querySelector('.message.assistant:last-child');
+  expect(node.querySelector('.turn-footer')).toBeNull();
+  const final = [...node.querySelectorAll('.message.assistant')].at(-1);
   await render([...items, run('completed')]);
   expect(node.querySelector('.turn-final-result .message')).toBe(final);
   expect(node.textContent).not.toContain('我会先检查布局');
@@ -50,6 +52,93 @@ it('streams the full process, collapses at completion, and expands the original 
   expect(writeText).toHaveBeenCalledWith('已完成布局优化。');
 });
 
+it('hides reply actions while starting, running or waiting without a run marker, then restores them on completion', async () => {
+  for (const sessionStatus of ['starting', 'running', 'waiting']) {
+    await render(items, false, { sessionStatus });
+    expect(node.textContent).toContain('已完成布局优化');
+    expect(node.querySelector('[aria-label="复制回复"]')).toBeNull();
+    expect(node.querySelector('[aria-label="复制消息"]')).not.toBeNull();
+  }
+  await render(items, false, { sessionStatus: 'idle' });
+  await act(async () => node.querySelector<HTMLButtonElement>('[aria-label="复制回复"]')!.click());
+  expect(writeText).toHaveBeenCalledWith('已完成布局优化。');
+});
+
+it('hides actions for streaming assistant messages before session or run metadata arrives', async () => {
+  for (const status of ['inProgress', 'running', 'preparing']) {
+    await render([items[0], { ...items[1], data: { status } }]);
+    expect(node.querySelector('.turn-footer')).toBeNull();
+  }
+});
+
+it('keeps actions for completed history while the current reply is still generating', async () => {
+  const old = [...items, run('completed')];
+  const current = [message('u2', 'user', '继续优化'), message('a2', 'assistant', '我会检查下一处。')];
+  await render([...old, ...current], false, { sessionStatus: 'running', activeTurnId: 't2' });
+  const turns = node.querySelectorAll('.assistant-turn');
+  expect(turns[0].querySelector('[aria-label="复制回复"]')).not.toBeNull();
+  expect(turns[1].querySelector('.turn-footer')).toBeNull();
+  await render([...old, ...current, run('completed', 'run2')], false, { sessionStatus: 'running' });
+  expect(node.querySelectorAll('[aria-label="复制回复"]')).toHaveLength(2);
+});
+
+it('shows animated current reasoning, editing and running after a tool failure without a run marker', async () => {
+  const failed = message('failure', 'tool', '下载失败', 'commandExecution', { command: 'node download.mjs', status: 'completed', exitCode: 1 });
+  const thinking = message('thinking', 'activity', '我会检查失败原因。', 'reasoning', { status: 'inProgress' });
+  const trace = [items[0], failed, thinking];
+  for (const [current, label] of [
+    [thinking, '正在思考'],
+    [message('edit', 'tool', '', 'claudeToolCall', { tool: 'Write', arguments: { file_path: 'scripts/test.mjs' }, status: 'preparing' }), '正在编辑文件'],
+    [message('edit', 'tool', '', 'fileChange', { changes: [{ path: 'scripts/test.mjs' }], status: 'inProgress' }), '正在编辑文件'],
+    [message('command', 'tool', '', 'commandExecution', { command: 'node scripts/test.mjs', status: 'running' }), '正在运行命令'],
+    [message('native-tool', 'tool', '', 'mcpToolCall', { tool: 'test', status: 'inProgress' }), '正在调用工具'],
+  ] as const) {
+    await render([...trace.filter(message => message.id !== current.id), current], true, { sessionStatus: 'running' });
+    const summary = node.querySelector('.activity-group-summary')!;
+    expect(summary.textContent).toContain(label);
+    expect(summary.textContent).not.toContain('调用失败');
+    expect(summary.querySelector('.pending-text')?.textContent).toBe(label);
+    expect(summary.closest('.activity-group')?.classList.contains('failed')).toBe(false);
+    expect(node.querySelector('.activity-item.failed')?.textContent).toContain('失败');
+  }
+});
+
+it('keeps one animated status across tool completion and text output, then removes it when the turn ends', async () => {
+  const failed = message('failure', 'tool', '失败', 'commandExecution', { status: 'completed', exitCode: 1 });
+  const trace = [items[0], failed];
+  await render(trace, false, { sessionStatus: 'running' });
+  expect(node.querySelector('.activity-group-summary .pending-text')?.textContent).toBe('正在思考');
+  expect(node.querySelector('.working-indicator')).toBeNull();
+  const commentary = message('commentary', 'assistant', '正在检查失败原因。', 'agentMessage', { phase: 'commentary' });
+  await render([...trace, commentary], false, { sessionStatus: 'running' });
+  expect(node.querySelector('.working-indicator .pending-text')?.textContent).toBe('正在思考');
+  expect(node.querySelectorAll('.working-indicator')).toHaveLength(1);
+  expect(node.querySelector('.turn-footer')).toBeNull();
+  await render([...trace, commentary, items[3], run('completed')], false, { sessionStatus: 'idle' });
+  expect(node.querySelector('.pending-text')).toBeNull();
+  expect(node.querySelector('.working-indicator')).toBeNull();
+  expect(node.querySelector('[aria-label="复制回复"]')).not.toBeNull();
+  await toggle();
+  const history = node.querySelector<HTMLButtonElement>('.turn-process-content .activity-group-summary')!;
+  expect(history.textContent).toContain('调用失败');
+  await act(async () => history.click());
+  expect(node.querySelector('.activity-item.failed')?.textContent).toContain('失败');
+});
+
+it('keeps active tool progress visible when assistant text arrives while the tool is still running', async () => {
+  const tool = message('command', 'tool', '', 'commandExecution', { command: 'npm run build', status: 'running' });
+  await render([items[0], tool, items[1]], false, { sessionStatus: 'running' });
+  expect(node.querySelector('.working-indicator .pending-text')?.textContent).toBe('正在运行命令');
+});
+
+it('shows progress before any assistant event arrives in both empty and optimistic user-message histories', async () => {
+  for (const messages of [[], [items[0]], [items[0], run('inProgress')]]) {
+    await render(messages, false, { sessionStatus: 'starting' });
+    expect(node.querySelectorAll('.working-indicator')).toHaveLength(1);
+    expect(node.querySelector('.working-indicator .pending-text')?.textContent).toBe('正在启动 Agent…');
+  }
+});
+
 it('keeps completed history collapsed even when individual tool details auto-expand, and resets for a new run', async () => {
   await render([...items, run('completed')], true);
   expect(node.querySelector('.activity-row')).toBeNull();
@@ -58,6 +147,38 @@ it('keeps completed history collapsed even when individual tool details auto-exp
   await render([...items, run('inProgress', 'new-run')], true);
   await render([...items, run('completed', 'new-run')], true);
   expect(node.querySelector('.turn-process-content')).toBeNull();
+});
+
+it('opens old idle history already collapsed without receiving a live completion event', async () => {
+  for (const marker of [[], [run('inProgress')]]) {
+    await render([...items, ...marker], true, { sessionStatus: 'idle' });
+    expect(node.querySelector('.turn-process-toggle')?.getAttribute('aria-expanded')).toBe('false');
+    expect(node.textContent).not.toContain('我会先检查布局');
+    expect(node.querySelector('.turn-final-result')?.textContent).toContain('已完成布局优化');
+    await toggle();
+    expect(node.querySelector('.turn-process-content')?.textContent).toContain('我会先检查布局');
+    await toggle();
+  }
+});
+
+it('restores a paginated run and keeps its final reply and manually expanded process stable when earlier pages arrive', async () => {
+  const marker = run('completed', 'run-old');
+  const page = items.slice(1).map((item, index) => ({ ...item, seq: index + 101,
+    ...(index === 0 ? { historyRun: { id: marker.id, turnKey: items[0].id, data: marker.data } } : {}) }));
+  await render(page, true);
+  expect(node.querySelector('.turn-process-toggle')?.getAttribute('aria-expanded')).toBe('false');
+  const final = node.querySelector('.turn-final-result .message');
+  await toggle();
+  await render([marker, message('earlier', 'assistant', '更早的过程'), ...page], true);
+  expect(node.querySelector('.turn-process-content')?.textContent).toContain('更早的过程');
+  expect(node.querySelector('.turn-final-result .message')).toBe(final);
+  await render([items[0], marker, message('earlier', 'assistant', '更早的过程'), ...page], true);
+  expect(node.querySelector('.turn-final-result .message')).toBe(final);
+  expect(node.querySelector('.turn-process-content')?.textContent).toContain('更早的过程');
+  expect(node.querySelector('.turn-process-content')?.textContent).toContain('我会先检查布局');
+  expect(node.textContent!.match(/已完成布局优化/g)).toHaveLength(1);
+  await toggle();
+  expect(node.querySelector('.turn-final-result .message')).toBe(final);
 });
 
 it('collapses immediately on completion and stays collapsed through a stale history refresh', async () => {

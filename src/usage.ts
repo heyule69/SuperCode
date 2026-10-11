@@ -7,11 +7,14 @@ export function contextUsage(usage?: TokenUsage) {
   const valid = (n?: number | null) => typeof n === 'number' && Number.isFinite(n) && n >= 0 ? n : undefined;
   // A non-cumulative total can contain many model calls in one turn. It must
   // never stand in for the current context, even if the provider omits it.
-  const used = valid(usage?.contextTokens) ?? (usage?.contextTokens === undefined && usage?.cumulative !== false ? valid(usage?.last?.totalTokens) ?? valid(usage?.last?.inputTokens) : undefined);
+  const lastTotal = valid(usage?.last?.totalTokens);
+  const lastInput = valid(usage?.last?.inputTokens);
+  const last = lastTotal != null && lastTotal > 0 ? lastTotal : lastInput != null ? lastInput + (valid(usage?.last?.outputTokens) ?? 0) : lastTotal;
+  const used = valid(usage?.contextTokens) ?? (usage?.contextTokens === undefined && usage?.cumulative !== false ? last : undefined);
   const capacity = valid(usage?.modelContextWindow);
   const window = capacity && capacity > 0 ? capacity : undefined;
   const percent = used != null && window != null ? Math.min(100, Math.round(used / window * 100)) : undefined;
-  return { used, window, percent, label: percent != null ? `上下文 ${percent}%` : used != null ? `上下文 ${compactNumber(used)}` : '上下文 —' };
+  return { used, window, percent, label: percent != null ? `上下文 ${used != null && used > 0 && percent === 0 ? '<1' : percent}%` : used != null ? `上下文 ${compactNumber(used)}` : '上下文 —' };
 }
 export function usageTotals(records: UsageRecord[]) {
   return records.reduce((sum, record) => {

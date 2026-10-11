@@ -58,7 +58,7 @@ impl Cue {
         writeln!(
             write,
             "{}",
-            json!({"token":token,"agent":agent,"builtin":builtin})
+            json!({"token":token,"agent":agent,"session":std::env::var("SUPERCODE_SESSION_ID").ok(),"builtin":builtin})
         )
         .map_err(|e| e.to_string())?;
         let mut answer = Vec::new();

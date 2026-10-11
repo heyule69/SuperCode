@@ -29,9 +29,11 @@ describe('context occupancy', () => {
     expect(contextUsage({ total: {}, last: {}, contextTokens: 16000, modelContextWindow: 128000 }).label).toBe('上下文 13%');
     expect(contextUsage({ total: {}, last: {}, contextTokens: 0, modelContextWindow: 128000 }).label).toBe('上下文 0%');
     expect(contextUsage({ total: {}, last: {}, contextTokens: 0 }).label).toBe('上下文 0');
+    expect(contextUsage({ total: {}, last: {}, contextTokens: 100, modelContextWindow: 1000000 }).label).toBe('上下文 <1%');
   });
   it('uses the latest Codex call, never cumulative or multi-call turn totals', () => {
     expect(contextUsage({ total: { totalTokens: 999999 }, last: { totalTokens: 18000, inputTokens: 17000 } }).used).toBe(18000);
+    expect(contextUsage({ total: { totalTokens: 999999 }, last: { totalTokens: 0, inputTokens: 17000, outputTokens: 1000 } }).used).toBe(18000);
     expect(contextUsage({ total: { totalTokens: 999999 }, last: { inputTokens: 999999 }, contextTokens: null, cumulative: false }).used).toBeUndefined();
     expect(contextUsage({ total: { totalTokens: 999999 }, last: { inputTokens: 999999 }, cumulative: false }).used).toBeUndefined();
   });

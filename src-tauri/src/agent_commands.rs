@@ -44,7 +44,7 @@ pub async fn execute_agent_command(
                 argument.trim(),
                 "" | "status" | "pause" | "resume" | "clear"
             ));
-    if state.store.running()? > 0 && !(active && control) {
+    if active && !control {
         return Err("请先停止或完成当前任务，再创建目标或压缩上下文".into());
     }
     let permission = permission_mode.as_deref().unwrap_or("ask");

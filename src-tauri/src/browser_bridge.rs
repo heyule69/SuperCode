@@ -77,6 +77,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
     }
     let token = args[1].clone();
     let agent = args[2].clone();
+    let session = std::env::var("SUPERCODE_SESSION_ID").ok();
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -106,14 +107,14 @@ pub fn run(args: &[String]) -> Result<(), String> {
                 "tools/list"=>send(&out,json!({"jsonrpc":"2.0","id":id,"result":{"tools":tools()}})),
                 "notifications/cancelled"=>{let id=value["params"]["requestId"].to_string();if let Some(task)=calls.remove(&id){let _=client.post(format!("http://{address}/cancel")).bearer_auth(&token).json(&json!({"agent":agent,"id":format!("{instance}:{id}")})).timeout(Duration::from_secs(2)).send().await;task.abort();}},
                 "tools/call"=>{
-                    let out=out.clone();let client=client.clone();let token=token.clone();let agent=agent.clone();
+                    let out=out.clone();let client=client.clone();let token=token.clone();let agent=agent.clone();let session=session.clone();
                     if calls.len()>=16 || calls.contains_key(&id.to_string()){send(&out,json!({"jsonrpc":"2.0","id":id,"error":{"code":-32600,"message":"Browser request limit or duplicate ID"}}));continue;}
                     let key=id.to_string();let request_id=format!("{instance}:{key}");
                     calls.insert(key,tokio::spawn(async move {
                         let name=value["params"]["name"].as_str().unwrap_or("");let arguments=value["params"].get("arguments").cloned().unwrap_or(json!({}));
                         let result=async {
                             validate(name,&arguments)?;
-                            let response=client.post(format!("http://{address}/call")).bearer_auth(&token).json(&json!({"agent":agent,"id":request_id,"name":name,"arguments":arguments})).send().await.map_err(|e|e.to_string())?;
+                            let response=client.post(format!("http://{address}/call")).bearer_auth(&token).json(&json!({"agent":agent,"session":session,"id":request_id,"name":name,"arguments":arguments})).send().await.map_err(|e|e.to_string())?;
                             if !response.status().is_success(){return Err("Browser connection rejected; return to the chat and check the browser panel".into());}
                             let bytes=response.bytes().await.map_err(|e|e.to_string())?;
                             if bytes.len()>8*1024*1024{return Err("Browser response too large".into());}

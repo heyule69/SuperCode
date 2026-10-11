@@ -186,7 +186,7 @@ pub(crate) fn on_agent_event(
         })
         .await;
         if let Ok(Err(error)) = result {
-            let _ = report.emit("runtime-log", format!("系统通知：{error}"));
+            crate::runtime_diagnostics::message(&report,None,"notification","warn","notification_unavailable",&error);
         }
     });
 }

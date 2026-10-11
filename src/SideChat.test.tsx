@@ -6,6 +6,8 @@ import SideChat, { type SideDraft } from './SideChat';
 import { call } from './api';
 import { PROVIDER_REQUIRED } from './chatConnection';
 import type { Session, RpcEvent } from './types';
+import type { ComponentProps } from 'react';
+import type { Followup } from './Followups';
 
 vi.mock('./api', () => ({ desktop:true, call:vi.fn(), subscribe:vi.fn(async()=>()=>{}) }));
 vi.mock('@tauri-apps/api/event', () => ({ listen:vi.fn(async()=>()=>{}) }));
@@ -33,10 +35,35 @@ beforeEach(() => {
   container=document.createElement('div');document.body.append(container);root=createRoot(container);
 });
 afterEach(async()=>{await act(async()=>root.unmount());container.remove();});
-async function render(draft:SideDraft) {
-  await act(async()=>root.render(<SideChat draft={draft} projectId="" agent="pi" connectionId={draft.connectionId??'@local'} defaults={defaults} close={()=>{}} opened={()=>{}} openFile={()=>{}} showDiff={()=>{}} providerRequired={providerRequired}/>));
+async function render(draft:SideDraft, options:Partial<ComponentProps<typeof SideChat>> = {}) {
+  await act(async()=>root.render(<SideChat draft={draft} projectId="" agent="pi" connectionId={draft.connectionId??'@local'} defaults={defaults} close={()=>{}} opened={()=>{}} openFile={()=>{}} showDiff={()=>{}} providerRequired={providerRequired} {...options}/>));
 }
 async function send() {await act(async()=>{container.querySelector('form')!.dispatchEvent(new Event('submit',{bubbles:true,cancelable:true}));});}
+it('edits its own queued message in the side composer and keeps its position instead of enqueueing a duplicate',async()=>{
+  missing=false;
+  const rows:Followup[]=['first','second'].map(id=>({id,sessionId:'side',status:'queued',error:null,payload:{...defaults,text:id==='first'?'第一条侧边补充':'第二条侧边补充',attachments:id==='first'?[{kind:'skill',name:'Recall',path:'D:/skills/recall/SKILL.md'}]:[]}}));
+  const base=vi.mocked(call).getMockImplementation()!;
+  vi.mocked(call).mockImplementation(async(command,args={})=>{
+    if(command==='list_followups')return structuredClone(rows);
+    if(command==='begin_followup_edit'){const row=rows.find(row=>row.id===args.id)!;const original=structuredClone(row);row.status='editing';return {row:original,token:'side-token'};}
+    if(command==='finish_followup_edit'){const row=rows.find(row=>row.id===args.id)!;if(args.payload)row.payload=structuredClone(args.payload) as Followup['payload'];row.status='queued';return null;}
+    return base(command,args);
+  });
+  await render({key:'draft',text:'开启侧边聊天'});await send();
+  const area=container.querySelector<HTMLTextAreaElement>('[aria-label="侧边聊天消息"]')!;
+  await act(async()=>{Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype,'value')!.set!.call(area,'保留侧边草稿');area.dispatchEvent(new Event('input',{bubbles:true}));});
+  await act(async()=>container.querySelector<HTMLButtonElement>('[data-followup-id="first"] [aria-label="排队消息更多操作"]')!.click());
+  await act(async()=>[...document.querySelectorAll<HTMLButtonElement>('.followup-menu button')].find(button=>button.textContent==='编辑消息')!.click());
+  expect(area.value).toBe('第一条侧边补充');expect(document.activeElement).toBe(area);
+  expect(container.querySelector('[data-followup-id="first"]')).toBeNull();
+  await act(async()=>{Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype,'value')!.set!.call(area,'编辑后的侧边补充');area.dispatchEvent(new Event('input',{bubbles:true}));});
+  vi.mocked(call).mockClear();await send();
+  expect(call).toHaveBeenCalledWith('finish_followup_edit',{id:'first',token:'side-token',payload:expect.objectContaining({text:'编辑后的侧边补充',attachments:rows[0].payload.attachments})});
+  expect(call).not.toHaveBeenCalledWith('enqueue_followup',expect.anything());
+  expect(call).not.toHaveBeenCalledWith('change_followup',expect.anything());
+  expect([...container.querySelectorAll('.followup-row')].map(row=>row.getAttribute('data-followup-id'))).toEqual(['first','second']);
+  expect(area.value).toBe('保留侧边草稿');
+});
 it('keeps the side-chat question beside its composer and cancels it without submitting a chat message', async () => {
   missing = false;
   requests = [{ id: 'pi:question', method: 'item/tool/requestUserInput', params: { threadId: null, nativeRequest: { method: 'select' }, questions: [{ id: '0', question: '怎么继续？', options: [{ label: '继续' }] }] } }];
@@ -117,4 +144,65 @@ it('can retry the preserved draft with the newly configured connection',async()=
   expect(call).toHaveBeenCalledWith('check_chat_connection',{agent:'pi',connectionId:'api:pi',sessionId:null});
   expect(call).toHaveBeenCalledWith('create_session',expect.objectContaining({connectionId:'api:pi'}));
   expect(call).toHaveBeenCalledWith('enqueue_followup',expect.objectContaining({payload:expect.objectContaining({text:'保留这段侧边提问'})}));
+});
+
+it('selects a supplier and model for the side draft without changing or starting the main conversation', async () => {
+  missing = false;
+  await render({key:'draft',text:'我的侧边提问',connectionId:'api:pi'}, {catalog:{origin:'saved',data:[{id:'test-model',model:'test-model',displayName:'test-model',isDefault:true}],source:{providerId:'custom',providerName:'Pi API',mark:'P',available:true}},profiles:[
+    {id:'api:pi',agent:'pi',name:'Pi API',model:'test-model',models:['test-model','other-model'],hasCredential:true,current:true},
+    {id:'other:pi',agent:'pi',name:'Other API',model:'second-model',hasCredential:true,current:false},
+    {id:'api:claude',agent:'claude',name:'Claude API',model:'claude-only',hasCredential:true,current:true},
+  ]});
+  expect(call).not.toHaveBeenCalledWith('create_session',expect.anything());
+  await act(async()=>container.querySelector<HTMLButtonElement>('.model-chip')!.click());
+  expect(container.querySelector('.model-popover')?.textContent).not.toContain('claude-only');
+  await act(async()=>Array.from(container.querySelectorAll<HTMLButtonElement>('.model-option')).find(button=>button.textContent?.includes('second-model'))!.click());
+  expect(container.querySelector<HTMLTextAreaElement>('textarea')!.value).toBe('我的侧边提问');
+  expect(call).not.toHaveBeenCalledWith('switch_session_model',expect.anything());
+  await send();
+  expect(call).toHaveBeenCalledWith('create_session',expect.objectContaining({connectionId:'other:pi',model:'second-model',agent:'pi'}));
+  expect(call).toHaveBeenCalledWith('enqueue_followup',expect.objectContaining({sessionId:'side',payload:expect.objectContaining({text:'我的侧边提问',model:'second-model'})}));
+});
+
+it('preserves the current side draft and its attachments when opening supplier settings', async () => {
+  const manageProviders = vi.fn();
+  const attachment = {kind:'skill' as const,name:'recall',path:'D:/skills/recall/SKILL.md'};
+  await render({key:'draft',text:'进一步说明',payload:{...defaults,attachments:[attachment]}}, {manageProviders});
+  await act(async()=>container.querySelector<HTMLButtonElement>('.model-chip')!.click());
+  expect(manageProviders).toHaveBeenCalledWith('pi',expect.objectContaining({text:'进一步说明',payload:expect.objectContaining({attachments:[attachment]})}));
+  expect(call).not.toHaveBeenCalledWith('create_session',expect.anything());
+  expect(call).not.toHaveBeenCalledWith('enqueue_followup',expect.anything());
+  await act(async()=>container.querySelector<HTMLButtonElement>('[aria-label="移除技能 recall"]')!.click());
+  expect(container.querySelector('.composer-skill')).toBeNull();
+  expect(container.querySelector<HTMLTextAreaElement>('textarea')!.value).toBe('进一步说明');
+});
+
+it('uses the configured send shortcut and retains the side permission choice in the next message', async () => {
+  missing = false;
+  await render({key:'draft',text:'侧边问题'}, {enterSend:false});
+  const textarea = container.querySelector<HTMLTextAreaElement>('textarea')!;
+  await act(async()=>textarea.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',bubbles:true,cancelable:true})));
+  expect(call).not.toHaveBeenCalledWith('enqueue_followup',expect.anything());
+  await act(async()=>container.querySelector<HTMLButtonElement>('[aria-label="侧边聊天权限模式"]')!.click());
+  await act(async()=>container.querySelector<HTMLButtonElement>('[role="menuitemradio"][aria-checked="false"]')!.click());
+  await act(async()=>textarea.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',ctrlKey:true,bubbles:true,cancelable:true})));
+  expect(call).toHaveBeenCalledWith('enqueue_followup',expect.objectContaining({payload:expect.objectContaining({text:'侧边问题',readOnly:false})}));
+});
+
+it('keeps a newer side draft while an earlier message is being submitted', async () => {
+  missing = false;
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const original = vi.mocked(call).getMockImplementation()!;
+  vi.mocked(call).mockImplementation(async (command,args={}) => {
+    if(command==='check_chat_connection') await gate;
+    return original(command,args);
+  });
+  await render({key:'draft',text:'先发送这条'});
+  await act(async()=>container.querySelector('form')!.dispatchEvent(new Event('submit',{bubbles:true,cancelable:true})));
+  const textarea = container.querySelector<HTMLTextAreaElement>('textarea')!;
+  await act(async()=>{Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype,'value')!.set!.call(textarea,'下一条还在编辑');textarea.dispatchEvent(new Event('input',{bubbles:true}));});
+  await act(async()=>{release();await gate;});
+  expect(call).toHaveBeenCalledWith('enqueue_followup',expect.objectContaining({payload:expect.objectContaining({text:'先发送这条'})}));
+  expect(textarea.value).toBe('下一条还在编辑');
 });

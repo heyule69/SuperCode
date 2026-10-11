@@ -330,11 +330,6 @@ pub async fn tray_menu_action(
         "new-window" => desktop_lifecycle::new_workspace_window(app)
             .await
             .map(|_| ()),
-        "new-chat" if app.state::<AppState>().store.running()? > 0 => {
-            desktop_lifecycle::new_workspace_window(app)
-                .await
-                .map(|_| ())
-        }
         "new-chat" | "search" => {
             desktop_lifecycle::show_window(&app, "main")?;
             app.emit_to(

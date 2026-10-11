@@ -21,6 +21,7 @@ fn admit(attempts: &mut Vec<u64>, now: u64) -> bool {
 }
 
 fn record(app: &tauri::AppHandle, value: serde_json::Value) {
+    crate::runtime_diagnostics::record(app,None,"ui_process_failed",value.clone());
     if let Some(state) = app.try_state::<crate::AppState>() {
         let dir = &state.data_dir;
         let path = dir.join("ui-crashes.jsonl");
@@ -67,6 +68,7 @@ pub fn attach(webview: &Webview) {
     drop(attached);
     let callback_app = app.clone();
     let callback_label = label.clone();
+    let registration_app = app.clone();
     let result = webview.with_webview(move |platform| unsafe {
         let register = || -> windows::core::Result<()> {
             let core = platform.controller().CoreWebView2()?;
@@ -89,7 +91,7 @@ pub fn attach(webview: &Webview) {
             core.add_ProcessFailed(&handler,&mut token)?;
             Ok(())
         };
-        if let Err(error) = register() { eprintln!("WebView 崩溃恢复监听初始化失败：{error}"); }
+        if let Err(error) = register() { crate::runtime_diagnostics::message(&registration_app,None,"webview","warn","ui_recovery_install_error",&error.to_string()); }
     });
     if result.is_err() {
         if let Ok(mut attached) = app.state::<UiRecovery>().attached.lock() {

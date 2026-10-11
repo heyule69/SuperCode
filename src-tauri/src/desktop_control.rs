@@ -9,7 +9,7 @@ use std::{
     },
     time::Duration,
 };
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::{AppHandle, Manager};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
 #[derive(Clone)]
@@ -24,6 +24,14 @@ struct Connection {
     session: Option<String>,
     revoked: bool,
     calls: HashSet<String>,
+}
+#[derive(Clone)]
+struct Grant {
+    agent: String,
+    turn: Option<String>,
+    token: String,
+    gate: Arc<crate::computer_gate::Gate>,
+    allowed: bool,
 }
 #[derive(Default)]
 struct Activity {
@@ -103,6 +111,9 @@ impl Activity {
         self.suspended = false;
         self.authorize_turn(agent) || changed
     }
+    fn can_prepare_session(&self, session: &str) -> bool {
+        self.session.as_deref() == Some(session) || self.engaged.is_empty()
+    }
     fn owns_event(&self, session: &str, turn: Option<&str>) -> bool {
         self.session.as_deref().is_none_or(|id| id == session)
             && turn.is_none_or(|turn| self.turn.as_deref() == Some(turn))
@@ -125,6 +136,7 @@ impl Activity {
 pub struct DesktopControl {
     endpoint: Mutex<Option<Endpoint>>,
     activity: Mutex<Activity>,
+    grants: Mutex<HashMap<String, Grant>>,
     yielded: Mutex<Vec<String>>,
     glow: Mutex<Option<desktop_glow::Glow>>,
     listener: Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
@@ -276,7 +288,7 @@ async fn connection(app: AppHandle, socket: tokio::net::TcpStream) {
         .insert(key.clone(), (agent.into(), builtin, cancel));
     {
         let mut activity = state.activity.lock().unwrap();
-        let session = activity.session.clone();
+        let session = hello["session"].as_str().map(str::to_owned).or_else(|| activity.session.clone());
         activity.connections.insert(
             key.clone(),
             Connection {
@@ -301,12 +313,9 @@ async fn connection(app: AppHandle, socket: tokio::net::TcpStream) {
             let Some(active) = message["active"].as_bool() else {
                 break;
             };
-            let current = state
-                .endpoint
-                .lock()
-                .unwrap()
-                .as_ref()
-                .map(|e| crate::computer_gate::event_name(&e.lease));
+            let current = if active { connection_gate(&app, &key) } else {
+                state.endpoint.lock().unwrap().as_ref().map(|e| crate::computer_gate::event_name(&e.lease))
+            };
             // A result from a revoked/previous turn cannot hide or rearm a newer cue.
             if !active
                 && message["gate"]
@@ -336,13 +345,7 @@ async fn connection(app: AppHandle, socket: tokio::net::TcpStream) {
             let (tx, rx) = tokio::sync::oneshot::channel();
             if app
                 .run_on_main_thread(move || {
-                    let current_gate = app_ui
-                        .state::<DesktopControl>()
-                        .endpoint
-                        .lock()
-                        .unwrap()
-                        .as_ref()
-                        .map(|e| crate::computer_gate::event_name(&e.lease));
+                    let current_gate = connection_gate(&app_ui, &key_ui);
                     let result =
                         current_gate == expected_gate && set_call(&app_ui, &key_ui, &id, active);
                     let _ = tx.send(result);
@@ -392,6 +395,21 @@ fn set_call(app: &AppHandle, connection: &str, id: &str, active: bool) -> bool {
     let ok = {
         let mut activity = state.activity.lock().unwrap();
         if active {
+            let Some(row) = activity.connections.get(connection) else { return false; };
+            let Some(session) = row.session.clone() else { return false; };
+            let grant = state.grants.lock().unwrap().get(&session).cloned();
+            let Some(grant) = grant.filter(|g| g.allowed && g.agent == row.agent && !row.revoked) else { return false; };
+            if activity.session.as_deref() != Some(&session) {
+                // Chat processes remain concurrent. Physical mouse/keyboard ownership
+                // changes only after its current owner's observation/action loop ends.
+                if !activity.can_prepare_session(&session) { return false; }
+                activity.prepare_session(&grant.agent, &session);
+                activity.turn = grant.turn.clone();
+            }
+            if let Some(old) = state.gate.lock().unwrap().replace(grant.gate.clone()) {
+                if !Arc::ptr_eq(&old, &grant.gate) { old.stop(); }
+            }
+            if let Some(endpoint) = state.endpoint.lock().unwrap().as_mut() { endpoint.lease = grant.token; }
             activity.start(connection, id)
         } else {
             activity.end(connection, id);
@@ -406,11 +424,19 @@ fn set_call(app: &AppHandle, connection: &str, id: &str, active: bool) -> bool {
     }
     if let Err(error) = refresh(app) {
         diagnostic(app, "cue_failed", Some(&error));
-        let _ = app.emit("runtime-log", format!("电脑操作已阻止：{error}"));
+        crate::runtime_diagnostics::message(app,None,"desktop_control","warn","desktop_control_blocked",&error.to_string());
         stop(app);
         return false;
     }
     true
+}
+fn connection_gate(app: &AppHandle, connection: &str) -> Option<String> {
+    let state = app.state::<DesktopControl>();
+    let activity = state.activity.lock().unwrap();
+    let row = activity.connections.get(connection)?;
+    let grants = state.grants.lock().unwrap();
+    grants.get(row.session.as_deref()?).filter(|g| g.allowed && g.agent == row.agent && !row.revoked)
+        .map(|g| crate::computer_gate::event_name(&g.token))
 }
 fn yield_desktop(app: &AppHandle) {
     let state = app.state::<DesktopControl>();
@@ -501,6 +527,8 @@ fn refresh(app: &AppHandle) -> Result<(), String> {
 fn diagnostic(app: &AppHandle, event: &str, error: Option<&str>) {
     use std::io::Write;
     let state = app.state::<DesktopControl>();
+    let session = state.activity.lock().unwrap().session.clone();
+    crate::runtime_diagnostics::record(app,session.as_deref(),"desktop_control",serde_json::json!({"action":event,"error":error}));
     let _lock = state.diagnostics.lock().unwrap();
     let path = app
         .state::<AppState>()
@@ -556,23 +584,16 @@ pub(crate) fn authorize_session(
     let gate = Arc::new(crate::computer_gate::Gate::create(
         &crate::computer_gate::event_name(&token),
     )?);
-    if let Some(old) = state.gate.lock().unwrap().as_ref() {
-        old.stop();
-    }
-    let old_glow = state.glow.lock().unwrap().take();
-    drop(old_glow);
-    *state.gate.lock().unwrap() = Some(gate);
-    *state.cue_status.lock().unwrap() = desktop_glow::Status::default();
-    let reconnect = state
-        .activity
-        .lock()
-        .unwrap()
-        .prepare_session(agent, session);
-    if let Some(endpoint) = state.endpoint.lock().unwrap().as_mut() {
-        endpoint.lease = token;
-        if reconnect {
-            endpoint.token = uuid::Uuid::new_v4().to_string();
-        }
+    let mut activity = state.activity.lock().unwrap();
+    let reconnect = activity.connections.values().any(|c| c.session.as_deref() == Some(session) && c.revoked);
+    let grant = Grant { agent: agent.into(), turn: None, token: token.clone(), gate: gate.clone(), allowed: true };
+    if let Some(old) = state.grants.lock().unwrap().insert(session.into(), grant) { old.gate.stop(); }
+    if activity.can_prepare_session(session) {
+        if let Some(old) = state.gate.lock().unwrap().replace(gate) { old.stop(); }
+        state.glow.lock().unwrap().take();
+        *state.cue_status.lock().unwrap() = desktop_glow::Status::default();
+        activity.prepare_session(agent, session);
+        if let Some(endpoint) = state.endpoint.lock().unwrap().as_mut() { endpoint.lease = token; }
     }
     Ok(reconnect)
 }
@@ -595,6 +616,11 @@ pub fn observe(app: &AppHandle, event: &Value) {
     let state = app.state::<DesktopControl>();
     {
         let mut activity = state.activity.lock().unwrap();
+        if let Some(grant) = state.grants.lock().unwrap().get_mut(&session.id) {
+            let turn = event["params"]["turn"]["id"].as_str().or(event["params"]["turnId"].as_str());
+            if started { grant.turn = turn.map(str::to_owned); }
+            if completed && grant.turn.as_deref() == turn { grant.allowed = false; grant.gate.stop(); }
+        }
         if activity
             .session
             .as_deref()
@@ -659,6 +685,9 @@ pub(crate) fn takeover_reason(app: &AppHandle, bring_back: bool, reason: &str) {
     }
     let agents = {
         let mut activity = state.activity.lock().unwrap();
+        if let Some(owner) = &activity.session {
+            if let Some(grant) = state.grants.lock().unwrap().get_mut(owner) { grant.allowed = false; }
+        }
         let agents = activity.engaged.clone();
         for agent in &agents {
             activity.revoke(agent);
@@ -670,13 +699,14 @@ pub(crate) fn takeover_reason(app: &AppHandle, bring_back: bool, reason: &str) {
     }
     // Native workers observe the gate and return a takeover result. Legacy servers
     // still need their process tree killed because they have no cancellation contract.
-    for (agent, builtin, cancel) in state.cancellations.lock().unwrap().values() {
-        if agents.contains(agent) && !builtin {
+    let owner = state.activity.lock().unwrap().session.clone();
+    for (key, (agent, builtin, cancel)) in state.cancellations.lock().unwrap().iter() {
+        let owned = state.activity.lock().unwrap().connections.get(key).is_some_and(|c| c.session == owner);
+        if owned && agents.contains(agent) && !builtin {
             let _ = cancel.send(true);
         }
     }
     diagnostic(app, "control_stopped", Some(reason));
-    let owner = state.activity.lock().unwrap().session.clone();
     let sessions = app.state::<AppState>().store.sessions().unwrap_or_default();
     for session in sessions.into_iter().filter(|s| {
         agents.contains(&s.agent)
@@ -734,6 +764,24 @@ pub(crate) fn active(app: &AppHandle) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn another_chat_with_the_same_agent_does_not_steal_desktop_ownership() {
+        let mut state = Activity::default();
+        for id in ["a", "b"] {
+            state.connections.insert(id.into(), Connection { agent:"codex".into(), session:Some(id.into()), ..Default::default() });
+        }
+        state.prepare_session("codex", "a");
+        assert!(state.start("a", "typing"));
+        assert!(!state.can_prepare_session("b"));
+        assert!(state.start("a", "next-action"));
+        assert!(!state.start("b", "conflicting-input"));
+        assert_eq!(state.session.as_deref(), Some("a"));
+        state.finish("codex");
+        assert!(state.can_prepare_session("b"));
+        state.prepare_session("codex", "b");
+        assert!(state.start("b", "now-available"));
+        assert!(!state.start("a", "late-input"));
+    }
     fn activity() -> Activity {
         let mut state = Activity::default();
         for (id, agent) in [("a", "codex"), ("b", "claude")] {

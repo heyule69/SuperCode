@@ -550,7 +550,7 @@ pub fn capture_change(app: &AppHandle, session: &crate::storage::Session, params
         return;
     }
     let state = app.state::<AppState>();
-    let id = path.to_string_lossy().to_string();
+    let id = (session.id.clone(), path.to_string_lossy().to_string());
     let Ok(mut snapshots) = state.change_snapshots.lock() else {
         return;
     };
@@ -589,7 +589,7 @@ pub fn capture_change(app: &AppHandle, session: &crate::storage::Session, params
             "turnDiff",
             &data,
         );
-    } else if snapshots.len() < 32 && !snapshots.contains_key(&id) {
+    } else if snapshots.keys().filter(|(owner, _)| owner == &session.id).count() < 32 && !snapshots.contains_key(&id) {
         let before = if path.is_file() {
             let Ok(content) = read_utf8(&path, 256 * 1024) else {
                 return;
