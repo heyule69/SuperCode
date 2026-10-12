@@ -15,7 +15,7 @@
 .project-folder[aria-expanded=true] .project-folder-closed { opacity:0; transform:translateY(1px) scale(.95); }
 .project-folder[aria-expanded=true] .project-folder-open { opacity:1; transform:none; }
 .sidebar-row-menu { display:flex; align-items:center; justify-content:center; width:27px; height:28px; padding:0; margin-right:2px; flex:none; background:transparent; color:var(--muted); border-radius:5px; opacity:0; pointer-events:none; }
-.project-heading:hover .sidebar-row-menu, .project-heading:focus-within .sidebar-row-menu, .sidebar-chat-row:hover .sidebar-row-menu, .sidebar-chat-row:focus-within .sidebar-row-menu, .sidebar-group-heading:hover .sidebar-row-menu, .sidebar-group-heading:focus-within .sidebar-row-menu { opacity:1; pointer-events:auto; }
+.project-heading:hover .sidebar-row-menu, .project-heading:focus-within .sidebar-row-menu, .sidebar-group-heading:hover .sidebar-row-menu, .sidebar-group-heading:focus-within .sidebar-row-menu { opacity:1; pointer-events:auto; }
 .sidebar-row-menu:focus-visible { opacity:1; pointer-events:auto; }
 .sidebar-row-menu:hover { color:var(--text); background:color-mix(in srgb,var(--text) 7%,transparent); }
 .sidebar-items .project-toggle { width:21px; flex:none; }
@@ -26,9 +26,9 @@
 .sidebar-chat-row .session-title { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .sidebar-chat-row.unread .session-title { font-weight:600; }
 .sidebar-chat-row .session-title small { display:block; color:var(--muted); font-size:11px; font-weight:400; margin-top:2px; overflow:hidden; text-overflow:ellipsis; }
-.sidebar-chat-row .session-row > .session-indicator { flex:none; overflow:visible; }
-.session-row > .session-spinner { color:var(--muted); }
-.session-row > .unread-dot { width:7px; height:7px; border-radius:50%; background:var(--chat-link); }
+.sidebar-chat-status .session-indicator { flex:none; overflow:visible; }
+.sidebar-chat-status > .session-spinner { color:var(--muted); }
+.sidebar-chat-status > .unread-dot { width:7px; height:7px; border-radius:50%; background:var(--chat-link); }
 .sidebar-group + .sidebar-group { margin-top:12px; }
 .sidebar-group-heading { display:flex; gap:6px; align-items:center; min-height:30px; color:var(--muted); font-size:11px; padding:0 6px; }
 .sidebar-group-heading > span { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }

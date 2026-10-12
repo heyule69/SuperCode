@@ -3,7 +3,7 @@ import { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import RequestCard from './RequestCard';
-import type { RpcEvent } from './types';
+import type { Message, RpcEvent } from './types';
 
 let root: Root, node: HTMLDivElement;
 const respond = vi.fn();
@@ -124,4 +124,31 @@ it('keeps approval requests separate and denies explicitly instead of auto appro
   await render({ id: 'approval', method: 'claude/tool/requestApproval', params: { toolName: 'Shell', input: { command: 'example' } } });
   expect(node.querySelector('.question-request')).toBeNull(); expect(respond).not.toHaveBeenCalled();
   await act(async () => button('拒绝').click()); expect(respond).toHaveBeenCalledExactlyOnceWith({ decision: 'decline' });
+});
+it('shows ACP operation arguments from the exact native call instead of its empty permission envelope', async () => {
+  const value: RpcEvent = {id:'opencode:read',method:'claude/tool/requestApproval',params:{
+    nativeRequest:{method:'session/request_permission'},input:{kind:'read',title:'read',rawInput:{},locations:[],toolCallId:'call-read'},
+  }};
+  const messages: Message[] = [
+    {seq:1,id:'turn-tool-call-read',sessionId:'s',role:'activity',kind:'claudeToolCall',text:'',data:{arguments:{filePath:'D:/audit/missing.md',file_path:'D:/audit/missing.md',offset:2}}},
+    {seq:2,id:'turn-tool-call-other',sessionId:'s',role:'activity',kind:'claudeToolCall',text:'',data:{arguments:{file_path:'D:/other/private.md'}}},
+  ];
+  await act(async () => root.render(<RequestCard request={value} messages={messages} respond={respond}/>));
+  expect(node.textContent).toContain('请求读取文件');
+  expect(node.textContent).toContain('D:/audit/missing.md');
+  expect(node.textContent).toContain('起始行');
+  expect(node.querySelectorAll('.request-operation pre')).toHaveLength(2);
+  expect(node.textContent).not.toContain('D:/other/private.md');
+  expect(node.textContent).not.toContain('toolCallId');
+  expect(respond).not.toHaveBeenCalled();
+  await act(async () => button('允许本次').click());
+  expect(respond).toHaveBeenCalledExactlyOnceWith({decision:'accept'});
+});
+it('does not invent missing ACP operation details or silently approve after history reload', async () => {
+  await render({id:'opencode:empty',method:'claude/tool/requestApproval',params:{nativeRequest:{method:'session/request_permission'},input:{kind:'read',title:'read',toolCallId:'unknown'}}});
+  expect(node.textContent).toContain('引擎尚未提供本次操作参数');
+  expect(node.querySelector('pre')).toBeNull();
+  expect(respond).not.toHaveBeenCalled();
+  await act(async () => button('拒绝').click());
+  expect(respond).toHaveBeenCalledExactlyOnceWith({decision:'decline'});
 });

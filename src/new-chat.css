@@ -1,5 +1,5 @@
 .workspace { --conversation-width:840px; }
-.workspace > .chat-scroll > .messages,
+.workspace .chat-scroll > .messages,
 .workspace > .composer-area { max-width:var(--conversation-width); }
 .workspace .conversation-turn + .conversation-turn { border-top:0; margin-top:32px; padding-top:12px; }
 

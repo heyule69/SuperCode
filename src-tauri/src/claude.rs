@@ -101,6 +101,50 @@ fn publish(app: &AppHandle, event: Value) {
     runtime::publish_event(app, event);
 }
 
+fn is_main_result(message: &Value) -> bool {
+    message["type"] == "result" && message["parent_tool_use_id"].is_null()
+}
+
+/// A native model result can precede the parent's background-task follow-up.
+/// New CLIs report run idleness separately; older CLIs still use task lifecycles.
+#[derive(Default)]
+struct RunCompletion {
+    state: Option<String>,
+    result_received: bool,
+}
+impl RunCompletion {
+    fn observe(&mut self, message: &Value) -> bool {
+        if message["type"] == "system" && message["subtype"] == "session_state_changed" {
+            if let Some(state @ ("running" | "requires_action" | "idle")) = message["state"].as_str() {
+                self.state = Some(state.to_owned());
+                return true;
+            }
+            return false;
+        }
+        if matches!(message["type"].as_str(), Some("assistant" | "stream_event"))
+            && message["parent_tool_use_id"].is_null()
+        {
+            // An old result must not finish a newly started parent response.
+            self.result_received = false;
+        }
+        false
+    }
+    fn result(&mut self) { self.result_received = true; }
+    fn ready(&self, children_pending: bool) -> bool {
+        self.result_received && !children_pending
+            && matches!(self.state.as_deref(), None | Some("idle"))
+    }
+    fn finished(&mut self) { self.result_received = false; }
+}
+
+fn permission_args(read_only: bool, permission: &str) -> Result<Vec<String>, String> {
+    let mode = crate::client_features::claude_native_permission(if read_only { "read" } else { permission })?;
+    // Native plan mode protects the workspace while allowing its designated
+    // plan file, questions, subagents and ExitPlanMode. A Read/Glob/Grep tool
+    // whitelist removes the planning workflow itself.
+    Ok(vec!["--permission-mode".into(), mode.into(), "--tools".into(), "default".into()])
+}
+
 fn result_failure(message: &Value) -> Option<String> {
     let subtype = message["subtype"].as_str().unwrap_or("");
     if message["is_error"] != true && !subtype.starts_with("error_") { return None; }
@@ -426,11 +470,7 @@ pub async fn send(
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     // Validate IDs before passing flags. Prompts and permission replies always travel via stdin.
     uuid::Uuid::parse_str(&native).map_err(|_| "Claude 原生会话 ID 无效")?;
-    let mode = crate::client_features::claude_native_permission(if read_only {
-        "read"
-    } else {
-        permission
-    })?;
+    let permission_args = permission_args(read_only, permission)?;
     let (native_mcp, plugin_settings, plugin_args) =
         crate::extensions::claude_config(app, Path::new(cwd))?;
     let mut args = vec![
@@ -444,14 +484,13 @@ pub async fn send(
         "--replay-user-messages".into(),
         "--permission-prompt-tool".into(),
         "stdio".into(),
-        "--permission-mode".into(),
-        mode.into(),
         "--strict-mcp-config".into(),
         "--settings".into(),
         plugin_settings.to_string(),
         "--append-system-prompt".into(),
         crate::client_features::instructions(app),
     ];
+    args.extend(permission_args);
     if permission == "full" {
         args.push("--allow-dangerously-skip-permissions".into());
     }
@@ -464,11 +503,6 @@ pub async fn send(
     crate::runtime_diagnostics::register_secrets(app, &mcp);
     if mcp["mcpServers"].as_object().is_some_and(|v| !v.is_empty()) {
         args.extend(["--mcp-config".into(), mcp.to_string()]);
-    }
-    if read_only {
-        args.extend(["--tools".into(), "Read,Glob,Grep".into()]);
-    } else {
-        args.extend(["--tools".into(), "default".into()]);
     }
     args.push(format!(
         "--{}={native}",
@@ -516,6 +550,7 @@ pub async fn send(
     }
     crate::official_accounts::configure(&mut command, app, "claude", &config)?;
     command.env("SUPERCODE_SESSION_ID", &session.id);
+    command.env("CLAUDE_CODE_SDK_READS_SESSION_STATE", "1");
     let mut child = command
         .current_dir(cwd)
         .stdin(std::process::Stdio::piped())
@@ -559,7 +594,9 @@ pub async fn send(
         crate::runtime_diagnostics::stderr(Some(log_app), Some(log_session), "claude", stderr).await;
     });
     let mut reader = BufReader::new(output);
-    turn.write(json!({"type":"control_request","request_id":"supercode-init","request":{"subtype":"initialize","hooks":{},"skills":[]}})).await?;
+    // Native SDK defaults forward only child tool activity. Ask for child text
+    // explicitly so independent reports can be rendered in their own panel.
+    turn.write(json!({"type":"control_request","request_id":"supercode-init","request":{"subtype":"initialize","hooks":{},"skills":[],"forwardSubagentText":true}})).await?;
     tokio::time::timeout(std::time::Duration::from_secs(60), async {
         loop {
             let frame = runtime::read_frame(&mut reader)
@@ -612,6 +649,7 @@ pub async fn send(
     let reader_app = app.clone();
     tauri::async_runtime::spawn(async move {
         let mut stream = Stream::default();
+        let mut completion = RunCompletion::default();
         let mut failure = Some("Claude 连接在任务完成前关闭".to_owned());
         loop {
             let frame = match runtime::read_frame(&mut reader).await {
@@ -631,6 +669,19 @@ pub async fn send(
             };
             turn.last_used
                 .store(crate::storage::now() as u64, Ordering::Relaxed);
+            let session_state_event = completion.observe(&message);
+            if session_state_event {
+                crate::runtime_diagnostics::record(&reader_app, Some(&turn.session), "agent_session_state", json!({"turnId":turn.id(),"state":message["state"]}));
+                if !completion.ready(stream.tasks.pending()) {
+                    continue;
+                }
+            }
+            if message["type"] == "system" && matches!(message["subtype"].as_str(), Some("task_started" | "task_progress" | "task_updated" | "task_notification")) {
+                crate::runtime_diagnostics::record(&reader_app, Some(&turn.session), "agent_background_task_event", json!({"turnId":turn.id(),"subtype":message["subtype"],"taskId":message["task_id"],"toolUseId":message["tool_use_id"],"status":message["status"].as_str().or_else(||message["patch"]["status"].as_str())}));
+            }
+            if message["type"] == "assistant" && message["parent_tool_use_id"].is_string() {
+                crate::runtime_diagnostics::record(&reader_app, Some(&turn.session), "agent_child_message", json!({"turnId":turn.id(),"toolUseId":message["parent_tool_use_id"],"contentBlocks":message["message"]["content"].as_array().map(Vec::len)}));
+            }
             let consumed = turn.inputs.lock().unwrap().consume(&message);
             for id in consumed {
                 crate::outbox::native_consumed(&reader_app, &id);
@@ -732,46 +783,59 @@ pub async fn send(
                         json!({"requestId":id}),
                     ),
                 );
-            } else if message["type"] == "result" {
-                let result_slot = session_runtime.client.lock().await;
-                let u = &message["usage"];
-                if u.is_object() {
-                    let data = stream.result_usage(&message, &mut turn.inputs.lock().unwrap());
-                    publish(
-                        &reader_app,
-                        event(
-                            "thread/tokenUsage/updated",
-                            &turn.native,
-                            &turn.id(),
-                            json!({"tokenUsage":data}),
-                        ),
-                    );
+            } else if message["type"] == "result" || session_state_event {
+                // Nested agent results belong to the Task tool, not this turn.
+                // Keep the main task, pending approvals and stream intact.
+                if !session_state_event && !is_main_result(&message) {
+                    continue;
                 }
-                if stream.message_id.is_empty() && message["is_error"] != true {
-                    if let Some(text) = message["result"].as_str().filter(|s| !s.is_empty()) {
-                        let item = json!({"type":"agentMessage","id":format!("command-result-{}",turn.id()),"text":protocol::bounded(text,128*1024)});
+                let result_slot = session_runtime.client.lock().await;
+                if !turn.active.load(Ordering::Acquire) {
+                    drop(result_slot);
+                    continue;
+                }
+                if !session_state_event {
+                    completion.result();
+                    let u = &message["usage"];
+                    if u.is_object() {
+                        let data = stream.result_usage(&message, &mut turn.inputs.lock().unwrap());
                         publish(
                             &reader_app,
                             event(
-                                "item/completed",
+                                "thread/tokenUsage/updated",
                                 &turn.native,
                                 &turn.id(),
-                                json!({"item":item}),
+                                json!({"tokenUsage":data}),
                             ),
                         );
                     }
+                    if stream.message_id.is_empty() && message["is_error"] != true {
+                        if let Some(text) = message["result"].as_str().filter(|s| !s.is_empty()) {
+                            let item = json!({"type":"agentMessage","id":format!("command-result-{}",turn.id()),"text":protocol::bounded(text,128*1024)});
+                            publish(
+                                &reader_app,
+                                event(
+                                    "item/completed",
+                                    &turn.native,
+                                    &turn.id(),
+                                    json!({"item":item}),
+                                ),
+                            );
+                        }
+                    }
+                    failure = result_failure(&message);
+                    for notification in stream.partial(&turn.native, &turn.id()) {
+                        publish(&reader_app, notification);
+                    }
                 }
-                failure = result_failure(&message);
-                for notification in stream.partial(&turn.native, &turn.id()) {
-                    publish(&reader_app, notification);
+                // A result ends one model turn. Native session state remains
+                // running while child notifications owe another parent reply.
+                // Preserve the task, stream and approvals until the run is idle.
+                if !turn.stopped.load(Ordering::Acquire) && failure.is_none() && !completion.ready(stream.tasks.pending()) {
+                    crate::runtime_diagnostics::record(&reader_app, Some(&turn.session), "background_agents_pending", json!({"turnId":turn.id(),"sessionState":completion.state,"childrenPending":stream.tasks.pending()}));
+                    drop(result_slot);
+                    continue;
                 }
-                stream = Stream {
-                    model: stream.model.clone(),
-                    model_context_window: stream.model_context_window,
-                    last_context: stream.context_usage(),
-                    ..Stream::default()
-                };
-                turn.requests.lock().await.clear();
                 let stopped = turn.stopped.load(Ordering::Acquire);
                 if stopped {
                     failure = None;
@@ -780,10 +844,16 @@ pub async fn send(
                 {
                     // A text-only response can finish before the queued supplement is replayed.
                     // It is still the same client task until all submitted input has been consumed.
-                    failure = Some("Claude 连接在任务完成前关闭".to_owned());
                     drop(result_slot);
                     continue;
                 }
+                stream = Stream {
+                    model: stream.model.clone(),
+                    model_context_window: stream.model_context_window,
+                    last_context: stream.context_usage(),
+                    ..Stream::default()
+                };
+                turn.requests.lock().await.clear();
                 let unconsumed = turn
                     .inputs
                     .lock()
@@ -808,6 +878,7 @@ pub async fn send(
                 turn.last_used
                     .store(crate::storage::now() as u64, Ordering::Relaxed);
                 turn.active.store(false, Ordering::Release);
+                completion.finished();
                 publish(
                     &reader_app,
                     event(
@@ -833,6 +904,11 @@ pub async fn send(
         let exit = turn.child.lock().await.try_wait().ok().flatten();
         let active = turn.active.load(Ordering::Acquire);
         let stopped = turn.stopped.load(Ordering::Acquire);
+        if active && !stopped && failure.is_none() {
+            // A successful model result deferred for background work is not a
+            // successful run if the native connection dies before becoming idle.
+            failure = Some("Claude 连接在任务完成前关闭".to_owned());
+        }
         crate::runtime_diagnostics::record(&reader_app, Some(&turn.session), "agent_connection_closed",
             json!({"turnId":turn.id(),"active":active,
                 "stopRequested":stopped,"pid":turn.pid,"exitCode":exit.and_then(|s| s.code()),"error":failure,
@@ -897,6 +973,7 @@ struct Stream {
     text: String,
     tools: HashMap<String, Value>,
     blocks: HashMap<usize, Value>,
+    tasks: crate::claude_tasks::Tasks,
 }
 impl Stream {
     fn reset_context(&mut self) {
@@ -1027,6 +1104,9 @@ impl Stream {
     }
     fn translate(&mut self, message: &Value, native: &str, turn: &str) -> Vec<Value> {
         let mut events = vec![];
+        if let Some(item) = self.tasks.observe(message, &self.tools, chrono::Utc::now().timestamp_millis()) {
+            events.push(event("item/updated", native, turn, json!({"item":item})));
+        }
         if !message["parent_tool_use_id"].is_null() {
             return events;
         }
@@ -1194,9 +1274,9 @@ impl Stream {
                             "item/started"
                         };
                         let item = json!({"id":id,"type":"claudeToolCall","tool":block["name"],"arguments":block["input"],"status":"inProgress"});
-                        if self.tools.len() < 200 {
-                            self.tools.insert(id.clone(), item.clone());
-                        }
+                        // These are in-flight tools, removed on tool_result.
+                        // A history cache budget must not lose live Agent IDs.
+                        self.tools.insert(id.clone(), item.clone());
                         events.push(event(method, native, turn, json!({"item":item})));
                     }
                 }
@@ -1233,6 +1313,7 @@ impl Stream {
                         } else {
                             "completed"
                         });
+                        self.tasks.launch(&mut item, &message["tool_use_result"], &output, chrono::Utc::now().timestamp_millis());
                         events.push(event("item/completed", native, turn, json!({"item":item})));
                     }
                 }
@@ -1249,6 +1330,115 @@ impl Stream {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn all_inflight_agent_calls_survive_the_tool_history_budget() {
+        let mut stream = Stream::default();
+        let calls = (0..205).map(|i| json!({"type":"tool_use","id":format!("agent-{i}"),"name":"Agent","input":{"description":format!("agent-{i}")}})).collect::<Vec<_>>();
+        stream.translate(&json!({"type":"assistant","message":{"id":"m","content":calls}}),"n","t");
+        assert_eq!(stream.tools.len(),205);
+        for i in 0..205 {
+            let id = format!("agent-{i}");
+            let task = format!("task-{i}");
+            let events = stream.translate(&json!({"type":"user","tool_use_result":{"status":"async_launched","isAsync":true,"agentId":task},"message":{"content":[{"type":"tool_result","tool_use_id":id,"content":"Async agent launched successfully."}]}}),"n","t");
+            assert_eq!(events[0]["params"]["item"]["tool"],"Agent");
+            assert_eq!(events[0]["params"]["item"]["subagentStatus"],"running");
+        }
+        assert!(stream.tools.is_empty());
+        assert!(stream.tasks.pending());
+        let last = stream.translate(&json!({"type":"system","subtype":"task_notification","task_id":"task-204","tool_use_id":"agent-204","status":"completed","result":"LAST_CHILD_DONE"}),"n","t");
+        assert_eq!(last[0]["params"]["item"]["subagentResult"],"LAST_CHILD_DONE");
+        assert!(stream.tasks.pending());
+    }
+    #[test]
+    fn native_run_waits_for_idle_after_all_background_children_finish() {
+        let mut run = RunCompletion::default();
+        run.observe(&json!({"type":"system","subtype":"session_state_changed","state":"running"}));
+        run.result();
+        assert!(!run.ready(true));
+        // All children can settle while their parent's follow-up is still owed.
+        assert!(!run.ready(false));
+        run.observe(&json!({"type":"system","subtype":"session_state_changed","state":"idle"}));
+        assert!(run.ready(false));
+        run.finished();
+        assert!(!run.ready(false));
+    }
+    #[test]
+    fn idle_before_result_and_old_cli_fallback_both_finish_once() {
+        let mut run = RunCompletion::default();
+        run.observe(&json!({"type":"system","subtype":"session_state_changed","state":"idle"}));
+        assert!(!run.ready(false));
+        run.result();
+        assert!(run.ready(false));
+        let mut old = RunCompletion::default();
+        old.result();
+        assert!(!old.ready(true));
+        assert!(old.ready(false));
+    }
+    #[test]
+    fn parent_followup_needs_its_own_result_but_child_text_does_not() {
+        let mut run = RunCompletion::default();
+        run.result();
+        run.observe(&json!({"type":"assistant","parent_tool_use_id":"child-tool"}));
+        assert!(run.ready(false));
+        for kind in ["assistant", "stream_event"] {
+            run.result();
+            run.observe(&json!({"type":kind,"parent_tool_use_id":null}));
+            run.observe(&json!({"type":"system","subtype":"session_state_changed","state":"idle"}));
+            assert!(!run.ready(false));
+        }
+        run.result();
+        assert!(run.ready(false));
+    }
+    #[test]
+    fn pending_native_permission_does_not_finish_the_run() {
+        let mut run = RunCompletion::default();
+        run.observe(&json!({"type":"system","subtype":"session_state_changed","state":"requires_action"}));
+        run.result();
+        assert!(!run.ready(false));
+        run.observe(&json!({"type":"system","subtype":"session_state_changed","state":"unexpected"}));
+        assert!(!run.ready(false));
+        run.observe(&json!({"type":"system","subtype":"session_state_changed","state":"running"}));
+        assert!(!run.ready(false));
+    }
+    #[test]
+    fn native_async_agent_report_updates_the_original_tool_without_main_context_pollution() {
+        let mut stream=Stream::default();
+        stream.translate(&json!({"type":"assistant","message":{"id":"m","model":"glm-5.3","content":[{"type":"tool_use","id":"a","name":"Agent","input":{"description":"normal-demo"}}]}}),"n","t");
+        let launched=stream.translate(&json!({"type":"user","tool_use_result":{"status":"async_launched","isAsync":true,"agentId":"child-a"},"message":{"content":[{"type":"tool_result","tool_use_id":"a","content":"Async agent launched successfully.\nagentId: child-a (internal ID)"}]}}),"n","t");
+        assert!(stream.tasks.pending());
+        assert_eq!(launched[0]["params"]["item"]["subagentStatus"],"running");
+        let child=stream.translate(&json!({"type":"assistant","parent_tool_use_id":"a","message":{"id":"child-message","model":"glm-5.3","content":[{"type":"text","text":"# 子代理报告\nCHILD_TEXT_DONE"}]}}),"n","t");
+        assert_eq!(child.len(),1);
+        assert_eq!(child[0]["params"]["item"]["subagentResult"],"# 子代理报告\nCHILD_TEXT_DONE");
+        assert_ne!(stream.message_id,"child-message");
+        // Task progress is lifecycle metadata, not primary-model token usage.
+        stream.translate(&json!({"type":"system","subtype":"task_progress","task_id":"child-a","usage":{"total_tokens":99999}}),"n","t");
+        assert!(stream.context_tokens.is_none());
+        let completed=stream.translate(&json!({"type":"user","origin":{"kind":"task-notification"},"message":{"content":"<task-notification><task-id>child-a</task-id><tool-use-id>a</tool-use-id><status>completed</status><result>完整报告\nCHILD_DONE</result></task-notification>"}}),"n","t");
+        assert!(!stream.tasks.pending());
+        assert_eq!(completed[0]["params"]["item"]["id"],"a");
+        assert_eq!(completed[0]["params"]["item"]["subagentResult"],"完整报告\nCHILD_DONE");
+        assert_eq!(completed[0]["params"]["turnId"],"t");
+    }
+    #[test]
+    fn planning_keeps_native_workflow_tools_without_widening_permissions() {
+        for (read_only, permission, native) in [(true,"full","plan"),(false,"read","plan"),(false,"ask","manual")] {
+            assert_eq!(permission_args(read_only,permission).unwrap(), vec!["--permission-mode",native,"--tools","default"]);
+        }
+        assert!(permission_args(false,"invalid").is_err());
+    }
+    #[test]
+    fn only_main_agent_results_can_end_the_turn() {
+        for result in [
+            json!({"type":"result","subtype":"success"}),
+            json!({"type":"result","parent_tool_use_id":null,"is_error":true}),
+        ] { assert!(is_main_result(&result)); }
+        for result in [
+            json!({"type":"result","parent_tool_use_id":"planning-task","subtype":"success"}),
+            json!({"type":"result","parent_tool_use_id":"planning-task","is_error":true}),
+            json!({"type":"assistant","parent_tool_use_id":null}),
+        ] { assert!(!is_main_result(&result)); }
+    }
     #[test]
     fn sdk_error_arrays_and_limit_reasons_are_not_lost() {
         let result = json!({"type":"result","subtype":"error_during_execution","is_error":true,

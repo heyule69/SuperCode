@@ -30,7 +30,7 @@ it('retains links and code nodes through stream deltas, completion and fade clea
   const inline = container.querySelector('.markdown-file-link')!;
   const pre = container.querySelector('pre')!;
   const code = pre.querySelector('code')!;
-  const copy = container.querySelector('.code-block button')!;
+  expect(container.querySelector('.code-block button')).toBeNull();
   let text = prefix;
   for (let i = 0; i < 24; i++) {
     text += `第 ${i + 1} 段 中文流式文字。`;
@@ -39,9 +39,10 @@ it('retains links and code nodes through stream deltas, completion and fade clea
     expect(container.querySelector('.markdown-file-link')).toBe(inline);
     expect(container.querySelector('pre')).toBe(pre);
     expect(pre.querySelector('code')).toBe(code);
-    expect(container.querySelector('.code-block button')).toBe(copy);
+    expect(container.querySelector('.code-block button')).toBeNull();
   }
   await act(async () => root.render(<Markdown text={text} openFile={open}/>));
+  expect(container.querySelector('.code-block button')?.getAttribute('aria-label')).toBe('复制代码');
   await act(async () => vi.advanceTimersByTime(1200));
   expect(container.querySelector('pre')).toBe(pre);
   expect(container.querySelector('.markdown-link')).toBe(link);

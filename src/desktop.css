@@ -116,8 +116,6 @@
 .sidebar-items .project-heading > .project-new-chat { right:2px; }
 .sidebar-items .project-heading:hover .project-row, .sidebar-items .project-heading:focus-within .project-row { padding-right:58px; }
 .sidebar-chat-row { position:relative; }
-.sidebar-chat-row > .sidebar-row-menu { position:absolute; right:2px; margin:0; }
-.sidebar-chat-row:hover .session-row, .sidebar-chat-row:focus-within .session-row { padding-right:32px; }
 .desktop-workarea .workspace-header { height:50px; border-bottom:0; padding:0 18px; gap:16px; }
 .breadcrumbs { color:var(--text); gap:12px; }
 .breadcrumbs > strong { max-width:none; font-size:var(--ui-size); font-weight:500; }

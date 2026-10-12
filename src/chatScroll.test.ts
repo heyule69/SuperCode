@@ -64,4 +64,12 @@ describe('conversation scroll destination', () => {
     expect(scrollTo.mock.calls.length).toBeLessThanOrEqual(4);
     expect(vi.getTimerCount()).toBe(0);
   });
+  it('keeps the selected step in view throughout the panel width transition, then releases the scroll', () => {
+    const { area, item, state } = fixture();
+    scrollToConversationTurn(area, item, 'instant', 320);
+    for (let i = 0; i < 15; i++) { state.start += 80; vi.advanceTimersByTime(16); }
+    vi.advanceTimersByTime(400);
+    expect(item.getBoundingClientRect().top).toBe(310);
+    expect(vi.getTimerCount()).toBe(0);
+  });
 });

@@ -113,6 +113,22 @@ it('reveals a relative image in its chat workspace through the media route, incl
   expect(container.querySelector('img')).not.toBeNull();
 });
 
+it('dismisses the file menu while Explorer is opening and keeps a later menu intact when the request finishes', async () => {
+  await resourceImage('D:/Downloads/兔子.png');
+  let finish!: () => void;
+  vi.mocked(call).mockImplementationOnce(() => new Promise<void>(resolve => { finish = resolve; }));
+  const image = container.querySelector('img')!;
+  await rightClick(image);
+  await act(async () => folderItem().click());
+  expect(document.querySelector('[role="menu"]')).toBeNull();
+  expect(call).toHaveBeenLastCalledWith('reveal_media', { path:'D:/Downloads/兔子.png', projectId:null, sessionId:null });
+  await rightClick(image);
+  const nextMenu = document.querySelector('[role="menu"]');
+  expect(folderItem().disabled).toBe(false);
+  await act(async () => finish());
+  expect(document.querySelector('[role="menu"]')).toBe(nextMenu);
+});
+
 it('supports right-clicking an enlarged image and lets Escape close the menu before the preview', async () => {
   await resourceImage('D:/Downloads/兔子 图片.png',{projectId:'p'});
   const button = container.querySelector<HTMLButtonElement>('.chat-image-button')!;
@@ -136,9 +152,11 @@ it('reports reveal failures without breaking the image preview', async () => {
   await rightClick(image!);
   vi.mocked(call).mockRejectedValueOnce(new Error('文件不存在'));
   await act(async () => folderItem().click());
-  expect(document.querySelector('[role="menu"] [role="alert"]')?.textContent).toContain('文件不存在');
+  expect(document.querySelector('[role="menu"]')).toBeNull();
+  expect(container.querySelector('[role="alert"]')?.textContent).toContain('文件不存在');
   expect(container.querySelector('img')).toBe(image);
-  await act(async () => document.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',bubbles:true})));
+  await act(async () => container.querySelector<HTMLButtonElement>('[title="关闭打开失败提示"]')!.click());
+  expect(container.querySelector('[role="alert"]')).toBeNull();
 });
 
 it('does not offer a local folder for remote-only images', async () => {

@@ -39,6 +39,19 @@ async function render(draft:SideDraft, options:Partial<ComponentProps<typeof Sid
   await act(async()=>root.render(<SideChat draft={draft} projectId="" agent="pi" connectionId={draft.connectionId??'@local'} defaults={defaults} close={()=>{}} opened={()=>{}} openFile={()=>{}} showDiff={()=>{}} providerRequired={providerRequired} {...options}/>));
 }
 async function send() {await act(async()=>{container.querySelector('form')!.dispatchEvent(new Event('submit',{bubbles:true,cancelable:true}));});}
+it.each(['execute','revise'] as const)('reviews a native side-chat plan as %s without replacing its unsent draft',async decision=>{
+  missing=false;
+  const base=vi.mocked(call).getMockImplementation()!;
+  vi.mocked(call).mockImplementation(async(command,args={})=>command==='list_messages'?[{id:'p',seq:1,sessionId:'side',role:'assistant',kind:'plan',text:'# 侧边计划\n\n包含边界验收。',data:{status:'completed'}},{id:'r',seq:2,sessionId:'side',role:'activity',kind:'runMarker',text:'',data:{status:'completed'}}]:base(command,args));
+  await act(async()=>{await import('./ProposedPlan');});
+  await render({key:'draft',text:'先规划'},{agent:'codex'});await send();
+  const input=container.querySelector<HTMLTextAreaElement>('[aria-label="侧边聊天消息"]')!;
+  await act(async()=>{Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype,'value')!.set!.call(input,'保留这份侧边草稿');input.dispatchEvent(new Event('input',{bubbles:true}));});
+  vi.mocked(call).mockClear();
+  await act(async()=>container.querySelector<HTMLButtonElement>(decision==='execute'?'.plan-request-execute':'.plan-request-revise')!.click());
+  expect(call).toHaveBeenCalledWith('enqueue_followup',{sessionId:'side',payload:expect.objectContaining({permissionMode:decision==='execute'?'ask':'read',readOnly:decision==='revise',attachments:[]})});
+  expect(input.value).toBe('保留这份侧边草稿');
+});
 it('edits its own queued message in the side composer and keeps its position instead of enqueueing a duplicate',async()=>{
   missing=false;
   const rows:Followup[]=['first','second'].map(id=>({id,sessionId:'side',status:'queued',error:null,payload:{...defaults,text:id==='first'?'第一条侧边补充':'第二条侧边补充',attachments:id==='first'?[{kind:'skill',name:'Recall',path:'D:/skills/recall/SKILL.md'}]:[]}}));
@@ -103,6 +116,32 @@ it('queues a configured side-chat message only after validation, then clears its
   expect(names.indexOf('check_chat_connection')).toBeLessThan(names.indexOf('create_session'));
   expect(container.querySelector('textarea')!.value).toBe('');
   expect(providerRequired).not.toHaveBeenCalled();
+});
+
+it('shows a disabled send arrow in an empty side chat and while it starts without a turn',async()=>{
+  missing=false;
+  const original=vi.mocked(call).getMockImplementation()!;
+  let finish!:()=>void;
+  const waiting=new Promise<void>(resolve=>{finish=resolve;});
+  vi.mocked(call).mockImplementation(async(command,args={})=>{
+    if(command==='enqueue_followup'){sessions[0]={...sessions[0],status:'starting'};return null;}
+    if(command==='bootstrap'){await waiting;return {sessions};}
+    return original(command,args);
+  });
+  await render({key:'draft',text:''});
+  const action=container.querySelector<HTMLButtonElement>('footer form .send-button')!;
+  expect(action.classList.contains('stop-button')).toBe(false);
+  expect(action.disabled).toBe(true);
+  const textarea=container.querySelector<HTMLTextAreaElement>('footer form textarea')!;
+  await act(async()=>{Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype,'value')!.set!.call(textarea,'开始侧边任务');textarea.dispatchEvent(new Event('input',{bubbles:true}));});
+  await send();
+  expect(textarea.value).toBe('');
+  expect(action.classList.contains('stop-button')).toBe(false);
+  expect(action.querySelector('.lucide-arrow-up')).not.toBeNull();
+  expect(action.disabled).toBe(true);
+  await act(async()=>{finish();});
+  expect(action.classList.contains('stop-button')).toBe(false);
+  expect(action.disabled).toBe(true);
 });
 
 it('uses one side-chat action for stopping and sending, and sends a new draft without interrupting its active task', async () => {

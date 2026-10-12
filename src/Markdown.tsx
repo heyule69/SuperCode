@@ -23,12 +23,13 @@ function RevealSpan({ node, children, ...props }: ComponentProps<'span'> & Extra
 
 function contentText(node: ReactNode): string { return Children.toArray(node).map(v => typeof v === 'string' || typeof v === 'number' ? String(v) : isValidElement<{ children?: ReactNode }>(v) ? contentText(v.props.children) : '').join(''); }
 function CodeBlock({ children }: { children?: ReactNode }) {
+  const { streaming } = useContext(MarkdownActions);
   const code = Children.toArray(children).find(isValidElement) as React.ReactElement<{ className?: string }> | undefined;
   const language = code?.props.className?.replace('language-', '') ?? '代码';
-  return <div className="code-block"><div className="code-block-heading"><span>{language}</span><CopyButton label="复制代码" text={contentText(children).replace(/\n$/, '')} /></div><pre>{children}</pre></div>;
+  return <div className="code-block"><div className="code-block-heading"><span>{language}</span>{!streaming ? <CopyButton className="code-copy" label="复制代码" text={contentText(children).replace(/\n$/, '')} /> : null}</div><pre>{children}</pre></div>;
 }
 
-const MarkdownActions = createContext<{ openFile?: (path: string, line?: number) => void; report: (error: string) => void }>({ report: () => {} });
+const MarkdownActions = createContext<{ openFile?: (path: string, line?: number) => void; report: (error: string) => void; streaming: boolean }>({ report: () => {}, streaming: false });
 
 function MarkdownCode({ children, className, node: _node, ...props }: ComponentProps<'code'> & ExtraProps) {
   const { openFile } = useContext(MarkdownActions);
@@ -65,7 +66,7 @@ const safeUrl = (href: string) => describeLink(href).kind === 'unsupported' ? ''
 
 export default function Markdown({ text, openFile, streaming = false }: { text: string; openFile?: (path: string, line?: number) => void; streaming?: boolean }) {
   const [error, setError] = useState('');
-  const actions = useMemo(() => ({ openFile, report: setError }), [openFile]);
+  const actions = useMemo(() => ({ openFile, report: setError, streaming }), [openFile, streaming]);
   const [reveal] = useState(() => new StreamReveal());
   const [settled, setSettled] = useState(0);
   reveal.update(text, streaming, performance.now());

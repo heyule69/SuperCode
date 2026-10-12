@@ -18,6 +18,7 @@ mod browser_native;
 mod ccswitch;
 mod chat_connection;
 mod claude;
+mod claude_tasks;
 mod client_features;
 mod commands;
 mod computer;
@@ -50,6 +51,7 @@ mod outbox;
 mod platform_usage;
 mod process;
 mod protocol;
+mod subagents;
 mod providers;
 mod runtime;
 mod runtime_diagnostics;
@@ -59,6 +61,7 @@ mod sidebar;
 mod skills;
 mod smoke;
 mod storage;
+mod startup_data;
 mod tray_popup;
 mod ui_recovery;
 mod usage_tokens;
@@ -80,6 +83,10 @@ pub struct AppState {
 
 pub fn run() {
     let args: Vec<_> = std::env::args().collect();
+    let diagnostic_dir = startup_data::directory(&args).unwrap_or_else(|error| {
+        eprintln!("{error}");
+        std::process::exit(2);
+    });
     if args.get(1).is_some_and(|arg| arg == "--browser-mcp") {
         if let Err(error) = browser_bridge::run(&args[2..]) {
             eprintln!("{error}");
@@ -151,10 +158,10 @@ pub fn run() {
                 })
         });
     let mut context = tauri::generate_context!();
-    if let Some(dir) = &smoke_dir {
+    if let Some(dir) = diagnostic_dir.as_ref().or(smoke_dir.as_ref()) {
         for window in &mut context.config_mut().app.windows {
             window.data_directory = Some(dir.join("webview-data"));
-            window.visible = false;
+            if smoke_dir.is_some() { window.visible = false; }
         }
     }
     if automation_test {
@@ -164,6 +171,7 @@ pub fn run() {
     }
     let builder = tauri::Builder::default();
     let builder = if smoke_test
+        || diagnostic_dir.is_some()
         || automation_test
         || agents_test
         || desktop_test
@@ -226,7 +234,7 @@ pub fn run() {
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_opener::init())
         .setup(move |app| {
-            let dir = if let Some(dir) = &smoke_dir {
+            let dir = if let Some(dir) = diagnostic_dir.as_ref().or(smoke_dir.as_ref()) {
                 dir.clone()
             } else {
                 app.path().app_data_dir()?
@@ -371,6 +379,7 @@ pub fn run() {
             commands::create_session,
             chat_connection::check_chat_connection,
             commands::list_messages,
+            subagents::get_subagent_messages,
             commands::send_message,
             commands::send_chat_message,
             outbox::enqueue_followup,

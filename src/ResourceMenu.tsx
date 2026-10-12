@@ -1,6 +1,6 @@
 import { useContext, useEffect, useId, useLayoutEffect, useRef, useState, type MouseEvent, type ReactNode } from 'react';
 import { createPortal } from 'react-dom';
-import { Copy, ExternalLink, FileText, FolderOpen } from 'lucide-react';
+import { Copy, ExternalLink, FileText, FolderOpen, X } from 'lucide-react';
 import { call, desktop } from './api';
 import { describeLink, resourceFromText, systemDocument } from './links';
 import { MediaContext } from './Media';
@@ -12,6 +12,7 @@ export function ResourceMenu({ children, openFile, openPath }: { children: React
   const mediaContext = useContext(MediaContext);
   const [menu, setMenu] = useState<{ resource: Resource; x: number; y: number; origin: HTMLElement } | null>(null);
   const [feedback, setFeedback] = useState('');
+  const [actionError, setActionError] = useState('');
   const [busy, setBusy] = useState(false);
   const popup = useRef<HTMLDivElement>(null);
   const id = useId();
@@ -59,14 +60,16 @@ export function ResourceMenu({ children, openFile, openPath }: { children: React
     event.preventDefault();
     const origin = media ? target.closest<HTMLElement>('button, [tabindex]') ?? media : tagged ?? anchor ?? code ?? target;
     const bounds = origin.getBoundingClientRect();
-    setFeedback(''); setBusy(false);
+    setFeedback(''); setActionError(''); setBusy(false);
     setMenu({ resource: { kind: resource.kind, target: resource.target, line: resource.line, media: !!media }, x: event.clientX || bounds.left, y: event.clientY || bounds.bottom, origin });
   }
   async function act(action: 'open' | 'reveal' | 'copy') {
     if (!menu || busy) return;
-    setFeedback(''); setBusy(true);
+    const resource = menu.resource;
+    const copying = action === 'copy';
+    if (copying) { setFeedback(''); setBusy(true); }
+    else { close(true); setActionError(''); }
     try {
-      const resource = menu.resource;
       if (action === 'copy') { await navigator.clipboard.writeText(resource.target); setFeedback('已复制'); }
       else {
         if (resource.kind === 'external') {
@@ -78,12 +81,14 @@ export function ResourceMenu({ children, openFile, openPath }: { children: React
           if (!openPath) throw new Error('请在桌面版中打开文件');
           await openPath(resource.target, action);
         } else openFile(resource.target, resource.line);
-        close();
       }
-    } catch (error) { setFeedback(String(error)); }
-    finally { setBusy(false); }
+    } catch (error) {
+      const text = error instanceof Error ? error.message : String(error);
+      if (copying) setFeedback(text); else setActionError(text);
+    }
+    finally { if (copying) setBusy(false); }
   }
-  return <div className="resource-menu-host" onContextMenu={show}>{children}{menu ? createPortal(<div ref={popup} className="resource-context-menu" role="menu" aria-label={menu.resource.kind === 'file' ? '文件操作' : '链接操作'} style={{ left: menu.x, top: menu.y }} onKeyDown={event => {
+  return <div className="resource-menu-host" onContextMenu={show}>{children}{actionError ? <div className="resource-menu-error resource-action-error" role="alert"><span>{actionError}</span><button type="button" className="icon-button" title="关闭打开失败提示" onClick={() => setActionError('')}><X size={13}/></button></div> : null}{menu ? createPortal(<div ref={popup} className="resource-context-menu" role="menu" aria-label={menu.resource.kind === 'file' ? '文件操作' : '链接操作'} style={{ left: menu.x, top: menu.y }} onKeyDown={event => {
     if (!['ArrowDown', 'ArrowUp', 'Home', 'End', 'Tab'].includes(event.key)) return;
     if (event.key === 'Tab') { close(true); return; }
     const buttons = [...popup.current!.querySelectorAll<HTMLButtonElement>('button:not(:disabled)')];

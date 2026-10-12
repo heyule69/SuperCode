@@ -98,7 +98,7 @@ pub fn model_source(config: &Value, agent: &str, connection_name: Option<&str>) 
                 && url.host_str() == Some("api.kimi.ai")
                 && url.path().starts_with("/coding")
             {
-                matched_plan = Some("coding");
+                matched_plan = Some(if url.path().trim_end_matches('/') == "/coding/v1" { "coding-responses" } else { "coding" });
                 best = catalog.as_array()?.iter().find(|p| p["id"] == "kimi");
             }
             best
@@ -118,7 +118,7 @@ pub fn model_source(config: &Value, agent: &str, connection_name: Option<&str>) 
             "custom"
         },
     );
-    let coding = id == "kimi" && plan == Some("coding");
+    let coding = id == "kimi" && matches!(plan, Some("coding" | "coding-responses"));
     let name = if coding {
         "Kimi Code"
     } else if id == "custom" {
@@ -660,10 +660,7 @@ pub async fn test_provider_connection(id: String, app: AppHandle) -> Result<Valu
         return Ok(json!({"ok":true,"model":s.model,"verifiedBy":"officialAccountStatus"}));
     }
     let base = validate_url(&s.base_url)?;
-    if matches!(s.plan.as_str(), "coding" | "token") {
-        if app.state::<AppState>().store.running()? > 0 {
-            return Err("请等待当前任务结束后测试套餐连接".into());
-        }
+    if subscription_plan(&s.plan) {
         return test_coding_plan(&app, &p).await;
     }
     let (url, body) = match s.protocol.as_str() {
@@ -714,12 +711,40 @@ pub async fn test_provider_connection(id: String, app: AppHandle) -> Result<Valu
     Ok(json!({"ok":true,"model":value["model"].as_str().unwrap_or(&s.model),"protocol":s.protocol}))
 }
 async fn test_coding_plan(app: &AppHandle, profile: &Profile) -> Result<Value, String> {
-    if profile.agent != "claude" || profile.config["protocol"] == "chat" {
-        return Err(
-            "套餐连接测试需要通过 Claude Code 的原生 Anthropic 接口，请选择对应预设".into(),
-        );
+    // Resolve the selected engine first, so missing Pi/OpenCode is reported as
+    // an installation problem rather than an unrelated Claude protocol error.
+    let launch = plan_test_launch(profile, |agent| crate::agents::resolve(app, agent))?;
+    crate::runtime_diagnostics::register_secrets(app, &profile.config);
+    let result = if profile.agent != "claude" {
+        crate::native_agents::test_provider_connection(app, profile, &launch).await
+    } else {
+        test_claude_plan(app, profile, &launch).await
+    };
+    result.map_err(|error| {
+        crate::runtime_diagnostics::message(app, None, &profile.agent, "error", "provider_connection_test_failed", &error);
+        let mut secrets = Vec::new();
+        crate::log_redaction::collect(&profile.config, &mut secrets, 0);
+        format!("{} 套餐连接测试失败：{}", crate::agents::name(&profile.agent), crate::log_redaction::text(&error, &secrets))
+    })
+}
+fn plan_test_launch(profile: &Profile, resolve: impl FnOnce(&str) -> Result<crate::agents::Launch, String>) -> Result<crate::agents::Launch, String> {
+    let launch = resolve(&profile.agent)?;
+    validate_plan_test_engine(&profile.agent, &settings(profile).protocol)?;
+    Ok(launch)
+}
+fn subscription_plan(plan: &str) -> bool {
+    matches!(plan.split('-').next(), Some("coding" | "token"))
+}
+fn validate_plan_test_engine(agent: &str, protocol: &str) -> Result<(), String> {
+    match (agent, protocol) {
+        ("claude", "anthropic") | ("codex", "responses")
+        | ("opencode" | "pi", "anthropic" | "chat" | "responses") => Ok(()),
+        ("claude", _) => Err("Claude Code 的套餐测试需要 Anthropic Messages 协议，请检查此连接的 API 协议".into()),
+        ("codex", _) => Err("Codex 的套餐测试需要 OpenAI Responses 协议，请检查此连接的 API 协议".into()),
+        _ => Err("此连接的引擎或 API 协议无效，请检查连接设置".into()),
     }
-    let launch = crate::agents::resolve(app, "claude")?;
+}
+async fn test_claude_plan(app: &AppHandle, profile: &Profile, launch: &crate::agents::Launch) -> Result<Value, String> {
     let model = real_claude_model(&profile.config, None).ok_or("请填写模型 ID")?;
     let mut cmd = launch.command(&[
         "--print",
@@ -759,10 +784,14 @@ async fn test_coding_plan(app: &AppHandle, profile: &Profile) -> Result<Value, S
     let mut child = cmd
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
         .spawn()
         .map_err(|_| "无法启动 Claude 连接测试")?;
     let _job = crate::process::JobGuard::attach(&child)?;
+    if let Some(stderr) = child.stderr.take() {
+        let log_app = app.clone();
+        tokio::spawn(async move { crate::runtime_diagnostics::stderr(Some(log_app), None, "claude", stderr).await; });
+    }
     let output = child.stdout.take().ok_or("无法读取测试输出")?;
     use tokio::io::AsyncReadExt;
     let mut bytes = Vec::new();
@@ -780,9 +809,7 @@ async fn test_coding_plan(app: &AppHandle, profile: &Profile) -> Result<Value, S
     let value: Value =
         serde_json::from_slice(&bytes).map_err(|_| "Claude 没有返回受支持的连接测试结果")?;
     if value["is_error"] == true || value["result"].as_str().is_none_or(|s| s.trim().is_empty()) {
-        return Err(
-            "套餐连接失败，请检查模型 ID、专属 Key 与套餐权限。详细原因可在会话中查看。".into(),
-        );
+        return Err(value["result"].as_str().filter(|s| !s.trim().is_empty()).unwrap_or("模型未返回测试回复，请检查模型 ID、专属 Key 与套餐权限").to_owned());
     }
     Ok(
         json!({"ok":true,"model":value["modelUsage"].as_object().and_then(|o|o.keys().next()).map(String::as_str).unwrap_or(&model),"protocol":"anthropic","verifiedBy":"Claude Code"}),
@@ -792,6 +819,25 @@ async fn test_coding_plan(app: &AppHandle, profile: &Profile) -> Result<Value, S
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn subscription_tests_accept_the_selected_engine_and_its_supported_protocols() {
+        for (agent, protocols) in [("claude", vec!["anthropic"]), ("codex", vec!["responses"]), ("opencode", vec!["anthropic", "responses", "chat"]), ("pi", vec!["anthropic", "responses", "chat"])] {
+            for protocol in ["anthropic", "responses", "chat"] {
+                assert_eq!(validate_plan_test_engine(agent, protocol).is_ok(), protocols.contains(&protocol), "{agent}: {protocol}");
+            }
+        }
+        for plan in ["coding", "token", "coding-responses", "token-responses"] { assert!(subscription_plan(plan)); }
+        for plan in ["standard", "standard-responses", "tokenhub-responses", "anthropic"] { assert!(!subscription_plan(plan)); }
+    }
+    #[test]
+    fn missing_engine_is_reported_before_protocol_validation_without_falling_back_to_claude() {
+        for agent in ["claude", "codex", "opencode", "pi"] {
+            let profile = Profile { id:"test".into(), agent:agent.into(), name:"GLM".into(), config:json!({"plan":"coding","protocol":"invalid","model":"glm-5.3"}) };
+            let missing = format!("未找到 {}，请到设置 → Agent 一键安装", crate::agents::name(agent));
+            let result = plan_test_launch(&profile, |selected| { assert_eq!(selected, agent); Err(missing.clone()) });
+            assert_eq!(result.err().as_deref(), Some(missing.as_str()));
+        }
+    }
     #[test]
     fn editing_imported_native_credentials_retains_metadata_only_on_the_same_route() {
         for (agent, raw, native) in [
@@ -841,6 +887,17 @@ mod tests {
             assert!(!source.to_string().contains(base));
             assert_eq!(real_claude_model(&config, None).as_deref(), Some("k3[1M]"));
         }
+    }
+    #[test]
+    fn kimi_coding_responses_uses_subscription_metadata() {
+        for base in ["https://api.kimi.com/coding/v1", "https://api.kimi.ai/coding/v1"] {
+            let config = json!({"baseUrl":base,"protocol":"responses"});
+            let source = model_source(&config, "codex", Some("Kimi 测试"));
+            assert_eq!(source["providerName"], "Kimi Code");
+            assert_eq!(source["planName"], "编程计划");
+        }
+        let source = model_source(&json!({"providerId":"kimi","plan":"coding-responses","baseUrl":"https://api.kimi.com/coding/v1"}), "codex", None);
+        assert_eq!(source["providerName"], "Kimi Code");
     }
     #[test]
     fn model_source_respects_custom_connections_and_codex_routes() {

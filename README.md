@@ -4,7 +4,7 @@
 
 把 Codex、Claude Code、OpenCode 和 Pi 放进一个桌面工作台，管理项目、模型连接和工具，直接用对话完成开发任务。
 
-当前版本 **0.2.0**，主要支持 **Windows**。基于 Tauri 2、Rust、React + TypeScript 和 SQLite。
+当前版本 **0.2.1**，主要支持 **Windows**。基于 Tauri 2、Rust、React + TypeScript 和 SQLite。
 
 [下载 Windows 安装包](https://github.com/heyule69/SuperCode/releases/latest) · [版本记录](https://github.com/heyule69/SuperCode/releases)
 
@@ -15,6 +15,7 @@
 - **Agent 管理**：自动发现本机 Agent，显示已安装和最新版本，支持一键安装、更新与连接测试。
 - **模型连接**：Codex、Claude 官方多账号登录，按 Agent 配置 API 协议，支持从 CC Switch 导入连接。
 - **对话工作台**：流式回复、工具记录、文件差异、历史会话和侧边聊天；任务运行中可以追加消息、排队或引导。
+- **计划与子代理**：显示原生计划文档并选择执行或继续修改；子代理有独立图标和详情，完整任务与步骤摘要持续可见，具体工具输出按需展开。能力以所选引擎支持为准。
 - **图片与媒体**：上传、粘贴图片，在对话中查看图片、播放视频和音频。
 - **技能、插件与 MCP**：发现本机技能，管理 Codex / Claude 插件和 MCP；内置浏览器、电脑操作，支持连接测试和随时接管。
 - **内置浏览器与电脑操作**：在右侧查看网页操作过程，浏览器与文件变更独立显示；电脑操作带屏幕光效和 AI 指针，按 Esc 或直接操作即可接管。

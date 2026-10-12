@@ -832,6 +832,17 @@ async fn start_for(
         .store
         .route(agent, session.map(|s| s.id.as_str()))?
         .config;
+    start_configured(app, agent, cwd, session, permission, config, &launch).await
+}
+async fn start_configured(
+    app: &AppHandle,
+    agent: &str,
+    cwd: &Path,
+    session: Option<&Session>,
+    permission: &str,
+    config: Value,
+    launch: &Launch,
+) -> Result<(Arc<Client>, mpsc::Receiver<Value>, Value), String> {
     let mut env = vec![];
     if let Some(session) = session { env.push(("SUPERCODE_SESSION_ID".into(), session.id.clone())); }
     let mut args = vec![];
@@ -842,7 +853,7 @@ async fn start_for(
             opencode_config(&config, permission).to_string(),
         ));
         env.push(("OPENCODE_DISABLE_AUTOUPDATE".into(), "true".into()));
-    } else {
+    } else if agent == "pi" {
         let dir = app.state::<AppState>().data_dir.join("agents/pi-runtime");
         tokio::fs::create_dir_all(&dir)
             .await
@@ -885,11 +896,154 @@ async fn start_for(
             settings["provider"] = provider;
         }
         env.push(("SUPERCODE_PI_CONFIG".into(), settings.to_string()));
+    } else if agent == "codex" {
+        args.extend(["app-server".into(), "--listen".into(), "stdio://".into()]);
+        let mut overrides = crate::ccswitch::codex_overrides(&config)?;
+        overrides.extend(["mcp_servers={}".into(), "features.shell_tool=false".into(), "web_search=\"disabled\"".into()]);
+        for value in overrides { args.extend(["-c".into(), value]); }
+        if let Some(key) = crate::providers::key(&config) {
+            env.push(("SUPERCODE_PROVIDER_API_KEY".into(), key.to_owned()));
+        }
+    } else {
+        return Err("连接测试不支持此引擎".into());
     }
     crate::runtime_diagnostics::register_secrets(app, &config);
-    let (client, events) = Client::start(&launch, &args, cwd, &env, agent == "pi",
+    let (client, events) = Client::start(launch, &args, cwd, &env, agent == "pi",
         Some((app.clone(),agent.to_owned(),session.map(|s|s.id.clone())))).await?;
     Ok((client, events, config))
+}
+// Test an explicitly selected profile in a separate, tool-free process. Never
+// replace a chat's runtime or activate the tested profile as the default.
+pub async fn test_provider_connection(
+    app: &AppHandle,
+    profile: &crate::ccswitch::Profile,
+    launch: &Launch,
+) -> Result<Value, String> {
+    let model = crate::providers::real_claude_model(&profile.config, None).ok_or("请填写模型 ID")?;
+    let cwd = app.state::<AppState>().data_dir.join("agents/connection-tests");
+    tokio::fs::create_dir_all(&cwd).await.map_err(|_| "无法创建连接测试目录")?;
+    let (client, mut events, config) = start_configured(app, &profile.agent, &cwd, None, "summary", profile.config.clone(), launch).await?;
+    let result = tokio::time::timeout(Duration::from_secs(90), probe_completion(&client, &mut events, &profile.agent, &config, &model, &cwd)).await;
+    client.close().await;
+    let text = result.map_err(|_| format!("{} 套餐连接测试超时", crate::agents::name(&profile.agent)))??;
+    if text.trim().is_empty() { return Err("模型没有返回测试回复，请检查模型权限和套餐状态".into()); }
+    Ok(json!({"ok":true,"model":model,"protocol":config["protocol"],"verifiedBy":crate::agents::name(&profile.agent)}))
+}
+async fn probe_request(client: &Client, events: &mut mpsc::Receiver<Value>, method: &str, params: Value) -> Result<Value, String> {
+    let request = client.request(method, params, 60);
+    tokio::pin!(request);
+    loop { tokio::select! {
+        result = &mut request => return result,
+        event = events.recv() => probe_notification(&event.ok_or("连接测试进程已退出")?)?,
+    } }
+}
+fn probe_notification(event: &Value) -> Result<(), String> {
+    if event["type"] == "supercode_disconnected" { return Err("连接测试进程已退出，请检查引擎安装和运行日志".into()); }
+    if event["type"] == "extension_error" { return Err(protocol::bounded(event["error"].as_str().unwrap_or("Pi 扩展加载失败"), 4096)); }
+    if event.get("id").is_some() && (event.get("method").is_some() || event["type"] == "extension_ui_request") {
+        return Err("连接测试收到审批请求，测试已停止；请在对话中处理该请求".into());
+    }
+    Ok(())
+}
+async fn probe_completion(client: &Client, events: &mut mpsc::Receiver<Value>, agent: &str, config: &Value, model: &str, cwd: &Path) -> Result<String, String> {
+    let wire = wire_model(config, model);
+    let native = if agent == "pi" {
+        probe_request(client, events, "get_state", json!({})).await?;
+        probe_request(client, events, "set_model", json!({"provider":"supercode","modelId":wire})).await?;
+        String::new()
+    } else if agent == "opencode" {
+        probe_request(client, events, "initialize", init()).await?;
+        let session = probe_request(client, events, "session/new", json!({"cwd":cwd,"mcpServers":[]})).await?;
+        let id = session["sessionId"].as_str().ok_or("OpenCode 未返回测试会话 ID")?.to_owned();
+        probe_request(client, events, "session/set_model", json!({"sessionId":id,"modelId":format!("supercode/{wire}")})).await?;
+        id
+    } else {
+        probe_request(client, events, "initialize", json!({"clientInfo":{"name":"supercode","version":env!("CARGO_PKG_VERSION")},"capabilities":{"experimentalApi":true}})).await?;
+        client.write(json!({"method":"initialized","params":{}})).await?;
+        let table = toml::from_str::<toml::Table>(config["config"].as_str().unwrap_or("")).map_err(|_| "Codex 连接配置无效")?;
+        let provider = table.get("model_provider").and_then(toml::Value::as_str);
+        let thread = probe_request(client, events, "thread/start", json!({"cwd":cwd,"model":model,"modelProvider":provider,"sandbox":"read-only","approvalPolicy":"untrusted","ephemeral":true,"developerInstructions":"Reply only OK. Do not use tools.","config":{"features.shell_tool":false,"web_search":"disabled"}})).await?;
+        thread["thread"]["id"].as_str().ok_or("Codex 未返回测试会话 ID")?.to_owned()
+    };
+    let prompt = "Reply only OK. Do not use tools.";
+    let (method, params) = match agent {
+        "pi" => ("prompt", json!({"message":prompt,"images":[]})),
+        "opencode" => ("session/prompt", json!({"sessionId":native,"prompt":[{"type":"text","text":prompt}]})),
+        _ => ("turn/start", json!({"threadId":native,"model":model,"input":[{"type":"text","text":prompt}]})),
+    };
+    let request = client.request(method, params, 90);
+    tokio::pin!(request);
+    let mut acknowledged = false;
+    let mut text = String::new();
+    let mut failure = None;
+    loop { tokio::select! {
+        result = &mut request, if !acknowledged => {
+            let result = result?;
+            if agent == "opencode" {
+                if result["stopReason"] == "cancelled" { return Err("OpenCode 取消了连接测试".into()); }
+                break;
+            }
+            acknowledged = true;
+        },
+        event = events.recv() => {
+            let event = event.ok_or("连接测试进程已退出")?;
+            probe_notification(&event)?;
+            if probe_output(&event, agent, &native, &mut text, &mut failure)? { break; }
+        },
+    } }
+    while let Ok(event) = events.try_recv() {
+        probe_notification(&event)?;
+        probe_output(&event, agent, &native, &mut text, &mut failure)?;
+    }
+    if let Some(error) = failure { return Err(error); }
+    Ok(text)
+}
+fn probe_output(event: &Value, agent: &str, native: &str, text: &mut String, failure: &mut Option<String>) -> Result<bool, String> {
+    if agent == "pi" {
+        if event["type"] == "tool_execution_start" { return Err("连接测试尝试调用工具，已停止测试".into()); }
+        if event["type"] == "message_update" && event["assistantMessageEvent"]["type"] == "text_delta" {
+            append_probe_text(text, event["assistantMessageEvent"]["delta"].as_str().unwrap_or(""));
+        }
+        if event["type"] == "message_end" && event["message"]["role"] == "assistant" {
+            let message = &event["message"];
+            if matches!(message["stopReason"].as_str(), Some("error" | "aborted")) {
+                *failure = Some(protocol::bounded(message["errorMessage"].as_str().unwrap_or("Pi 模型请求失败"), 4096));
+            }
+            if text.is_empty() { if let Some(parts) = message["content"].as_array() { for part in parts { if part["type"] == "text" { append_probe_text(text, part["text"].as_str().unwrap_or("")); } } } }
+        }
+        return Ok(event["type"] == "agent_settled");
+    }
+    if agent == "opencode" {
+        if event["params"]["sessionId"] != native { return Ok(false); }
+        let update = &event["params"]["update"];
+        if matches!(update["sessionUpdate"].as_str(), Some("tool_call" | "tool_call_update")) { return Err("连接测试尝试调用工具，已停止测试".into()); }
+        if update["sessionUpdate"] == "agent_message_chunk" && update["content"]["type"] == "text" { append_probe_text(text, update["content"]["text"].as_str().unwrap_or("")); }
+        return Ok(false);
+    }
+    if event["params"]["threadId"] != native { return Ok(false); }
+    if event["method"] == "error" {
+        return Err(protocol::bounded(event["params"]["error"]["message"].as_str().unwrap_or("Codex 模型请求失败"), 4096));
+    }
+    if matches!(event["method"].as_str(), Some("item/started" | "item/completed")) {
+        let item = &event["params"]["item"];
+        match item["type"].as_str() {
+            Some("agentMessage") if event["method"] == "item/completed" => append_probe_text(text, item["text"].as_str().unwrap_or("")),
+            Some("userMessage" | "agentMessage" | "reasoning" | "contextCompaction") => {},
+            Some(_) => return Err("连接测试尝试调用工具，已停止测试".into()),
+            _ => {},
+        }
+    }
+    if event["method"] == "turn/completed" {
+        let turn = &event["params"]["turn"];
+        if turn["status"] != "completed" { *failure = Some(protocol::bounded(turn["error"]["message"].as_str().unwrap_or("Codex 模型请求失败"), 4096)); }
+        return Ok(true);
+    }
+    Ok(false)
+}
+fn append_probe_text(text: &mut String, value: &str) {
+    let mut end = value.len().min(8192usize.saturating_sub(text.len()));
+    while !value.is_char_boundary(end) { end -= 1; }
+    text.push_str(&value[..end]);
 }
 pub async fn send(
     app: &AppHandle,
@@ -1692,9 +1846,7 @@ impl Mapper {
                         u["toolCallId"].as_str().unwrap_or("unknown")
                     );
                     let row=self.items.entry(id.clone()).or_insert(json!({"id":id,"type":"claudeToolCall","tool":acp_tool(u),"arguments":tool_args(&u["rawInput"]),"status":"inProgress"}));
-                    if u["kind"].is_string() {
-                        row["tool"] = acp_tool(u).into();
-                    }
+                    update_acp_tool(row, u);
                     if let Some(c) = u.get("rawInput") {
                         row["arguments"] = tool_args(c);
                     }
@@ -1702,8 +1854,8 @@ impl Mapper {
                         row["output"] = blocks_text(c).into();
                         row["contentItems"] = c.clone();
                     }
-                    if matches!(u["status"].as_str(), Some("completed" | "failed")) {
-                        row["status"] = u["status"].clone();
+                    if let Some(status) = acp_tool_status(u) {
+                        row["status"] = status.into();
                     }
                     item = Some(row.clone());
                 }
@@ -1722,7 +1874,7 @@ impl Mapper {
         }
         if let Some(mut row) = item {
             row["turnId"] = t.turn.clone().into();
-            let method = if matches!(row["status"].as_str(), Some("completed" | "failed")) {
+            let method = if matches!(row["status"].as_str(), Some("completed" | "failed" | "interrupted")) {
                 self.items.remove(row["id"].as_str().unwrap_or(""));
                 "item/completed"
             } else {
@@ -1797,12 +1949,32 @@ impl Mapper {
     }
 }
 fn acp_tool(v: &Value) -> &str {
+    if v["rawInput"]["subagent_type"].is_string() && v["rawInput"]["prompt"].is_string() {
+        return "Task";
+    }
     match v["kind"].as_str() {
         Some("read") => "Read",
         Some("edit") => "Edit",
         Some("execute") => "Bash",
         Some("search") => "Grep",
         _ => v["title"].as_str().unwrap_or("Tool"),
+    }
+}
+fn update_acp_tool(row: &mut Value, update: &Value) {
+    // OpenCode replaces a Task's title with its description after approval.
+    // Keep the native tool identity so progress and completion still reach its row.
+    if matches!(row["tool"].as_str(), Some("Task" | "task")) {
+        return;
+    }
+    if update["kind"].is_string() || update["rawInput"]["subagent_type"].is_string() {
+        row["tool"] = acp_tool(update).into();
+    }
+}
+fn acp_tool_status(update: &Value) -> Option<&str> {
+    match update["status"].as_str() {
+        Some("failed") if blocks_text(&update["content"]).trim() == "Task cancelled" => Some("interrupted"),
+        Some(status @ ("completed" | "failed")) => Some(status),
+        _ => None,
     }
 }
 fn blocks_text(v: &Value) -> String {
@@ -1842,6 +2014,65 @@ fn tool_args(v: &Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn acp_task_identity_survives_native_title_updates_and_completion() {
+        let start = json!({"kind":"other","title":"task","rawInput":{"subagent_type":"explore","prompt":"Read fixture files","description":"kimi-opencode-a"}});
+        let mut row = json!({"tool":acp_tool(&start),"arguments":start["rawInput"]});
+        assert_eq!(row["tool"], "Task");
+        update_acp_tool(&mut row, &json!({"kind":"other","title":"kimi-opencode-a","status":"in_progress"}));
+        update_acp_tool(&mut row, &json!({"kind":"other","title":"kimi-opencode-a","status":"completed"}));
+        assert_eq!(row["tool"], "Task");
+        assert_eq!(row["arguments"]["prompt"], "Read fixture files");
+        let mut generic = json!({"tool":"Tool"});
+        update_acp_tool(&mut generic, &json!({"kind":"read","title":"Read README.md"}));
+        assert_eq!(generic["tool"], "Read");
+        assert_eq!(acp_tool_status(&json!({"status":"failed","content":[{"type":"content","content":{"type":"text","text":"Task cancelled"}}]})), Some("interrupted"));
+        assert_eq!(acp_tool_status(&json!({"status":"failed","content":[{"type":"content","content":{"type":"text","text":"File does not exist"}}]})), Some("failed"));
+    }
+    #[tokio::test]
+    async fn provider_probes_use_the_configured_model_and_wait_for_actual_completion() {
+        let Some(program) = process::find_program("node") else { return; };
+        // Controlled protocol peers exercise adapters without real provider calls.
+        let script = r#"const rl=require('readline').createInterface({input:process.stdin});
+const out=v=>process.stdout.write(JSON.stringify(v)+'\n');
+rl.on('line',line=>{const v=JSON.parse(line),m=v.method||v.type;
+const reply=data=>out(v.type?{type:'response',id:v.id,success:true,data}:{jsonrpc:'2.0',id:v.id,result:data});
+if(m==='initialized')return;
+if(m==='get_state')return reply({sessionId:'test'});
+if(m==='initialize')return reply({protocolVersion:1});
+if(m==='session/new')return reply({sessionId:'test'});
+if(m==='thread/start'){if(v.params.model!=='glm-5.3'||v.params.ephemeral!==true)process.exit(3);return reply({thread:{id:'test'}});}
+if(m==='set_model'){if(v.provider!=='supercode'||v.modelId!=='glm-5.3')process.exit(4);return reply({});}
+if(m==='session/set_model'){if(v.params.modelId!=='supercode/glm-5.3')process.exit(5);return reply({});}
+if(m==='prompt'){reply({});out({type:'message_end',message:{role:'assistant',content:[{type:'text',text:'OK'}],stopReason:'stop'}});return out({type:'agent_settled'});}
+if(m==='session/prompt'){out({method:'session/update',params:{sessionId:'test',update:{sessionUpdate:'agent_message_chunk',content:{type:'text',text:'OK'}}}});return reply({stopReason:'end_turn'});}
+if(m==='turn/start'){reply({turn:{id:'turn'}});out({method:'item/completed',params:{threadId:'test',item:{type:'userMessage'}}});out({method:'item/completed',params:{threadId:'test',item:{type:'agentMessage',text:'OK'}}});return out({method:'turn/completed',params:{threadId:'test',turn:{id:'turn',status:'completed'}}});}
+process.exit(6);
+});"#;
+        let launch = Launch { program, prefix:vec!["-e".into(),script.into()], source:"protocol-test".into() };
+        for agent in ["pi", "opencode", "codex"] {
+            let (client, mut events) = Client::start(&launch, &[], Path::new("."), &[], agent == "pi", None).await.unwrap();
+            let config = json!({"baseUrl":"https://example.invalid/anthropic","protocol":"anthropic","model":"glm-5.3","config":"model_provider='selected'"});
+            let result = tokio::time::timeout(Duration::from_secs(5), probe_completion(&client, &mut events, agent, &config, "glm-5.3", Path::new("."))).await;
+            client.close().await;
+            assert_eq!(result.unwrap().unwrap(), "OK", "{agent}");
+        }
+    }
+    #[test]
+    fn provider_probes_preserve_failures_reject_tools_and_bound_unicode_output() {
+        let mut text = String::new(); let mut failure = None;
+        probe_output(&json!({"type":"message_end","message":{"role":"assistant","stopReason":"error","errorMessage":"401 invalid key"}}), "pi", "", &mut text, &mut failure).unwrap();
+        assert_eq!(failure.as_deref(), Some("401 invalid key"));
+        assert!(probe_output(&json!({"type":"tool_execution_start"}), "pi", "", &mut text, &mut failure).is_err());
+        assert!(probe_notification(&json!({"type":"extension_ui_request","id":1,"method":"confirm"})).is_err());
+        assert!(probe_output(&json!({"method":"item/started","params":{"threadId":"test","item":{"type":"commandExecution"}}}), "codex", "test", &mut text, &mut failure).is_err());
+        failure = None;
+        assert!(probe_output(&json!({"method":"turn/completed","params":{"threadId":"test","turn":{"status":"failed","error":{"message":"model unavailable"}}}}), "codex", "test", &mut text, &mut failure).unwrap());
+        assert_eq!(failure.as_deref(), Some("model unavailable"));
+        let long = "中文".repeat(4000);
+        probe_output(&json!({"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":long},{"type":"text","text":long}]}}), "pi", "", &mut text, &mut failure).unwrap();
+        assert!(text.len() <= 8192); assert!(text.ends_with('中') || text.ends_with('文'));
+    }
     #[tokio::test]
     async fn independent_protocol_processes_do_not_block_or_cancel_each_other() {
         let Some(program) = process::find_program("node") else { return; };

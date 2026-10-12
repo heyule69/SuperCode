@@ -57,7 +57,7 @@ export function summarizeActivities(messages: Message[], live = false) {
     const tool = String(data.tool ?? '');
     const args = (data.arguments ?? {}) as Record<string, unknown>;
     if (message.kind === 'reasoning') add('reasoning');
-    else if (message.kind === 'executionPlan') add('plan');
+    else if (message.kind === 'executionPlan' || message.kind === 'claudeToolCall' && ['EnterPlanMode', 'ExitPlanMode'].includes(tool)) add('plan');
     else if (message.kind === 'contextCompaction') add('context');
     else if (message.kind === 'fileChange') {
       const paths = Array.isArray(data.changes) ? data.changes.map(change => (change as { path?: unknown }).path) : message.text.split('\n');

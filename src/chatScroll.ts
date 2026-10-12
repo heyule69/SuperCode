@@ -12,7 +12,7 @@ export function revealScrollItem(area: HTMLElement | null, item: HTMLElement | n
   else if (target.bottom > bottom) area.scrollTop += target.bottom - bottom;
 }
 
-export function scrollToConversationTurn(area: HTMLElement, item: HTMLElement, behavior: ScrollBehavior) {
+export function scrollToConversationTurn(area: HTMLElement, item: HTMLElement, behavior: ScrollBehavior, settleMs = 0) {
   let frame = 0;
   let stopped = false;
   let corrections = 0;
@@ -39,11 +39,14 @@ export function scrollToConversationTurn(area: HTMLElement, item: HTMLElement, b
     } else if (behavior === 'instant' || time - stableSince >= 100) {
       // content-visibility and lazy Markdown can change earlier heights during travel.
       const top = targetTop();
-      if (Math.abs(top - area.scrollTop) <= 2 || corrections >= 3) { stop(); return; }
-      corrections++;
-      area.scrollTo({ top, behavior });
-      previousTop = area.scrollTop;
-      stableSince = time;
+      const settled = time - started >= settleMs;
+      if ((Math.abs(top - area.scrollTop) <= 2 || corrections >= 3) && settled) { stop(); return; }
+      if (Math.abs(top - area.scrollTop) > 2) {
+        if (settled) corrections++;
+        area.scrollTo({ top, behavior });
+        previousTop = area.scrollTop;
+        stableSince = time;
+      }
     }
     frame = requestAnimationFrame(settle);
   };

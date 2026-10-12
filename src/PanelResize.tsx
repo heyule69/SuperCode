@@ -2,14 +2,15 @@ import { useLayoutEffect, useRef, useState, type KeyboardEvent, type PointerEven
 import './panel-resize.css';
 
 type Side = 'left' | 'right';
+type Panel = 'workspace' | 'browser' | 'conversation';
 export type PanelWidths = Record<Side, number>;
 const key = 'supercode.panel-widths';
 export const defaultWidths: PanelWidths = { left: 288, right: 284 };
-export function decodePanelWidths(raw: string | null): PanelWidths {
+export function decodePanelWidths(raw: string | null, rightDefault = defaultWidths.right): PanelWidths {
   try {
     const value = JSON.parse(raw ?? '{}');
-    return { left: valid(value?.left, 180, 580, defaultWidths.left), right: valid(value?.right, 240, 620, defaultWidths.right) };
-  } catch { return { ...defaultWidths }; }
+    return { left: valid(value?.left, 180, 580, defaultWidths.left), right: valid(value?.right, 240, 620, rightDefault) };
+  } catch { return { ...defaultWidths, right: rightDefault }; }
 }
 function valid(value: unknown, min: number, max: number, fallback: number) {
   return typeof value === 'number' && Number.isFinite(value) ? Math.max(min, Math.min(max, value)) : fallback;
@@ -17,12 +18,14 @@ function valid(value: unknown, min: number, max: number, fallback: number) {
 export function panelLayout(widths: PanelWidths, available: number, left: boolean, right: boolean) {
   const overlay = window.matchMedia('(max-width: 1100px)').matches;
   const minLeft = Math.min(180, Math.max(120, available - 320));
-  const rightWidth = Math.min(widths.right, Math.max(240, available - (left ? minLeft : 0) - 360));
+  const rightWidth = Math.min(widths.right, Math.max(240, available - (overlay ? 32 : (left ? minLeft : 0) + 360)));
   const leftWidth = Math.min(widths.left, Math.max(minLeft, available - (right && !overlay ? rightWidth : 0) - 360));
   return { left: leftWidth, right: Math.min(rightWidth, Math.max(0, available - 32)), overlay };
 }
 
-export function usePanelResize(left: boolean, right: boolean, disabled: boolean, browser = false, expanded = false) {
+export function usePanelResize(left: boolean, right: boolean, disabled: boolean, panel: Panel = 'workspace', expanded = false) {
+  const storageKey = panel === 'workspace' ? key : `${key}.${panel}`;
+  const rightDefault = panel === 'workspace' ? defaultWidths.right : 520;
   const root = useRef<HTMLDivElement>(null);
   const [widths, setWidths] = useState(() => decodePanelWidths(localStorage.getItem(key)));
   const preferred = useRef(widths);
@@ -41,15 +44,15 @@ export function usePanelResize(left: boolean, right: boolean, disabled: boolean,
   function commit() {
     setWidths({ ...preferred.current });
     try {
-      localStorage.setItem(browser ? `${key}.browser` : key, JSON.stringify(preferred.current));
-      if (browser) localStorage.setItem(key, JSON.stringify({...decodePanelWidths(localStorage.getItem(key)),left:preferred.current.left}));
+      localStorage.setItem(storageKey, JSON.stringify(preferred.current));
+      if (panel !== 'workspace') localStorage.setItem(key, JSON.stringify({...decodePanelWidths(localStorage.getItem(key)),left:preferred.current.left}));
     } catch { /* Layout still works if storage is full. */ }
   }
   useLayoutEffect(()=>{
-    const saved=localStorage.getItem(browser ? `${key}.browser` : key);
-    preferred.current={...preferred.current,right:browser && !saved ? 520 : decodePanelWidths(saved).right};
+    const saved=localStorage.getItem(storageKey);
+    preferred.current={...preferred.current,right:decodePanelWidths(saved, rightDefault).right};
     setWidths({...preferred.current});apply();
-  },[browser]);
+  },[panel]);
   useLayoutEffect(() => {
     apply(); const observer = new ResizeObserver(apply); if (root.current) observer.observe(root.current);
     return () => { observer.disconnect(); root.current?.classList.remove('panel-resizing'); };
@@ -71,7 +74,7 @@ export function usePanelResize(left: boolean, right: boolean, disabled: boolean,
   function handle(side: Side) {
     return {
       role: 'separator', tabIndex: 0, 'aria-orientation': 'vertical' as const,
-      'aria-label': side === 'left' ? '调整侧栏宽度' : browser ? '调整浏览器宽度' : '调整工作区宽度',
+      'aria-label': side === 'left' ? '调整侧栏宽度' : panel === 'browser' ? '调整浏览器宽度' : panel === 'conversation' ? '调整对话面板宽度' : '调整工作区宽度',
       'aria-valuemin': side === 'left' ? 180 : 240, 'aria-valuemax': side === 'left' ? 580 : 620,
       'aria-valuenow': widths[side], className: `panel-resize-handle ${side}`,
       title: '拖动调整宽度，双击恢复默认',
@@ -87,7 +90,7 @@ export function usePanelResize(left: boolean, right: boolean, disabled: boolean,
         set(side, drag.width + (e.clientX - drag.x) * (side === 'left' ? 1 : -1));
       },
       onPointerUp: () => finish(), onPointerCancel: () => finish(true), onLostPointerCapture: () => finish(),
-      onDoubleClick: () => { set(side, browser && side==='right' ? 520 : defaultWidths[side]); commit(); },
+      onDoubleClick: () => { set(side, side === 'right' ? rightDefault : defaultWidths.left); commit(); },
       onKeyDown: (e: KeyboardEvent<HTMLDivElement>) => {
         if (e.key === 'Escape') { finish(true); return; }
         if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(e.key)) return;

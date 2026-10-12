@@ -1,6 +1,20 @@
 use std::path::{Path, PathBuf};
 use tokio::process::{Child, Command};
 
+// These belong to the hosting Codex task, not an independently launched CLI.
+// Keep user configuration (including CODEX_HOME) and let each agent's explicit
+// launch/turn settings select its permissions and runtime.
+const HOST_TASK_ENV: &[&str] = &[
+    "CODEX_APP_TOOLS_PIPE_PATH", "CODEX_CLI_PATH", "CODEX_THREAD_ID", "CODEX_SESSION_ID",
+    "CODEX_INTERNAL_ORIGINATOR_OVERRIDE", "CODEX_PERMISSION_PROFILE",
+    "CODEX_WINDOWS_SANDBOX_PACKAGE_FAMILY", "CODEX_TASK_WORKSPACE_VERIFYING_IDENTITY",
+    "CODEX_MCP_NODE_PATH", "CODEX_SHELL", "CODEX_CI",
+];
+
+fn isolate_host_task(command: &mut Command) {
+    for name in HOST_TASK_ENV { command.env_remove(name); }
+}
+
 pub fn find_program(name: &str) -> Option<PathBuf> {
     if matches!(name, "codex" | "claude") {
         return crate::agents::local(name).map(|launch| launch.program);
@@ -39,6 +53,7 @@ pub fn command(program: &Path, args: &[&str]) -> Command {
     };
     #[cfg(windows)]
     command.creation_flags(0x08000000);
+    isolate_host_task(&mut command);
     command.kill_on_drop(true);
     command
 }
@@ -92,6 +107,15 @@ fn config_overrides(text: &str, load_mcp: bool) -> Result<Vec<String>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn external_commands_do_not_inherit_the_hosting_task_transport_or_permission_profile() {
+        let mut command = Command::new("agent");
+        command.env("CODEX_THREAD_ID", "hosting-task").env("CODEX_HOME", "user-config");
+        isolate_host_task(&mut command);
+        let environment = command.as_std().get_envs().collect::<std::collections::HashMap<_,_>>();
+        for name in HOST_TASK_ENV { assert_eq!(environment.get(std::ffi::OsStr::new(name)), Some(&None)); }
+        assert_eq!(environment.get(std::ffi::OsStr::new("CODEX_HOME")), Some(&Some(std::ffi::OsStr::new("user-config"))));
+    }
     #[test]
     fn overrides_validate_mcp_keys_and_never_include_credentials() {
         let text = "service_tier='priority'\n[mcp_servers.\"tool-search\"]\ncommand='tool'\n[mcp_servers.\"tool-search\".env]\nAPI_KEY='private'\n";

@@ -12,6 +12,7 @@ const emptyProfiles: AgentProfile[] = [];
 const agentNames: Record<string, string> = { claude: 'Claude Code', codex: 'Codex', opencode: 'OpenCode', pi: 'Pi' };
 import { createChatSession } from './chatSession';
 import { isProviderRequired, requireChatConnection } from './chatConnection';
+import { planFollowup, type PlanDecision } from './planPresentation';
 import { Conversation } from './Conversation';
 import { mergeEvent } from './events';
 import { FollowupQueue, useFollowups, type FollowupPayload } from './Followups';
@@ -95,10 +96,19 @@ export default function SideChat({draft,projectId,agent,connectionId,defaults,cl
     setDraft:next=>{updateOptions(next);setInput(next.text);},
     reload:followups.reload,report,focus:()=>textarea.current?.focus(),
   });
-  const stopMode=busy&&!hasDraft&&!followupEditor.editingId;
+  const stopMode=isActive(session?.status)&&!!session?.turnId&&!hasDraft&&!followupEditor.editingId;
   async function refresh(){const s=current.current;if(!s)return;const [data,items,info]=await Promise.all([call<Bootstrap>('bootstrap'),call<Message[]>('list_messages',{sessionId:s.id,limit:120}),call<RuntimeInfo>('runtime_info')]);const saved=data.sessions.find(x=>x.id===s.id);if(saved){current.current=saved;setSession(saved);setRequests(info.requests.filter(r=>r.params?.threadId===saved.nativeId));}setMessages(items);}
   useEffect(()=>{let disposed=false;let off:(()=>void)|undefined;const schedule=()=>{if(!current.current||timer.current)return;timer.current=setTimeout(()=>{timer.current=undefined;void refresh().catch(e=>setError(String(e)));},150);};void subscribe(e=>{if(e.method==='turn/started'||e.method==='turn/completed'){schedule();return;}const s=current.current;if(s&&e.params?.threadId===s.nativeId){setMessages(old=>mergeEvent(old,e,s.id));if(e.id!=null)setRequests(old=>old.some(r=>r.id===e.id)?old:[...old,e]);if(e.method==='serverRequest/resolved')setRequests(old=>old.filter(r=>r.id!==e.params?.requestId));}},()=>{},schedule,schedule).then(fn=>{if(disposed)fn();else off=fn;});return()=>{disposed=true;off?.();if(timer.current)clearTimeout(timer.current);};},[]);
   useEffect(()=>{if(area.current&&stickToBottom.current)area.current.scrollTop=area.current.scrollHeight;},[messages]);
+  async function respondPlan(message:Message,decision:PlanDecision,feedback:string) {
+    const s=current.current;
+    if(!s || agent!=='codex' || busy || sendLock.current || followups.rows.length || message.sessionId!==s.id)throw new Error('请等待当前任务结束后再确认计划。');
+    const mode=decision==='execute'?'ask':'read';
+    const sent={...options.current,text:planFollowup(decision,feedback),attachments:[],permissionMode:mode,readOnly:mode==='read'};
+    sendLock.current=true;setSending(true);
+    try {await requireChatConnection(agent,selection,s.id);await call('enqueue_followup',{sessionId:s.id,payload:sent});permission(mode);await followups.reload();await refresh();}
+    finally {sendLock.current=false;setSending(false);}
+  }
   async function change(id:string,action:string,text?:string){try{await call('change_followup',{id,action,text:text??null});await followups.reload();}catch(e){report(e);throw e;}}
   async function stop(){const s=current.current;if(!s||stopping)return;setStopping(true);try{await call('interrupt_turn',{sessionId:s.id});}catch(e){setError(String(e));}finally{setStopping(false);}}
   async function send(){if(sendLock.current||importing||!hasDraft||followupEditor.busy)return;const sent={...options.current,text:inputRef.current};if(followupEditor.editingId){await followupEditor.save(sent);return;}sendLock.current=true;setSending(true);setError('');try{let s=current.current;await requireChatConnection(agent,selection,s?.id);if(!s){s=await createChatSession({projectId,agent,connectionId:selection,model:options.current.model??''});current.current=s;setSession(s);}await call('enqueue_followup',{sessionId:s.id,payload:sent});if(source.current){await call('change_followup',{id:source.current,action:'remove',text:null});source.current=undefined;}updateOptions({...options.current,attachments:options.current.attachments.filter(a=>!sent.attachments.some(s=>s.path===a.path))});if(inputRef.current===sent.text)setInput('');await followups.reload();await refresh();}catch(e){report(e);}finally{sendLock.current=false;setSending(false);}}
@@ -108,9 +118,9 @@ export default function SideChat({draft,projectId,agent,connectionId,defaults,cl
       <button className="icon-button" aria-label="收起侧边聊天" title="收起侧边聊天" onClick={()=>{if(session)opened(session);close();}}><X size={16}/></button>
     </header>
     <div className="side-chat-scroll" ref={area} onClickCapture={e=>{if((e.target as Element).closest('.turn-process-toggle, .activity-group-summary, .activity-row, .activity-toggle-more'))stickToBottom.current=false;}} onScroll={()=>{const el=area.current;if(el)stickToBottom.current=el.scrollHeight-el.scrollTop-el.clientHeight<100;}}>
-      {messages.length||busy?<Conversation messages={messages} agentName={agentName} autoExpand={false} projectId={projectId} sessionId={session?.id} sessionStatus={sending&&!isActive(session?.status)?'starting':session?.status} pendingLabel={sending&&!isActive(session?.status)?'正在发送…':undefined} activeTurnId={session?.turnId} openFile={(path,line)=>openFile(path,line,session?.id)} showDiff={showDiff}/>
+      {messages.length||busy?<Conversation messages={messages} agentName={agentName} autoExpand={false} projectId={projectId} sessionId={session?.id} sessionStatus={sending&&!isActive(session?.status)?'starting':session?.status} pendingLabel={sending&&!isActive(session?.status)?'正在发送…':undefined} activeTurnId={session?.turnId} openFile={(path,line)=>openFile(path,line,session?.id)} showDiff={showDiff} onPlanAction={agent==='codex' && !busy && !followups.rows.length ? respondPlan : undefined}/>
         :<div className="side-chat-welcome"><MessageSquare size={24} strokeWidth={1.5}/><h2>继续探讨</h2><p>围绕选中内容开启一个独立对话</p></div>}
-      {requests.filter(r=>r.method!=='item/tool/requestUserInput').map(r=><Suspense key={String(r.id)} fallback={<p>正在加载确认请求…</p>}><RequestCard request={r} respond={result=>respondRequest(r,result)} openFile={(path,line)=>openFile(path,line,session?.id)}/></Suspense>)}
+      {requests.filter(r=>r.method!=='item/tool/requestUserInput').map(r=><Suspense key={String(r.id)} fallback={<p>正在加载确认请求…</p>}><RequestCard request={r} respond={result=>respondRequest(r,result)} openFile={(path,line)=>openFile(path,line,session?.id)} messages={messages}/></Suspense>)}
     </div>
     <footer className={'composer-area side-chat-composer-area'+(questionPending?' has-question':'')}>
       {error?<div className="error-banner" role="alert"><span>{error}</span><button className="icon-button" aria-label="关闭侧边聊天提示" onClick={()=>setError('')}><X size={14}/></button></div>:null}
@@ -129,7 +139,7 @@ export default function SideChat({draft,projectId,agent,connectionId,defaults,cl
         </div><div className="composer-right">
           <span className="side-chat-agent" title={agentName}><AgentIcon agent={agent}/><span>{agentName}</span></span>
           <ModelMenu value={payload.model??''} models={models.data} catalogLoaded={models.origin!=null} catalogWarning={models.warning||models.notice} profiles={profiles} activeProfile={profiles.find(p=>p.id===selection&&p.agent===agent)} connectionId={selection} source={models.source} agent={agent} busy={busy||configuring} loading={loadingModels} choose={chooseModel} reload={force=>void reloadModels(force)} manage={()=>(manageProviders??providerRequired)(agent,savedDraft())} effort={payload.effort??''} setEffort={effort=>updateOptions({...options.current,effort:effort||null})} hasConversation={!!session?.nativeId}/>
-          <button className={'send-button'+(stopMode?' stop-button':'')} type={stopMode?'button':'submit'} disabled={stopMode?!session?.turnId||stopping:sending||importing||configuring||followupEditor.busy||!hasDraft} onClick={stopMode?()=>void stop():undefined} aria-label={stopMode?'停止侧边聊天任务':followupEditor.editingId?'发送侧边聊天修改':'发送侧边聊天消息'} title={stopMode?'停止生成':isActive(session?.status)?'加入队列，当前任务完成后发送':'发送消息'}>{stopMode?<Square size={14} fill="currentColor"/>:<ArrowUp size={18}/>}</button>
+          <button className={'send-button'+(stopMode?' stop-button':'')} type={stopMode?'button':'submit'} disabled={stopMode?!session?.turnId||stopping:sending||importing||configuring||followupEditor.busy||!hasDraft} onClick={stopMode?()=>void stop():undefined} aria-label={stopMode?'停止侧边聊天任务':followupEditor.editingId?'发送侧边聊天修改':'发送侧边聊天消息'} title={stopMode?'停止生成':isActive(session?.status)&&hasDraft?'加入队列，当前任务完成后发送':'发送消息'}>{stopMode?<Square size={14} fill="currentColor"/>:<ArrowUp size={18}/>}</button>
         </div></div>
       </form>
     </footer>

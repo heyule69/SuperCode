@@ -10,7 +10,7 @@ import type { TurnLifecycle } from './turnPresentation';
 vi.mock('./api', () => ({ desktop: true, call: vi.fn(async () => ({ token: 'full', previewToken: 'small' })) }));
 vi.mock('@tauri-apps/api/core', () => ({ convertFileSrc: (token: string) => `http://supercode-media.localhost/${token}` }));
 const message = (id: string, role: string, text: string, kind = 'agentMessage', data: Message['data'] = null): Message => ({ id, seq: 0, sessionId: 's', role, kind, text, data });
-const items = [message('u', 'user', '优化页面'), message('start', 'assistant', '我会先检查布局。'), message('tool', 'tool', '构建通过', 'commandExecution', { command: 'npm run build', status: 'completed' }), message('final', 'assistant', '已完成布局优化。')];
+const items = [message('u', 'user', '优化页面'), message('start', 'assistant', '我会先检查布局。', 'agentMessage', { phase:'commentary' }), message('tool', 'tool', '构建通过', 'commandExecution', { command: 'npm run build', status: 'completed' }), message('final', 'assistant', '已完成布局优化。')];
 const run = (status: string, id = 'run') => message(id, 'activity', '', 'runMarker', { status, durationMs: 691000 });
 let root: Root, node: HTMLDivElement;
 const writeText = vi.fn(async () => {});
@@ -24,6 +24,23 @@ beforeEach(async () => {
 afterEach(async () => { await act(async () => root.unmount()); node.remove(); vi.unstubAllGlobals(); });
 async function render(messages: Message[], autoExpand = false, lifecycle: TurnLifecycle = {}) { await act(async () => root.render(<Conversation messages={messages} agentName="Codex" autoExpand={autoExpand} sessionStatus={lifecycle.sessionStatus} activeTurnId={lifecycle.activeTurnId} showDiff={() => {}} openFile={() => {}}/>)); }
 async function toggle() { await act(async () => node.querySelector<HTMLButtonElement>('.turn-process-toggle')!.click()); }
+
+it('offers execution only on the latest successfully completed native plan, not on streaming or historical plans',async()=>{
+  await act(async()=>{await import('./ProposedPlan');});
+  const onPlanAction=vi.fn(async()=>{});
+  const plan=message('native-plan','assistant','# 完整原生计划\n\n包括全部边界验收。','plan',{status:'inProgress',turnId:'t'});
+  const base=[message('question','user','先规划'),plan];
+  const draw=async(messages:Message[],status:string)=>act(async()=>root.render(<Conversation messages={messages} agentName="Codex" sessionStatus={status} autoExpand={false} showDiff={()=>{}} openFile={()=>{}} onPlanAction={onPlanAction}/>));
+  await draw([...base,run('inProgress')],'running');
+  expect(node.querySelector('.plan-request-execute')).toBeNull();
+  const finished=[base[0],{...plan,data:{...plan.data,status:'completed'}},run('completed')];
+  await draw(finished,'idle');
+  expect(node.querySelector('.plan-request-execute')).not.toBeNull();
+  expect(onPlanAction).not.toHaveBeenCalled();
+  await draw([...finished,message('next','user','继续'),message('reply','assistant','后续回复'),run('completed','run2')],'idle');
+  expect(node.textContent).toContain('包括全部边界验收');
+  expect(node.querySelector('.plan-request-execute')).toBeNull();
+});
 
 it('streams the full process, collapses at completion, and expands the original chronology without duplicating the final answer', async () => {
   await render([...items, run('inProgress')]);
@@ -50,6 +67,36 @@ it('streams the full process, collapses at completion, and expands the original 
   expect(node.querySelector('.turn-final-result .message')).toBe(final);
   await act(async () => node.querySelector<HTMLButtonElement>('[aria-label="复制回复"]')!.click());
   expect(writeText).toHaveBeenCalledWith('已完成布局优化。');
+});
+
+it('keeps every Pi answer section visible and copyable after tools are collapsed, including legacy blocks without message groups', async () => {
+  const first = '第一类报错：这个 bash 环境里没有安装 Python 和 Node。';
+  const second = '第二类报错：配置路径不正确，需要调整路径后再运行。';
+  const final = '处理方法：安装运行环境，然后修复配置路径。';
+  for (const grouped of [false, true]) {
+    const trace = [
+      message('question', 'user', '为什么运行报错了'),
+      message('t-msg-1-0', 'assistant', first, 'agentMessage', grouped ? { messageId:'t-msg-1' } : null),
+      message('tool-check', 'tool', 'python: command not found', 'commandExecution', { command:'python --version', status:'completed' }),
+      message('t-msg-2-0', 'assistant', second, 'agentMessage', grouped ? { messageId:'t-msg-2' } : null),
+      message('thought-check', 'activity', '检查配置路径', 'reasoning', { status:'completed' }),
+      message('t-msg-3-0', 'assistant', final, 'agentMessage', grouped ? { messageId:'t-msg-3' } : null),
+    ];
+    for (const marker of [[], [run('completed')]]) {
+      await render([...trace, ...marker], false, { sessionStatus:'idle' });
+      const result = node.querySelector('.turn-final-result')!;
+      for (const section of [first, second, final]) expect(result.textContent).toContain(section);
+      expect(result.querySelectorAll('.message.assistant')).toHaveLength(3);
+      expect(node.querySelector('.turn-process-content')).toBeNull();
+      await act(async () => node.querySelector<HTMLButtonElement>('.turn-copy')!.click());
+      expect(writeText).toHaveBeenLastCalledWith([first, second, final].join('\n\n'));
+      await toggle();
+      const process = node.querySelector('.turn-process-content')!;
+      expect(process.querySelector('.message.assistant')).toBeNull();
+      expect(node.querySelectorAll('.turn-final-result .message.assistant')).toHaveLength(3);
+      await toggle();
+    }
+  }
 });
 
 it('hides reply actions while starting, running or waiting without a run marker, then restores them on completion', async () => {
@@ -80,6 +127,47 @@ it('keeps actions for completed history while the current reply is still generat
   expect(turns[1].querySelector('.turn-footer')).toBeNull();
   await render([...old, ...current, run('completed', 'run2')], false, { sessionStatus: 'running' });
   expect(node.querySelectorAll('[aria-label="复制回复"]')).toHaveLength(2);
+});
+
+it('keeps the process and waiting indicator visible until plan approval and continuation finish', async () => {
+  const marker = { ...run('completed'), data:{ status:'completed', turnId:'plan-first', durationMs:61000 } };
+  const trace = [items[0], marker, items[1], items[2], message('planning', 'assistant', '还在设计方案，请稍等。')];
+  await render(trace, false, { sessionStatus:'waiting', activeTurnId:'plan-first' });
+  expect(node.querySelector('.turn-process-header')).toBeNull();
+  expect(node.querySelector('.turn-live-content')?.textContent).toContain('还在设计方案');
+  expect(node.querySelector('.working-indicator .pending-text')?.textContent).toContain('等待你的确认');
+  expect(node.querySelector('.turn-footer')).toBeNull();
+  await render(trace, false, { sessionStatus:'running', activeTurnId:'plan-next' });
+  expect(node.querySelector('.turn-process-header')).toBeNull();
+  expect(node.querySelector('.working-indicator .pending-text')).not.toBeNull();
+  await render([...trace, { ...run('completed', 'next'), data:{ status:'completed', turnId:'plan-next' } }], false,
+    { sessionStatus:'running', activeTurnId:'plan-next' });
+  expect(node.querySelector('.turn-process-header')).not.toBeNull();
+  expect(node.querySelector('.working-indicator')).toBeNull();
+});
+
+it('shows the streaming plan without expanding tool details and fades only newly arriving text', async () => {
+  const plan = '# 实施计划\n\n## 第一阶段\n\n创建原型。';
+  const draft = message('plan-draft', 'tool', '', 'claudeToolCall', { tool:'ExitPlanMode', status:'preparing', turnId:'plan', inputText:JSON.stringify({ plan }).slice(0, -2) });
+  await act(async () => { await import('./PlanDocument'); });
+  await render([items[0], draft], false, { sessionStatus:'running', activeTurnId:'plan' });
+  const document = node.querySelector('.plan-generation .plan-document');
+  expect(document?.textContent).toContain('创建原型');
+  expect(document?.querySelector('.stream-text-fragment')).not.toBeNull();
+  expect(node.querySelector('[aria-label="复制详情"]')).toBeNull();
+  const heading = document?.querySelector('h1');
+  const continued = { ...draft, data:{ ...draft.data, inputText:JSON.stringify({ plan:plan+'\n\n## 验收\n\n验证完整流程。' }).slice(0, -2) } };
+  await render([items[0], continued], false, { sessionStatus:'running', activeTurnId:'plan' });
+  expect(node.querySelector('.plan-generation h1')).toBe(heading);
+  expect(node.querySelector('.plan-generation')?.textContent).toContain('验证完整流程');
+  expect(node.textContent).not.toContain('"plan":');
+  await act(async () => node.querySelector<HTMLButtonElement>('.activity-group-summary')!.click());
+  expect(node.querySelector('.activity-body .plan-document')?.textContent).toContain('验证完整流程');
+  expect(node.querySelector('.plan-generation')).toBeNull();
+  await render([items[0], { ...continued, data:{ ...continued.data, status:'completed', arguments:{ plan } } }], true,
+    { sessionStatus:'idle' });
+  expect(node.querySelector('.plan-generation')).toBeNull();
+  expect(node.querySelector('.plan-document .stream-text-fragment')).toBeNull();
 });
 
 it('shows animated current reasoning, editing and running after a tool failure without a run marker', async () => {
@@ -169,10 +257,11 @@ it('restores a paginated run and keeps its final reply and manually expanded pro
   expect(node.querySelector('.turn-process-toggle')?.getAttribute('aria-expanded')).toBe('false');
   const final = node.querySelector('.turn-final-result .message');
   await toggle();
-  await render([marker, message('earlier', 'assistant', '更早的过程'), ...page], true);
+  const earlier = message('earlier', 'assistant', '更早的过程', 'agentMessage', { phase:'commentary' });
+  await render([marker, earlier, ...page], true);
   expect(node.querySelector('.turn-process-content')?.textContent).toContain('更早的过程');
   expect(node.querySelector('.turn-final-result .message')).toBe(final);
-  await render([items[0], marker, message('earlier', 'assistant', '更早的过程'), ...page], true);
+  await render([items[0], marker, earlier, ...page], true);
   expect(node.querySelector('.turn-final-result .message')).toBe(final);
   expect(node.querySelector('.turn-process-content')?.textContent).toContain('更早的过程');
   expect(node.querySelector('.turn-process-content')?.textContent).toContain('我会先检查布局');

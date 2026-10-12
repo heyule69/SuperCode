@@ -25,11 +25,11 @@ describe('task replies and execution history', () => {
     const assistant = render([messages[0], message('picture', 'assistant', '', 'agentMessage', { media })]);
     expect(assistant).toContain('data-media-source="D:/cache/截图.png"');
   });
-  it('collapses intermediate text and tools behind elapsed time when a task completes', () => {
+  it('keeps unphased answer text visible while collapsing tools behind elapsed time when a task completes', () => {
     const html = render();
     expect(html.match(/class="assistant-turn"/g)).toHaveLength(1);
     expect(html.match(/aria-label="复制回复"/g)).toHaveLength(1);
-    expect(html).not.toContain('排版已经修好了');
+    expect(html).toContain('排版已经修好了');
     expect(html).toContain('PDF 已保存');
     expect(html).not.toContain('message-avatar');
     expect(html).not.toContain('message-label');

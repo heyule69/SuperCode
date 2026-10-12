@@ -1,0 +1,38 @@
+.subagent-rows { margin:6px 0 10px; }
+.subagent-row { display:flex; align-items:center; gap:9px; width:fit-content; max-width:100%; min-height:30px; padding:3px 0; border:0; border-radius:6px; background:transparent; color:var(--muted); font:inherit; font-size:var(--chat-size,13px); text-align:left; }
+.subagent-row > span { display:flex; min-width:0; align-items:baseline; gap:3px; }
+.subagent-row-name { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.subagent-row > span > span:last-child { flex:none; }
+.subagent-row:hover:not(:disabled),.subagent-row:focus-visible { color:var(--text); }
+.subagent-row:focus-visible { outline:2px solid var(--accent); outline-offset:4px; }
+.subagent-row:disabled { opacity:1; cursor:default; }
+.subagent-row.failed { color:var(--danger); }
+.subagent-avatar { width:19px; height:19px; flex:none; }
+.subagent-avatar.color-0 { color:#a480cc; }.subagent-avatar.color-1 { color:#699ed2; }.subagent-avatar.color-2 { color:#53aa99; }.subagent-avatar.color-3 { color:#c39355; }.subagent-avatar.color-4 { color:#ca819d; }.subagent-avatar.color-5 { color:#859f58; }
+.subagent-panel { min-width:0; min-height:0; display:flex; flex-direction:column; background:var(--bg); border-left:1px solid var(--line); position:relative; }
+.desktop-workarea .subagent-panel { grid-column:3; grid-row:1; z-index:2; }
+.desktop-workarea .app.has-subagent-panel > .side-chat { display:none; }
+.subagent-panel-tabs { display:flex; align-items:center; justify-content:space-between; gap:8px; min-height:50px; padding:8px 12px; border-bottom:1px solid var(--line); }
+.subagent-panel-tab { display:flex; align-items:center; gap:8px; min-width:0; padding:7px 9px; border:1px solid var(--line); border-radius:9px; background:var(--surface); font-size:13px; }
+.subagent-panel-tab > span { margin-right:24px; }.subagent-panel-tab button { margin-left:auto; }
+.subagent-panel-heading { display:flex; align-items:center; gap:10px; min-height:52px; padding:8px 18px; border-bottom:1px solid var(--line); }
+.subagent-panel-heading strong { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:13px; font-weight:600; }
+.subagent-panel-heading .subagent-avatar { width:23px; height:23px; }
+.subagent-model { margin-left:auto; font-size:11px; color:var(--muted); text-align:right; overflow-wrap:anywhere; }
+.subagent-panel-scroll { flex:1; min-height:0; overflow:auto; overscroll-behavior:contain; padding:28px 30px; }
+.subagent-panel-scroll .messages { padding:0; width:100%; max-width:880px; margin:0 auto; }
+.subagent-panel-scroll .message.assistant { margin-bottom:14px; }
+.subagent-panel-list { display:flex; flex-direction:column; gap:6px; }
+.subagent-panel-list > button { display:flex; align-items:center; gap:10px; width:100%; min-width:0; padding:12px; border-radius:9px; background:transparent; color:var(--text); text-align:left; }
+.subagent-panel-list > button:hover { background:var(--hover); }
+.subagent-panel-list > button > span { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.subagent-panel-list small { flex:none; color:var(--muted); font-size:11px; }
+.subagent-task { margin:0 0 24px; color:var(--muted); font-size:12px; }
+.subagent-task h3 { margin:0 0 8px; color:var(--muted); font-size:12px; font-weight:500; }
+.subagent-task p { margin:0; color:var(--text); white-space:pre-wrap; line-height:1.7; overflow-wrap:anywhere; }
+.subagent-panel-scroll .activity-timeline { margin:8px 0 16px; }
+.subagent-empty,.subagent-error { color:var(--muted); font-size:12px; line-height:1.7; }
+.subagent-error { display:flex; align-items:center; gap:10px; margin-bottom:18px; }.subagent-error span { flex:1; }.subagent-error button { flex:none; }
+@media (max-width:1100px) { .desktop-workarea .subagent-panel { grid-column:1 / -1; position:absolute; inset:0 0 0 auto; width:min(740px,calc(100% - 32px)); z-index:60; box-shadow:-10px 0 35px #00000012; } }
+@media (max-width:600px) { .subagent-panel-heading { flex-wrap:wrap; padding:8px 12px; }.subagent-model { flex-basis:100%; padding-left:37px; text-align:left; }.subagent-panel-scroll { padding:20px 18px; } }
+@media (pointer:coarse) { .subagent-row { min-height:44px; } }

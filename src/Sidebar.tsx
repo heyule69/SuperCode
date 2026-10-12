@@ -6,7 +6,6 @@ import { exportFilename, projectSessions, sidebarAreas, type SidebarGroup } from
 import { isActive, type ArchivedSession, type Project, type Session, type SidebarSection, type SidebarState } from './types';
 import { SessionIndicator } from './SessionIndicator';
 import { Collapsible } from './Collapsible';
-import { sidebarTime } from './sidebarTime';
 
 type Target = { kind: 'project'; item: Project } | { kind: 'session'; item: Session } | { kind: 'section'; item: SidebarSection } | { kind: 'root' };
 type SessionDialog = { [Kind in 'rename' | 'share' | 'delete']: { kind: Kind; session: Session } }['rename' | 'share' | 'delete'];
@@ -28,6 +27,7 @@ export function Sidebar(props: SidebarProps) {
   const [title, setTitle] = useState('');
   const [path, setPath] = useState('');
   const [error, setError] = useState('');
+  const [launchError, setLaunchError] = useState('');
   const [feedback, setFeedback] = useState('');
   const [working, setWorking] = useState(false);
   const [archives, setArchives] = useState<ArchivedSession[]>([]);
@@ -53,13 +53,14 @@ export function Sidebar(props: SidebarProps) {
   }
 
   function closeMenu(restore = false) { if (restore) menu?.origin.focus({ preventScroll: true }); setMenu(null); setSub(null); setError(''); setFeedback(''); }
-  function show(event: MouseEvent, target: Target, fromButton = false) {
+  function show(event: MouseEvent | React.KeyboardEvent, target: Target, fromButton = false) {
     if (blocked || dialog || working) return;
     event.preventDefault(); event.stopPropagation();
-    const origin = event.currentTarget as HTMLElement;
-    const bounds = origin.getBoundingClientRect();
+    const element = event.currentTarget as HTMLElement;
+    const origin = target.kind === 'session' ? element.closest('.sidebar-chat-row')?.querySelector<HTMLButtonElement>('.session-row') ?? element : element;
+    const bounds = element.getBoundingClientRect();
     setError(''); setFeedback(''); setSub(null);
-    setMenu({ target, x: fromButton ? bounds.right : event.clientX || bounds.left, y: fromButton ? bounds.bottom : event.clientY || bounds.bottom, origin });
+    setMenu({ target, x: fromButton ? bounds.right : 'clientX' in event ? event.clientX || bounds.left : bounds.left, y: fromButton ? bounds.bottom : 'clientY' in event ? event.clientY || bounds.bottom : bounds.bottom, origin });
   }
   function openDialog(next: Dialog) {
     origin.current = menu?.origin ?? document.activeElement as HTMLElement;
@@ -128,6 +129,12 @@ export function Sidebar(props: SidebarProps) {
     finally { actionLock.current = false; setWorking(false); }
   }
   async function command(name: string, args: Record<string, unknown>) { await run(async () => { await call(name, args); await updated(); }); }
+  async function launch(name: string, args: Record<string, unknown>) {
+    if (actionLock.current) return;
+    closeMenu(true); setLaunchError('');
+    try { await call(name, args); }
+    catch (e) { setLaunchError(e instanceof Error ? e.message : String(e)); }
+  }
   async function update(kind: 'project' | 'session', id: string, action: string, value: unknown) { await command('update_sidebar_item', { kind, id, action, value }); }
   async function copy(text: string) { await run(async () => { await navigator.clipboard.writeText(text); setFeedback('已复制'); }, false); }
   async function fork(session: Session, projectId?: string) { await run(async () => { const next = await call<Session>('fork_sidebar_session', { sessionId: session.id, projectId: projectId ?? null }); await updated(); await selectSession(next); }); }
@@ -157,8 +164,8 @@ export function Sidebar(props: SidebarProps) {
         { label: meta?.pinned ? '取消置顶' : '置顶', icon: meta?.pinned ? PinOff : Pin, run: () => void update('project', item.id, 'pin', !meta?.pinned) },
         { label: '编辑项目', icon: Settings2, disabled: busy, run: () => openDialog({ kind: 'edit', project: target.item }) },
         { label: '分区', icon: List, divider: true, items: sectionItems(target) },
-        { label: '在资源管理器中打开', icon: FolderOpen, disabled: !desktop, run: () => void command('open_sidebar_project', { projectId: item.id, mode: 'folder' }) },
-        { label: '打开方式', icon: ExternalLink, items: [{ label: 'VS Code', icon: PanelTop, disabled: !desktop, run: () => void command('open_sidebar_project', { projectId: item.id, mode: 'vscode' }) }, { label: '系统终端', icon: Terminal, disabled: !desktop, run: () => void command('open_sidebar_project', { projectId: item.id, mode: 'terminal' }) }] },
+        { label: '在资源管理器中打开', icon: FolderOpen, disabled: !desktop, run: () => void launch('open_sidebar_project', { projectId: item.id, mode: 'folder' }) },
+        { label: '打开方式', icon: ExternalLink, items: [{ label: 'VS Code', icon: PanelTop, disabled: !desktop, run: () => void launch('open_sidebar_project', { projectId: item.id, mode: 'vscode' }) }, { label: '系统终端', icon: Terminal, disabled: !desktop, run: () => void launch('open_sidebar_project', { projectId: item.id, mode: 'terminal' }) }] },
         { label: '复制路径', icon: Copy, run: () => void copy(target.item.path) },
         { label: '归档聊天', icon: Archive, divider: true, disabled: busy || !sessions.some(s => s.projectId === item.id), run: () => openDialog({ kind: 'archiveProject', project: target.item }) },
         { label: '移除项目', icon: X, divider: true, disabled: busy, run: () => openDialog({ kind: 'remove', project: target.item }) },
@@ -174,7 +181,7 @@ export function Sidebar(props: SidebarProps) {
       { label: '分叉', icon: GitFork, divider: true, disabled: busy, items: [{ label: session.projectId ? '在当前项目分叉' : '在当前聊天目录分叉', icon: GitFork, run: () => void fork(session) }, ...projects.filter(p => p.id !== session.projectId).map(p => ({ id:p.id, label: p.name, description: projects.some(other=>other.id!==p.id && other.name===p.name) ? p.path : undefined, icon: Folder, run: () => void fork(session, p.id) }))] },
       { label: '分享', icon: Share2, divider: true, run: () => openDialog({ kind: 'share', session }) },
       { label: '复制', icon: Copy, items: [{ label: '聊天标题', run: () => void copy(session.title) }, { label: '聊天内容', run: () => void run(async () => { const text = await call<string>('copy_chat_transcript', { sessionId: session.id }); await navigator.clipboard.writeText(text); setFeedback('已复制'); }, false) }, { label: '聊天 ID', run: () => void copy(session.id) }] },
-      { label: '在新窗口中打开', icon: PanelTop, divider: true, disabled: !desktop, run: () => void command('open_chat_window', { sessionId: session.id, dark: document.documentElement.dataset.theme === 'dark' || document.documentElement.dataset.theme === 'graphite' }) },
+      { label: '在新窗口中打开', icon: PanelTop, divider: true, disabled: !desktop, run: () => void launch('open_chat_window', { sessionId: session.id, dark: document.documentElement.dataset.theme === 'dark' || document.documentElement.dataset.theme === 'graphite' }) },
       { label: '打开方式', icon: ExternalLink, items: [{ label: '在当前窗口中打开', icon: PanelTop, run: () => { closeMenu(); void selectSession(session); } }, { label: '导出 Markdown…', icon: Download, disabled: !desktop, run: () => void exportChat(session, 'md') }] },
       { label: '归档', icon: Archive, shortcut: 'Ctrl+Shift+A', divider: true, disabled: busy, run: () => void command('archive_session', { sessionId: session.id }) },
       { label: '永久删除', icon: Trash2, disabled: busy, danger: true, run: () => openDialog({ kind: 'delete', session }) },
@@ -229,11 +236,15 @@ export function Sidebar(props: SidebarProps) {
   }
   function chatRow(session: Session, standalone = false) {
     const meta = state.sessions[session.id];
-    return <div className={`sidebar-chat-row ${session.id === sessionId ? 'selected' : ''} ${meta?.unread && !isActive(session.status) ? 'unread' : ''}`} key={session.id} onContextMenu={e => show(e, { kind: 'session', item: session })}>
-      <button className={`session-row ${session.id === sessionId ? 'selected' : ''}`} aria-current={session.id === sessionId ? 'page' : undefined} onClick={() => void selectSession(session)} title={session.title}>
-        <span className="session-title">{session.title}{standalone && session.projectId ? <small>{projects.find(p => p.id === session.projectId)?.name}</small> : null}</span>{!isActive(session.status) ? <time className="sidebar-session-time" dateTime={Number.isFinite(session.updatedAt) && session.updatedAt > 0 && session.updatedAt < 8.64e12 ? new Date(session.updatedAt * 1000).toISOString() : undefined}>{sidebarTime(session.updatedAt)}</time> : null}<SessionIndicator status={session.status} unread={meta?.unread}/>{session.status === 'waiting' ? <span className="waiting-badge" aria-label="需要确认">!</span> : null}
+    const active = isActive(session.status);
+    return <div className={`sidebar-chat-row ${session.id === sessionId ? 'selected' : ''} ${meta?.unread && !active ? 'unread' : ''}`} key={session.id} onContextMenu={e => show(e, { kind: 'session', item: session })}>
+      <button className={`session-row ${session.id === sessionId ? 'selected' : ''}`} aria-current={session.id === sessionId ? 'page' : undefined} aria-haspopup="menu" onClick={() => void selectSession(session)} onKeyDown={event => { if (event.key === 'ContextMenu' || event.shiftKey && event.key === 'F10') show(event, { kind: 'session', item: session }); }} title={session.title}>
+        <span className="session-title">{session.title}{standalone && session.projectId ? <small>{projects.find(p => p.id === session.projectId)?.name}</small> : null}</span><span className="sidebar-chat-status"><SessionIndicator status={session.status} unread={meta?.unread}/>{session.status === 'waiting' ? <span className="waiting-badge" aria-label="需要确认">!</span> : null}</span>
       </button>
-      <button className="sidebar-row-menu" aria-label={`${session.title} 的菜单`} onClick={e => show(e, { kind: 'session', item: session }, true)}><MoreHorizontal size={15}/></button>
+      <div className="sidebar-chat-actions">
+        <button type="button" className="sidebar-chat-action" aria-label={`${meta?.pinned ? '取消置顶' : '置顶'} ${session.title}`} aria-pressed={!!meta?.pinned} title={meta?.pinned ? '取消置顶' : '置顶'} disabled={!ready || blocked || working} onClick={() => void update('session', session.id, 'pin', !meta?.pinned)}>{meta?.pinned ? <PinOff size={16}/> : <Pin size={16}/>}</button>
+        <button type="button" className="sidebar-chat-action" aria-label={`归档 ${session.title}`} title={active ? '运行中的聊天暂不能归档' : '归档'} disabled={!ready || blocked || working || active} onClick={() => void command('archive_session', { sessionId: session.id })}><Archive size={16}/></button>
+      </div>
     </div>;
   }
   function toggleProject(id: string) {
@@ -276,6 +287,7 @@ export function Sidebar(props: SidebarProps) {
         <Collapsible id={`${regionId}-projects`} open={!collapsedAreas.includes('projects')}><div className="sidebar-items">{!ready ? <div className="sidebar-loading" role="status">正在加载项目…</div> : areas.projects.map(group => renderGroup(group))}{ready && !projects.length ? <button className="empty-project" onClick={addProject}><FolderOpen size={22}/><span>添加项目</span></button> : null}</div></Collapsible>
       </section>
     </div>
+    {launchError ? <div className="sidebar-action-error" role="alert"><span>{launchError}</span><button className="icon-button" title="关闭打开失败提示" onClick={() => setLaunchError('')}><X size={13}/></button></div> : null}
     {error && !menu && !dialog ? <div className="sidebar-action-error" role="alert"><span>{error}</span><button className="icon-button" title="关闭提示" onClick={() => setError('')}><X size={13}/></button></div> : null}
     {menu ? createPortal(<div ref={popup} className="sidebar-context-menu" role="menu" aria-label={menu.target.kind === 'project' ? '项目操作' : menu.target.kind === 'session' ? '聊天操作' : '分区操作'} style={{ left: menu.x, top: menu.y }} onKeyDown={navigate}>
       {renderItems(menuItems(menu.target))}{feedback ? <div className="sidebar-menu-feedback" role="status">{feedback}</div> : null}{error ? <div className="resource-menu-error" role="alert">{error}</div> : null}

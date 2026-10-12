@@ -6,8 +6,8 @@ import { decodePanelWidths, defaultWidths, panelLayout, usePanelResize } from '.
 
 let root: Root, container: HTMLDivElement;
 let narrow = false;
-function Layout({browser=false,left=true,right=true,expanded=false}:{browser?:boolean;left?:boolean;right?:boolean;expanded?:boolean}) {
-  const panels = usePanelResize(left, right, false, browser, expanded);
+function Layout({panel='workspace',left=true,right=true,expanded=false}:{panel?:'workspace'|'browser'|'conversation';left?:boolean;right?:boolean;expanded?:boolean}) {
+  const panels = usePanelResize(left, right, false, panel, expanded);
   return <div ref={panels.root}><div {...panels.handle('left')}/><div {...panels.handle('right')}/></div>;
 }
 beforeEach(() => {
@@ -50,15 +50,31 @@ it('bounds saved values and preserves the chat at smaller window sizes', () => {
   expect(1200 - layout.left - layout.right).toBeGreaterThanOrEqual(360);
   narrow = true;
   expect(panelLayout(defaultWidths, 900, true, true).overlay).toBe(true);
+  expect(panelLayout({left:288,right:520}, 900, true, true).right).toBe(520);
+  expect(panelLayout({left:288,right:620}, 600, true, true).right).toBe(568);
 });
 it('keeps browser widths separate while sharing the saved sidebar width', async()=>{
-  await act(async()=>root.render(<Layout browser/>));
+  await act(async()=>root.render(<Layout panel="browser"/>));
   expect(handle('right').getAttribute('aria-valuenow')).toBe('520');
   await pointer('left','pointerdown',288);await pointer('left','pointermove',310);await pointer('left','pointerup',310);
   await pointer('right','pointerdown',880);await pointer('right','pointermove',840);await pointer('right','pointerup',840);
   expect(JSON.parse(localStorage.getItem('supercode.panel-widths')!)).toEqual({left:310,right:284});
   await act(async()=>root.render(<Layout/>));expect(handle('right').getAttribute('aria-valuenow')).toBe('284');
-  await act(async()=>root.render(<Layout browser/>));expect(handle('right').getAttribute('aria-valuenow')).toBe('560');
+  await act(async()=>root.render(<Layout panel="browser"/>));expect(handle('right').getAttribute('aria-valuenow')).toBe('560');
+});
+it('gives conversation panes room to read without changing the file pane width', async () => {
+  localStorage.setItem('supercode.panel-widths', JSON.stringify({left:310,right:280}));
+  await act(async()=>root.render(<Layout panel="conversation"/>));
+  expect(handle('right').getAttribute('aria-valuenow')).toBe('520');
+  expect(handle('right').getAttribute('aria-label')).toBe('调整对话面板宽度');
+  await pointer('right','pointerdown',880);await pointer('right','pointermove',840);await pointer('right','pointerup',840);
+  await act(async()=>root.render(<Layout/>));
+  expect(handle('right').getAttribute('aria-valuenow')).toBe('280');
+  expect(handle('left').getAttribute('aria-valuenow')).toBe('310');
+  await act(async()=>root.render(<Layout panel="conversation"/>));
+  expect(handle('right').getAttribute('aria-valuenow')).toBe('560');
+  await act(async()=>handle('right').dispatchEvent(new MouseEvent('dblclick',{bubbles:true})));
+  expect(handle('right').getAttribute('aria-valuenow')).toBe('520');
 });
 it('uses stable tracks to animate hidden panes and restores saved widths after expansion', async () => {
   await act(async () => root.render(<Layout left={false} right={false}/>));

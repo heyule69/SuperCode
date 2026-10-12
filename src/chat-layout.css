@@ -1,6 +1,9 @@
 /* Shared chat geometry, including the narrow conversation beside the workspace. */
 .workspace { --conversation-width:800px; container-type:inline-size; container-name:chat-workspace; }
-.workspace > .chat-scroll > .messages { padding:24px 32px 36px; }
+.workspace > .chat-viewport { position:relative; display:flex; flex-direction:column; flex:1; min-height:0; min-width:0; }
+.workspace > .chat-viewport > .chat-scroll { flex:1; min-height:0; }
+.chat-viewport > .jump-to-latest { bottom:12px; }
+.workspace .chat-scroll > .messages { padding:24px 32px 36px; }
 .workspace > .composer-area { padding:10px 32px 12px; }
 .composer { border:1px solid var(--composer-line); border-radius:24px; background:var(--composer-bg); box-shadow:none; }
 .composer:focus-within { border-color:color-mix(in srgb,var(--text) 16%,transparent); box-shadow:none; }

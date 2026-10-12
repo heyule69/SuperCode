@@ -17,6 +17,10 @@ describe('compact execution records', () => {
 
 describe('activity summaries', () => {
   const tool = (id: string, name: string, path?: string, status = 'completed') => ({ ...item(id, { tool: name, arguments: { file_path: path }, status }), kind: 'claudeToolCall' });
+  it('shows animated plan progress for native planning tools', () => {
+    expect(summarizeActivities([tool('plan', 'ExitPlanMode', undefined, 'preparing')], true))
+      .toEqual({ label:'正在更新计划', category:'plan', status:'preparing' });
+  });
   it('combines consecutive operations in order and counts distinct edited files', () => {
     const result = summarizeActivities([
       tool('a', 'Edit', 'C:\\project\\src\\App.tsx'),

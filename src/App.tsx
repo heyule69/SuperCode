@@ -1,8 +1,10 @@
-import { lazy, Suspense, useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
-import { Sparkles, ArrowUp, ArrowUpRight, Folder, Globe, MessageSquare, MoreHorizontal, PanelLeftOpen, PanelRightClose, PanelRightOpen, RefreshCw, Search, Square, SquarePen, Terminal, X } from 'lucide-react';
+import { lazy, Suspense, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { Sparkles, ArrowUp, Folder, Globe, MessageSquare, MoreHorizontal, PanelLeftOpen, PanelRightClose, PanelRightOpen, RefreshCw, Search, Square, SquarePen, Terminal, X } from 'lucide-react';
 import { call, desktop, subscribe } from './api';
 import { isDisplayEvent, mergeEvent, reconcileMessages } from './events';
 import { Conversation, JumpToLatest } from './Conversation';
+import { collectSubagents, subagentEventStatus, type SubagentStatus } from './subagents';
+const SubagentPanel = lazy(() => import('./SubagentPanel'));
 import { isActive, type Agent, type Bootstrap, type Changes, type Message, type Model, type ModelCatalog, type ModelSource, type PermissionMode, type Project, type RpcEvent, type RuntimeInfo, type Session, type SidebarState } from './types';
 import { Sidebar } from './Sidebar';
 import { emptySidebar } from './sidebarState';
@@ -21,7 +23,7 @@ import { commandIndex, decodeDrafts, encodeDrafts, restoreWorkspace, type DraftM
 import { CopyButton } from './CopyButton';
 import { exportRuntimeDiagnostics, openRuntimeLogFolder } from './runtimeDiagnostics';
 import { diffFiles } from './diff';
-import { revealScrollItem, scrollToLatest } from './chatScroll';
+import { revealScrollItem, scrollToConversationTurn, scrollToLatest } from './chatScroll';
 import { systemDocument } from './links';
 import type { ClientTab, Skill } from './ClientSettings';
 import { version as appVersion } from '../package.json';
@@ -43,6 +45,7 @@ import { ActivityRail } from './ActivityRail';
 import { AgentMenu } from './AgentMenu';
 import { NewChat } from './NewChat';
 import { usePanelResize } from './PanelResize';
+import { planFollowup, type PlanDecision } from './planPresentation';
 import { useBrowserDock } from './BrowserDock';
 import { useChatReadReceipt } from './useChatReadReceipt';
 import { clipboardImages, imageBase64, imageBytes, MAX_ATTACHMENTS, MAX_TOTAL_IMAGE_BYTES, mergeAttachments, readClipboardImages, validateImageFile } from './attachments';
@@ -65,6 +68,11 @@ export default function App() {
   const [prefs, setPrefs] = useState(loadPreferences);
   const [ready, setReady] = useState(false);
   const [sideDraft,setSideDraft]=useState<SideDraft|null>(null);
+  const [subagentSelection,setSubagentSelection]=useState<{sessionId:string;key:string|null}|null>(null);
+  const [subagentExpanded,setSubagentExpanded]=useState(true);
+  const [subagentStates,setSubagentStates]=useState<{sessionId:string;statuses:Record<string,SubagentStatus>}>({sessionId:'',statuses:{}});
+  const subagentThreads=useRef(new Set<string>());
+  const subagentOpener=useRef<HTMLElement|null>(null);
   const [selectionDetail,setSelectionDetail]=useState('');
   const [detached] = useState(() => { const query = new URLSearchParams(location.search); return query.has('session') || query.get('window') === 'new'; });
   const [savedWorkspace] = useState(() => { const query = new URLSearchParams(location.search); const fresh = query.get('window') === 'new'; return { sessionId: fresh ? '' : query.get('session') ?? localStorage.getItem('supercode.session') ?? '', projectId: localStorage.getItem('supercode.project') ?? '', fresh }; });
@@ -196,7 +204,29 @@ export default function App() {
   const project = projects.find(p => p.id === projectId);
   const session = sessions.find(s => s.id === sessionId);
   const workspacePath = project?.path ?? session?.workspacePath ?? undefined;
-  const panels = usePanelResize(sidebar, !!(showContext || sideDraft), settingsOpen, false, workspaceExpanded && !sideDraft);
+  const showSubagents = subagentSelection?.sessionId === sessionId && !!sessionId;
+  const subagents = useMemo(() => collectSubagents(messages).map(agent=>subagentStates.sessionId===sessionId && subagentStates.statuses[agent.key]?{...agent,status:subagentStates.statuses[agent.key]}:agent), [messages,subagentStates,sessionId]);
+  subagentThreads.current=new Set(subagents.flatMap(agent=>agent.threadId?[agent.threadId]:[]));
+  const updateSubagentStatus=useCallback((key:string,status:SubagentStatus)=>setSubagentStates(old=>({sessionId,statuses:{...(old.sessionId===sessionId?old.statuses:{}),[key]:status}})),[sessionId]);
+  const panels = usePanelResize(sidebar, !!(showContext || sideDraft || showSubagents), settingsOpen, sideDraft || showSubagents ? 'conversation' : 'workspace', showSubagents ? subagentExpanded : workspaceExpanded && !sideDraft);
+  const openSubagent = useCallback((key:string) => {
+    subagentOpener.current=[...scrollArea.current?.querySelectorAll<HTMLElement>('.subagent-row')??[]].find(row=>row.dataset.subagentKey===key)??null;
+    stickToBottom.current=false;
+    setSubagentExpanded(true);setSubagentSelection({sessionId,key});
+  }, [sessionId]);
+  useLayoutEffect(()=>{
+    const area=scrollArea.current, opener=subagentOpener.current;
+    if(area&&opener&&area.contains(opener))return scrollToConversationTurn(area,opener,'instant',320);
+  },[showSubagents,subagentExpanded]);
+  function closeSubagents() {
+    setSubagentSelection(null);
+    requestAnimationFrame(()=>{
+      if(subagentOpener.current?.isConnected){
+        subagentOpener.current.focus({preventScroll:true});
+        revealScrollItem(scrollArea.current,subagentOpener.current);
+      }
+    });
+  }
   const browserDock = useBrowserDock(showBrowser, browserExpanded);
   useChatReadReceipt({ sessionId, status: session?.status, unread: !!sidebarState.sessions[sessionId]?.unread, throughSeq: messages.reduce((seq, message) => Math.max(seq, message.seq), 0), loading: messagesLoading, settingsOpen,
     onRead: id => setSidebarState(old => ({ ...old, sessions: { ...old.sessions, [id]: { ...old.sessions[id], unread: false } } })), onError: report });
@@ -220,7 +250,7 @@ export default function App() {
     },
     reload:followups.reload,report,focus:()=>textarea.current?.focus(),
   });
-  const stopMode = busy && !hasDraft && !followupEditor.editingId;
+  const stopMode = isActive(session?.status) && !!session?.turnId && !hasDraft && !followupEditor.editingId;
   const connectionId = session?.connectionId ?? draftConnectionId ?? profiles.find(p => p.agent === agentId && p.current)?.id ?? (officialAgents.includes(agentId) ? '@official' : '@local');
   const activeProfile = profiles.find(p => p.agent === agentId && p.id === connectionId);
   const [handoffTarget, setHandoffTarget] = useState('');
@@ -274,14 +304,13 @@ export default function App() {
     })().catch(e => { if (!disposed && request === modelRequest.current) report(e); }).finally(() => { if (!disposed && request === modelRequest.current) setLoadingModels(false); });
     return () => { disposed = true; };
   }, [profileRevision, ready]);
-  const currentRequests = requests.filter(r => !r.params.threadId || r.params.threadId === session?.nativeId || r.params.threadId === current.current.nativeId);
+  const currentRequests = requests.filter(r => !r.params.threadId || r.params.threadId === session?.nativeId || r.params.threadId === current.current.nativeId || subagents.some(agent=>agent.threadId===r.params.threadId));
   const questionPending = currentRequests.some(request => request.method === 'item/tool/requestUserInput');
   async function respondRequest(request: RpcEvent, result: unknown) {
     try { await call('respond_request', { id: request.id, result }); setRequests(old => old.filter(r => r.id !== request.id)); }
     catch (e) { report(e); throw e; }
   }
   const newChat = ready && !messages.length && !busy && !messagesLoading && !currentRequests.length;
-  const activeElsewhere = sessions.find(s => isActive(s.status) && s.id !== sessionId);
 
   const agentName = agents.find(a => a.id === agentId)?.name ?? agentId;
   newSessionRef.current = () => { void newSession(); };
@@ -362,6 +391,11 @@ export default function App() {
       if (disposed) return;
       const p = event.params;
       const native = p.threadId ?? p.thread?.id;
+      const childStatus=subagentEventStatus(event);
+      if(typeof native==='string'&&subagentThreads.current.has(native)&&childStatus) {
+        const parent=current.current.sessionId;
+        setSubagentStates(old=>({sessionId:parent,statuses:{...(old.sessionId===parent?old.statuses:{}),[native]:childStatus}}));
+      }
       if (event.method === 'agent/commands' && native === current.current.nativeId) {
         setNativeCommands(Array.isArray(p.commands) ? p.commands as string[] : []);
         return;
@@ -369,11 +403,16 @@ export default function App() {
       if (['thread/goal/updated', 'thread/goal/cleared'].includes(event.method) && native === current.current.nativeId) {
         const goal = p.goal as { objective?: string; status?: string; tokensUsed?: number } | undefined;
         const names: Record<string, string> = { active: '执行中', paused: '已暂停', complete: '已完成', blocked: '等待解决阻碍', budgetLimited: '已达到目标预算', usageLimited: '已达到用量限制' };
-        setCommandMessage(goal ? `目标：${goal.objective}\n状态：${names[goal.status ?? ''] ?? goal.status}\n已用 Token：${goal.tokensUsed ?? 0}` : '目标已清除。');
+        if (goal) setCommandMessage(`目标：${goal.objective}\n状态：${names[goal.status ?? ''] ?? goal.status}\n已用 Token：${goal.tokensUsed ?? 0}`);
+        else setCommandMessage(previous => previous.startsWith('目标：') ? '目标已清除。' : previous);
         return;
       }
       const owner = p.appSessionId ?? sessionsRef.current.find(s => s.nativeId === native)?.id;
-      if (owner && native && ['thread/started', 'turn/started'].includes(event.method)) {
+      const boundNative = sessionsRef.current.find(s => s.id === owner)?.nativeId
+        ?? (owner === current.current.sessionId ? current.current.nativeId : null);
+      // One app-server also emits its children's events. The process owner is
+      // not permission to replace an already bound primary native thread.
+      if (owner && native && (!boundNative || boundNative === native) && ['thread/started', 'turn/started'].includes(event.method)) {
         if (current.current.sessionId === owner) current.current.nativeId = native;
         setSessions(old => old.map(s => s.id === owner ? { ...s, nativeId: native } : s));
       }
@@ -547,7 +586,7 @@ export default function App() {
     setAttachments(attachmentDrafts.current.get(draftKey.current) ?? []); setInput(drafts.current.get(draftKey.current) ?? '');
     flush(); setProjectId((p?.id ?? '')); setSessionId(''); setMessages([]); setPreview(null); setChanges(emptyChanges);
     setHasMore(false); setShowJump(false); setMessagesLoading(false); stickToBottom.current = true; changesRevision.current++;
-    current.current = { sessionId: '', projectId: (p?.id ?? ''), nativeId: null }; setError('');
+    current.current = { sessionId: '', projectId: (p?.id ?? ''), nativeId: null }; setError(''); setCommandMessage('');
     if (sameProject && context) void refreshChanges((p?.id ?? ''));
   }
   async function selectSession(s: Session) {
@@ -557,7 +596,7 @@ export default function App() {
     const editingPayload=followupEditor.payloadFor(s.id);setEffort(editingPayload?.effort??'');if(editingPayload)setPermissionMode(editingPayload.permissionMode as PermissionMode,s.agent);
     setDraftConnectionId(undefined);
     draftKey.current = s.id; setInput(drafts.current.get(s.id) ?? ''); setHasMore(false); setShowJump(false);
-    flush(); setSessionId(s.id); setProjectId(s.projectId); setMessages([]); setPreview(null); setAgentId(s.agent); setModels([]); setModelCatalogRevision(''); setModelSource(profiles.find(p => p.id === s.connectionId)?.modelSource); setModel(s.model ?? ''); setUsage(undefined); setError(''); stickToBottom.current = true;
+    flush(); setSessionId(s.id); setProjectId(s.projectId); setMessages([]); setPreview(null); setAgentId(s.agent); setModels([]); setModelCatalogRevision(''); setModelSource(profiles.find(p => p.id === s.connectionId)?.modelSource); setModel(s.model ?? ''); setUsage(undefined); setError(''); setCommandMessage(''); stickToBottom.current = true;
     current.current = { sessionId: s.id, projectId: s.projectId, nativeId: s.nativeId }; setModal(null);
     try { await loadMessages(s.id); } catch (e) { report(e); }
   }
@@ -584,6 +623,19 @@ export default function App() {
     requestAnimationFrame(() => textarea.current?.focus());
   }
   function followupPayload(text:string,taskAttachments=attachments):FollowupPayload { return {text,model:model||null,readOnly,permissionMode,attachments:taskAttachments,effort:effort||null}; }
+  async function respondPlan(message:Message,decision:PlanDecision,feedback:string) {
+    const id=sessionId;
+    if (!session || session.agent!=='codex' || busy || sendLocks.current.has(id) || followups.rows.length || message.sessionId!==id) throw new Error('请等待当前任务结束后再确认计划。');
+    const mode=decision==='execute'?'ask':'read';
+    const payload={...followupPayload(planFollowup(decision,feedback),[]),permissionMode:mode,readOnly:mode==='read'};
+    const flight=beginSending();flight.track(id);
+    try {
+      await requireChatConnection('codex',connectionId,id);
+      await call('enqueue_followup',{sessionId:id,payload});
+      if(current.current.sessionId===id){setPermissionMode(mode,'codex');stickToBottom.current=true;await followups.reload();await loadMessages(id);}
+      await refresh();
+    } finally { flight.finish(); }
+  }
   async function changeFollowup(id:string,action:string,text?:string){try{await call('change_followup',{id,action,text:text??null});await followups.reload();}catch(e){report(e);throw e;}}
   async function steerFollowup(id:string){try{await call('steer_followup',{id,expectedTurnId:session?.turnId});await followups.reload();await refresh();await loadMessages(sessionId);}catch(e){report(e);}}
   async function openSide(row?:Followup,text='') {
@@ -931,7 +983,7 @@ export default function App() {
     ] },
   ];
 
-  return <div className="desktop-shell"><DesktopTitleBar menus={desktopMenus} back={() => void navigate(-1)} forward={() => void navigate(1)} canBack={settingsOpen || navigation.index > 0} canForward={navigation.index < navigation.entries.length - 1} sidebar={sidebar} toggleSidebar={() => setSidebar(v => !v)} blocked={!!modal || sidebarDialog} report={report}/><div className="desktop-workarea"><ActivityRail settings={settingsOpen} blocked={!!modal || sidebarDialog} home={() => setSettingsOpen(false)} create={() => { setSettingsOpen(false); void newSession(); }} search={() => setModal('search')} projects={() => { setSettingsOpen(false); setSidebar(true); }} preferences={() => { setSettingsTab('general'); openSettings(); }}/><div ref={panels.root} className={`app ${settingsOpen ? 'settings-open' : ''} ${sidebar ? '' : 'sidebar-hidden'} ${showContext || sideDraft ? '' : 'context-hidden'} ${sideDraft?'has-side-chat':''}`}>
+  return <div className="desktop-shell"><DesktopTitleBar menus={desktopMenus} back={() => void navigate(-1)} forward={() => void navigate(1)} canBack={settingsOpen || navigation.index > 0} canForward={navigation.index < navigation.entries.length - 1} sidebar={sidebar} toggleSidebar={() => setSidebar(v => !v)} blocked={!!modal || sidebarDialog} report={report}/><div className="desktop-workarea"><ActivityRail settings={settingsOpen} blocked={!!modal || sidebarDialog} home={() => setSettingsOpen(false)} create={() => { setSettingsOpen(false); void newSession(); }} search={() => setModal('search')} projects={() => { setSettingsOpen(false); setSidebar(true); }} preferences={() => { setSettingsTab('general'); openSettings(); }}/><div ref={panels.root} className={`app ${settingsOpen ? 'settings-open' : ''} ${sidebar ? '' : 'sidebar-hidden'} ${showContext || sideDraft || showSubagents ? '' : 'context-hidden'} ${sideDraft?'has-side-chat':''} ${showSubagents?'has-subagent-panel':''}`}>
     <aside className={`sidebar ${sidebar ? "" : "pane-collapsed"}`} hidden={settingsOpen} aria-hidden={!sidebar} inert={!sidebar || !!modal || sidebarDialog}>
       {!settingsOpen ? <div {...panels.handle('left')}/> : null}
       <div className="brand"><span>SuperCode</span><button className="icon-button brand-search" aria-label="搜索会话" title="搜索会话 (Ctrl+K)" onClick={() => setModal('search')}><Search size={16}/></button></div>
@@ -943,12 +995,13 @@ export default function App() {
     <main className={`workspace${newChat ? ' new-chat-page' : ''}`} hidden={settingsOpen} inert={!!modal || sidebarDialog}>
       {desktop ? <AppUpdateNotice open={() => { setSettingsTab('about'); openSettings(); }}/> : null}
       <header className="workspace-header"><div className="breadcrumbs">{!sidebar ? <button className="icon-button" title="展开侧栏" onClick={() => setSidebar(true)}><PanelLeftOpen size={18} /></button> : null}<Folder size={15} /><strong title={`${project?.name ?? '工作区'} · ${session?.title ?? '新会话'}`}>{session?.title ?? project?.name ?? '新聊天'}</strong>{!desktop ? <span className="preview-badge">界面预览</span> : null}</div><div className="header-actions"><button className={`icon-button ${showBrowser ? 'on' : ''}`} aria-label="打开内置浏览器" aria-pressed={showBrowser} title={showBrowser ? '收起浏览器' : '内置浏览器'} disabled={!desktop || !sessionId} onClick={()=>{setBrowserSession(showBrowser ? null : sessionId);setBrowserExpanded(false);}}><Globe size={16}/></button>{session ? <button className="icon-button" title="会话设置" onClick={() => { setRename(session.title); setModal('rename'); }}><MoreHorizontal size={18} /></button> : null}<button className={`icon-button ${logsOpen ? 'on' : ''}`} title="运行日志" onClick={() => setLogsOpen(v => !v)}><Terminal size={16} /></button><button className="icon-button" aria-label={showContext ? '收起工作空间' : '打开工作空间'} aria-pressed={showContext} title={showContext ? '收起工作空间' : '打开工作空间'} onClick={() => { if(narrow)setContextOverlay(v => !v);else setContext(v => !v); }}>{showContext ? <PanelRightClose size={17} /> : <PanelRightOpen size={17} />}</button></div></header>
-      <div className="chat-scroll" aria-busy={!ready} ref={scrollArea} onClickCapture={e => { if ((e.target as Element).closest('.activity-row, .activity-group-summary, .activity-toggle-more, .turn-process-toggle')) stickToBottom.current = false; }} onScroll={() => { if (settingsOpenRef.current) return; const el = scrollArea.current; if (el) { stickToBottom.current = el.scrollHeight - el.scrollTop - el.clientHeight < 100; setShowJump(!stickToBottom.current); } }}>
-        {!ready ? <div className="startup-loading" role="status"><span className="pending-text">正在加载工作区…</span></div> : messages.length || busy || messagesLoading || currentRequests.length ? <div className="messages" aria-busy={messagesLoading}>{hasMore ? <button className="load-earlier" disabled={messagesLoading} onClick={() => void loadMessages(sessionId, messages.find(m => m.seq > 0)?.seq).catch(report)}>{messagesLoading ? '正在加载…' : '加载更早的消息'}</button> : null}{messagesLoading && !messages.length ? <div className="working-indicator"><span className="pending-text">正在加载会话…</span></div> : null}<Conversation messages={messages} agentName={agentName} autoExpand={autoExpand} showDiff={showDiff} openFile={showFile} openPath={openPath} projectId={projectId} sessionId={sessionId} sessionStatus={sending && !isActive(session?.status) ? 'starting' : session?.status} pendingLabel={sending && !isActive(session?.status) ? '正在发送…' : undefined} activeTurnId={session?.turnId} />{handoffTarget ? <div className="working-indicator" role="status"><span className="pending-text">{handoffTarget === '@compact' ? '正在压缩上下文…' : `正在切换到 ${handoffTarget}…`}</span></div> : null}{currentRequests.filter(request => request.method !== 'item/tool/requestUserInput').map(request => <Suspense key={String(request.id)} fallback={<div className="working-indicator">正在加载确认请求…</div>}><RequestCard request={request} respond={result => respondRequest(request, result)} openFile={showFile} /></Suspense>)}</div>
+      <div className="chat-viewport"><div className="chat-scroll" aria-busy={!ready} ref={scrollArea} onClickCapture={e => { if ((e.target as Element).closest('.activity-row, .activity-group-summary, .activity-toggle-more, .turn-process-toggle')) stickToBottom.current = false; }} onScroll={() => { if (settingsOpenRef.current) return; const el = scrollArea.current; if (el) { stickToBottom.current = el.scrollHeight - el.scrollTop - el.clientHeight < 100; setShowJump(!stickToBottom.current); } }}>
+        {!ready ? <div className="startup-loading" role="status"><span className="pending-text">正在加载工作区…</span></div> : messages.length || busy || messagesLoading || currentRequests.length ? <div className="messages" aria-busy={messagesLoading}>{hasMore ? <button className="load-earlier" disabled={messagesLoading} onClick={() => void loadMessages(sessionId, messages.find(m => m.seq > 0)?.seq).catch(report)}>{messagesLoading ? '正在加载…' : '加载更早的消息'}</button> : null}{messagesLoading && !messages.length ? <div className="working-indicator"><span className="pending-text">正在加载会话…</span></div> : null}<Conversation messages={messages} agentName={agentName} autoExpand={autoExpand} showDiff={showDiff} openFile={showFile} openPath={openPath} projectId={projectId} sessionId={sessionId} sessionStatus={sending && !isActive(session?.status) ? 'starting' : session?.status} pendingLabel={sending && !isActive(session?.status) ? '正在发送…' : undefined} activeTurnId={session?.turnId} openSubagent={openSubagent} onPlanAction={agentId==='codex' && !busy && !followups.rows.length ? respondPlan : undefined} />{handoffTarget ? <div className="working-indicator" role="status"><span className="pending-text">{handoffTarget === '@compact' ? '正在压缩上下文…' : `正在切换到 ${handoffTarget}…`}</span></div> : null}{currentRequests.filter(request => request.method !== 'item/tool/requestUserInput').map(request => <Suspense key={String(request.id)} fallback={<div className="working-indicator">正在加载确认请求…</div>}><RequestCard request={request} respond={result => respondRequest(request, result)} openFile={showFile} messages={messages} /></Suspense>)}</div>
           : <NewChat project={project} projects={projects} selectProject={selectProject} addProject={() => void addProject()}/>}
       </div>
       {showJump ? <JumpToLatest onClick={() => { stickToBottom.current = true; setShowJump(false); scrollToLatest(scrollArea.current, !prefs.animations || window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'instant' : 'smooth'); }} /> : null}
-      <div className={`composer-area${questionPending ? ' has-question' : ''}`}>{error ? <div className="error-banner" role="alert"><span>{error}</span><button className="icon-button" title="关闭提示" onClick={() => setError('')}><X size={15} /></button></div> : null}{activeElsewhere && !busy ? <button className="active-elsewhere" onClick={() => void selectSession(activeElsewhere)}><span className="pending-text">另一会话正在运行：{activeElsewhere.title}</span><ArrowUpRight size={13} /></button> : null}
+      </div>
+      <div className={`composer-area${questionPending ? ' has-question' : ''}`}>{error ? <div className="error-banner" role="alert"><span>{error}</span><button className="icon-button" title="关闭提示" onClick={() => setError('')}><X size={15} /></button></div> : null}
         {commandMessage ? <div className="command-feedback" role="status"><pre>{commandMessage}</pre><button className="icon-button" title="关闭命令结果" onClick={() => setCommandMessage('')}><X size={14} /></button></div> : null}
         {questionPending ? <Suspense fallback={<div className="working-indicator">正在加载提问…</div>}><QuestionDock requests={currentRequests} respond={respondRequest} /></Suspense> : null}
         {busy && session?.turnId && messages.some(message => message.kind === 'turnDiff') ? <Suspense fallback={null}><TurnChangesDock key={sessionId} messages={messages} activeTurnId={session.turnId} showDiff={showDiff}/></Suspense> : null}
@@ -967,25 +1020,26 @@ export default function App() {
           </div><div className="composer-right">
             <AgentMenu value={agentId} agents={agents} busy={configuring} choose={switchAgent}/>
             <ModelMenu value={model} models={modelSourceRevision === profileRevision ? models : []} catalogLoaded={modelCatalogRevision === profileRevision} catalogWarning={modelCatalogRevision === profileRevision ? modelCatalogWarning : ''} profiles={profiles} activeProfile={activeProfile} connectionId={connectionId} order={connectionOrder} source={currentModelSource} busy={busy || configuring} loading={loadingModels} agent={agentId} choose={chooseModel} reload={force => void loadModels(force)} manage={() => {setProviderSettingsAgent(agentId);setSettingsTab('providers');openSettings();}} effort={effort} setEffort={setEffort} hasConversation={!!session?.nativeId} />
-            <button className={`send-button${stopMode ? ' stop-button' : ''}`} type={stopMode ? 'button' : 'submit'} disabled={stopMode ? !session?.turnId || stopping : !hasDraft || sending || importingImages || followupEditor.busy} onClick={stopMode ? () => void stop() : undefined} aria-label={stopMode ? '停止生成' : followupEditor.editingId ? '发送修改' : busy ? '加入队列' : '发送消息'} title={stopMode ? '停止生成' : followupEditor.editingId ? '发送修改，保留原来的顺序' : busy ? '加入队列，当前任务完成后发送' : '发送消息'}>{stopMode ? <Square size={14} fill="currentColor" /> : <ArrowUp size={18} />}</button></div></div>
+            <button className={`send-button${stopMode ? ' stop-button' : ''}`} type={stopMode ? 'button' : 'submit'} disabled={stopMode ? !session?.turnId || stopping : !hasDraft || sending || importingImages || followupEditor.busy} onClick={stopMode ? () => void stop() : undefined} aria-label={stopMode ? '停止生成' : followupEditor.editingId ? '发送修改' : busy && hasDraft ? '加入队列' : '发送消息'} title={stopMode ? '停止生成' : followupEditor.editingId ? '发送修改，保留原来的顺序' : busy && hasDraft ? '加入队列，当前任务完成后发送' : '发送消息'}>{stopMode ? <Square size={14} fill="currentColor" /> : <ArrowUp size={18} />}</button></div></div>
         </form><div className="composer-footnote"><span /><div>{currentModelSource?.available === true ? <PlatformUsageIndicator key={`${agentId}:${connectionId}`} agent={agentId} connectionId={agentId === 'codex' && connectionId === '@local' ? '@official' : connectionId} revision={profileRevision} openStats={() => {setSettingsTab('quota');openSettings();}} /> : null}<UsageIndicator usage={usage} busy={busy || !session?.nativeId} compact={() => void handleCommand('/compact','')} openStats={() => {setSettingsTab('usage');openSettings();}} /><span>{prefs.enterSend ? 'Enter 发送' : 'Ctrl Enter 发送'} · Shift Enter 换行</span></div></div>
       </div>
       {logsOpen ? <section className="logs-panel"><div><span title="自动保存到文件，保留 30 天"><Terminal size={14} />运行日志 · 保留 30 天</span><button className="quiet-button" disabled={!desktop} onClick={() => void openRuntimeLogFolder().catch(report)}>打开文件夹</button><button className="quiet-button" disabled={!desktop || exportingLogs} onClick={() => void exportLogs()}>{exportingLogs ? '正在导出…' : '导出诊断日志'}</button><button className="quiet-button" title="仅清空当前显示，保留日志文件" onClick={() => setLogs([])}>清空显示</button><button className="icon-button" title="关闭日志" onClick={() => setLogsOpen(false)}><X size={15} /></button></div><pre>{logs.length ? logs.join('\n') : '日志已自动保存到文件。可打开文件夹查看，或导出最近 30 天的诊断日志。'}</pre></section> : null}
     </main>
-    {showBrowser ? <Suspense fallback={<aside className="browser-panel">正在打开浏览器…</aside>}><BrowserPanel key={sessionId} sessionId={sessionId} visible={!settingsOpen && !modal && !sidebarDialog && !selectionDetail && !(narrow && (showContext || sideDraft))} close={()=>{setBrowserSession(null);setBrowserExpanded(false);}} resizeHandle={<div {...browserDock.handle}/>} expanded={browserExpanded} expand={()=>setBrowserExpanded(v=>!v)}/></Suspense> : null}
+    {showBrowser ? <Suspense fallback={<aside className="browser-panel">正在打开浏览器…</aside>}><BrowserPanel key={sessionId} sessionId={sessionId} visible={!settingsOpen && !modal && !sidebarDialog && !selectionDetail && !(narrow && (showContext || sideDraft || showSubagents))} close={()=>{setBrowserSession(null);setBrowserExpanded(false);}} resizeHandle={<div {...browserDock.handle}/>} expanded={browserExpanded} expand={()=>setBrowserExpanded(v=>!v)}/></Suspense> : null}
     </div>
 
     <SelectionActions key={sessionId} area={scrollArea} add={text=>{setInput(old=>[old,text.split('\n').map(line=>`> ${line}`).join('\n')].filter(Boolean).join('\n\n'));requestAnimationFrame(()=>textarea.current?.focus());}} details={setSelectionDetail} ask={text=>void openSide(undefined,`关于下面这段内容：\n\n${text}\n\n请帮我进一步解释。`)}/>
     {sideDraft && !settingsOpen ? <Suspense fallback={<aside className="side-chat">正在打开侧边聊天…</aside>}><SideChat key={sideDraft.key} draft={sideDraft} projectId={sideDraft.projectId??projectId} agent={sideDraft.agent??agentId} connectionId={sideDraft.connectionId??connectionId} defaults={followupPayload('')} profiles={profiles} enterSend={prefs.enterSend} manageProviders={(agent,draft)=>{setSideDraft(draft);setProviderSettingsAgent(agent);setSettingsTab('providers');openSettings();}} close={()=>setSideDraft(null)} opened={()=>void refresh()} openFile={showFile} showDiff={showDiff} providerRequired={(agent,draft)=>{setSideDraft(draft);showProviderRequired(agent);}} resizeHandle={<div {...panels.handle('right')}/>}/></Suspense> : null}
+    {showSubagents && !settingsOpen ? <Suspense fallback={<aside className="subagent-panel"><span className="pending-text">正在打开子智能体...</span></aside>}><SubagentPanel agents={subagents} onStatus={updateSubagentStatus} selected={subagentSelection?.key??null} select={key=>setSubagentSelection({sessionId,key})} close={closeSubagents} sessionId={sessionId} projectId={projectId} openFile={showFile} showDiff={showDiff} openPath={openPath} expanded={subagentExpanded} expand={()=>setSubagentExpanded(value=>!value)} resizeHandle={<div {...panels.handle('right')}/>}/></Suspense> : null}
     {selectionDetail?<div className="modal-backdrop" onClick={()=>setSelectionDetail('')}><section className="modal" role="dialog" aria-modal="true" aria-label="选中内容" onClick={e=>e.stopPropagation()}><div className="modal-heading"><h2>选中内容</h2><button className="icon-button" aria-label="关闭选中内容" onClick={()=>setSelectionDetail('')}><X size={16}/></button></div><pre className="selection-detail">{selectionDetail}</pre><CopyButton text={selectionDetail} label="复制选中内容"/></section></div>:null}
-    <aside className={`context-panel workspace-panel ${showContext && !sideDraft ? '' : 'pane-collapsed'}`} aria-label={showContext && !sideDraft ? '工作空间' : undefined} aria-hidden={!showContext || !!sideDraft} hidden={settingsOpen || !!sideDraft} inert={!showContext || !!modal || sidebarDialog}>
+    <aside className={`context-panel workspace-panel ${showContext && !sideDraft && !showSubagents ? '' : 'pane-collapsed'}`} aria-label={showContext && !sideDraft && !showSubagents ? '工作空间' : undefined} aria-hidden={!showContext || !!sideDraft || showSubagents} hidden={settingsOpen || !!sideDraft || showSubagents} inert={!showContext || showSubagents || !!modal || sidebarDialog}>
       {!settingsOpen && showContext && !workspaceExpanded ? <div {...panels.handle('right')}/> : null}
-      {showContext || workspaceMounted ? <Suspense fallback={<div className="workspace-loading">正在打开工作空间…</div>}><WorkspacePanel active={showContext && !settingsOpen && !sideDraft} projectId={projectId} sessionId={sessionId} workspacePath={workspacePath} workspaceName={project?.name ?? session?.title} changes={changes} loading={changesLoading} preview={preview} expanded={workspaceExpanded} refresh={() => void refreshChanges(projectId)} close={() => narrow ? setContextOverlay(false) : setContext(false)} expand={() => setWorkspaceExpanded(value => !value)} closePreview={() => setPreview(null)} openFile={path => void showFile(path)} reviewFile={reviewFile} showDiff={showDiff} reveal={() => void openPath('.', 'reveal').catch(report)}/></Suspense> : null}
+      {showContext || workspaceMounted ? <Suspense fallback={<div className="workspace-loading">正在打开工作空间…</div>}><WorkspacePanel active={showContext && !settingsOpen && !sideDraft && !showSubagents} projectId={projectId} sessionId={sessionId} workspacePath={workspacePath} workspaceName={project?.name ?? session?.title} changes={changes} loading={changesLoading} preview={preview} expanded={workspaceExpanded} refresh={() => void refreshChanges(projectId)} close={() => narrow ? setContextOverlay(false) : setContext(false)} expand={() => setWorkspaceExpanded(value => !value)} closePreview={() => setPreview(null)} openFile={path => void showFile(path)} reviewFile={reviewFile} showDiff={showDiff} reveal={() => void openPath('.', 'reveal').catch(report)}/></Suspense> : null}
     </aside>
 
-    {settingsOpen ? <Suspense fallback={<div className="startup-loading" role="status">正在加载设置…</div>}><SettingsPage tab={settingsTab} select={setSettingsTab} blocked={!!modal || sidebarDialog}>
+    {settingsOpen ? <Suspense fallback={<main className="settings-loading" role="status"><span className="pending-text">正在加载设置…</span></main>}><SettingsPage tab={settingsTab} select={setSettingsTab} blocked={!!modal || sidebarDialog}>
       {modalError ? <div className="error-banner modal-error" role="alert"><span>{modalError}</span><button className="icon-button" aria-label="关闭错误提示" onClick={() => setModalError('')}><X size={14} /></button></div> : null}
-      {settingsTab === 'agents' ? <AgentSettings agents={agents} busy={anyBusy || configuring} loadMcp={loadMcp} setLoadMcp={setLoadMcp} saveMcp={saveCodex}/> : null}
+      {settingsTab === 'agents' ? <Suspense fallback={<p className="muted pending-text" role="status">正在加载 Agent…</p>}><AgentSettings agents={agents} busy={anyBusy || configuring} loadMcp={loadMcp} setLoadMcp={setLoadMcp} saveMcp={saveCodex}/></Suspense> : null}
       {settingsTab === 'providers' ? <Suspense fallback={<p className="muted">正在加载模型连接…</p>}><ProviderSettings profiles={profiles} officialAgents={officialAgents} order={connectionOrder} busy={anyBusy} updated={connectionUpdated} initialAgent={providerSettingsAgent} /></Suspense> : null}
       {settingsTab === 'general' ? <GeneralSettings prefs={prefs} setPrefs={setPrefs} busy={anyBusy} autoExpand={autoExpand} setAutoExpand={setAutoExpand} agents={agents} /> : null}
       {settingsTab === 'usage' ? <Suspense fallback={<p className="muted">加载中…</p>}><UsagePanel /></Suspense> : null}

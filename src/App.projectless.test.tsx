@@ -64,6 +64,20 @@ async function send() {
   await act(async()=>{container.querySelector<HTMLFormElement>('.composer')!.dispatchEvent(new Event('submit',{bubbles:true,cancelable:true}));await new Promise(resolve=>setTimeout(resolve,30));});
 }
 
+it.each(['execute','revise'] as const)('submits a reviewed native plan as %s with the right mode while preserving the composer draft',async decision=>{
+  localStorage.setItem('supercode.session','planned');
+  localStorage.setItem('supercode.permissions.v2',JSON.stringify({codex:'read'}));
+  data.profiles=[{...data.profiles[0],id:'api:codex',agent:'codex'}];
+  data.sessions=[{id:'planned',projectId:'existing',title:'原生计划',agent:'codex',connectionId:'api:codex',model:'test-model',status:'idle',nativeId:'native',turnId:null,updatedAt:1}];
+  messages=[{id:'u',seq:1,sessionId:'planned',role:'user',text:'先规划',kind:'userMessage',data:{}},{id:'p',seq:2,sessionId:'planned',role:'assistant',text:'# 完整计划\n\n先校验再合并，包含边界验收。',kind:'plan',data:{status:'completed',turnId:'t'}},{id:'r',seq:3,sessionId:'planned',role:'activity',text:'',kind:'runMarker',data:{status:'completed',turnId:'t'}}];
+  await act(async()=>{await import('./ProposedPlan');});
+  await render();await type('尚未发送的自己的草稿');
+  expect(call).not.toHaveBeenCalledWith('enqueue_followup',expect.anything());
+  await act(async()=>{container.querySelector<HTMLButtonElement>(decision==='execute'?'.plan-request-execute':'.plan-request-revise')!.click();await new Promise(resolve=>setTimeout(resolve,30));});
+  expect(call).toHaveBeenCalledWith('enqueue_followup',{sessionId:'planned',payload:expect.objectContaining({text:decision==='execute'?'请按上一条已确认的计划开始执行。':'请继续修改上一条计划，保持计划模式，暂不执行。',permissionMode:decision==='execute'?'ask':'read',readOnly:decision==='revise',attachments:[]})});
+  expect(container.querySelector<HTMLTextAreaElement>('.composer textarea')!.value).toBe('尚未发送的自己的草稿');
+});
+
 function queuedMessages() {
   localStorage.setItem('supercode.session','running');
   data.sessions=[{id:'running',projectId:'existing',title:'正在工作',agent:'claude',connectionId:'api:claude',model:'test-model',status:'running',nativeId:'native',turnId:'turn',updatedAt:1}];
@@ -81,6 +95,57 @@ async function editFirstQueuedMessage(){
   await act(async()=>container.querySelector<HTMLButtonElement>('[data-followup-id="first"] [aria-label="排队消息更多操作"]')!.click());
   await act(async()=>{[...document.querySelectorAll<HTMLButtonElement>('.followup-menu button')].find(button=>button.textContent==='编辑消息')!.click();await new Promise(resolve=>setTimeout(resolve,30));});
 }
+it('keeps child startup and completion separate from the primary thread even with a shared process owner',async()=>{
+  queuedMessages(); data.sessions[0].agent='codex';
+  messages=[{id:'user',seq:1,sessionId:'running',role:'user',text:'检查两个子代理',kind:'userMessage',data:{}}];
+  await render();
+  await act(async()=>notify({method:'thread/started',params:{appSessionId:'running',thread:{id:'child-a',source:{subAgent:{threadSpawn:{parentThreadId:'native'}}}}}}));
+  await act(async()=>notify({method:'turn/started',params:{appSessionId:'running',threadId:'child-a',turn:{id:'child-turn'}}}));
+  await act(async()=>{
+    notify({method:'item/completed',params:{appSessionId:'running',threadId:'child-a',item:{id:'child-answer',type:'agentMessage',text:'子代理内容不能串进主对话'}}});
+    notify({method:'item/completed',params:{appSessionId:'running',threadId:'native',item:{id:'parent-answer',type:'agentMessage',text:'主代理继续等待结果'}}});
+    await new Promise(resolve=>setTimeout(resolve,70));
+  });
+  expect(container.textContent).toContain('主代理继续等待结果');
+  expect(container.textContent).not.toContain('子代理内容不能串进主对话');
+  expect(container.querySelector('.composer [aria-label="停止生成"]')).not.toBeNull();
+  await act(async()=>notify({method:'turn/completed',params:{appSessionId:'running',threadId:'child-a',turn:{id:'child-turn',status:'completed'}}}));
+  expect(container.querySelector('.composer [aria-label="停止生成"]')).not.toBeNull();
+});
+it('ignores an initial empty goal notification and clears command feedback when switching conversations',async()=>{
+  queuedMessages(); data.sessions[0].agent='codex'; await render();
+  await act(async()=>notify({method:'thread/goal/cleared',params:{threadId:'native',goal:null}}));
+  expect(container.querySelector('.command-feedback')).toBeNull();
+  await act(async()=>notify({method:'thread/goal/updated',params:{threadId:'native',goal:{objective:'完成测试目标',status:'active',tokensUsed:15}}}));
+  expect(container.querySelector('.command-feedback')?.textContent).toContain('完成测试目标');
+  await act(async()=>notify({method:'thread/goal/cleared',params:{threadId:'native',goal:null}}));
+  expect(container.querySelector('.command-feedback')?.textContent).toContain('目标已清除');
+  await act(async()=>container.querySelector<HTMLButtonElement>('[title="新建聊天 (Ctrl+N)"]')!.click());
+  expect(container.querySelector('.command-feedback')).toBeNull();
+});
+it('opens child details without starting a chat and preserves the main composer and workspace when closed',async()=>{
+  queuedMessages();
+  localStorage.setItem('supercode.context','true');
+  messages=[{id:'task',seq:1,sessionId:'running',role:'tool',text:'只读检查完成',kind:'claudeToolCall',data:{tool:'Task',status:'completed',arguments:{description:'demo'}}}];
+  await act(async()=>{await import('./SubagentPanel');});
+  await render();await type('尚未发送的主会话草稿');
+  await act(async()=>container.querySelector<HTMLButtonElement>('.subagent-row')!.click());
+  expect(container.querySelector('.subagent-panel')?.textContent).toContain('Agent demo');
+  expect(container.querySelector('.subagent-panel')?.textContent).toContain('只读检查完成');
+  expect(container.querySelector<HTMLElement>('.workspace-panel')?.hidden).toBe(true);
+  expect(container.querySelector('.conversation-surface [aria-label="任务运行状态"]')).not.toBeNull();
+  expect(container.querySelector<HTMLTextAreaElement>('.composer textarea')?.value).toBe('尚未发送的主会话草稿');
+  expect(call).not.toHaveBeenCalledWith('create_session',expect.anything());
+  expect(call).not.toHaveBeenCalledWith('send_chat_message',expect.anything());
+  const opener=container.querySelector<HTMLButtonElement>('.subagent-row')!;
+  const focus=vi.spyOn(opener,'focus');
+  await act(async()=>container.querySelector<HTMLButtonElement>('[aria-label="关闭子智能体"]')!.click());
+  await act(async()=>{await new Promise(resolve=>requestAnimationFrame(resolve));});
+  expect(focus).toHaveBeenCalledWith({preventScroll:true});
+  expect(container.querySelector('.subagent-panel')).toBeNull();
+  expect(container.querySelector<HTMLElement>('.workspace-panel')?.hidden).toBe(false);
+  expect(container.querySelector<HTMLTextAreaElement>('.composer textarea')?.value).toBe('尚未发送的主会话草稿');
+});
 it('edits a queued message in the main composer, saves in place, and restores its unsent draft',async()=>{
   const rows=queuedMessages();await render();await type('原来没发的草稿');await editFirstQueuedMessage();
   const input=container.querySelector<HTMLTextAreaElement>('.composer textarea')!;
@@ -437,7 +502,7 @@ it('hides the live changes dock and collapses the process as soon as completion 
   const diff='diff --git a/live.ts b/live.ts\n@@ -0,0 +1 @@\n+new';
   messages=mergeEvent([{id:'u',seq:1,sessionId:'chat',role:'user',kind:'userMessage',text:'编辑文件',data:{}}], {method:'turn/started',params:{turn:{id:'t'}}}, 'chat');
   messages.push(
-    {id:'progress',seq:3,sessionId:'chat',role:'assistant',kind:'agentMessage',text:'先检查文件',data:{turnId:'t',status:'completed'}},
+    {id:'progress',seq:3,sessionId:'chat',role:'assistant',kind:'agentMessage',text:'先检查文件',data:{turnId:'t',status:'completed',phase:'commentary'}},
     {id:'final',seq:4,sessionId:'chat',role:'assistant',kind:'agentMessage',text:'修改完成',data:{turnId:'t',status:'completed'}},
     {id:'diff-t',seq:5,sessionId:'chat',role:'activity',kind:'turnDiff',text:diff,data:{turnId:'t',status:'completed'}});
   messages=messages.map((message,index)=>({...message,seq:index + 1}));
@@ -456,7 +521,7 @@ it('hides the live changes dock and collapses the process as soon as completion 
   expect(container.querySelector('.composer-area .turn-change-dock')).toBeNull();
 });
 
-it('folds a restored long legacy conversation before any completion event and keeps pagination working', async () => {
+it('folds restored legacy tools while preserving every unphased answer section through pagination', async () => {
   localStorage.setItem('supercode.session', 'chat');
   data.sessions = [{id:'chat',projectId:'existing',title:'旧历史记录',agent:'claude',connectionId:'api:claude',model:null,status:'idle',nativeId:'native',turnId:null,updatedAt:1}];
   const marker: Message = {id:'run-old',seq:2,sessionId:'chat',role:'activity',kind:'runMarker',text:'',data:{turnId:'old',status:'inProgress'}};
@@ -471,16 +536,19 @@ it('folds a restored long legacy conversation before any completion event and ke
   });
   await render();
   expect(container.querySelector('.turn-process-toggle')?.getAttribute('aria-expanded')).toBe('false');
-  expect(container.textContent).not.toContain('旧执行过程');
+  expect(container.querySelector('.turn-process-content')).toBeNull();
+  expect(container.querySelector('.turn-final-result')?.textContent).toContain('旧执行过程 26');
+  expect(container.querySelector('.turn-final-result')?.textContent).not.toContain('旧执行过程 27');
   expect(container.querySelector('.turn-final-result')?.textContent).toContain('插件开发完成');
-  const final = container.querySelector('.turn-final-result .message');
+  const final = container.querySelector('.turn-final-result .message:last-child');
   await act(async () => container.querySelector<HTMLButtonElement>('.turn-process-toggle')!.click());
-  expect(container.querySelector('.turn-process-content')?.textContent).toContain('旧执行过程 26');
+  expect(container.querySelector('.turn-process-content .activity-group-summary')?.getAttribute('aria-label')).toBe('运行了命令，50 条记录');
   await act(async () => { container.querySelector<HTMLButtonElement>('.load-earlier')!.click(); await vi.dynamicImportSettled(); });
   expect(vi.mocked(call).mock.calls.some(([command,args]) => command === 'list_messages' && args?.before === 28)).toBe(true);
   expect(container.querySelector('.load-earlier')).toBeNull();
-  expect(container.querySelector('.turn-process-content')?.textContent).toContain('旧执行过程 0');
-  expect(container.querySelector('.turn-final-result .message')).toBe(final);
+  expect(container.querySelector('.turn-process-content .activity-group-summary')?.getAttribute('aria-label')).toBe('运行了命令，62 条记录');
+  expect(container.querySelector('.turn-final-result')?.textContent).toContain('旧执行过程 0');
+  expect(container.querySelector('.turn-final-result .message:last-child')).toBe(final);
   expect(container.querySelectorAll('[aria-label="你的消息"]')).toHaveLength(1);
 });
 
@@ -651,7 +719,7 @@ it('switches one composer button between stopping an empty running chat and queu
   expect(call).not.toHaveBeenCalledWith('send_chat_message',expect.anything());
 });
 
-it('keeps an empty idle chat in send mode when another chat is running, and disables stop until a turn exists', async () => {
+it('keeps empty idle and starting chats in disabled send mode until a turn exists', async () => {
   localStorage.setItem('supercode.session','idle');
   data.sessions = [
     {id:'idle',projectId:'existing',title:'空闲聊天',agent:'claude',connectionId:'api:claude',model:'test-model',status:'idle',nativeId:null,turnId:null,updatedAt:2},
@@ -660,12 +728,46 @@ it('keeps an empty idle chat in send mode when another chat is running, and disa
   await render();
   expect(container.querySelector('.composer .stop-button')).toBeNull();
   expect(container.querySelector<HTMLButtonElement>('.composer .send-button')?.disabled).toBe(true);
+  expect(container.querySelector('.active-elsewhere')).toBeNull();
+  expect(container.textContent).not.toContain('另一会话正在运行');
   await act(async () => { container.querySelector<HTMLButtonElement>('.session-row[title="正在启动"]')!.click(); await new Promise(resolve=>setTimeout(resolve,30)); });
-  const stop = container.querySelector<HTMLButtonElement>('.composer .send-button')!;
-  expect(stop.getAttribute('aria-label')).toBe('停止生成');
-  expect(stop.disabled).toBe(true);
-  await act(async () => stop.click());
+  const action = container.querySelector<HTMLButtonElement>('.composer .send-button')!;
+  expect(container.querySelector('.composer .stop-button')).toBeNull();
+  expect(action.type).toBe('submit');
+  expect(action.getAttribute('aria-label')).toBe('发送消息');
+  expect(action.disabled).toBe(true);
+  await act(async () => action.click());
   expect(call).not.toHaveBeenCalledWith('interrupt_turn',expect.anything());
+});
+
+it.each(['codex','claude','opencode','pi'])('does not show a stop icon for an empty %s chat without an active turn',async agent=>{
+  localStorage.setItem('supercode.session','starting');
+  data.sessions=[{id:'starting',projectId:'existing',title:'正在启动',agent,connectionId:'@local',model:'test-model',status:'starting',nativeId:null,turnId:null,updatedAt:1}];
+  await render();
+  const action=container.querySelector<HTMLButtonElement>('.composer .send-button')!;
+  expect(action.classList.contains('stop-button')).toBe(false);
+  expect(action.querySelector('.lucide-square')).toBeNull();
+  expect(action.querySelector('.lucide-arrow-up')).not.toBeNull();
+  expect(action.disabled).toBe(true);
+});
+
+it('keeps the disabled send arrow while a cleared draft is being submitted and switches to stop only when its turn starts',async()=>{
+  localStorage.setItem('supercode.session','idle');
+  data.sessions=[{id:'idle',projectId:'existing',title:'空闲聊天',agent:'claude',connectionId:'api:claude',model:'test-model',status:'idle',nativeId:'native',turnId:null,updatedAt:1}];
+  let finish!:(session:Session)=>void;
+  const base=vi.mocked(call).getMockImplementation()!;
+  vi.mocked(call).mockImplementation(async(command,args={})=>command==='send_chat_message'?new Promise<Session>(resolve=>{finish=resolve;}):base(command,args));
+  await render();await type('开始检查');await send();
+  const action=container.querySelector<HTMLButtonElement>('.composer .send-button')!;
+  expect(container.querySelector<HTMLTextAreaElement>('.composer textarea')?.value).toBe('');
+  expect(action.classList.contains('stop-button')).toBe(false);
+  expect(action.querySelector('.lucide-arrow-up')).not.toBeNull();
+  expect(action.disabled).toBe(true);
+  await act(async()=>{data.sessions[0]={...data.sessions[0],status:'starting'};finish(data.sessions[0]);await new Promise(resolve=>setTimeout(resolve,30));});
+  expect(action.classList.contains('stop-button')).toBe(false);
+  await act(async()=>{data.sessions[0]={...data.sessions[0],status:'running',turnId:'turn'};notify({method:'turn/started',params:{threadId:'native',turn:{id:'turn'}}});await new Promise(resolve=>setTimeout(resolve,30));});
+  expect(action.classList.contains('stop-button')).toBe(true);
+  expect(action.disabled).toBe(false);
 });
 
 it('keeps local help usable without a supplier and permits retrying the draft after configuration', async () => {

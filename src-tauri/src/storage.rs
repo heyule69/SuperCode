@@ -720,6 +720,14 @@ impl Store {
         Ok(())
     }
 
+    pub fn has_subagent(&self, session: &str, child: &str) -> Result<bool> {
+        let conn = self.0.lock().map_err(|e| e.to_string())?;
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM messages WHERE session_id=?1 AND kind IN ('collabAgentToolCall','collabToolCall') AND json_valid(data) AND (EXISTS(SELECT 1 FROM json_each(data,'$.receiverThreadIds') WHERE value=?2) OR EXISTS(SELECT 1 FROM json_each(data,'$.agentsStates') WHERE key=?2)))",
+            params![session, child], |row| row.get(0),
+        ).map_err(|e| e.to_string())
+    }
+
     pub fn messages(&self, id: &str, before: Option<i64>) -> Result<Vec<Message>> {
         let conn = self.0.lock().map_err(|e| e.to_string())?;
         let mut stmt=conn.prepare("SELECT seq,id,session_id,role,text,kind,data FROM messages WHERE session_id=?1 AND seq<?2 ORDER BY seq DESC LIMIT 100").map_err(|e|e.to_string())?;
@@ -964,6 +972,21 @@ impl Store {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn subagent_lookup_is_scoped_to_declared_children_of_one_parent() {
+        let store = Store::from_connection(Connection::open_in_memory().unwrap()).unwrap();
+        let project = store.add_project(Path::new("D:/子代理测试")).unwrap();
+        let parent = store.create_session(&project.id, None).unwrap();
+        let other = store.create_session(&project.id, None).unwrap();
+        let child = "child\".'";
+        store.save_message("spawn", &parent.id, "tool", "", "collabAgentToolCall", &serde_json::json!({"receiverThreadIds":[child]})).unwrap();
+        assert!(store.has_subagent(&parent.id, child).unwrap());
+        assert!(!store.has_subagent(&other.id, child).unwrap());
+        assert!(!store.has_subagent(&parent.id, "undeclared").unwrap());
+        store.save_message("wait", &parent.id, "tool", "", "collabToolCall", &serde_json::json!({"agentsStates":{"second":{"status":"completed"}}})).unwrap();
+        assert!(store.has_subagent(&parent.id, "second").unwrap());
+    }
+
     #[test]
     fn projectless_chats_have_durable_independent_workspaces_for_all_agents() {
         let root =
