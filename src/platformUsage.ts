@@ -8,7 +8,7 @@ export interface PlatformUsage {
   windows: AllowanceWindow[]; balances: { label: string; amount: number; currency: string }[]; queriedAt: number;
 }
 export interface QuotaConnection { connectionId: string; agent: string; connectionName: string; source: ModelSource }
-type CachedUsage = { revision: string; at: number; value: PlatformUsage | null };
+type CachedUsage = { revision: string; at: number; value: PlatformUsage | null; known?: PlatformUsage; knownAt?: number };
 type UsageRequest = { revision: string; force: boolean; promise: Promise<PlatformUsage | null> };
 export class UsageQueries {
   private cache = new Map<string, CachedUsage>();
@@ -21,6 +21,10 @@ export class UsageQueries {
     if (this.now() - saved.at >= 300_000) { this.cache.delete(key); return undefined; }
     this.cache.delete(key); this.cache.set(key, saved);
     return saved.value;
+  }
+  lastKnown(agent: string, connectionId: string, revision = '') {
+    const saved = this.cache.get(JSON.stringify([agent, connectionId]));
+    return saved?.revision === revision && saved.known && this.now() - (saved.knownAt ?? 0) < 300_000 ? saved.known : undefined;
   }
   query(agent: string, connectionId: string, force = false, revision = ''): Promise<PlatformUsage | null> {
     const key = JSON.stringify([agent, connectionId]);
@@ -38,7 +42,9 @@ export class UsageQueries {
     }
     const request: Promise<PlatformUsage | null> = Promise.resolve().then(() => this.read(agent, connectionId, force)).catch(() => null).then(value => {
       if (this.pending.get(key)?.promise === request) {
-        this.cache.delete(key); this.cache.set(key, { revision, at: this.now(), value });
+        const previous = this.cache.get(key), at = this.now();
+        const known = value ?? (previous?.revision === revision ? this.lastKnown(agent, connectionId, revision) : undefined);
+        this.cache.delete(key); this.cache.set(key, { revision, at, value, known, knownAt: value ? at : known ? previous?.knownAt : undefined });
         if (this.cache.size > 64) this.cache.delete(this.cache.keys().next().value!);
       }
       return value;
@@ -72,6 +78,9 @@ export function allowanceSummary(value: PlatformUsage) {
   const balance = value.balances[0];
   return balance ? `${balance.label} ${balance.currency === 'CNY' ? '¥' : balance.currency === 'USD' ? '$' : ''}${balance.amount.toFixed(2)}` : '';
 }
+export function supportsPlatformUsage(agent: string, source?: ModelSource) {
+  return !!source && (['glm', 'kimi', 'minimax', 'deepseek', 'openrouter'].includes(source.providerId) || source.modelFamily === 'kimi' || agent === 'codex' && source.providerId === 'openai');
+}
 export function resetLabel(resetAt?: string | null) {
   if (!resetAt) return '';
   const date = /^\d+$/.test(resetAt) ? new Date(Number(resetAt) * 1000) : new Date(resetAt);
@@ -80,22 +89,24 @@ export function resetLabel(resetAt?: string | null) {
 export function usePlatformUsage(agent: string, connectionId: string, revision: string) {
   const key = JSON.stringify([agent, connectionId, revision]);
   const serial = useRef(0);
-  const [state, setState] = useState<{ key: string; value: PlatformUsage | null; loading: boolean }>(() => ({ key, value: queries.peek(agent, connectionId, revision) ?? null, loading: desktop }));
+  const initial = () => { const cached = queries.peek(agent, connectionId, revision); const value = cached ?? queries.lastKnown(agent, connectionId, revision) ?? null; return { key, value, loading: desktop, stale: !cached && !!value }; };
+  const [state, setState] = useState(initial);
   const refresh = useCallback(async (force = false) => {
     if (!desktop) return;
     const request = ++serial.current;
-    setState(old => ({ key, value: old.key === key ? old.value : queries.peek(agent, connectionId, revision) ?? null, loading: true }));
+    setState(old => ({ key, value: old.key === key ? old.value : queries.peek(agent, connectionId, revision) ?? queries.lastKnown(agent, connectionId, revision) ?? null, loading: true, stale: old.key === key && old.stale }));
     const value = await queryPlatformUsage(agent, connectionId, force, revision);
-    if (serial.current === request) setState({ key, value, loading: false });
+    if (serial.current === request) setState(old => ({ key, value: value ?? (old.key === key ? old.value : queries.lastKnown(agent, connectionId, revision) ?? null), loading: false, stale: value === null }));
   }, [agent, connectionId, key, revision]);
   useEffect(() => {
     if (!desktop) return;
     const cached = queries.peek(agent, connectionId, revision);
-    setState({ key, value: cached ?? null, loading: true });
+    const known = queries.lastKnown(agent, connectionId, revision);
+    setState({ key, value: cached ?? known ?? null, loading: true, stale: !cached && !!known });
     // Rapid selection changes should not start a request for each intermediate connection.
     const first = window.setTimeout(() => void refresh(), cached === undefined ? 120 : 0);
     const timer = window.setInterval(() => { if (document.visibilityState === 'visible') void refresh(); }, 120_000);
     return () => { ++serial.current; window.clearTimeout(first); window.clearInterval(timer); };
   }, [agent, connectionId, key, revision, refresh]);
-  return { value: state.key === key ? state.value : queries.peek(agent, connectionId, revision) ?? null, loading: state.key === key ? state.loading : desktop, refresh };
+  return { value: state.key === key ? state.value : queries.peek(agent, connectionId, revision) ?? queries.lastKnown(agent, connectionId, revision) ?? null, loading: state.key === key ? state.loading : desktop, stale: state.key === key ? state.stale : false, refresh };
 }

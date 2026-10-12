@@ -35,6 +35,7 @@ mod desktop_lifecycle;
 mod desktop_smoke;
 mod extensions;
 mod followup_smoke;
+mod file_changes;
 mod handoff;
 mod image_attachments;
 mod installation_exit;
@@ -43,6 +44,7 @@ mod links;
 mod log_files;
 mod log_redaction;
 mod media;
+mod model_context;
 mod native_agents;
 mod notifications;
 mod official_accounts;
@@ -77,8 +79,7 @@ pub struct AppState {
     pub claude: claude::Runtime,
     pub native: native_agents::Runtime,
     pub activity: session_runtimes::Sessions<std::sync::Mutex<protocol::ActivityBuffer>>,
-    pub change_snapshots:
-        std::sync::Mutex<std::collections::HashMap<(String, String), (String, Option<String>)>>,
+    pub change_snapshots: std::sync::Mutex<file_changes::Tracker>,
 }
 
 pub fn run() {
@@ -138,7 +139,7 @@ pub fn run() {
                 | "--agent-updates-test"
                 | "--provider-accounts-test"
         )
-    });
+    }) || cfg!(debug_assertions) && args.iter().any(|arg|arg=="--activity-details-test");
     let smoke_dir = (smoke_test
         || agents_test
         || desktop_test
@@ -220,6 +221,8 @@ pub fn run() {
             if !webview.label().starts_with("browser-")
                 && matches!(payload.event(), tauri::webview::PageLoadEvent::Finished)
             {
+                runtime_diagnostics::record(webview.app_handle(), None, "ui_page_loaded",
+                    serde_json::json!({"window":webview.label()}));
                 ui_recovery::attach(webview);
             }
         })
@@ -251,7 +254,7 @@ pub fn run() {
                 claude: claude::Runtime::default(),
                 native: native_agents::Runtime::default(),
                 activity: session_runtimes::Sessions::default(),
-                change_snapshots: std::sync::Mutex::new(std::collections::HashMap::new()),
+                change_snapshots: std::sync::Mutex::new(file_changes::Tracker::default()),
             });
             runtime_diagnostics::record(app.handle(), None, "app_started", serde_json::json!({}));
             if let Err(error) = desktop_control::install(app.handle()) {

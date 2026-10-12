@@ -4,6 +4,7 @@ import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import RequestCard from './RequestCard';
 import type { RpcEvent } from './types';
+import { PlanDisplayContext } from './PlanDisplayContext';
 
 vi.mock('./api', () => ({ desktop: false, call: vi.fn() }));
 const plan = '# ImageHive 实施计划\n\n## 实现步骤\n\n1. 创建 Dashboard\n2. 支持图片批量下载\n\n| 内容 | 状态 |\n| --- | --- |\n| 图片 | 首期 |\n\n```ts\nconst preview = true;\n```\n\n## 验收\n\n确认图片可下载。\n\n[说明文档](./docs/plan.md)';
@@ -101,4 +102,33 @@ it('does not treat an ordinary operation containing a plan field as plan confirm
   expect(node.querySelector('.plan-request')).toBeNull();
   expect(node.querySelector('.request-card')).not.toBeNull();
   expect(respond).not.toHaveBeenCalled();
+});
+
+it('places confirmation in the composer dock and opens the complete plan without approving it', async () => {
+  const dock = document.createElement('div'); document.body.append(dock);
+  const openPlan = vi.fn();
+  await act(async () => {
+    root.render(<PlanDisplayContext.Provider value={{ decisionContainer: dock, openPlan }}><RequestCard request={request()} respond={respond} openFile={openFile}/></PlanDisplayContext.Provider>);
+    await vi.dynamicImportSettled();
+  });
+  expect(node.querySelector('.plan-request-footer')).toBeNull();
+  expect(dock.querySelector('.plan-decision-heading')?.textContent).toContain('实施此计划？');
+  await click('[aria-label="在侧边栏查看完整计划"]');
+  expect(openPlan).toHaveBeenCalledExactlyOnceWith('ImageHive 实施计划', plan, openFile);
+  expect(respond).not.toHaveBeenCalled();
+  await act(async () => root.render(null)); dock.remove();
+});
+
+it('submits typed revisions on Enter and ignores composition, repeats, Shift+Enter and empty feedback', async () => {
+  await render();
+  const input = node.querySelector<HTMLTextAreaElement>('[aria-label="计划修改意见"]')!;
+  await act(async () => input.dispatchEvent(new KeyboardEvent('keydown', {key:'Enter',bubbles:true})));
+  expect(respond).not.toHaveBeenCalled();
+  await feedback('  包含边界用例\n先做第一阶段  ');
+  for (const flags of [{isComposing:true},{repeat:true},{shiftKey:true}]) {
+    await act(async () => input.dispatchEvent(new KeyboardEvent('keydown', {key:'Enter',bubbles:true,...flags})));
+    expect(respond).not.toHaveBeenCalled();
+  }
+  await act(async () => input.dispatchEvent(new KeyboardEvent('keydown', {key:'Enter',bubbles:true})));
+  expect(respond).toHaveBeenCalledExactlyOnceWith({decision:'decline',feedback:'包含边界用例\n先做第一阶段'});
 });

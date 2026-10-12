@@ -1,5 +1,5 @@
 import { lazy, Suspense, useEffect, useRef, useState } from 'react';
-import { Check, ChevronDown, ChevronRight, Folder, FolderOpen, GitBranch, LayoutGrid, ListFilter, LoaderCircle, Maximize2, Minimize2, PanelRightClose, RefreshCw, Search, SquarePlus, X } from 'lucide-react';
+import { Check, ChevronDown, ChevronRight, Folder, FolderOpen, GitBranch, LayoutGrid, Lightbulb, ListFilter, LoaderCircle, Maximize2, Minimize2, PanelRightClose, RefreshCw, Search, SquarePlus, X } from 'lucide-react';
 import { call, desktop } from './api';
 import type { Changes, WorkspaceDirectory, WorkspaceEntry } from './types';
 import { CopyButton } from './CopyButton';
@@ -10,6 +10,7 @@ import './workspace-panel.css';
 
 const DiffView = lazy(() => import('./DiffView'));
 const SourceView = lazy(() => import('./SourceView'));
+const PlanDocument = lazy(() => import('./PlanDocument').then(module => ({ default: module.PlanDocument })));
 const ChangeReview = lazy(() => import('./ChangeReview'));
 const views = [
   { id: 'overview', label: '概览', icon: LayoutGrid },
@@ -17,13 +18,14 @@ const views = [
   { id: 'changes', label: '变更', icon: SquarePlus },
 ] as const;
 type View = typeof views[number]['id'];
-export interface FilePreview { name: string; text: string; diff?: boolean; line?: number }
+export interface FilePreview { name: string; text: string; diff?: boolean; plan?: boolean; line?: number; loading?: boolean; error?: string; openFile?: (path: string, line?: number) => void }
 interface Props {
   active: boolean; projectId: string; sessionId: string; workspacePath?: string; workspaceName?: string;
   changes: Changes; loading: boolean; preview: FilePreview | null; expanded: boolean;
   refresh: () => void; close: () => void; expand: () => void; closePreview: () => void;
   openFile: (path: string) => void; reviewFile: (path: string) => void; showDiff: (name: string, diff: string) => void;
   reveal: () => void;
+  embedded?: boolean;
 }
 function Empty({ title, children }: { title: string; children?: React.ReactNode }) {
   return <div className="workspace-empty"><FolderOpen size={27}/><strong>{title}</strong>{children ? <p>{children}</p> : null}</div>;
@@ -54,15 +56,15 @@ export default function WorkspacePanel(props: Props) {
   const refresh = () => { setRevision(value => value + 1); props.refresh(); };
   return <>
     <div className="workspace-panel-toolbar">
-      <span className="workspace-panel-caption">工作空间</span>
+      <span className="workspace-panel-caption">{preview?.plan ? '计划' : '工作空间'}</span>
       <div>
-        <button className="icon-button" title="在资源管理器中打开" aria-label="定位工作空间" disabled={!desktop || !workspacePath} onClick={props.reveal}><FolderOpen size={16}/></button>
-        <button className="icon-button" title="刷新工作空间" aria-label="刷新工作空间" disabled={!workspacePath || loading} onClick={refresh}><RefreshCw size={16} className={loading ? 'spin' : ''}/></button>
-        <button className="icon-button" title={props.expanded ? '还原工作空间宽度' : '展开工作空间'} aria-label={props.expanded ? '还原工作空间宽度' : '展开工作空间'} aria-pressed={props.expanded} onClick={props.expand}>{props.expanded ? <Minimize2 size={16}/> : <Maximize2 size={16}/>}</button>
-        <button className="icon-button" title="收起工作空间" aria-label="收起工作空间" onClick={props.close}><PanelRightClose size={17}/></button>
+        {!preview?.plan ? <><button className="icon-button" title="在资源管理器中打开" aria-label="定位工作空间" disabled={!desktop || !workspacePath} onClick={props.reveal}><FolderOpen size={16}/></button>
+        <button className="icon-button" title="刷新工作空间" aria-label="刷新工作空间" disabled={!workspacePath || loading} onClick={refresh}><RefreshCw size={16} className={loading ? 'spin' : ''}/></button></> : null}
+        {!props.embedded ? <><button className="icon-button" title={props.expanded ? '还原工作空间宽度' : '展开工作空间'} aria-label={props.expanded ? '还原工作空间宽度' : '展开工作空间'} aria-pressed={props.expanded} onClick={props.expand}>{props.expanded ? <Minimize2 size={16}/> : <Maximize2 size={16}/>}</button>
+        <button className="icon-button" title="收起工作空间" aria-label="收起工作空间" onClick={props.close}><PanelRightClose size={17}/></button></> : null}
       </div>
     </div>
-    <div className="workspace-view-bar">
+    {!preview?.plan ? <div className="workspace-view-bar">
       <div className="workspace-view-anchor" ref={layer.root} onKeyDown={layer.navigate}>
         <button className="workspace-view-trigger" aria-label="切换工作空间视图" aria-haspopup="menu" aria-expanded={menu} onClick={() => setMenu(value => !value)} onKeyDown={event => { if (event.key === 'ArrowDown') { event.preventDefault(); setMenu(true); } }}>
           <current.icon size={16}/><span>{current.label}</span><ChevronDown size={13} className={menu ? 'turned' : ''}/>
@@ -71,10 +73,10 @@ export default function WorkspacePanel(props: Props) {
           {views.map(item => <button key={item.id} role="menuitemradio" aria-checked={view === item.id} onClick={() => { setView(item.id); props.closePreview(); layer.dismiss(true); }}><item.icon size={16}/><span>{item.label}</span>{view === item.id ? <Check size={15} className="workspace-view-check"/> : null}</button>)}
         </div> : null}
       </div>
-    </div>
-    {preview ? <div className="file-preview workspace-file-preview">
-      <div className="file-preview-header"><FileIcon name={preview.name}/><span title={preview.name}>{preview.name.split(/[\\/]/).pop()}</span><CopyButton text={preview.text} label="复制文件内容" iconOnly/><button className="icon-button" title="关闭文件" onClick={props.closePreview}><X size={14}/></button></div>
-      <Suspense fallback={<pre>{preview.text}</pre>}>{preview.diff ? <DiffView text={preview.text}/> : <SourceView text={preview.text} line={preview.line} name={preview.name}/>}</Suspense>
+    </div> : null}
+    {preview ? <div className={`file-preview workspace-file-preview${preview.plan ? ' workspace-plan-preview' : ''}`}>
+      <div className="file-preview-header">{preview.plan ? <Lightbulb size={16}/> : <FileIcon name={preview.name}/>}<span title={preview.name}>{preview.name.split(/[\\/]/).pop()}</span><CopyButton text={preview.text} label={preview.plan ? '复制完整计划' : '复制文件内容'} iconOnly/><button className="icon-button" title={preview.plan ? '关闭计划' : '关闭文件'} onClick={props.closePreview}><X size={14}/></button></div>
+      <Suspense fallback={<pre>{preview.text}</pre>}>{preview.plan ? <PlanDocument text={preview.text} openFile={preview.openFile ?? props.openFile}/> : preview.diff ? <DiffView text={preview.text}/> : <SourceView text={preview.text} line={preview.line} name={preview.name}/>}</Suspense>
     </div> : <div className={`workspace-panel-content ${view === 'changes' && workspacePath ? 'workspace-change-content' : ''}`} key={view}>
       {!workspacePath ? <Empty title="还没有工作文件">发送任务后会创建独立目录，也可以选择项目。</Empty> : view === 'changes' ? <Suspense fallback={<div className="workspace-loading"><LoaderCircle size={16} className="spin"/>正在打开变更…</div>}><ChangeReview key={`${projectId}:${sessionId}:${workspacePath}`} changes={changes} loading={loading} expanded={props.expanded} expand={props.expand} openFile={props.openFile}/></Suspense> : view === 'files' ? <WorkspaceFiles key={`${projectId}:${sessionId}:${workspacePath}`} active={active} projectId={projectId} sessionId={sessionId} revision={revision} changes={changes} openFile={props.openFile}/> : <>
         <div className="workspace-location" title={locationLabel}><FileIcon name={props.workspaceName ?? locationLabel} directory size={22}/><span><strong>{props.workspaceName ?? '任务工作空间'}</strong><small>{locationLabel}</small>{changes.branch ? <span className="workspace-location-branch"><GitBranch size={11}/>{changes.branch}</span> : null}</span></div>

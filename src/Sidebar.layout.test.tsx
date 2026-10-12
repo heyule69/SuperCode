@@ -99,9 +99,16 @@ it('pins and archives a background chat directly without selecting it or changin
   expect(document.querySelector('[role="menu"][aria-label="项目操作"]')?.textContent).toContain('编辑项目');
 });
 it('opens chat actions by right click or keyboard, restores focus, and keeps active chats from being archived', async () => {
+  props.sessions[1] = { ...props.sessions[1], status:'waiting', turnId:'active' };
+  await act(async () => root.render(<Sidebar {...props}/>));
+  const waitingChat = host.querySelector<HTMLButtonElement>('.session-row[title="项目会话"]')!;
+  expect(waitingChat.querySelector('.session-input-badge')?.textContent).toBe('需要用户输入');
+  expect(waitingChat.querySelector('.waiting-badge')).toBeNull();
+  expect(waitingChat.querySelector('[aria-label="等待确认"]')).not.toBeNull();
   props.sessions[1] = { ...props.sessions[1], status:'running', turnId:'active' };
   await act(async () => root.render(<Sidebar {...props}/>));
   const chat = host.querySelector<HTMLButtonElement>('.session-row[title="项目会话"]')!;
+  expect(chat.querySelector('.session-input-badge')).toBeNull();
   expect(chat.querySelector('[aria-label="运行中"]')).not.toBeNull();
   expect(host.querySelector<HTMLButtonElement>('[aria-label="归档 项目会话"]')?.disabled).toBe(true);
   await act(async () => chat.dispatchEvent(new MouseEvent('contextmenu', { bubbles:true, cancelable:true, clientX:40, clientY:90 })));

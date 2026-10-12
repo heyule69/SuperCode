@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { ArrowLeft, Check, ChevronDown, Eye, FileCheck2, Hand, ShieldAlert, ShieldX, SquareTerminal } from 'lucide-react';
+import { ArrowLeft, Check, ChevronDown, Eye, FileCheck2, Hand, Lightbulb, ShieldAlert, ShieldX, SquareTerminal } from 'lucide-react';
 import type { PermissionMode } from './types';
 import { permissionDescription, permissionDetails, permissionName, permissionOrder, visiblePermission } from './permissions';
 import { useFloatingLayer } from './useFloatingLayer';
@@ -24,7 +24,8 @@ export function PermissionMenu({ value, onChange, busy, agent = 'claude', label 
     if (mode === 'full' && value !== 'full') { setPanel('confirm'); return; }
     onChange(mode); layer.dismiss(true);
   }
-  const Icon = icons[value];
+  const planning = value === 'read' && (agent === 'claude' || agent === 'codex');
+  const Icon = planning ? Lightbulb : icons[value];
   const selected = visiblePermission(value, agent);
   return <div className="composer-menu-anchor permission-menu" ref={layer.root} onKeyDown={layer.navigate}>
     <button type="button" className={`composer-chip permission-chip ${value === 'full' ? 'full-access' : ''}`}

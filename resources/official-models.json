@@ -2,12 +2,110 @@
   "source": "https://developers.openai.com/codex/models",
   "updatedAt": "2026-10-11",
   "models": [
-    { "model": "gpt-6.1-sol", "displayName": "GPT-6.1 Sol", "isDefault": true, "defaultReasoningEffort": "low", "efforts": ["low", "medium", "high", "xhigh", "max", "ultra"] },
-    { "model": "gpt-6-astra", "displayName": "GPT-6 Astra", "defaultReasoningEffort": "medium", "efforts": ["low", "medium", "high", "xhigh", "max", "ultra"] },
-    { "model": "gpt-6-sol", "displayName": "GPT-6 Sol", "defaultReasoningEffort": "medium", "efforts": ["low", "medium", "high", "xhigh", "max", "ultra"] },
-    { "model": "gpt-6-luna", "displayName": "GPT-6 Luna", "defaultReasoningEffort": "medium", "efforts": ["low", "medium", "high", "xhigh", "max"] },
-    { "model": "gpt-5.6-sol", "displayName": "GPT-5.6 Sol", "defaultReasoningEffort": "low", "efforts": ["low", "medium", "high", "xhigh", "max", "ultra"] },
-    { "model": "gpt-5.6-terra", "displayName": "GPT-5.6 Terra", "defaultReasoningEffort": "medium", "efforts": ["low", "medium", "high", "xhigh", "max", "ultra"] },
-    { "model": "gpt-5.6-luna", "displayName": "GPT-5.6 Luna", "defaultReasoningEffort": "medium", "efforts": ["low", "medium", "high", "xhigh", "max"] }
-  ]
+    {
+      "model": "gpt-6.1-sol",
+      "displayName": "GPT-6.1 Sol",
+      "isDefault": true,
+      "defaultReasoningEffort": "low",
+      "efforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max",
+        "ultra"
+      ],
+      "contextWindow": 500000,
+      "effectiveContextWindowPercent": 95
+    },
+    {
+      "model": "gpt-6-astra",
+      "displayName": "GPT-6 Astra",
+      "defaultReasoningEffort": "medium",
+      "efforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max",
+        "ultra"
+      ],
+      "contextWindow": 272000,
+      "effectiveContextWindowPercent": 95
+    },
+    {
+      "model": "gpt-6-sol",
+      "displayName": "GPT-6 Sol",
+      "defaultReasoningEffort": "medium",
+      "efforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max",
+        "ultra"
+      ],
+      "contextWindow": 272000,
+      "effectiveContextWindowPercent": 95
+    },
+    {
+      "model": "gpt-6-luna",
+      "displayName": "GPT-6 Luna",
+      "defaultReasoningEffort": "medium",
+      "efforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "contextWindow": 272000,
+      "effectiveContextWindowPercent": 95
+    },
+    {
+      "model": "gpt-5.6-sol",
+      "displayName": "GPT-5.6 Sol",
+      "defaultReasoningEffort": "low",
+      "efforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max",
+        "ultra"
+      ],
+      "contextWindow": 272000,
+      "effectiveContextWindowPercent": 95
+    },
+    {
+      "model": "gpt-5.6-terra",
+      "displayName": "GPT-5.6 Terra",
+      "defaultReasoningEffort": "medium",
+      "efforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max",
+        "ultra"
+      ],
+      "contextWindow": 272000,
+      "effectiveContextWindowPercent": 95
+    },
+    {
+      "model": "gpt-5.6-luna",
+      "displayName": "GPT-5.6 Luna",
+      "defaultReasoningEffort": "medium",
+      "efforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "contextWindow": 272000,
+      "effectiveContextWindowPercent": 95
+    }
+  ],
+  "contextMetadataSource": "Codex native model catalog, verified locally on 2026-10-12; account API metadata takes precedence"
 }

@@ -506,99 +506,22 @@ fn skill_roots(
     Ok(roots)
 }
 
+#[cfg(test)]
 fn canonical_target(path: &Path) -> Option<PathBuf> {
-    if let Ok(path) = path.canonicalize() {
-        return Some(path);
-    }
-    if path
-        .components()
-        .any(|c| matches!(c, std::path::Component::ParentDir))
-    {
-        return None;
-    }
-    let mut ancestor = path;
-    let mut missing = vec![];
-    while !ancestor.exists() {
-        missing.push(ancestor.file_name()?.to_owned());
-        ancestor = ancestor.parent()?;
-    }
-    let mut resolved = ancestor.canonicalize().ok()?;
-    for part in missing.into_iter().rev() {
-        resolved.push(part);
-    }
-    Some(resolved)
+    crate::file_changes::canonical_target(path)
 }
-pub fn capture_change(app: &AppHandle, session: &crate::storage::Session, params: &Value) {
-    let item = &params["item"];
-    let Some(path) = item["arguments"]["file_path"].as_str() else {
-        return;
-    };
-    let Ok(project) = app.state::<AppState>().store.session_workspace(&session) else {
-        return;
-    };
-    let root = Path::new(&project.path);
-    let path = if Path::new(path).is_absolute() {
-        PathBuf::from(path)
-    } else {
-        root.join(path)
-    };
-    let resolved = canonical_target(&path);
-    let Some(path) = resolved else {
-        return;
-    };
-    if !root.canonicalize().is_ok_and(|r| path.starts_with(r)) {
-        return;
-    }
+pub fn capture_change(app: &AppHandle, session: &crate::storage::Session, params: &mut Value) {
+    let Ok(workspace) = app.state::<AppState>().store.session_workspace(session) else { return; };
     let state = app.state::<AppState>();
-    let id = (session.id.clone(), path.to_string_lossy().to_string());
-    let Ok(mut snapshots) = state.change_snapshots.lock() else {
-        return;
-    };
-    if item["status"] == "completed" {
-        let Some((path, before)) = snapshots.get(&id).cloned() else {
-            return;
-        };
-        let Ok(after) = read_utf8(Path::new(&path), 256 * 1024) else {
-            return;
-        };
-        let relative = Path::new(&path)
-            .strip_prefix(root.canonicalize().unwrap_or_else(|_| root.to_path_buf()))
-            .unwrap_or(Path::new(&path))
-            .to_string_lossy()
-            .replace('\\', "/");
-        let before = before.unwrap_or_default();
-        let diff = if before == after {
-            String::new()
-        } else {
-            format!(
-                "diff --git a/{relative} b/{relative}\n{}",
-                similar::TextDiff::from_lines(&before, &after)
-                    .unified_diff()
-                    .context_radius(3)
-                    .header(&format!("a/{relative}"), &format!("b/{relative}"))
-                    .to_string()
-            )
-        };
-        let turn = params["turnId"].as_str().unwrap_or("unknown");
-        let data = json!({"turnId":turn,"status":"completed","path":relative});
+    let Ok(mut snapshots) = state.change_snapshots.lock() else { return; };
+    let changes = snapshots.observe(&session.id, Path::new(&workspace.path), &mut params["item"]);
+    let turn = params["turnId"].as_str().unwrap_or("unknown");
+    for change in changes {
         let _ = state.store.save_message(
-            &format!("change-{turn}:{relative}"),
-            &session.id,
-            "activity",
-            &crate::protocol::bounded(&diff, 128 * 1024),
-            "turnDiff",
-            &data,
+            &format!("change-{turn}:{}",change.path), &session.id, "activity",
+            &crate::protocol::bounded(&change.diff,128*1024), "turnDiff",
+            &json!({"turnId":turn,"status":"completed","path":change.path}),
         );
-    } else if snapshots.keys().filter(|(owner, _)| owner == &session.id).count() < 32 && !snapshots.contains_key(&id) {
-        let before = if path.is_file() {
-            let Ok(content) = read_utf8(&path, 256 * 1024) else {
-                return;
-            };
-            Some(content)
-        } else {
-            None
-        };
-        snapshots.insert(id, (path.to_string_lossy().into(), before));
     }
 }
 #[tauri::command]

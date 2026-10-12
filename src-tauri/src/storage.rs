@@ -242,6 +242,24 @@ impl Store {
         })
         .transpose()
     }
+    pub(crate) fn save_model_metadata(&self, expected: &crate::ccswitch::Profile, metadata: &Value) -> Result<bool> {
+        let conn = self.0.lock().map_err(|e| e.to_string())?;
+        let raw: Option<String> = conn.query_row(
+            "SELECT config FROM agent_profiles WHERE id=?1 AND agent=?2",
+            params![expected.id, expected.agent], |row| row.get(0),
+        ).optional().map_err(|e| e.to_string())?;
+        let Some(raw) = raw else { return Ok(false); };
+        let mut config: Value = serde_json::from_str(&crate::credentials::open(&raw)?)
+            .map_err(|_| "本地配置 JSON 无效")?;
+        // An asynchronous catalog response must never undo a newer settings edit
+        // or recreate a connection deleted while the request was in flight.
+        if config != expected.config { return Ok(false); }
+        config["modelMetadata"] = metadata.clone();
+        let sealed = crate::credentials::seal(&config.to_string())?;
+        conn.execute("UPDATE agent_profiles SET config=?1 WHERE id=?2 AND agent=?3",
+            params![sealed, expected.id, expected.agent]).map_err(|e|e.to_string())?;
+        Ok(true)
+    }
     pub fn import_profiles(&self, profiles: &[crate::ccswitch::Profile]) -> Result<()> {
         let mut conn = self.0.lock().map_err(|e| e.to_string())?;
         let tx = conn.transaction().map_err(|e| e.to_string())?;
@@ -1374,6 +1392,26 @@ mod tests {
         assert!(store.profile("codex", "selected").unwrap().is_none());
         assert!(store.profile("claude", "missing").unwrap().is_none());
         assert!(store.route_for("codex", "selected").is_err());
+    }
+    #[test]
+    fn delayed_model_metadata_cannot_overwrite_settings_or_recreate_a_deleted_connection() {
+        let store = Store::from_connection(Connection::open_in_memory().unwrap()).unwrap();
+        let original = crate::ccswitch::Profile {id:"models".into(),agent:"pi".into(),name:"Original".into(),config:serde_json::json!({"apiKey":"old-key","model":"glm-5.3"})};
+        store.import_profiles(&[original.clone()]).unwrap();
+        let metadata=serde_json::json!({"glm-5.3":{"contextWindow":1000000}});
+        assert!(store.save_model_metadata(&original,&metadata).unwrap());
+        let mut newer=store.profile("pi","models").unwrap().unwrap();
+        assert_eq!(newer.config["modelMetadata"],metadata);
+        newer.config["apiKey"]="new-key".into();
+        newer.name="New name".into();
+        store.import_profiles(&[newer.clone()]).unwrap();
+        assert!(!store.save_model_metadata(&original,&metadata).unwrap());
+        let saved=store.profile("pi","models").unwrap().unwrap();
+        assert_eq!(saved.config["apiKey"],"new-key");
+        assert_eq!(saved.name,"New name");
+        store.delete_profile("models").unwrap();
+        assert!(!store.save_model_metadata(&newer,&metadata).unwrap());
+        assert!(store.profile("pi","models").unwrap().is_none());
     }
     #[test]
     fn encrypted_connections_crud_and_official_selection() {

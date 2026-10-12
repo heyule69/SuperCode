@@ -219,6 +219,7 @@
 .platform-usage-popover .popover-heading >div { display:flex;flex-direction:column;gap:3px;min-width:0; }
 .platform-usage-popover .popover-heading small { font-size:11px;color:var(--muted); }
 .platform-allowances { display:grid;gap:15px; }
+.platform-usage-status { margin:12px 0 0; font-size:12px; line-height:1.7; color:var(--muted); }
 .platform-window >div { display:flex;justify-content:space-between;gap:10px;font-size:12px; }
 .platform-window strong { font-weight:500;font-variant-numeric:tabular-nums; }
 .platform-window progress { display:block;width:100%;height:5px;margin:8px 0 5px;border:0;accent-color:var(--text); }

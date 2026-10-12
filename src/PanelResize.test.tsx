@@ -6,7 +6,7 @@ import { decodePanelWidths, defaultWidths, panelLayout, usePanelResize } from '.
 
 let root: Root, container: HTMLDivElement;
 let narrow = false;
-function Layout({panel='workspace',left=true,right=true,expanded=false}:{panel?:'workspace'|'browser'|'conversation';left?:boolean;right?:boolean;expanded?:boolean}) {
+function Layout({panel='workspace',left=true,right=true,expanded=false}:{panel?:'workspace'|'browser'|'conversation'|'content';left?:boolean;right?:boolean;expanded?:boolean}) {
   const panels = usePanelResize(left, right, false, panel, expanded);
   return <div ref={panels.root}><div {...panels.handle('left')}/><div {...panels.handle('right')}/></div>;
 }
@@ -83,4 +83,16 @@ it('uses stable tracks to animate hidden panes and restores saved widths after e
   expect(container.firstElementChild?.getAttribute('style')).toContain('288px minmax(0,1fr) 752px');
   await act(async () => root.render(<Layout/>));
   expect(container.firstElementChild?.getAttribute('style')).toContain('288px minmax(0,1fr) 284px');
+});
+it('uses a shared reading width and reserves no column after the content dock closes',async()=>{
+  await act(async()=>root.render(<Layout panel="content"/>));
+  expect(handle('right').getAttribute('aria-label')).toBe('调整右侧栏宽度');
+  expect(handle('right').getAttribute('aria-valuenow')).toBe('520');
+  await act(async()=>root.render(<Layout panel="content" right={false}/>));
+  expect(container.firstElementChild?.getAttribute('style')).toContain('288px minmax(0,1fr) 0px');
+});
+it('keeps a medium desktop split instead of overlaying content at the older workspace breakpoint',()=>{
+  vi.spyOn(window,'matchMedia').mockImplementation(query=>({matches:query.includes('1100px')} as MediaQueryList));
+  expect(panelLayout({left:288,right:520},1000,true,true,'content').overlay).toBe(false);
+  expect(panelLayout({left:288,right:520},1000,true,true).overlay).toBe(true);
 });

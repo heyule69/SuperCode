@@ -1,5 +1,5 @@
 import { useEffect, useId, useRef, useState, type KeyboardEvent } from 'react';
-import { ArrowRight, Check, ChevronLeft, MessageCircleQuestion, Pencil, X } from 'lucide-react';
+import { ArrowRight, Check, ChevronLeft, Pencil, X } from 'lucide-react';
 import type { RpcEvent } from './types';
 import './question-request.css';
 
@@ -87,18 +87,19 @@ export default function QuestionRequest({ request, respond }: Props) {
   }
 
   return <section ref={panel} className="question-request" tabIndex={-1} aria-label="Agent 提问" aria-busy={busy} onKeyDown={keyDown}>
-    <header className="question-request-header"><span><MessageCircleQuestion size={16} />问题</span>
+    <header className="question-request-header"><h3 id={`${id}-title`}>{question?.question ?? '问题'}</h3>
       <div>{questions.length > 1 ? <span className="question-request-page" aria-live="polite">{page + 1} / {questions.length}</span> : null}
         <button type="button" className="question-request-close" aria-label="跳过并关闭提问" disabled={disabled} onClick={() => void submit(true)}><X size={16} /></button></div>
     </header>
     {question ? <div ref={content} className="question-request-content" role="group" aria-labelledby={`${id}-title`}>
-      <div className="question-request-heading">{questions.length > 1 && question.header ? <span>{question.header}</span> : null}
-        <h3 id={`${id}-title`}>{question.question}</h3>{question.multiSelect ? <small>可多选</small> : null}</div>
+      {questions.length > 1 && question.header || question.multiSelect ? <div className="question-request-heading">{questions.length > 1 && question.header ? <span>{question.header}</span> : null}{question.multiSelect ? <small>可多选</small> : null}</div> : null}
       <div className="question-request-options">{(question.options ?? []).map((option, index) => {
         const selected = choices[question.id]?.includes(option.label) ?? false;
+        const recommended = /\s*[（(](?:Recommended|推荐)[）)]\s*$/i.test(option.label);
+        const label = recommended ? option.label.replace(/\s*[（(](?:Recommended|推荐)[）)]\s*$/i, '') : option.label;
         return <button key={option.label} type="button" disabled={disabled} aria-pressed={selected} className={`question-request-option${selected ? ' is-selected' : ''}`} onClick={event => { if (event.detail <= 1) choose(option.label); }}>
           <span className="question-request-number" aria-hidden="true">{selected ? <Check size={12} /> : index + 1}</span>
-          <span className="question-request-option-text"><strong>{option.label}</strong>{option.description ? <small>{option.description}</small> : null}</span>
+          <span className="question-request-option-text"><span className="question-request-option-label"><strong>{label}</strong>{recommended ? <span className="question-request-recommended">推荐</span> : null}</span>{option.description ? <small>{option.description}</small> : null}</span>
           <ArrowRight className="question-request-option-arrow" size={15} aria-hidden="true" />
         </button>;
       })}</div>
@@ -113,7 +114,7 @@ export default function QuestionRequest({ request, respond }: Props) {
       <div className="question-request-actions">
         {page > 0 ? <button type="button" className="question-request-back" aria-label="上一题" disabled={disabled} onClick={() => setPage(page - 1)}><ChevronLeft size={16} /></button> : null}
         <button type="button" className="question-request-skip" disabled={disabled} onClick={() => void submit(true)}>跳过</button>
-        <button type="button" className="question-request-send" disabled={disabled || !question || (last ? !complete : !answered(question))} onClick={() => next()}>{busy ? '发送中…' : submitted ? '已回答' : last ? '发送' : '下一题'}</button>
+        <button type="button" className="question-request-send" hidden={!busy && !submitted && (!question || (last ? !complete : !answered(question)))} disabled={disabled || !question || (last ? !complete : !answered(question))} onClick={() => next()}>{busy ? '发送中…' : submitted ? '已回答' : last ? '发送' : '下一题'}</button>
       </div>
     </footer>
   </section>;

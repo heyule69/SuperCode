@@ -22,6 +22,54 @@ beforeEach(async () => {
   await act(async () => { await import('./Markdown'); });
 });
 afterEach(async () => { await act(async () => root.unmount()); node.remove(); vi.unstubAllGlobals(); });
+it('opens file operations in the side review and keeps command output behind its own detail toggle',async()=>{
+  const diff='--- a/src/中文.ts\n+++ b/src/中文.ts\n@@ -1,2 +1,3 @@\n stable\n-old-value\n+new-value\n+added-value\n';
+  const edits=Array.from({length:5},(_,i)=>message(`edit-${i}`,'tool','TOOL_RESULT_'+i,'claudeToolCall',{tool:i?'Edit':'Write',status:'completed',arguments:{file_path:'src/中文.ts'},changes:[{path:'src/中文.ts',kind:{type:i?'update':'add'},diff,added:2,removed:1}]}));
+  const command='node "scripts/中文.mjs" --check';
+  const check=message('check','tool',command+'\nFULL_COMMAND_OUTPUT','commandExecution',{command,exitCode:0,durationMs:1300,cwd:'D:/test',status:'completed'});
+  const showDiff=vi.fn(), openFile=vi.fn();
+  await act(async()=>root.render(<Conversation messages={[message('u','user','test'),...edits,check]} agentName="Pi" sessionStatus="idle" autoExpand={false} showDiff={showDiff} openFile={openFile}/>));
+  expect(node.querySelectorAll('.activity-row')).toHaveLength(0);
+  await act(async()=>node.querySelector<HTMLButtonElement>('.activity-group-summary')!.click());
+  expect(node.querySelectorAll('.activity-row')).toHaveLength(6);
+  expect(node.querySelector('.activity-code-diff')).toBeNull();
+  expect(node.textContent).not.toContain('FULL_COMMAND_OUTPUT');
+  expect(node.querySelector('.activity-row')!.textContent).toContain('已创建');
+  expect(node.querySelector('.activity-row')!.textContent).toContain('+2−1');
+  expect(node.querySelectorAll('.activity-row')[5].textContent).toContain(command);
+  await act(async()=>node.querySelector<HTMLButtonElement>('.activity-row')!.click());
+  expect(showDiff).toHaveBeenCalledWith('本次变更 · src/中文.ts',`diff --git a/src/中文.ts b/src/中文.ts\n${diff}`);
+  expect(openFile).not.toHaveBeenCalled();
+  expect(node.querySelector('.activity-body')).toBeNull();
+  expect(node.textContent).not.toContain('new-value');
+  expect(node.querySelector('.activity-row')?.hasAttribute('aria-expanded')).toBe(false);
+  await act(async()=>node.querySelectorAll<HTMLButtonElement>('.activity-row')[5].click());
+  expect(node.textContent).toContain('FULL_COMMAND_OUTPUT');
+  expect(node.textContent).toContain('退出码 0');
+  expect(node.textContent).toContain('D:/test');
+  expect(node.querySelector('.activity-toggle-more')).toBeNull();
+});
+it('opens multi-file operation patches in the side review even when automatic detail expansion is enabled',async()=>{
+  const showDiff=vi.fn();
+  const first='diff --git a/a.ts b/a.ts\n@@ -1 +1 @@\n-old-a\n+new-a\n';
+  const second='@@ -1 +1 @@\n-old-b\n+new-b\n';
+  const file=message('files','tool','applied','fileChange',{status:'completed',changes:[{path:'a.ts',diff:first,added:1,removed:1},{path:'b.ts',diff:second,added:1,removed:1}]});
+  await act(async()=>root.render(<Conversation messages={[message('u','user','修改文件'),file]} agentName="Codex" autoExpand={true} sessionStatus="idle" showDiff={showDiff} openFile={()=>{}}/>));
+  expect(node.querySelector('.activity-body')).toBeNull();
+  expect(node.textContent).not.toContain('new-a');
+  await act(async()=>node.querySelector<HTMLButtonElement>('.activity-row')!.click());
+  expect(showDiff).toHaveBeenCalledWith('本次变更',`${first}\ndiff --git a/b.ts b/b.ts\n${second}`);
+  expect(node.querySelector('.activity-body')).toBeNull();
+});
+it('keeps legacy edit arguments out of the conversation when the operation patch was not recorded',async()=>{
+  const showDiff=vi.fn();
+  const edit=message('old-edit','tool','saved','claudeToolCall',{tool:'Edit',status:'completed',arguments:{file_path:'old.ts',old_string:'OLD_PRIVATE_CODE',new_string:'NEW_PRIVATE_CODE'}});
+  await act(async()=>root.render(<Conversation messages={[message('u','user','修改文件'),edit]} agentName="Claude" autoExpand={true} sessionStatus="idle" showDiff={showDiff} openFile={()=>{}}/>));
+  expect(node.querySelector('.activity-body')).toBeNull();
+  expect(node.textContent).not.toContain('NEW_PRIVATE_CODE');
+  await act(async()=>node.querySelector<HTMLButtonElement>('.activity-row')!.click());
+  expect(showDiff).toHaveBeenCalledWith('本次变更 · old.ts','此记录没有保存可展示的代码差异。');
+});
 async function render(messages: Message[], autoExpand = false, lifecycle: TurnLifecycle = {}) { await act(async () => root.render(<Conversation messages={messages} agentName="Codex" autoExpand={autoExpand} sessionStatus={lifecycle.sessionStatus} activeTurnId={lifecycle.activeTurnId} showDiff={() => {}} openFile={() => {}}/>)); }
 async function toggle() { await act(async () => node.querySelector<HTMLButtonElement>('.turn-process-toggle')!.click()); }
 
@@ -69,30 +117,34 @@ it('streams the full process, collapses at completion, and expands the original 
   expect(writeText).toHaveBeenCalledWith('已完成布局优化。');
 });
 
-it('keeps every Pi answer section visible and copyable after tools are collapsed, including legacy blocks without message groups', async () => {
+it('folds intermediate Pi responses while keeping every block of the complete final response visible and copyable', async () => {
+  const progress = '先检查环境，之后继续验证配置。';
   const first = '第一类报错：这个 bash 环境里没有安装 Python 和 Node。';
   const second = '第二类报错：配置路径不正确，需要调整路径后再运行。';
   const final = '处理方法：安装运行环境，然后修复配置路径。';
   for (const grouped of [false, true]) {
     const trace = [
       message('question', 'user', '为什么运行报错了'),
-      message('t-msg-1-0', 'assistant', first, 'agentMessage', grouped ? { messageId:'t-msg-1' } : null),
+      message('t-msg-1-0', 'assistant', progress, 'agentMessage', grouped ? { messageId:'t-msg-1' } : null),
       message('tool-check', 'tool', 'python: command not found', 'commandExecution', { command:'python --version', status:'completed' }),
-      message('t-msg-2-0', 'assistant', second, 'agentMessage', grouped ? { messageId:'t-msg-2' } : null),
+      message('t-msg-3-0', 'assistant', first, 'agentMessage', grouped ? { messageId:'t-msg-3' } : null),
       message('thought-check', 'activity', '检查配置路径', 'reasoning', { status:'completed' }),
-      message('t-msg-3-0', 'assistant', final, 'agentMessage', grouped ? { messageId:'t-msg-3' } : null),
+      message('t-msg-3-1', 'assistant', second, 'agentMessage', grouped ? { messageId:'t-msg-3' } : null),
+      message('t-msg-3-2', 'assistant', final, 'agentMessage', grouped ? { messageId:'t-msg-3' } : null),
     ];
     for (const marker of [[], [run('completed')]]) {
       await render([...trace, ...marker], false, { sessionStatus:'idle' });
       const result = node.querySelector('.turn-final-result')!;
       for (const section of [first, second, final]) expect(result.textContent).toContain(section);
       expect(result.querySelectorAll('.message.assistant')).toHaveLength(3);
+      expect(result.textContent).not.toContain(progress);
       expect(node.querySelector('.turn-process-content')).toBeNull();
       await act(async () => node.querySelector<HTMLButtonElement>('.turn-copy')!.click());
       expect(writeText).toHaveBeenLastCalledWith([first, second, final].join('\n\n'));
       await toggle();
       const process = node.querySelector('.turn-process-content')!;
-      expect(process.querySelector('.message.assistant')).toBeNull();
+      expect(process.querySelectorAll('.message.assistant')).toHaveLength(1);
+      expect(process.textContent).toContain(progress);
       expect(node.querySelectorAll('.turn-final-result .message.assistant')).toHaveLength(3);
       await toggle();
     }
@@ -345,7 +397,7 @@ it('renders and copies readable questions through streaming, completion and expa
 
 it('retains technical input and output details for ordinary tools', async () => {
   await render([items[0], message('bash', 'tool', '构建通过', 'claudeToolCall', { tool: 'Bash', arguments: { command: 'npm run build' }, status: 'completed' }), run('inProgress')], true);
-  expect(node.textContent).toContain('输入参数');
+  expect(node.textContent).toContain('命令');
   expect(node.textContent).toContain('工具结果');
   expect(node.querySelectorAll('.activity-body pre')).toHaveLength(2);
   expect(node.querySelector('.question-history')).toBeNull();

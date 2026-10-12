@@ -21,6 +21,7 @@ use tokio::{
 type Reply = oneshot::Sender<Result<Value, String>>;
 struct Client {
     diagnostics: Option<(AppHandle, String, Option<String>)>,
+    cwd: String,
     pid: u32,
     input: Mutex<ChildStdin>,
     child: Mutex<Child>,
@@ -61,6 +62,7 @@ impl Client {
         let stderr = child.stderr.take().ok_or("Agent 无错误管道")?;
         let client = Arc::new(Self {
             diagnostics: diagnostics.clone(),
+            cwd: cwd.to_string_lossy().into_owned(),
             pid: child.id().unwrap_or(0),
             input: Mutex::new(input),
             child: Mutex::new(child),
@@ -695,11 +697,17 @@ fn opencode_config(config: &Value, permission: &str) -> Value {
         let models = crate::providers::model_ids(config)
             .into_iter()
             .map(|m| {
-                let definition = native["models"]
+                let mut definition = native["models"]
                     .get(&m)
                     .filter(|v| v.is_object())
                     .cloned()
                     .unwrap_or_else(|| json!({"name":m}));
+                if !definition["limit"]["context"].is_number() {
+                    if let Some(capacity) = crate::model_context::for_model(config, &m) {
+                        if !definition["limit"].is_object() { definition["limit"] = json!({}); }
+                        definition["limit"]["context"] = json!(capacity);
+                    }
+                }
                 (wire_model(config, &m), definition)
             })
             .collect::<serde_json::Map<String, Value>>();
@@ -763,11 +771,7 @@ fn pi_provider_config(config: &Value) -> Option<Value> {
             } else {
                 json!(["text", "image"])
             };
-            let context = if m.to_ascii_lowercase().ends_with("[1m]") {
-                1000000
-            } else {
-                128000
-            };
+            let context = crate::model_context::for_model(config, &m).unwrap_or(128000);
             let mut definition = json!({
                 "id": id, "name": m, "reasoning": !native.is_object(), "input": input,
                 "contextWindow": context, "maxTokens": 8192,
@@ -805,8 +809,33 @@ fn pi_provider_config(config: &Value) -> Option<Value> {
     provider.insert("models".into(), json!(models));
     Some(Value::Object(provider))
 }
-const PI_EXTENSION: &str = r#"export default function(pi) {
+const PI_EXTENSION: &str = r#"import * as fs from 'node:fs/promises';
+import * as path from 'node:path';
+export default function(pi) {
   const config = JSON.parse(process.env.SUPERCODE_PI_CONFIG || '{}');
+  const snapshots = new Map();
+  let snapshotBytes = 0;
+  const limit = 256 * 1024;
+  const inside = (root, target) => { const relative=path.relative(root,target); return relative!== '..' && !relative.startsWith('..'+path.sep) && !path.isAbsolute(relative); };
+  async function targetPath(cwd, input) {
+    if (typeof input.path !== 'string') return null;
+    const root=await fs.realpath(cwd), target=path.resolve(root,input.path);
+    let ancestor=target, missing=[];
+    while (true) {
+      try { ancestor=await fs.realpath(ancestor); break; }
+      catch (error) { if (error.code!=='ENOENT' || missing.length>=32) throw error; missing.unshift(path.basename(ancestor)); ancestor=path.dirname(ancestor); }
+    }
+    const resolved=path.join(ancestor,...missing);
+    return inside(root,resolved) ? {absolute:resolved,path:path.relative(root,resolved).replaceAll('\\','/')} : null;
+  }
+  async function readSnapshot(target) {
+    try {
+      if ((await fs.stat(target)).size>limit) throw new Error('snapshot too large');
+      const bytes=await fs.readFile(target);
+      if (bytes.length>limit) throw new Error('snapshot too large');
+      return new TextDecoder('utf-8',{fatal:true,ignoreBOM:true}).decode(bytes);
+    } catch(error) { if(error.code==='ENOENT') return null; throw error; }
+  }
   for (const [name, server] of Object.entries(config.mcp || {})) pi.registerMcpServer(name, server);
   if (config.provider) pi.registerProvider('supercode', config.provider);
   pi.on('tool_call', async (event, ctx) => {
@@ -817,7 +846,28 @@ const PI_EXTENSION: &str = r#"export default function(pi) {
     if (config.permission !== 'full' && (!read || config.permission === 'strict')) {
       if (!await ctx.ui.confirm('允许本次工具操作？', event.toolName + '\n' + JSON.stringify(event.input))) return {block:true,reason:'User declined'};
     }
+    // Capture inside the native pre-execution hook. A fast write can finish
+    // before the desktop consumes its tool_execution_start notification.
+    if (['write','edit'].includes(event.toolName) && snapshots.size<64) {
+      try {
+        const target=await targetPath(ctx.cwd,event.input);
+        if (!target) return;
+        const before=await readSnapshot(target.absolute), bytes=Buffer.byteLength(before||'','utf8');
+        if (snapshotBytes+bytes>2*1024*1024) return;
+        snapshots.set(event.toolCallId,{...target,before,bytes}); snapshotBytes+=bytes;
+      } catch { /* Keep native execution and the desktop fallback available. */ }
+    }
   });
+  pi.on('tool_result', async event => {
+    const snapshot=snapshots.get(event.toolCallId);
+    if (!snapshot) return;
+    snapshots.delete(event.toolCallId); snapshotBytes-=snapshot.bytes;
+    try {
+      const after=await readSnapshot(snapshot.absolute);
+      return {details:{...(event.details||{}),supercodeFileChange:{path:snapshot.path,before:snapshot.before,after}}};
+    } catch { /* Large/binary files retain their original native result. */ }
+  });
+  pi.on('agent_end', () => { snapshots.clear(); snapshotBytes=0; });
 }"#;
 async fn start_for(
     app: &AppHandle,
@@ -1045,6 +1095,11 @@ fn append_probe_text(text: &mut String, value: &str) {
     while !value.is_char_boundary(end) { end -= 1; }
     text.push_str(&value[..end]);
 }
+fn warm_identity_matches(session: &Session, cached_session: &str, cached_native: &str) -> bool {
+    // Model handoff and compaction can clear the persisted native binding while
+    // the supplier, model and permission signature remain unchanged.
+    session.id == cached_session && session.native_id.as_deref() == Some(cached_native)
+}
 pub async fn send(
     app: &AppHandle,
     s: &Session,
@@ -1075,7 +1130,7 @@ pub async fn send(
     .to_string();
     let cached = session_runtime.warm.lock().await.take();
     let cached = if let Some(c) = cached {
-        if c.session == s.id && c.signature == signature && c.client.alive.load(Ordering::Acquire) {
+        if warm_identity_matches(s, &c.session, &c.native) && c.signature == signature && c.client.alive.load(Ordering::Acquire) {
             Some(c)
         } else {
             c.client.close().await;
@@ -1351,10 +1406,18 @@ pub async fn send(
             json!({"turn":{"id":turn.turn,"status":"running"}}),
         ),
     );
+    let model_context_window = if turn.agent == "pi" {
+        selected.as_deref().and_then(|model| crate::model_context::for_model(&config, model))
+            .or_else(|| defaults["model"]["id"].as_str()
+                .filter(|id| selected.as_deref().is_none_or(|model| model.rsplit('/').next() == Some(*id)))
+                .and_then(|_| crate::model_context::positive(&defaults["model"]["contextWindow"])))
+            .or_else(|| config["baseUrl"].is_string().then_some(128000))
+    } else { None };
     let app = app.clone();
     tokio::spawn(async move {
         let mut mapped = Mapper {
             priced: !config["baseUrl"].is_string(),
+            model_context_window,
             ..Mapper::default()
         };
         let mut completed = false;
@@ -1620,6 +1683,7 @@ struct Mapper {
     failure: Option<String>,
     usage: Value,
     priced: bool,
+    model_context_window: Option<u64>,
     acp_phase: String,
     acp_segment: u64,
     media_segment: u64,
@@ -1714,10 +1778,13 @@ impl Mapper {
                         v["toolCallId"].as_str().unwrap_or("unknown")
                     );
                     let end = v["type"] == "tool_execution_end";
-                    let row=self.items.entry(id.clone()).or_insert(json!({"id":id,"type":"claudeToolCall","tool":pi_tool(v["toolName"].as_str().unwrap_or("Tool")),"arguments":tool_args(&v["args"]),"status":"inProgress"}));
+                    let row=self.items.entry(id.clone()).or_insert(json!({"id":id,"type":"claudeToolCall","tool":pi_tool(v["toolName"].as_str().unwrap_or("Tool")),"arguments":tool_args(&v["args"]),"cwd":t.client.cwd,"status":"inProgress"}));
+                    if !end && v["partialResult"]["content"].is_array() {
+                        row["output"]=blocks_text(&v["partialResult"]["content"]).into();
+                        row["contentItems"]=v["partialResult"]["content"].clone();
+                    }
                     if end {
-                        row["output"] = blocks_text(&v["result"]["content"]).into();
-                        row["contentItems"] = v["result"]["content"].clone();
+                        apply_pi_result(row,&v["result"],v["isError"]==true);
                         row["status"] = if v["isError"] == true {
                             "failed"
                         } else {
@@ -1865,9 +1932,8 @@ impl Mapper {
                     )
                 }
                 "usage_update" => {
-                    let used = crate::usage_tokens::count(&u["used"]);
-                    let size = crate::usage_tokens::count(&u["size"]).filter(|n| *n > 0);
-                    out.push(event(t,"thread/tokenUsage/updated",json!({"tokenUsage":{"total":{},"last":{},"contextTokens":used,"modelContextWindow":size,"cumulative":false}})));
+                    let usage = self.observe_acp_usage(u);
+                    out.push(event(t,"thread/tokenUsage/updated",json!({"tokenUsage":usage})));
                 }
                 _ => {}
             }
@@ -1933,6 +1999,12 @@ impl Mapper {
         }
         self.usage.clone()
     }
+    fn observe_acp_usage(&mut self, native: &Value) -> Value {
+        let used = crate::usage_tokens::count(&native["used"]);
+        self.model_context_window = crate::model_context::positive(&native["size"])
+            .or(self.model_context_window);
+        json!({"total":{},"last":{},"contextTokens":used,"modelContextWindow":self.model_context_window,"cumulative":false})
+    }
     fn observe_pi_usage(&mut self, native: &Value) -> bool {
         let last = crate::usage_tokens::pi_usage(native);
         let context = crate::usage_tokens::pi_context(&last);
@@ -1945,7 +2017,29 @@ impl Mapper {
         let changed = self.usage["last"] != last || self.usage["contextTokens"] != json!(context);
         self.usage["last"] = last;
         self.usage["contextTokens"] = json!(context);
+        if let Some(capacity) = self.model_context_window {
+            self.usage["modelContextWindow"] = json!(capacity);
+        }
         changed
+    }
+}
+fn apply_pi_result(row: &mut Value, result: &Value, is_error: bool) {
+    row["output"]=blocks_text(&result["content"]).into();
+    row["contentItems"]=result["content"].clone();
+    let structured=&result["structuredContent"];
+    if let Some(code)=structured["exit_code"].as_i64() { row["exitCode"]=code.into(); }
+    if let Some(seconds)=structured["wall_time_seconds"].as_f64().filter(|seconds|seconds.is_finite() && *seconds>=0.0) {
+        row["durationMs"]=json!((seconds*1000.0).round() as u64);
+    }
+    if !is_error {
+        if let (Some(path),Some(patch))=(row["arguments"]["file_path"].as_str(),result["details"]["patch"].as_str()) {
+            if let Some(change)=crate::file_changes::patch_change(path,patch) {
+                row["changes"]=json!([change]); crate::file_changes::summarize(row);
+            }
+        }
+    }
+    if result["details"]["supercodeFileChange"].is_object() {
+        row["fileSnapshot"]=result["details"]["supercodeFileChange"].clone();
     }
 }
 fn acp_tool(v: &Value) -> &str {
@@ -2014,6 +2108,17 @@ fn tool_args(v: &Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn cleared_or_replaced_native_checkpoint_does_not_resume_old_context() {
+        let mut session=Session {id:"chat".into(),project_id:String::new(),workspace_path:None,title:"Test".into(),agent:"pi".into(),model:Some("glm-5.3".into()),connection_id:Some("glm".into()),native_id:Some("native-before".into()),status:"idle".into(),updated_at:0,turn_id:None};
+        assert!(warm_identity_matches(&session,"chat","native-before"));
+        assert!(!warm_identity_matches(&session,"other-chat","native-before"));
+        session.native_id=None;
+        assert!(!warm_identity_matches(&session,"chat","native-before"));
+        session.native_id=Some("native-after".into());
+        assert!(!warm_identity_matches(&session,"chat","native-before"));
+        assert!(warm_identity_matches(&session,"chat","native-after"));
+    }
     #[test]
     fn acp_task_identity_survives_native_title_updates_and_completion() {
         let start = json!({"kind":"other","title":"task","rawInput":{"subagent_type":"explore","prompt":"Read fixture files","description":"kimi-opencode-a"}});
@@ -2231,11 +2336,12 @@ write(v.type?{type:'response',command:method,id:v.id,success:true,data:{session:
     }
     #[test]
     fn streaming_usage_updates_context_without_accumulating_billing_or_erasing_it_with_zero() {
-        let mut mapper = Mapper::default();
+        let mut mapper = Mapper { model_context_window: Some(1_000_000), ..Mapper::default() };
         assert!(!mapper.observe_pi_usage(&json!({"input":0,"output":0,"totalTokens":0})));
         assert!(mapper
             .observe_pi_usage(&json!({"input":100,"cacheRead":50,"output":5,"totalTokens":0})));
         assert_eq!(mapper.usage["contextTokens"], 155);
+        assert_eq!(mapper.usage["modelContextWindow"], 1_000_000);
         assert_eq!(mapper.usage["total"], json!({}));
         assert!(mapper.observe_pi_usage(&json!({"input":100,"cacheRead":50,"output":10})));
         assert_eq!(mapper.usage["contextTokens"], 160);
@@ -2245,6 +2351,34 @@ write(v.type?{type:'response',command:method,id:v.id,success:true,data:{session:
         let data = mapper.add_usage(&json!({"input":100,"cacheRead":50,"output":10}));
         assert_eq!(data["total"]["totalTokens"], 160);
         assert_eq!(data["total"]["inputTokens"], 150);
+        assert!(mapper.observe_pi_usage(&json!({"input":20,"output":2})));
+        assert_eq!(mapper.usage["contextTokens"], 22);
+        assert_eq!(mapper.usage["total"]["totalTokens"], 160);
+    }
+    #[test]
+    fn acp_partial_updates_keep_capacity_and_compaction_can_reduce_context() {
+        let mut mapper = Mapper::default();
+        let first = mapper.observe_acp_usage(&json!({"used":82300,"size":262144}));
+        assert_eq!(first["modelContextWindow"], 262144);
+        let next = mapper.observe_acp_usage(&json!({"used":90000}));
+        assert_eq!(next["contextTokens"], 90000);
+        assert_eq!(next["modelContextWindow"], 262144);
+        let compacted = mapper.observe_acp_usage(&json!({"used":10000,"size":0}));
+        assert_eq!(compacted["contextTokens"], 10000);
+        assert_eq!(compacted["modelContextWindow"], 262144);
+        assert_eq!(mapper.observe_acp_usage(&json!({"size":1048576}))["modelContextWindow"],1048576);
+    }
+    #[test]
+    fn generated_provider_limits_are_model_specific_and_native_limits_win() {
+        let config=json!({"baseUrl":"https://api.example","protocol":"anthropic","model":"glm-5.3","models":["glm-5.3","kimi-for-coding","kimi-for-coding-highspeed","MiniMax-M2.7"]});
+        let provider=pi_provider_config(&config).unwrap();
+        for (id, capacity) in [("glm-5.3",1000000),("kimi-for-coding",1048576),("kimi-for-coding-highspeed",262144),("MiniMax-M2.7",204800)] {
+            let row=provider["models"].as_array().unwrap().iter().find(|row|row["id"]==id).unwrap();
+            assert_eq!(row["contextWindow"],capacity);
+            assert_eq!(opencode_config(&config,"read")["provider"]["supercode"]["models"][id]["limit"]["context"],capacity);
+        }
+        let declared=json!({"baseUrl":"https://api.example","protocol":"anthropic","model":"glm-5.3","piProvider":{"models":[{"id":"glm-5.3","contextWindow":32768}]}});
+        assert_eq!(pi_provider_config(&declared).unwrap()["models"][0]["contextWindow"],32768);
     }
     #[test]
     fn native_tool_paths_and_interrupted_items_survive_normalization() {
@@ -2311,6 +2445,30 @@ write(v.type?{type:'response',command:method,id:v.id,success:true,data:{session:
         assert_eq!(c["permission"]["*"], "deny");
         assert_eq!(c["permission"]["read"], "allow");
         assert!(PI_EXTENSION.contains("User declined"));
+    }
+    #[test]
+    fn opencode_execution_permissions_do_not_keep_the_readonly_policy() {
+        for mode in ["ask", "strict", "full"] {
+            let config = opencode_config(&json!({}), mode);
+            assert_eq!(config["permission"]["*"], if mode == "full" { "allow" } else { "ask" });
+            assert!(config["permission"].get("read").is_none());
+        }
+        assert_eq!(opencode_config(&json!({}), "read")["permission"]["*"], "deny");
+    }
+    #[test]
+    fn pi_operation_results_keep_native_counts_output_and_command_metadata() {
+        let mut edit=json!({"arguments":{"file_path":"a.ts"}});
+        apply_pi_result(&mut edit,&json!({"content":[{"type":"text","text":"Edited a.ts"}],"details":{"patch":"@@ -1 +1 @@\n-old\n+new\n","supercodeFileChange":{"path":"a.ts","before":"old\n","after":"new\n"}}}),false);
+        assert_eq!(edit["changeSummary"][0]["added"],1);
+        assert_eq!(edit["changeSummary"][0]["removed"],1);
+        assert_eq!(edit["fileSnapshot"]["before"],"old\n");
+        assert_eq!(edit["output"],"Edited a.ts");
+        let mut command=json!({"arguments":{"command":"node check.js"}});
+        apply_pi_result(&mut command,&json!({"content":[{"type":"text","text":"native output"}],"structuredContent":{"exit_code":1,"wall_time_seconds":1.3}}),true);
+        assert_eq!(command["exitCode"],1);
+        assert_eq!(command["durationMs"],1300);
+        assert_eq!(command["output"],"native output");
+        assert!(command["changes"].is_null());
     }
     #[test]
     fn image_and_history_inputs_are_preserved() {

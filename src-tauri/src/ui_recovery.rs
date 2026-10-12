@@ -72,6 +72,13 @@ pub fn attach(webview: &Webview) {
     let result = webview.with_webview(move |platform| unsafe {
         let register = || -> windows::core::Result<()> {
             let core = platform.controller().CoreWebView2()?;
+            let mut version = windows::core::PWSTR::null();
+            let runtime_version = match platform.environment().BrowserVersionString(&mut version) {
+                Ok(()) => Some(webview2_com::take_pwstr(version)),
+                Err(_) => None,
+            };
+            crate::runtime_diagnostics::record(&registration_app, None, "ui_runtime_ready",
+                serde_json::json!({"window":callback_label,"backend":"webview2","runtimeVersion":runtime_version}));
             let handler = ProcessFailedEventHandler::create(Box::new(move |sender,args| {
                 let Some(args) = args else { return Ok(()); };
                 let mut kind = COREWEBVIEW2_PROCESS_FAILED_KIND::default();

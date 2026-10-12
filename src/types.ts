@@ -14,7 +14,7 @@ export interface ProviderPreset { id: string; name: string; protocol: string; ba
 export interface Provider { id: string; name: string; mark: string; category: string; presets: ProviderPreset[] }
 export interface ProviderSettings { id: string | null; name: string; agent: string; providerId: string; plan: string; protocol: string; baseUrl: string; model: string; models: string[]; apiKey?: string | null; hasCredential: boolean; official?: boolean }
 export type PermissionMode = 'read' | 'ask' | 'strict' | 'auto' | 'edit' | 'deny' | 'full';
-export interface Model { id: string; model: string; displayName: string; isDefault: boolean; defaultReasoningEffort?: string; supportedReasoningEfforts?: { reasoningEffort: string; description?: string }[] }
+export interface Model { id: string; model: string; displayName: string; isDefault: boolean; contextWindow?: number | null; effectiveContextWindowPercent?: number | null; defaultReasoningEffort?: string; supportedReasoningEfforts?: { reasoningEffort: string; description?: string }[] }
 export interface Changes { isGit: boolean; branch: string; files: { path: string; status: string }[]; diff: string }
 export interface WorkspaceEntry { name: string; path: string; isDirectory: boolean }
 export interface WorkspaceDirectory { entries: WorkspaceEntry[]; truncated: boolean }

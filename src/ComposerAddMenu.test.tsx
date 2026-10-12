@@ -5,6 +5,7 @@ import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { AddMenu } from './ComposerAddMenu';
 import { call } from './api';
 import { loadLocalSkills, type Skill } from './skills';
+import { open as pickFiles } from '@tauri-apps/plugin-dialog';
 import type { ExtensionCatalog, ExtensionPlugin } from './extensions';
 import type { PermissionMode } from './types';
 
@@ -113,14 +114,32 @@ it('ignores an old project metadata response after changing workspace, and retri
 it('handles keyboard traversal, Escape and outside clicks without starting a goal', async () => {
   await render(); await open(); const first = node.querySelector<HTMLElement>('[role="menuitem"]')!; expect(document.activeElement).toBe(first);
   await act(async () => first.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true })));
-  expect(document.activeElement?.textContent).toContain('图片');
+  expect(document.activeElement?.textContent).toContain('目标');
   await act(async () => document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true })));
   expect(node.querySelector('.add-popover')).toBeNull(); expect(document.activeElement).toBe(node.querySelector('[aria-label="添加附件"]'));
   await open(); await act(async () => document.body.dispatchEvent(new Event('pointerdown', { bubbles: true })));
   expect(node.querySelector('.add-popover')).toBeNull(); expect(onGoal).not.toHaveBeenCalled();
 });
 it('preserves local file picking and image detection from the file entry', async () => {
-  await render(); await open(); await click(button('文件'));
+  await render(); await open(); await click(button('文件和文件夹')); await click(button('文件'));
   expect(addAttachments).toHaveBeenCalledExactlyOnceWith([{ kind: 'image', path: 'C:/docs/参考.png', name: '参考.png' }, { kind: 'file', path: 'C:/docs/报告.pdf', name: '报告.pdf' }]);
   expect(node.querySelector('.add-popover')).toBeNull();
+});
+it('opens attachment choices with keyboard focus and returns without opening a picker', async () => {
+  await render(); await open(); await click(button('文件和文件夹'));
+  expect(node.querySelector('[aria-label="添加文件和文件夹"]')).not.toBeNull();
+  expect(document.activeElement).toBe(button('文件'));
+  await act(async () => button('文件').dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true })));
+  expect(document.activeElement).toBe(button('图片'));
+  await click(button('返回')); await act(async () => new Promise<void>(resolve => requestAnimationFrame(() => resolve())));
+  expect(document.activeElement).toBe(button('文件和文件夹'));
+  expect(pickFiles).not.toHaveBeenCalled(); expect(addAttachments).not.toHaveBeenCalled();
+});
+it.each(['图片', '文件夹'])('keeps the %s picker available from the compact entry', async name => {
+  await render(); await open(); await click(button('文件和文件夹')); await click(button(name));
+  expect(pickFiles).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+    directory: name === '文件夹', multiple: name !== '文件夹',
+    ...(name === '图片' ? { filters: [{ name: '图片', extensions: ['png', 'jpg', 'jpeg', 'gif', 'webp'] }] } : {}),
+  }));
+  expect(addAttachments).toHaveBeenCalledOnce(); expect(node.querySelector('.add-popover')).toBeNull();
 });

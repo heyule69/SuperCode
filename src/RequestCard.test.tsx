@@ -50,6 +50,14 @@ it('uses numbered shortcuts for the same direct answer flow as option clicks', a
   await render(); await key('2');
   expect(respond).toHaveBeenCalledExactlyOnceWith({ answers: { next: { answers: ['稍后'] } } });
 });
+it('shows a recommendation tag while returning the exact native option label', async () => {
+  const label='继续 (Recommended)';
+  await render(request({questions:[{id:'next',question:'接下来怎么做？',options:[{label,description:'沿用现有方案'}]}]}));
+  expect(node.querySelector('.question-request-option-label strong')?.textContent).toBe('继续');
+  expect(node.querySelector('.question-request-recommended')?.textContent).toBe('推荐');
+  await click('.question-request-option');
+  expect(respond).toHaveBeenCalledExactlyOnceWith({answers:{next:{answers:[label]}}});
+});
 it('keeps all answers while navigating multiple questions and supports multiple selections', async () => {
   await render(request({ questions: [...questions, { id: 'features', header: '功能', question: '选哪些？', multiSelect: true, options: [{ label: 'A' }, { label: 'B' }] }] }));
   await key('1');

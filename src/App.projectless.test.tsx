@@ -8,12 +8,13 @@ import type { Bootstrap, Message, Session, RpcEvent } from './types';
 import { PROVIDER_REQUIRED } from './chatConnection';
 import { mergeEvent } from './events';
 import type { Followup } from './Followups';
+import { PlatformUsageIndicator } from './PlatformUsageView';
 
 vi.mock('./api', () => ({ desktop:true, call:vi.fn(), subscribe:vi.fn(async()=>()=>{}) }));
 vi.mock('@tauri-apps/api/event', () => ({ listen:vi.fn(async()=>()=>{}) }));
 vi.mock('./windowTheme', () => ({ watchWindowTheme:()=>()=>{} }));
 vi.mock('./DesktopTitleBar', () => ({ DesktopTitleBar:()=>null }));
-vi.mock('./PlatformUsageView', () => ({ PlatformUsageIndicator:()=> <span data-testid="platform-allowance">供应商额度</span> }));
+vi.mock('./PlatformUsageView', () => ({ PlatformUsageIndicator:vi.fn(()=> <span data-testid="platform-allowance">供应商额度</span>) }));
 vi.mock('./AppUpdate', () => ({ default:()=>null, AppUpdateNotice:()=>null }));
 let root: Root, container: HTMLDivElement, data: Bootstrap, messages: Message[], providerMissing: boolean;
 let pendingRequests: RpcEvent[];
@@ -64,9 +65,10 @@ async function send() {
   await act(async()=>{container.querySelector<HTMLFormElement>('.composer')!.dispatchEvent(new Event('submit',{bubbles:true,cancelable:true}));await new Promise(resolve=>setTimeout(resolve,30));});
 }
 
-it.each(['execute','revise'] as const)('submits a reviewed native plan as %s with the right mode while preserving the composer draft',async decision=>{
+it.each([['execute','ask'],['execute','full'],['execute','auto'],['revise','full']] as const)('submits a reviewed native plan as %s preserving %s permission and the composer draft',async (decision,remembered)=>{
   localStorage.setItem('supercode.session','planned');
   localStorage.setItem('supercode.permissions.v2',JSON.stringify({codex:'read'}));
+  localStorage.setItem('supercode.execution-permissions.v1',JSON.stringify({codex:remembered}));
   data.profiles=[{...data.profiles[0],id:'api:codex',agent:'codex'}];
   data.sessions=[{id:'planned',projectId:'existing',title:'原生计划',agent:'codex',connectionId:'api:codex',model:'test-model',status:'idle',nativeId:'native',turnId:null,updatedAt:1}];
   messages=[{id:'u',seq:1,sessionId:'planned',role:'user',text:'先规划',kind:'userMessage',data:{}},{id:'p',seq:2,sessionId:'planned',role:'assistant',text:'# 完整计划\n\n先校验再合并，包含边界验收。',kind:'plan',data:{status:'completed',turnId:'t'}},{id:'r',seq:3,sessionId:'planned',role:'activity',text:'',kind:'runMarker',data:{status:'completed',turnId:'t'}}];
@@ -74,8 +76,35 @@ it.each(['execute','revise'] as const)('submits a reviewed native plan as %s wit
   await render();await type('尚未发送的自己的草稿');
   expect(call).not.toHaveBeenCalledWith('enqueue_followup',expect.anything());
   await act(async()=>{container.querySelector<HTMLButtonElement>(decision==='execute'?'.plan-request-execute':'.plan-request-revise')!.click();await new Promise(resolve=>setTimeout(resolve,30));});
-  expect(call).toHaveBeenCalledWith('enqueue_followup',{sessionId:'planned',payload:expect.objectContaining({text:decision==='execute'?'请按上一条已确认的计划开始执行。':'请继续修改上一条计划，保持计划模式，暂不执行。',permissionMode:decision==='execute'?'ask':'read',readOnly:decision==='revise',attachments:[]})});
+  expect(call).toHaveBeenCalledWith('enqueue_followup',{sessionId:'planned',payload:expect.objectContaining({text:decision==='execute'?'请按上一条已确认的计划开始执行。':'请继续修改上一条计划，保持计划模式，暂不执行。',permissionMode:decision==='execute'?remembered:'read',readOnly:decision==='revise',attachments:[]})});
   expect(container.querySelector<HTMLTextAreaElement>('.composer textarea')!.value).toBe('尚未发送的自己的草稿');
+});
+
+it.each([['full','full'],['auto','auto'],['ask','edit']] as const)('continues a confirmed Claude plan with %s execution permission as %s',async (remembered,expected)=>{
+  localStorage.setItem('supercode.session','planned-claude');
+  localStorage.setItem('supercode.permissions.v2',JSON.stringify({claude:'read'}));
+  localStorage.setItem('supercode.execution-permissions.v1',JSON.stringify({claude:remembered}));
+  data.sessions=[{id:'planned-claude',projectId:'existing',title:'确认计划',agent:'claude',connectionId:'api:claude',model:'test-model',status:'waiting',nativeId:'native',turnId:'turn',updatedAt:1}];
+  pendingRequests=[{id:'claude:planned-claude:plan',method:'claude/tool/requestApproval',params:{threadId:'native',toolName:'ExitPlanMode',input:{plan:'# 页面计划\n\n创建 HTML 并校验。'}}}];
+  await act(async()=>{await import('./PlanRequest');await import('./Markdown');});
+  await render();
+  await act(async()=>{await vi.dynamicImportSettled();});
+  expect(call).not.toHaveBeenCalledWith('respond_request',expect.anything());
+  await act(async()=>container.querySelector<HTMLButtonElement>('.plan-request-execute')!.click());
+  expect(call).toHaveBeenCalledWith('respond_request',{id:'claude:planned-claude:plan',result:{decision:'accept',executionPermission:expected}});
+  expect(JSON.parse(localStorage.getItem('supercode.permissions.v2')!).claude).toBe(expected);
+});
+
+it('restores full access when leaving the temporary planning menu',async()=>{
+  localStorage.setItem('supercode.permissions.v2',JSON.stringify({claude:'full'}));
+  await render();
+  for(const mode of ['read','full']){
+    await act(async()=>container.querySelector<HTMLButtonElement>('[aria-label="添加附件"]')!.click());
+    await act(async()=>{await vi.dynamicImportSettled();});
+    const button=Array.from(container.querySelectorAll<HTMLButtonElement>('[role="menuitemcheckbox"]')).find(b=>b.textContent?.includes('计划模式'))!;
+    await act(async()=>button.click());
+    expect(JSON.parse(localStorage.getItem('supercode.permissions.v2')!).claude).toBe(mode);
+  }
 });
 
 function queuedMessages() {
@@ -91,6 +120,26 @@ function queuedMessages() {
   });
   return rows;
 }
+
+it('opens a complete plan in the right pane while keeping confirmation and the unsent draft in the composer',async()=>{
+  localStorage.setItem('supercode.session','planned');
+  data.profiles=[{...data.profiles[0],id:'api:codex',agent:'codex'}];
+  data.sessions=[{id:'planned',projectId:'existing',title:'原生计划',agent:'codex',connectionId:'api:codex',model:'test-model',status:'idle',nativeId:'native',turnId:null,updatedAt:1}];
+  const fullPlan='# 长计划\n\n'+Array.from({length:30},(_,i)=>`## 阶段 ${i+1}\n\n完整实施与验收内容。`).join('\n\n')+'\n\n最后的边界验收。';
+  messages=[{id:'u',seq:1,sessionId:'planned',role:'user',text:'先规划',kind:'userMessage',data:{}},{id:'p',seq:2,sessionId:'planned',role:'assistant',text:fullPlan,kind:'plan',data:{status:'completed',turnId:'t'}},{id:'r',seq:3,sessionId:'planned',role:'activity',text:'',kind:'runMarker',data:{status:'completed',turnId:'t'}}];
+  await render(); await type('保留这段草稿');
+  expect(container.querySelector('.messages .plan-decision')).toBeNull();
+  expect(container.querySelector('.composer-area .plan-decision')).not.toBeNull();
+  await act(async()=>{container.querySelector<HTMLButtonElement>('[aria-label="在侧边栏查看完整计划"]')!.click(); await vi.dynamicImportSettled();});
+  const document=container.querySelector('.workspace-plan-preview [aria-label="完整计划文档"]');
+  expect(document?.querySelectorAll('h2')).toHaveLength(30);
+  expect(document?.textContent).toContain('最后的边界验收');
+  expect(call).not.toHaveBeenCalledWith('enqueue_followup',expect.anything());
+  expect(container.querySelector<HTMLTextAreaElement>('.composer textarea')!.value).toBe('保留这段草稿');
+  await act(async()=>container.querySelector<HTMLButtonElement>('[title="关闭计划"]')!.click());
+  expect(container.querySelector('.workspace-plan-preview')).toBeNull();
+  expect(container.querySelector('.composer-area .plan-decision')).not.toBeNull();
+});
 async function editFirstQueuedMessage(){
   await act(async()=>container.querySelector<HTMLButtonElement>('[data-followup-id="first"] [aria-label="排队消息更多操作"]')!.click());
   await act(async()=>{[...document.querySelectorAll<HTMLButtonElement>('.followup-menu button')].find(button=>button.textContent==='编辑消息')!.click();await new Promise(resolve=>setTimeout(resolve,30));});
@@ -145,6 +194,57 @@ it('opens child details without starting a chat and preserves the main composer 
   expect(container.querySelector('.subagent-panel')).toBeNull();
   expect(container.querySelector<HTMLElement>('.workspace-panel')?.hidden).toBe(false);
   expect(container.querySelector<HTMLTextAreaElement>('.composer textarea')?.value).toBe('尚未发送的主会话草稿');
+});
+it.each(['none','subagent','side-chat'] as const)('opens an operation code change with %s in the right pane and preserves drafts',async pane=>{
+  localStorage.setItem('supercode.session','review');
+  localStorage.setItem('supercode.context','false');
+  data.sessions=[{id:'review',projectId:'existing',title:'本次代码改动',agent:'claude',connectionId:'api:claude',model:'test-model',status:'idle',nativeId:'native',turnId:null,updatedAt:1}];
+  const diff='diff --git a/中文.ts b/中文.ts\n--- a/中文.ts\n+++ b/中文.ts\n@@ -1 +1 @@\n-old_value\n+new_value\n';
+  messages=[
+    {id:'u',seq:1,sessionId:'review',role:'user',kind:'userMessage',text:'修改文件',data:{}},
+    {id:'edit',seq:2,sessionId:'review',role:'tool',kind:'claudeToolCall',text:'saved',data:{tool:'Edit',status:'completed',changes:[{path:'中文.ts',diff,added:1,removed:1}]}},
+    {id:'answer',seq:3,sessionId:'review',role:'assistant',kind:'agentMessage',text:'修改已完成',data:{}},
+    {id:'run',seq:4,sessionId:'review',role:'activity',kind:'runMarker',text:'',data:{status:'completed',durationMs:1000}},
+  ];
+  if(pane==='subagent') messages.splice(2,0,{id:'task',seq:0,sessionId:'review',role:'tool',kind:'claudeToolCall',text:'子代理只读结果',data:{tool:'Task',status:'completed',arguments:{description:'demo'}}});
+  if(pane==='side-chat') {
+    const base=vi.mocked(call).getMockImplementation()!;
+    vi.mocked(call).mockImplementation(async(command,args={})=>command==='list_followups'&&args.sessionId==='review'?[{id:'side-source',sessionId:'review',status:'paused',error:null,payload:{text:'侧边聊天草稿',permissionMode:'ask',model:'test-model',attachments:[]}}]:base(command,args));
+  }
+  await render(); await type('保留我的未发送草稿');
+  if(pane==='subagent') await act(async()=>{container.querySelector<HTMLButtonElement>('.subagent-row')!.click();await vi.dynamicImportSettled();});
+  if(pane==='side-chat') {
+    await act(async()=>{await import('./SideChat');});
+    await act(async()=>container.querySelector<HTMLButtonElement>('[aria-label="排队消息更多操作"]')!.click());
+    await act(async()=>{[...document.querySelectorAll<HTMLButtonElement>('[role="menuitem"]')].find(item=>item.textContent?.includes('在侧边聊天中打开'))!.click();await new Promise(resolve=>setTimeout(resolve,30));await vi.dynamicImportSettled();});
+    const input=container.querySelector<HTMLTextAreaElement>('[aria-label="侧边聊天消息"]')!;
+    expect(input).not.toBeNull();
+    await act(async()=>{Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype,'value')!.set!.call(input,'保留侧边聊天草稿');input.dispatchEvent(new Event('input',{bubbles:true}));});
+  }
+  const previousPane=pane==='none'?null:container.querySelector<HTMLElement>(`.${pane==='subagent'?'subagent-panel':'side-chat'}`);
+  if(previousPane) expect(previousPane.hidden).toBe(false);
+  await act(async()=>container.querySelector<HTMLButtonElement>('.conversation-surface .turn-process-toggle')!.click());
+  await act(async()=>container.querySelector<HTMLButtonElement>('.conversation-surface .activity-group-summary')!.click());
+  expect(container.querySelector('.file-preview')).toBeNull();
+  await act(async()=>{container.querySelector<HTMLButtonElement>('.conversation-surface .activity-row')!.click();await vi.dynamicImportSettled();});
+  await act(async()=>{await vi.dynamicImportSettled();});
+  const workspace=container.querySelector<HTMLElement>('.workspace-panel')!;
+  expect(workspace.hidden).toBe(false);
+  expect(workspace.getAttribute('aria-hidden')).toBe('false');
+  expect(workspace.querySelector('.workspace-file-preview')?.textContent).toContain('本次变更 · 中文.ts');
+  expect(workspace.querySelector('.change-preview')?.textContent).toContain('new_value');
+  expect(container.querySelector('.conversation-surface .activity-body')).toBeNull();
+  expect(container.querySelector('.conversation-surface')?.textContent).not.toContain('new_value');
+  expect(container.querySelector<HTMLTextAreaElement>('.composer textarea')?.value).toBe('保留我的未发送草稿');
+  if(previousPane) expect(previousPane.hidden).toBe(true);
+  await act(async()=>container.querySelector<HTMLButtonElement>('.right-pane [title="关闭文件"]')!.click());
+  expect(container.querySelector('.workspace-file-preview')).toBeNull();
+  expect(container.querySelector<HTMLTextAreaElement>('.composer textarea')?.value).toBe('保留我的未发送草稿');
+  if(previousPane) {
+    expect(previousPane.isConnected).toBe(true);
+    expect(previousPane.hidden).toBe(false);
+  }
+  if(pane==='side-chat') expect(container.querySelector<HTMLTextAreaElement>('[aria-label="侧边聊天消息"]')?.value).toBe('保留侧边聊天草稿');
 });
 it('edits a queued message in the main composer, saves in place, and restores its unsent draft',async()=>{
   const rows=queuedMessages();await render();await type('原来没发的草稿');await editFirstQueuedMessage();
@@ -521,7 +621,7 @@ it('hides the live changes dock and collapses the process as soon as completion 
   expect(container.querySelector('.composer-area .turn-change-dock')).toBeNull();
 });
 
-it('folds restored legacy tools while preserving every unphased answer section through pagination', async () => {
+it('folds restored legacy progress and tools while preserving the final answer through pagination', async () => {
   localStorage.setItem('supercode.session', 'chat');
   data.sessions = [{id:'chat',projectId:'existing',title:'旧历史记录',agent:'claude',connectionId:'api:claude',model:null,status:'idle',nativeId:'native',turnId:null,updatedAt:1}];
   const marker: Message = {id:'run-old',seq:2,sessionId:'chat',role:'activity',kind:'runMarker',text:'',data:{turnId:'old',status:'inProgress'}};
@@ -537,17 +637,19 @@ it('folds restored legacy tools while preserving every unphased answer section t
   await render();
   expect(container.querySelector('.turn-process-toggle')?.getAttribute('aria-expanded')).toBe('false');
   expect(container.querySelector('.turn-process-content')).toBeNull();
-  expect(container.querySelector('.turn-final-result')?.textContent).toContain('旧执行过程 26');
+  expect(container.querySelector('.turn-final-result')?.textContent).not.toContain('旧执行过程 26');
   expect(container.querySelector('.turn-final-result')?.textContent).not.toContain('旧执行过程 27');
   expect(container.querySelector('.turn-final-result')?.textContent).toContain('插件开发完成');
   const final = container.querySelector('.turn-final-result .message:last-child');
   await act(async () => container.querySelector<HTMLButtonElement>('.turn-process-toggle')!.click());
-  expect(container.querySelector('.turn-process-content .activity-group-summary')?.getAttribute('aria-label')).toBe('运行了命令，50 条记录');
+  expect(container.querySelectorAll('.turn-process-content .activity-group-summary')).toHaveLength(50);
+  expect(container.querySelector('.turn-process-content')?.textContent).toContain('旧执行过程 26');
   await act(async () => { container.querySelector<HTMLButtonElement>('.load-earlier')!.click(); await vi.dynamicImportSettled(); });
   expect(vi.mocked(call).mock.calls.some(([command,args]) => command === 'list_messages' && args?.before === 28)).toBe(true);
   expect(container.querySelector('.load-earlier')).toBeNull();
-  expect(container.querySelector('.turn-process-content .activity-group-summary')?.getAttribute('aria-label')).toBe('运行了命令，62 条记录');
-  expect(container.querySelector('.turn-final-result')?.textContent).toContain('旧执行过程 0');
+  expect(container.querySelectorAll('.turn-process-content .activity-group-summary')).toHaveLength(62);
+  expect(container.querySelector('.turn-process-content')?.textContent).toContain('旧执行过程 0');
+  expect(container.querySelector('.turn-final-result')?.textContent).not.toContain('旧执行过程 0');
   expect(container.querySelector('.turn-final-result .message:last-child')).toBe(final);
   expect(container.querySelectorAll('[aria-label="你的消息"]')).toHaveLength(1);
 });
@@ -580,24 +682,25 @@ it('reloads persisted adapter edit snapshots during a turn without waiting for c
   expect(container.querySelector('.turn-change-dock')?.textContent).toContain('1 个文件已更改');
   expect(vi.mocked(call).mock.calls.filter(([command])=>command==='list_messages')).toHaveLength(before+1);
 });
-it('keeps browser and file changes independent, including fullscreen and closing either panel', async () => {
+it('shares right-side tabs without remounting the browser and collapses the last closed tab', async () => {
   const media = vi.spyOn(window, 'matchMedia').mockImplementation(() => ({matches:false,addEventListener:()=>{},removeEventListener:()=>{}} as unknown as MediaQueryList));
   localStorage.setItem('supercode.context', 'true');
   localStorage.setItem('supercode.session', 'chat');
   data.sessions = [{id:'chat',projectId:'existing',title:'面板测试',agent:'claude',connectionId:'api:claude',model:null,status:'idle',nativeId:null,turnId:null,updatedAt:1}];
   await render();
+  await type('保留主聊天草稿');
   expect(container.querySelector('[aria-label="工作空间"]')).not.toBeNull();
   await act(async () => { container.querySelector<HTMLButtonElement>('[aria-label="打开内置浏览器"]')!.click(); await vi.dynamicImportSettled(); await new Promise(resolve=>setTimeout(resolve,30)); });
   const browser = container.querySelector('[aria-label="内置浏览器"]')!;
   expect(browser).not.toBeNull();
   expect(browser.querySelector('.context-tabs')).toBeNull();
   expect(browser.textContent).not.toContain('文件变更');
-  expect(browser.parentElement?.classList.contains('conversation-surface')).toBe(true);
-  expect(container.querySelector('[aria-label="工作空间"]')?.parentElement).toBe(container.querySelector('.app'));
-  await act(async () => container.querySelector<HTMLButtonElement>('[aria-label="全屏查看网页"]')!.click());
-  expect(browser.classList.contains('browser-expanded')).toBe(true);
+  expect(browser.parentElement?.classList.contains('right-pane-content')).toBe(true);
+  expect(container.querySelector('[aria-label="工作空间"]')?.parentElement).toBe(browser.parentElement);
+  await act(async () => container.querySelector<HTMLButtonElement>('[aria-label="展开右侧栏"]')!.click());
+  expect(container.querySelector('[aria-label="还原右侧栏宽度"]')).not.toBeNull();
   expect(container.querySelector('[aria-label="工作空间"]')).not.toBeNull();
-  await act(async () => container.querySelector<HTMLButtonElement>('[aria-label="收起工作空间"]')!.click());
+  await act(async () => container.querySelector<HTMLButtonElement>('[aria-label="关闭工作空间"]')!.click());
   expect(container.querySelector('[aria-label="工作空间"]')).toBeNull();
   expect(container.querySelector('[aria-label="内置浏览器"]')).toBe(browser);
   expect(call).toHaveBeenCalledWith('browser_open', expect.objectContaining({sessionId:'chat'}));
@@ -607,7 +710,31 @@ it('keeps browser and file changes independent, including fullscreen and closing
   await act(async () => container.querySelector<HTMLButtonElement>('[aria-label="关闭浏览器"]')!.click());
   expect(container.querySelector('[aria-label="内置浏览器"]')).toBeNull();
   expect(container.querySelector('[aria-label="工作空间"]')).not.toBeNull();
+  expect(call).toHaveBeenCalledWith('browser_close',expect.objectContaining({sessionId:'chat',mountId:expect.any(String)}));
+  await act(async () => container.querySelector<HTMLButtonElement>('[aria-label="关闭工作空间"]')!.click());
+  expect(container.querySelector<HTMLElement>('.right-pane')?.hidden).toBe(true);
+  expect(container.querySelector('.app')?.classList.contains('context-hidden')).toBe(true);
+  expect(container.querySelector<HTMLTextAreaElement>('.composer textarea')?.value).toBe('保留主聊天草稿');
+  expect(call).not.toHaveBeenCalledWith('interrupt_turn',expect.anything());
   media.mockRestore();
+});
+it.each(['close','switch'] as const)('does not reopen or select a delayed file after the user chooses to %s its view',async action=>{
+  localStorage.setItem('supercode.context','true');localStorage.setItem('supercode.workspace-view','files');localStorage.setItem('supercode.session','slow-file');
+  data.sessions=[{id:'slow-file',projectId:'existing',title:'慢文件',agent:'claude',connectionId:'api:claude',model:'test-model',status:'running',nativeId:'native',turnId:'t',updatedAt:1}];
+  let finish!:(text:string)=>void;const pending=new Promise<string>(resolve=>{finish=resolve;});
+  const base=vi.mocked(call).getMockImplementation()!;
+  vi.mocked(call).mockImplementation(async(command,args={})=>command==='list_workspace_directory'?{entries:[{name:'slow.ts',path:'slow.ts',isDirectory:false}],truncated:false}:command==='read_project_file'?pending:base(command,args));
+  await render();await act(async()=>{await vi.dynamicImportSettled();});await type('保留草稿');
+  await act(async()=>container.querySelector<HTMLButtonElement>('.workspace-tree-row[title="slow.ts"]')!.click());
+  expect(container.querySelector('.right-pane-tabs')?.textContent).toContain('slow.ts');
+  if(action==='close')await act(async()=>container.querySelector<HTMLButtonElement>('[aria-label="关闭右侧栏"]')!.click());
+  else await act(async()=>Array.from(container.querySelectorAll<HTMLButtonElement>('.right-pane [role="tab"]')).find(tab=>tab.textContent==='工作空间')!.click());
+  await act(async()=>finish('export const loaded = true;'));await act(async()=>{await vi.dynamicImportSettled();});
+  if(action==='close') {expect(container.querySelector('.document-panel')).toBeNull();expect(container.querySelector<HTMLElement>('.right-pane')?.hidden).toBe(true);}
+  else {expect(container.querySelector<HTMLElement>('.document-panel')?.hidden).toBe(true);expect(container.querySelector<HTMLElement>('[aria-label="工作空间"]')?.hidden).toBe(false);}
+  expect(container.querySelector<HTMLTextAreaElement>('.composer textarea')?.value).toBe('保留草稿');
+  expect(container.querySelector('.composer .send-button')?.getAttribute('aria-label')).toBe('加入队列');
+  expect(call).not.toHaveBeenCalledWith('interrupt_turn',expect.anything());
 });
 it('docks questions above the composer while keeping approvals in the conversation and restores the composer after answering', async () => {
   pendingRequests = [
@@ -817,6 +944,25 @@ it('displays models and platform allowance only for the current configured suppl
   expect(container.querySelector('.model-chip')?.textContent).toContain('test-model');
   expect(container.querySelector('[data-testid="platform-allowance"]')).not.toBeNull();
   expect(call).toHaveBeenCalledWith('get_model_source',expect.objectContaining({agent:'claude',connectionId:'api:claude',sessionId:null}));
+});
+it('keeps one connection quota revision across chats rather than treating each chat as a new plan',async()=>{
+  localStorage.setItem('supercode.session','quota-first');
+  data.sessions=['quota-first','quota-second'].map((id,index)=>({id,projectId:'existing',title:index?'第二个额度聊天':'第一个额度聊天',agent:'claude',connectionId:'api:claude',model:'test-model',status:'idle',nativeId:null,turnId:null,updatedAt:index+1}));
+  vi.mocked(PlatformUsageIndicator).mockClear();await render();
+  const before=vi.mocked(PlatformUsageIndicator).mock.calls.at(-1)?.[0];
+  expect(before?.source?.available).toBe(true);
+  await act(async()=>{Array.from(container.querySelectorAll<HTMLButtonElement>('.session-row')).find(button=>button.textContent?.includes('第二个额度聊天'))!.click();await new Promise(resolve=>setTimeout(resolve,30));});
+  const after=vi.mocked(PlatformUsageIndicator).mock.calls.at(-1)?.[0];
+  expect(after?.connectionId).toBe('api:claude');expect(after?.revision).toBe(before?.revision);
+});
+it('keeps a configured plan entry when model catalog metadata is temporarily absent',async()=>{
+  data.profiles=[{...data.profiles[0],name:'GLM Coding',providerId:'glm',plan:'coding'}];
+  const base=vi.mocked(call).getMockImplementation()!;
+  vi.mocked(call).mockImplementation(async(command,args={})=>command==='list_models'?{data:[{id:'test-model',model:'test-model',displayName:'test-model',isDefault:true}]}:base(command,args));
+  await render();
+  expect(container.querySelector('[data-testid="platform-allowance"]')).not.toBeNull();
+  const props=vi.mocked(PlatformUsageIndicator).mock.calls.at(-1)?.[0];
+  expect(props?.source?.providerId).toBe('glm');expect(props?.source?.connectionName).toBe('GLM Coding');
 });
 
 it('selects an inline skill and toggles planning without losing the message draft or opening settings', async () => {

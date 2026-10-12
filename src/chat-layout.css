@@ -37,6 +37,7 @@
   position:relative; display:flex; flex-direction:column; min-width:0; min-height:0; background:var(--bg);
   border-left:1px solid var(--line); container-type:inline-size; container-name:side-conversation;
 }
+.side-chat[hidden], .subagent-panel[hidden] { display:none; }
 .desktop-workarea .side-chat { border-left:1px solid var(--line); }
 .side-chat-header { display:flex; align-items:center; gap:10px; flex:none; height:50px; padding:0 16px; border-bottom:1px solid var(--frame-line,var(--line)); }
 .side-chat-header > svg { color:var(--muted); flex:none; }

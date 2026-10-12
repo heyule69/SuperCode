@@ -134,7 +134,7 @@ it('retains live thinking, plan steps and tool steps when a child completes, wit
     await new Promise(resolve=>setTimeout(resolve,70));
   });
   expect(node.textContent).toContain('边界验证完成');
-  expect(node.textContent).toContain('运行了命令');
+  expect(node.textContent).toContain('已运行');
   expect(node.querySelectorAll('.activity-item')).toHaveLength(3);
   expect(node.querySelector('.turn-process-toggle')).toBeNull();
   expect(node.querySelectorAll('.activity-body')).toHaveLength(1);

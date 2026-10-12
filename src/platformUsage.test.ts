@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { allowanceSummary, primaryAllowance, resetLabel, UsageQueries, type PlatformUsage } from './platformUsage';
+import { allowanceSummary, primaryAllowance, resetLabel, supportsPlatformUsage, UsageQueries, type PlatformUsage } from './platformUsage';
 const example: PlatformUsage = { agent: 'claude', connectionId: 'a', providerName: 'GLM', connectionName: 'GLM Coding', queriedAt: 1, windows: [], balances: [] };
 describe('platform allowance display', () => {
   it('prioritizes the short model window over weekly and MCP quota, with matching meter data', () => {
@@ -27,6 +27,19 @@ describe('platform allowance display', () => {
 });
 
 describe('bounded quota queries', () => {
+  it('retains a separately marked last successful value after an unavailable update and expires it independently',async()=>{
+    let time=0;
+    const read=vi.fn().mockResolvedValueOnce(example).mockResolvedValue(null);
+    const queries=new UsageQueries(read,()=>time);
+    await queries.query('claude','a',false,'revision');time=10_000;
+    await queries.query('claude','a',true,'revision');
+    expect(queries.peek('claude','a','revision')).toBeNull();
+    expect(queries.lastKnown('claude','a','revision')).toBe(example);
+    expect(queries.lastKnown('claude','other','revision')).toBeUndefined();
+    expect(queries.lastKnown('claude','a','changed-key')).toBeUndefined();
+    time=300_001;await queries.query('claude','a',true,'revision');
+    expect(queries.lastKnown('claude','a','revision')).toBeUndefined();
+  });
   it('shares concurrent requests and serves revisited connections from memory', async () => {
     let time = 0;
     const read = vi.fn(async () => example);
@@ -90,4 +103,9 @@ describe('bounded quota queries', () => {
     expect(queries.peek('claude', '1')).toBeUndefined(); expect(queries.peek('claude', '0')).toBe(example);
     time = 300_000; expect(queries.peek('claude', '0')).toBeUndefined();
   });
+});
+it('only reserves a quota entry for supported providers when no data has been returned',()=>{
+  expect(supportsPlatformUsage('claude',{providerId:'glm',providerName:'GLM',mark:'Z'})).toBe(true);
+  expect(supportsPlatformUsage('pi',{providerId:'kimi',providerName:'Kimi',mark:'K'})).toBe(true);
+  expect(supportsPlatformUsage('claude',{providerId:'custom',providerName:'Local',mark:'L'})).toBe(false);
 });

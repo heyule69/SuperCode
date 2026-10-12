@@ -106,6 +106,7 @@ pub(crate) fn preset() -> Value {
     let models: Vec<_> = catalog["models"].as_array().unwrap().iter().map(|model| json!({
         "id":model["model"],"model":model["model"],"displayName":model["displayName"],"isDefault":model["isDefault"]==true,
         "defaultReasoningEffort":model["defaultReasoningEffort"],"supportedReasoningEfforts":model["efforts"].as_array().unwrap().iter().map(|effort| json!({"reasoningEffort":effort})).collect::<Vec<_>>()
+        ,"contextWindow":model["contextWindow"],"effectiveContextWindowPercent":model["effectiveContextWindowPercent"]
     })).collect();
     json!({"data":models,"origin":"preset","notice":"官方模型目录 · 实际可用范围由账号权限决定"})
 }
@@ -140,7 +141,9 @@ fn parse_catalog(value: &Value) -> Result<Value, String> {
                 )
             })
             .collect();
-        models.push(json!({"id":id,"model":id,"displayName":row["display_name"].as_str().unwrap_or(id),"isDefault":models.is_empty(),"defaultReasoningEffort":row["default_reasoning_level"],"supportedReasoningEfforts":efforts}));
+        let mut parsed = crate::model_context::metadata(row);
+        parsed.as_object_mut().unwrap().extend(json!({"id":id,"model":id,"displayName":row["display_name"].as_str().unwrap_or(id),"isDefault":models.is_empty(),"defaultReasoningEffort":row["default_reasoning_level"],"supportedReasoningEfforts":efforts}).as_object().unwrap().clone());
+        models.push(parsed);
     }
     Ok(json!({"data":models,"origin":"officialApi"}))
 }
@@ -264,6 +267,8 @@ mod tests {
         let rows = data["data"].as_array().unwrap();
         assert_eq!(rows.len(), 7);
         assert_eq!(rows[0]["model"], "gpt-6.1-sol");
+        assert_eq!(rows[0]["contextWindow"], 500000);
+        assert_eq!(rows[0]["effectiveContextWindowPercent"], 95);
         assert_eq!(
             rows.iter().filter(|row| row["isDefault"] == true).count(),
             1
@@ -294,6 +299,13 @@ mod tests {
             .unwrap_err()
             .find("secret")
             .is_none());
+    }
+    #[test]
+    fn official_api_capacity_overrides_presets_without_exposing_extra_fields() {
+        let catalog=parse_catalog(&json!({"models":[{"slug":"gpt-6.1-sol","visibility":"list","context_window":600000,"effective_context_window_percent":95,"private":"secret"}]})).unwrap();
+        assert_eq!(catalog["data"][0]["contextWindow"],600000);
+        assert_eq!(catalog["data"][0]["effectiveContextWindowPercent"],95);
+        assert!(!catalog.to_string().contains("secret"));
     }
     #[test]
     fn local_official_status_never_treats_api_keys_as_official_login_or_leaks_tokens() {

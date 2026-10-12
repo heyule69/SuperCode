@@ -1,5 +1,5 @@
 import { afterEach, expect, it, vi } from 'vitest';
-import { compatiblePermission, isPermissionMode, loadPermissionChoices } from './permissions';
+import { compatiblePermission, isPermissionMode, loadPermissionChoices, loadExecutionPermissionChoices, planExecutionPermission } from './permissions';
 
 function stored(values: Record<string, string>) {
   vi.stubGlobal('localStorage', { getItem: (key: string) => values[key] ?? null });
@@ -32,4 +32,20 @@ it('rejects invalid and unsupported native modes and retains readonly settings',
 it('recovers malformed storage conservatively without restoring a different Agent full-access choice', () => {
   stored({ 'supercode.permissions.v2': '{bad', 'supercode.permission': 'full' });
   expect(loadPermissionChoices('codex', 'ask')).toEqual({ codex: 'ask' });
+});
+
+it('retains execution permissions when planning is saved and keeps each Agent separate', () => {
+  stored({ 'supercode.execution-permissions.v1': JSON.stringify({ claude: 'full', codex: 'auto', pi: 'read', injected: 'full' }) });
+  expect(loadExecutionPermissionChoices({ claude: 'read', codex: 'read', opencode: 'ask' })).toEqual({ claude: 'full', codex: 'auto', opencode: 'ask' });
+  expect(loadExecutionPermissionChoices({ claude: 'edit' }).claude).toBe('edit');
+  stored({ 'supercode.execution-permissions.v1': '{broken' });
+  expect(loadExecutionPermissionChoices({ claude: 'read' })).toEqual({});
+});
+
+it('accepts ordinary Claude plan edits without granting full access or replacing explicit policies', () => {
+  stored({});
+  for (const mode of ['ask', 'read', undefined]) expect(planExecutionPermission(mode, 'claude')).toBe('edit');
+  for (const mode of ['strict', 'edit', 'auto', 'deny', 'full'] as const) expect(planExecutionPermission(mode, 'claude')).toBe(mode);
+  expect(planExecutionPermission('read', 'codex')).toBe('ask');
+  expect(planExecutionPermission('full', 'codex')).toBe('full');
 });

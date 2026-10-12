@@ -4,7 +4,9 @@ import { conversationTurns, isActivity, type ConversationTurn } from './events';
 import { isActive, type Message } from './types';
 import { diffFiles } from './diff';
 import { CopyButton } from './CopyButton';
-import { activityStatus, compactActivities, concisePath, summarizeActivities } from './activityPresentation';
+import { activityStatus, concisePath, summarizeActivities } from './activityPresentation';
+import { activityCommand, activityDiff, activityFiles, activityOutput, fileAction } from './activityDetails';
+import './activity-details.css';
 import { ResourceMenu, type OpenPath } from './ResourceMenu';
 import { ConversationIndex } from './ConversationIndex';
 import { AttachmentImage } from './AttachmentImage';
@@ -15,7 +17,7 @@ import { QuestionHistory } from './QuestionHistory';
 import { planText, type PlanDecision } from './planPresentation';
 import { collectSubagents, isSubagent } from './subagents';
 import { SubagentContext, SubagentRows } from './SubagentRow';
-const PlanDocument = lazy(() => import('./PlanDocument').then(module => ({ default: module.PlanDocument })));
+const PlanCard = lazy(() => import('./PlanCard').then(module => ({ default: module.PlanCard })));
 const ProposedPlan = lazy(() => import('./ProposedPlan'));
 
 const Markdown = lazy(() => import('./Markdown'));
@@ -32,7 +34,7 @@ export function activityTitle(m: Message) {
   if (m.kind === 'claudeToolCall') {
     const args = (d.arguments ?? {}) as Record<string, unknown>;
     const labels: Record<string, string> = { Read: '读取文件', Glob: '查找文件', Grep: '搜索代码', Edit: '编辑文件', Write: '写入文件', Bash: '执行命令', AskUserQuestion: '询问用户', EnterPlanMode: '开始规划', ExitPlanMode: '提交计划' };
-    return { label: labels[name] ?? (name || '调用工具'), detail: String(args.file_path ?? args.command ?? args.pattern ?? args.path ?? ''), icon: name === 'AskUserQuestion' ? MessageCircleQuestion : ['EnterPlanMode', 'ExitPlanMode'].includes(name) ? ListChecks : name === 'Bash' ? SquareTerminal : ['Read', 'Glob', 'Grep'].includes(name) ? FileSearch : ['Edit', 'Write'].includes(name) ? FileCode2 : Wrench };
+    return { label: labels[name] ?? (name || '调用工具'), detail: String(args.file_path ?? args.command ?? args.pattern ?? args.path ?? ''), icon: name === 'AskUserQuestion' ? MessageCircleQuestion : ['EnterPlanMode', 'ExitPlanMode'].includes(name) ? ListChecks : name === 'Bash' ? SquareTerminal : ['Read', 'Glob', 'Grep'].includes(name) ? FileSearch : ['Edit', 'Write','MultiEdit','NotebookEdit','apply_patch','ApplyPatch'].includes(name) ? Pencil : Wrench };
   }
   if (m.kind === 'commandExecution') {
     const actions = d.commandActions as { type: string; path?: string; query?: string }[] | undefined;
@@ -40,7 +42,7 @@ export function activityTitle(m: Message) {
     const label = action?.type === 'read' ? '读取文件' : action?.type === 'search' ? '搜索代码' : action?.type === 'listFiles' ? '浏览文件' : '执行命令';
     return { label, detail: String(action?.path ?? action?.query ?? d.command ?? m.text.split('\n')[0]), icon: action && action.type !== 'unknown' ? FileSearch : SquareTerminal };
   }
-  if (m.kind === 'fileChange') return { label: '修改文件', detail: m.text.split('\n')[0], icon: FileCode2 };
+  if (m.kind === 'fileChange') return { label: '修改文件', detail: m.text.split('\n')[0], icon: Pencil };
   if (m.kind === 'webSearch') return { label: '搜索网页', detail: m.text || stringify(d.action), icon: Globe };
   if (m.kind === 'imageView') return { label: '查看图片', detail: m.text, icon: FileSearch };
   if (m.kind.startsWith('collab')) return { label: '协作 Agent', detail: name, icon: Network };
@@ -53,7 +55,7 @@ function StatusIcon({ status }: { status: string }) {
   return pending(status) ? null : ['failed', 'declined'].includes(status) ? <X size={14} /> : status === 'interrupted' ? <Square size={12} /> : <Check size={14} />;
 }
 
-const ActivityItem = memo(function ActivityItem({ message: m, autoExpand }: { message: Message; autoExpand: boolean }) {
+const ActivityItem = memo(function ActivityItem({ message: m, autoExpand, showDiff }: { message: Message; autoExpand: boolean; showDiff:(name:string,text:string)=>void }) {
   const [expanded, setExpanded] = useState(autoExpand || m.kind === 'claudeToolCall' && m.data?.tool === 'ExitPlanMode' && m.data.status === 'preparing');
   useEffect(() => setExpanded(autoExpand || m.kind === 'claudeToolCall' && m.data?.tool === 'ExitPlanMode' && m.data.status === 'preparing'), [autoExpand, m.id]);
 
@@ -65,33 +67,40 @@ const ActivityItem = memo(function ActivityItem({ message: m, autoExpand }: { me
   const question = m.kind === 'claudeToolCall' && d.tool === 'AskUserQuestion';
   const planSubmission = m.kind === 'claudeToolCall' && d.tool === 'ExitPlanMode';
   const document = planSubmission && expanded ? planText(d.arguments) || planText(d.inputText, status === 'preparing') : '';
-  const output = m.kind === 'commandExecution' ? m.text.slice(String(d.command ?? m.text.split('\n')[0]).length).replace(/^\n/, '') : m.kind === 'fileChange' ? String(d.output ?? '') : m.kind === 'claudeToolCall' ? m.text : stringify(d.result ?? d.contentItems ?? d.error);
-  const args = question || planSubmission ? '' : d.inputText && status === 'preparing' ? String(d.inputText) : stringify(d.arguments);
-  const changes = Array.isArray(d.changes) ? d.changes as { path: string; kind?: { type?: string } | string; diff?: string }[] : [];
+  const command = activityCommand(m);
+  const output = ['commandExecution','fileChange','claudeToolCall'].includes(m.kind) ? activityOutput(m) : stringify(d.result ?? d.contentItems ?? d.error);
+  const changes = useMemo(() => activityFiles(m), [m]);
+  const patch = useMemo(() => activityDiff(changes), [changes]);
+  const fileOperation = changes.length > 0 || m.kind === 'fileChange' || m.kind === 'claudeToolCall' && ['Edit','Write','MultiEdit','NotebookEdit','apply_patch','ApplyPatch'].includes(String(d.tool));
+  const args = question || planSubmission || command || fileOperation ? '' : d.inputText && status === 'preparing' ? String(d.inputText) : stringify(d.arguments);
+  const counted = changes.length > 0 && changes.every(c => c.added != null && c.removed != null);
+  const added = changes.reduce((sum,c)=>sum+(c.added ?? 0),0), removed = changes.reduce((sum,c)=>sum+(c.removed ?? 0),0);
   const steps = Array.isArray(d.plan) ? d.plan as { step: string; status: string }[] : [];
   const stateText = status === 'preparing' ? question ? '生成问题' : planSubmission ? '生成计划' : '生成参数' : pending(status) ? reasoning ? '思考中' : '运行中' : status === 'failed' ? '失败' : status === 'interrupted' ? '已停止' : status === 'declined' ? '已拒绝' : '完成';
   const finishedLabels: Record<string, string> = { '执行命令': '运行了命令', '读取文件': '读取了文件', '编辑文件': '编辑了文件', '写入文件': '写入了文件', '修改文件': '修改了文件', '查找文件': '查找了文件', '搜索代码': '搜索了代码', '搜索网页': '搜索了网页', '查看图片': '查看了图片' };
-  const rowLabel = pending(status) || ['failed', 'declined', 'interrupted'].includes(status) ? label : finishedLabels[label] ?? label;
-  const hasBody = question || planSubmission || reasoning || plan || !!(output || args || changes.length || d.progress || d.terminalInput || d.cwd || d.prompt || d.agentsStates || (m.kind === 'commandExecution' && detail));
-  const copyText = question ? '' : planSubmission ? document : [detail, args, reasoning ? m.text : output, ...changes.map(c => `${c.path}\n${c.diff ?? ''}`)].filter(Boolean).join('\n\n');
-  const preview = label === '执行命令' ? '' : reasoning ? m.text.replace(/\s+/g, ' ').trim().slice(0, 160) : m.kind === 'fileChange' ? changes.map(c => concisePath(c.path)).join('、') || concisePath(detail) : ['读取文件', '编辑文件', '写入文件', '查找文件', '查看图片'].includes(label) ? concisePath(detail) : detail;
+  const rowLabel = pending(status) || ['failed', 'declined', 'interrupted'].includes(status) ? label : changes.length === 1 ? fileAction(changes[0].kind) : command && label === '执行命令' ? '已运行' : finishedLabels[label] ?? label;
+  const hasBody = !fileOperation && (question || planSubmission || reasoning || plan || !!(command || output || args || d.changeNote || d.progress || d.terminalInput || d.cwd || d.prompt || d.agentsStates));
+  const copyText = question || fileOperation ? '' : planSubmission ? document : [detail, args, reasoning ? m.text : output].filter(Boolean).join('\n\n');
+  const commandPreview = !!command && label === '执行命令';
+  const preview = commandPreview ? command : changes.length ? changes.map(c=>concisePath(c.path)).join('、') : reasoning ? m.text.replace(/\s+/g, ' ').trim().slice(0, 160) : ['读取文件', '编辑文件', '写入文件', '查找文件', '查看图片'].includes(label) ? concisePath(detail) : detail;
+  const pathPreview = !commandPreview && !reasoning && (changes.length || ['读取文件','编辑文件','写入文件','查看图片'].includes(label));
   return <section className={`activity-item ${reasoning ? 'reasoning' : ''} ${status}`} aria-label={`${label}：${stateText}`}>
-    <button className="activity-row" type="button" aria-label={`${label}${preview ? ` · ${preview.slice(0, 160)}` : ''} · ${stateText}`} aria-expanded={hasBody && expanded} onClick={() => setExpanded(v => !v)} disabled={!hasBody}>
-      <Icon size={14} /><strong>{rowLabel}</strong>{preview ? <code className={reasoning ? 'activity-summary-detail' : undefined} title={reasoning ? undefined : detail.slice(0, 240)}>{preview}</code> : null}{pending(status) || ['failed', 'declined', 'interrupted'].includes(status) ? <span className="activity-state"><StatusIcon status={status} /><span className={pending(status) ? 'pending-text' : undefined}>{stateText}</span></span> : null}{hasBody ? <ChevronDown size={12} className={expanded ? 'expanded' : ''} /> : null}
+    <button className="activity-row" type="button" aria-label={`${label}${preview ? ` · ${preview.slice(0, 160)}` : ''} · ${stateText}`} title={fileOperation ? '在侧边栏查看本次代码改动' : undefined} aria-expanded={hasBody ? expanded : undefined} onClick={() => fileOperation ? showDiff(changes.length === 1 ? `本次变更 · ${changes[0].path}` : changes.length ? '本次变更' : `本次变更${detail ? ` · ${detail}` : ''}`, patch || `此记录没有保存可展示的代码差异。${d.changeNote ? `\n${String(d.changeNote)}` : ''}`) : setExpanded(v => !v)} disabled={!hasBody && !fileOperation || fileOperation && pending(status) && !patch}>
+      <Icon size={14} /><strong>{rowLabel}</strong>{preview ? <code className={reasoning ? 'activity-summary-detail' : command ? 'activity-command-preview' : pathPreview ? 'activity-file-path' : undefined} title={reasoning ? undefined : (command || changes.map(c=>c.path).join('、') || detail).slice(0, 4096)} data-resource-path={pathPreview && changes.length <= 1 ? changes[0]?.path || detail : undefined}>{preview}</code> : null}{counted ? <span className="activity-line-counts" aria-label={`本次新增 ${added} 行，删除 ${removed} 行`}><span className="added-count">+{added}</span><span className="removed-count">−{removed}</span></span> : null}{pending(status) || ['failed', 'declined', 'interrupted'].includes(status) ? <span className="activity-state"><StatusIcon status={status} /><span className={pending(status) ? 'pending-text' : undefined}>{stateText}</span></span> : null}{hasBody ? <ChevronDown size={12} className={expanded ? 'expanded' : ''} /> : null}
     </button>
     {expanded && hasBody ? <div className="activity-body">
       {reasoning ? <div className="reasoning-text">{m.text || (d.redacted ? 'Agent 未公开此段思考内容。' : pending(status) ? '正在等待 Agent 返回思考摘要…' : 'Agent 未返回可展示的思考摘要。')}</div> : null}
       {plan ? <><p className="plan-explanation">{m.text}</p><ol className="plan-steps">{steps.map((step, i) => <li key={i} className={step.status}>{step.status === 'completed' ? <Check size={14} /> : <Circle size={12} />}<span className={step.status === 'inProgress' && pending(status) ? 'pending-text' : undefined}>{step.step}</span><small>{step.status === 'completed' ? '完成' : step.status === 'inProgress' ? pending(status) ? '进行中' : '未完成' : '待处理'}</small></li>)}</ol></> : null}
       {d.cwd ? <div className="activity-meta">工作目录 <code>{String(d.cwd)}</code></div> : null}
-      {m.kind === 'commandExecution' && detail ? <div className="activity-section"><span>命令</span><pre>{detail}</pre></div> : null}
+      {command ? <div className="activity-section"><span>命令</span><pre className="activity-command-text">{command}</pre></div> : null}
       {question ? <QuestionHistory message={m} /> : planSubmission ? <>
-        {document ? <Suspense fallback={<p>正在加载计划文档…</p>}><PlanDocument text={document} streaming={status === 'preparing'} /></Suspense> : <div className="activity-placeholder">{status === 'preparing' ? '正在生成计划…' : 'Agent 未提供可展示的计划文档。'}</div>}
+        {document ? <Suspense fallback={<p>正在加载计划文档…</p>}><PlanCard text={document} streaming={pending(status)} /></Suspense> : <div className="activity-placeholder">{status === 'preparing' ? '正在生成计划…' : 'Agent 未提供可展示的计划文档。'}</div>}
       </> : <>
         {args ? <div className="activity-section"><span>输入参数{status === 'preparing' ? ' · 正在生成' : ''}</span><pre>{args}</pre></div> : null}
         {output ? <div className="activity-section"><span>{m.kind === 'claudeToolCall' ? '工具结果' : '输出'}{pending(status) ? ' · 实时更新' : ''}</span><pre>{output}</pre></div> : null}
         {pending(status) && !reasoning && !plan && !output ? <div className="activity-placeholder"><span className="pending-text">{status === 'preparing' ? '正在生成调用参数…' : '等待工具返回结果…'}</span></div> : null}
       </>}
-      {changes.map(c => <div className="activity-section file-operation" key={c.path}><span><FileCode2 size={13} />{c.path}<small>{typeof c.kind === 'string' ? c.kind : c.kind?.type ?? '修改'}</small></span>{c.diff ? <pre>{c.diff.split('\n').map((line, i) => <span key={i} className={line.startsWith('+') ? 'added-line' : line.startsWith('-') ? 'removed-line' : ''}>{line}{'\n'}</span>)}</pre> : null}</div>)}
+      {d.changeNote ? <p className="activity-change-note">{String(d.changeNote)}</p> : null}
       {d.progress ? <div className="activity-section"><span>进度</span><pre>{String(d.progress)}</pre></div> : null}
       {d.terminalInput ? <div className="activity-section"><span>终端输入</span><pre>{String(d.terminalInput)}</pre></div> : null}
       {d.prompt ? <div className="activity-section"><span>协作任务</span><pre>{String(d.prompt)}</pre></div> : null}
@@ -101,28 +110,26 @@ const ActivityItem = memo(function ActivityItem({ message: m, autoExpand }: { me
   </section>;
 });
 
-function ActivityGroup({ messages, autoExpand, live, processDisplay }: { messages: Message[]; autoExpand: boolean; live: boolean; processDisplay: ProcessDisplay }) {
+function ActivityGroup({ messages, autoExpand, live, processDisplay, showDiff }: { messages: Message[]; autoExpand: boolean; live: boolean; processDisplay: ProcessDisplay; showDiff:(name:string,text:string)=>void }) {
   const [collapsed, setCollapsed] = useState(!autoExpand);
-  const [showAll, setShowAll] = useState(false);
   useEffect(() => setCollapsed(!autoExpand), [autoExpand]);
   const { label, category, status } = summarizeActivities(messages, live);
   const Icon = { command: SquareTerminal, edit: Pencil, read: FileSearch, search: FileSearch, web: Globe, browser: Globe, computer: Monitor, plan: ListChecks, reasoning: Brain, context: ListChecks, tool: Wrench }[category];
   const stateText = status === 'failed' ? '调用失败' : status === 'declined' ? '已拒绝' : status === 'interrupted' ? '已停止' : '';
-  const visible = autoExpand || showAll ? messages : compactActivities(messages);
   const media = [...new Map(messages.flatMap(messageMedia).map(ref => [ref.path, ref])).values()].slice(0, 12);
   const mediaErrors = messages.flatMap(m => Array.isArray(m.data?.mediaErrors) ? m.data.mediaErrors.filter((error: unknown) => typeof error === 'string') as string[] : []).slice(0, 3);
   const generatingPlan = live && collapsed && processDisplay === 'collapsible' ? [...messages].reverse().find(m => m.kind === 'claudeToolCall' && m.data?.tool === 'ExitPlanMode' && pending(m.data.status)) : undefined;
   const draftPlan = generatingPlan ? planText(generatingPlan.data?.arguments) || planText(generatingPlan.data?.inputText, true) : '';
   if (processDisplay === 'timeline') return <div className="activity-timeline">
-    {messages.map(m => <ActivityItem key={m.id} message={m} autoExpand={m.kind === 'executionPlan'} />)}
+    {messages.map(m => <ActivityItem key={m.id} message={m} autoExpand={m.kind === 'executionPlan'} showDiff={showDiff} />)}
     <MediaList media={media}/>{mediaErrors.map((error, index) => <p className="inline-error" role="status" key={index}>{error}</p>)}
   </div>;
   return <div className={`activity-group ${status}`}>
     <button className="activity-group-summary" aria-label={`${label}${stateText ? ` · ${stateText}` : ''}，${messages.length} 条记录`} aria-expanded={!collapsed} onClick={() => setCollapsed(value => !value)}>
       {category === 'reasoning' && pending(status) ? null : <Icon size={15}/>}<span className={pending(status) ? 'pending-text' : undefined}>{label}</span>{stateText ? <small>{stateText}</small> : null}<ChevronRight size={13} className={collapsed ? '' : 'expanded'}/>
     </button>
-    {collapsed ? null : <div className="activity-items">{visible.map(m => <ActivityItem key={m.id} message={m} autoExpand={autoExpand} />)}{!autoExpand && messages.length > 3 ? <button className="activity-toggle-more" aria-expanded={showAll} onClick={() => setShowAll(value => !value)}>{showAll ? '收起' : `另 ${messages.length - visible.length} 项`}<ChevronDown size={11} className={showAll ? 'expanded' : ''} /></button> : null}</div>}
-    {draftPlan ? <div className="plan-generation" aria-label="正在生成计划"><Suspense fallback={<span className="pending-text">正在加载计划文档…</span>}><PlanDocument text={draftPlan} streaming={generatingPlan?.data?.status === 'preparing'} /></Suspense></div> : null}
+    {collapsed ? null : <div className="activity-items">{messages.map(m => <ActivityItem key={m.id} message={m} autoExpand={autoExpand} showDiff={showDiff} />)}</div>}
+    {draftPlan ? <div className="plan-generation" aria-label="正在生成计划"><Suspense fallback={<span className="pending-text">正在加载计划文档…</span>}><PlanCard text={draftPlan} streaming /></Suspense></div> : null}
     <MediaList media={media}/>{mediaErrors.map((error, index) => <p className="inline-error" role="status" key={index}>{error}</p>)}
   </div>;
 }
@@ -199,7 +206,7 @@ function TurnView({ turn, lifecycle, pendingLabel, agentName, autoExpand, proces
       else blocks.push(item);
     }
     const waiting = live && lifecycle.sessionStatus === 'waiting';
-    const content = blocks.map((block, index) => Array.isArray(block) ? <ActivityGroup key={block[0].id} messages={block} autoExpand={autoExpand} processDisplay={processDisplay} live={live && !waiting && index === blocks.length - 1} /> : isSubagent(block) && collectSubagents([block]).length ? <SubagentRows key={block.id} messageId={block.id} /> : block.kind === 'plan' ? <Suspense key={block.id} fallback={<span className="pending-text">正在加载计划文档…</span>}><ProposedPlan text={block.text} streaming={!!generating && pending(block.data?.status)} openFile={openFile} respond={presentation.completed && lifecycle.latest && block.id === latestPlan?.id && onPlanAction ? (decision,feedback)=>onPlanAction(block,decision,feedback) : undefined}/></Suspense> : <MessageView key={block.id} message={block} openFile={openFile} />);
+    const content = blocks.map((block, index) => Array.isArray(block) ? <ActivityGroup key={block[0].id} messages={block} autoExpand={autoExpand} processDisplay={processDisplay} showDiff={showDiff} live={live && !waiting && index === blocks.length - 1} /> : isSubagent(block) && collectSubagents([block]).length ? <SubagentRows key={block.id} messageId={block.id} /> : block.kind === 'plan' ? <Suspense key={block.id} fallback={<span className="pending-text">正在加载计划文档…</span>}><ProposedPlan text={block.text} streaming={!!generating && pending(block.data?.status)} openFile={openFile} respond={presentation.completed && lifecycle.latest && block.id === latestPlan?.id && onPlanAction ? (decision,feedback)=>onPlanAction(block,decision,feedback) : undefined}/></Suspense> : <MessageView key={block.id} message={block} openFile={openFile} />);
     if (waiting) content.push(<TurnProgress key="turn-progress" label={pendingLabel} />);
     else if (live && !Array.isArray(blocks.at(-1))) {
       const activities = items.filter(item => isActivity(item) && !isSubagent(item));

@@ -281,7 +281,11 @@ pub fn model_ids(config: &Value) -> Vec<String> {
 
 pub fn catalog_models(config: &Value) -> Value {
     let default = real_claude_model(config, None);
-    json!({"data":model_ids(config).into_iter().map(|id| json!({"id":id,"model":id,"displayName":id,"isDefault":Some(id.as_str())==default.as_deref()})).collect::<Vec<_>>()})
+    json!({"data":model_ids(config).into_iter().map(|id| {
+        let mut row = crate::model_context::catalog_row(config, &id);
+        row.as_object_mut().unwrap().extend(json!({"id":id,"model":id,"displayName":id,"isDefault":Some(id.as_str())==default.as_deref()}).as_object().unwrap().clone());
+        row
+    }).collect::<Vec<_>>()})
 }
 
 pub fn validate_url(value: &str) -> Result<String, String> {
@@ -477,7 +481,7 @@ fn make_profile(mut s: Settings, previous: Option<&Profile>) -> Result<Profile, 
     if let Some(previous) =
         previous.filter(|p| p.config["protocol"] == s.protocol && p.config["baseUrl"] == base)
     {
-        for field in ["opencodeProvider", "piProvider"] {
+        for field in ["opencodeProvider", "piProvider", "modelMetadata"] {
             if let Some(native) = previous.config.get(field) {
                 config[field] = native.clone();
             }
@@ -642,6 +646,10 @@ pub async fn fetch_provider_models(id: String, app: AppHandle) -> Result<Vec<Str
     models.dedup();
     if models.is_empty() {
         return Err("供应商没有返回模型列表，请手动添加模型 ID".into());
+    }
+    let metadata = crate::model_context::api_catalog(&value);
+    if !metadata.as_object().unwrap().is_empty() {
+        app.state::<AppState>().store.save_model_metadata(&p, &metadata)?;
     }
     Ok(models)
 }
@@ -852,17 +860,19 @@ mod tests {
                 "piProvider",
             ),
         ] {
-            let profile = Profile {
+            let mut profile = Profile {
                 id: format!("{agent}:a"),
                 agent: agent.into(),
                 name: "导入连接".into(),
                 config: crate::ccswitch::sanitize_provider(agent, "a", raw).unwrap(),
             };
+            profile.config["modelMetadata"] = json!({"m":{"contextWindow":65536}});
             let mut edit = settings(&profile);
             edit.api_key = Some("new-key".into());
             let saved = make_profile(edit, Some(&profile)).unwrap();
             assert_eq!(key(&saved.config), Some("new-key"));
             assert_eq!(saved.config[native], profile.config[native]);
+            assert_eq!(saved.config["modelMetadata"], profile.config["modelMetadata"]);
             let mut reroute = settings(&saved);
             reroute.base_url = "https://new.example/v1".into();
             assert!(make_profile(reroute, Some(&saved))
@@ -870,6 +880,9 @@ mod tests {
                 .config
                 .get(native)
                 .is_none());
+            let mut reroute=settings(&saved);
+            reroute.base_url="https://new.example/v1".into();
+            assert!(make_profile(reroute,Some(&saved)).unwrap().config.get("modelMetadata").is_none());
         }
     }
     #[test]

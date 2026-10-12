@@ -1,5 +1,5 @@
-import { lazy, Suspense, useEffect, useRef, useState, type ReactNode } from 'react';
-import { ArrowUp, ExternalLink, MessageSquare, Square, X } from 'lucide-react';
+import { lazy, Suspense, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import { ArrowUp, MessageSquare, Square, X } from 'lucide-react';
 import { call, desktop, subscribe } from './api';
 import { ComposerTextarea } from './ComposerTextarea';
 import { AddMenu, AttachmentStrip, ComposerSkills, ModelMenu, PermissionMenu } from './ComposerMenus';
@@ -7,6 +7,7 @@ import { AgentIcon } from './AgentIcon';
 import { clipboardImages, imageBase64, imageBytes, MAX_ATTACHMENTS, MAX_TOTAL_IMAGE_BYTES, mergeAttachments, validateImageFile, type Attachment } from './attachments';
 import type { ModelOption } from './modelPicker';
 import type { AgentProfile, ModelCatalog, ModelSource, PermissionMode } from './types';
+import { compatiblePermission, loadExecutionPermissionChoices, planExecutionPermission } from './permissions';
 
 const emptyProfiles: AgentProfile[] = [];
 const agentNames: Record<string, string> = { claude: 'Claude Code', codex: 'Codex', opencode: 'OpenCode', pi: 'Pi' };
@@ -14,6 +15,7 @@ import { createChatSession } from './chatSession';
 import { isProviderRequired, requireChatConnection } from './chatConnection';
 import { planFollowup, type PlanDecision } from './planPresentation';
 import { Conversation } from './Conversation';
+import { PlanDisplayContext } from './PlanDisplayContext';
 import { mergeEvent } from './events';
 import { FollowupQueue, useFollowups, type FollowupPayload } from './Followups';
 import { useFollowupEditor } from './useFollowupEditor';
@@ -21,10 +23,15 @@ import { isActive, type Bootstrap, type Message, type RuntimeInfo, type Session,
 const RequestCard=lazy(()=>import('./RequestCard'));
 const QuestionDock=lazy(()=>import('./QuestionDock'));
 export interface SideDraft {key:string;text:string;payload?:FollowupPayload;sourceId?:string;projectId?:string;agent?:string;connectionId?:string}
-export default function SideChat({draft,projectId,agent,connectionId,defaults,close,opened,openFile,showDiff,resizeHandle,providerRequired,manageProviders,profiles=emptyProfiles,catalog,enterSend=true}:{draft:SideDraft;projectId:string;agent:string;connectionId:string;defaults:FollowupPayload;close:()=>void;opened:(session:Session)=>void;openFile:(path:string,line?:number,workspaceSessionId?:string)=>void;resizeHandle?:ReactNode;showDiff:(name:string,text:string)=>void;providerRequired:(agent:string,draft:SideDraft)=>void;manageProviders?:(agent:string,draft:SideDraft)=>void;profiles?:AgentProfile[];catalog?:ModelCatalog;enterSend?:boolean}){
+export default function SideChat({draft,projectId,agent,connectionId,defaults,close,opened,openFile,showDiff,resizeHandle,providerRequired,manageProviders,profiles=emptyProfiles,catalog,enterSend=true,hidden=false,embedded=false}:{draft:SideDraft;projectId:string;agent:string;connectionId:string;defaults:FollowupPayload;close:()=>void;opened:(session:Session)=>void;openFile:(path:string,line?:number,workspaceSessionId?:string)=>void;resizeHandle?:ReactNode;showDiff:(name:string,text:string)=>void;providerRequired:(agent:string,draft:SideDraft)=>void;manageProviders?:(agent:string,draft:SideDraft)=>void;profiles?:AgentProfile[];catalog?:ModelCatalog;enterSend?:boolean;hidden?:boolean;embedded?:boolean}){
   const [input,setInput]=useState(draft.text);const [session,setSession]=useState<Session>();const [messages,setMessages]=useState<Message[]>([]);const [requests,setRequests]=useState<RpcEvent[]>([]);const [error,setError]=useState('');const [sending,setSending]=useState(false);const [stopping,setStopping]=useState(false);
+  const parentPlanDisplay=useContext(PlanDisplayContext);
+  const [planDock,setPlanDock]=useState<HTMLDivElement|null>(null);
+  const planDisplay=useMemo(()=>({openPlan:parentPlanDisplay.openPlan,decisionContainer:planDock}),[parentPlanDisplay.openPlan,planDock]);
   const current=useRef(session);current.current=session;const area=useRef<HTMLDivElement>(null);const stickToBottom=useRef(true);const timer=useRef<ReturnType<typeof setTimeout>|undefined>(undefined);
   const [payload,setPayload]=useState(draft.payload??defaults);
+  const [initialExecutionPermission]=useState(()=>loadExecutionPermissionChoices({[agent]:compatiblePermission((draft.payload??defaults).permissionMode,agent)})[agent]??'ask');
+  const executionPermission=useRef(initialExecutionPermission);
   const options=useRef(payload);options.current=payload;const source=useRef(draft.sourceId);
   const inputRef=useRef(input);inputRef.current=input;
   const [selection,setSelection]=useState(connectionId);const [models,setModels]=useState<ModelCatalog>(catalog??{data:[]});
@@ -35,7 +42,13 @@ export default function SideChat({draft,projectId,agent,connectionId,defaults,cl
   const agentName=agentNames[agent]??agent;
   function savedDraft():SideDraft{return {...draft,text:inputRef.current,connectionId:selection,payload:options.current,sourceId:source.current};}
   function updateOptions(next:FollowupPayload){options.current=next;setPayload(next);}
-  function permission(mode:PermissionMode){updateOptions({...options.current,permissionMode:mode,readOnly:mode==='read'});}
+  function permission(mode:PermissionMode){
+    if(mode==='read'&&options.current.permissionMode!=='read')executionPermission.current=compatiblePermission(options.current.permissionMode,agent);
+    else if(mode!=='read')executionPermission.current=compatiblePermission(mode,agent);
+    const remembered=loadExecutionPermissionChoices({});remembered[agent]=executionPermission.current;
+    localStorage.setItem('supercode.execution-permissions.v1',JSON.stringify(remembered));
+    updateOptions({...options.current,permissionMode:mode,readOnly:mode==='read'});
+  }
   function removeAttachment(path:string){updateOptions({...options.current,attachments:options.current.attachments.filter(a=>a.path!==path)});textarea.current?.focus();}
   useEffect(()=>{if(!current.current)setSelection(connectionId);},[connectionId]);
   useEffect(()=>{
@@ -89,7 +102,12 @@ export default function SideChat({draft,projectId,agent,connectionId,defaults,cl
   }
   function report(e:unknown){if(isProviderRequired(e)){providerRequired(agent,savedDraft());return;}setError(e instanceof Error?e.message:String(e));}
   const questionPending=requests.some(r=>r.method==='item/tool/requestUserInput');
-  async function respondRequest(request:RpcEvent,result:unknown){await call('respond_request',{id:request.id,result});setRequests(old=>old.filter(r=>r.id!==request.id));await refresh();}
+  async function respondRequest(request:RpcEvent,result:unknown){
+    const execute=request.method==='claude/tool/requestApproval'&&request.params.toolName==='ExitPlanMode'&&(result as {decision?:string})?.decision==='accept';
+    const mode=planExecutionPermission(executionPermission.current,agent);
+    const reply=execute?{...(result as Record<string,unknown>),executionPermission:mode}:result;
+    await call('respond_request',{id:request.id,result:reply});if(execute)permission(mode);setRequests(old=>old.filter(r=>r.id!==request.id));await refresh();
+  }
   const followups=useFollowups(session?.id??'',report);
   const followupEditor=useFollowupEditor(session?.id??'',{
     getDraft:()=>({...options.current,text:inputRef.current}),
@@ -103,7 +121,7 @@ export default function SideChat({draft,projectId,agent,connectionId,defaults,cl
   async function respondPlan(message:Message,decision:PlanDecision,feedback:string) {
     const s=current.current;
     if(!s || agent!=='codex' || busy || sendLock.current || followups.rows.length || message.sessionId!==s.id)throw new Error('请等待当前任务结束后再确认计划。');
-    const mode=decision==='execute'?'ask':'read';
+    const mode=decision==='execute'?planExecutionPermission(executionPermission.current,agent):'read';
     const sent={...options.current,text:planFollowup(decision,feedback),attachments:[],permissionMode:mode,readOnly:mode==='read'};
     sendLock.current=true;setSending(true);
     try {await requireChatConnection(agent,selection,s.id);await call('enqueue_followup',{sessionId:s.id,payload:sent});permission(mode);await followups.reload();await refresh();}
@@ -112,10 +130,9 @@ export default function SideChat({draft,projectId,agent,connectionId,defaults,cl
   async function change(id:string,action:string,text?:string){try{await call('change_followup',{id,action,text:text??null});await followups.reload();}catch(e){report(e);throw e;}}
   async function stop(){const s=current.current;if(!s||stopping)return;setStopping(true);try{await call('interrupt_turn',{sessionId:s.id});}catch(e){setError(String(e));}finally{setStopping(false);}}
   async function send(){if(sendLock.current||importing||!hasDraft||followupEditor.busy)return;const sent={...options.current,text:inputRef.current};if(followupEditor.editingId){await followupEditor.save(sent);return;}sendLock.current=true;setSending(true);setError('');try{let s=current.current;await requireChatConnection(agent,selection,s?.id);if(!s){s=await createChatSession({projectId,agent,connectionId:selection,model:options.current.model??''});current.current=s;setSession(s);}await call('enqueue_followup',{sessionId:s.id,payload:sent});if(source.current){await call('change_followup',{id:source.current,action:'remove',text:null});source.current=undefined;}updateOptions({...options.current,attachments:options.current.attachments.filter(a=>!sent.attachments.some(s=>s.path===a.path))});if(inputRef.current===sent.text)setInput('');await followups.reload();await refresh();}catch(e){report(e);}finally{sendLock.current=false;setSending(false);}}
-  return <aside className="side-chat" aria-label="侧边聊天">{resizeHandle}
+  return <PlanDisplayContext.Provider value={planDisplay}><aside className="side-chat" aria-label="侧边聊天" hidden={hidden} inert={hidden}>{resizeHandle}
     <header className="side-chat-header"><MessageSquare size={16}/><strong>侧边聊天</strong>
-      {session?<button className="icon-button" aria-label="打开侧边聊天的独立窗口" title="在独立窗口中打开" onClick={()=>void call('open_chat_window',{sessionId:session.id}).catch(report)}><ExternalLink size={16}/></button>:null}
-      <button className="icon-button" aria-label="收起侧边聊天" title="收起侧边聊天" onClick={()=>{if(session)opened(session);close();}}><X size={16}/></button>
+      {!embedded ? <button className="icon-button" aria-label="关闭侧边聊天" title="关闭侧边聊天" onClick={()=>{if(session)opened(session);close();}}><X size={16}/></button> : null}
     </header>
     <div className="side-chat-scroll" ref={area} onClickCapture={e=>{if((e.target as Element).closest('.turn-process-toggle, .activity-group-summary, .activity-row, .activity-toggle-more'))stickToBottom.current=false;}} onScroll={()=>{const el=area.current;if(el)stickToBottom.current=el.scrollHeight-el.scrollTop-el.clientHeight<100;}}>
       {messages.length||busy?<Conversation messages={messages} agentName={agentName} autoExpand={false} projectId={projectId} sessionId={session?.id} sessionStatus={sending&&!isActive(session?.status)?'starting':session?.status} pendingLabel={sending&&!isActive(session?.status)?'正在发送…':undefined} activeTurnId={session?.turnId} openFile={(path,line)=>openFile(path,line,session?.id)} showDiff={showDiff} onPlanAction={agent==='codex' && !busy && !followups.rows.length ? respondPlan : undefined}/>
@@ -126,15 +143,16 @@ export default function SideChat({draft,projectId,agent,connectionId,defaults,cl
       {error?<div className="error-banner" role="alert"><span>{error}</span><button className="icon-button" aria-label="关闭侧边聊天提示" onClick={()=>setError('')}><X size={14}/></button></div>:null}
       {followups.rows.length&&!session?.turnId?<p className="side-chat-queue-note">已排队，将在当前任务完成后发送</p>:null}
       {questionPending?<Suspense fallback={<p>正在加载提问…</p>}><QuestionDock requests={requests} respond={respondRequest}/></Suspense>:null}
+      <div className="plan-decision-dock" ref={setPlanDock}/>
       <FollowupQueue rows={followups.rows} agent={agent} turnId={session?.turnId} steeringMode={followups.steeringMode} change={change} steer={async id=>{try{await call('steer_followup',{id,expectedTurnId:session?.turnId});await followups.reload();}catch(e){report(e);}}} openSide={row=>void followupEditor.begin(row)} edit={followupEditor.begin} editingId={followupEditor.editingId}/>
       <form className={'composer side-chat-composer'+(busy?' busy':'')} onSubmit={e=>{e.preventDefault();void send();}}>
         {followupEditor.editingId?<div className="composer-editing"><span>编辑排队消息</span><button type="button" disabled={followupEditor.busy} onClick={()=>void followupEditor.cancel()}>取消编辑</button></div>:null}
         <AttachmentStrip attachments={payload.attachments} loading={importing} remove={removeAttachment}/>
         <div className="composer-input"><ComposerSkills attachments={payload.attachments} remove={removeAttachment}/>
-          <ComposerTextarea ref={textarea} disabled={followupEditor.busy} autoFocus aria-label="侧边聊天消息" value={input} rows={questionPending?1:2} placeholder={questionPending?'随心输入':'继续提问…'} onChange={e=>setInput(e.target.value)} onPaste={e=>{const images=clipboardImages(e.clipboardData);if(images.length){e.preventDefault();void addAttachments(images).catch(report);}}} onKeyDown={e=>{if(e.key==='Enter'&&(enterSend||e.ctrlKey||e.metaKey)&&!e.shiftKey&&!e.nativeEvent.isComposing){e.preventDefault();void send();}}}/>
+          <ComposerTextarea ref={textarea} disabled={followupEditor.busy} autoFocus aria-label="侧边聊天消息" value={input} rows={questionPending?1:2} placeholder={questionPending?'随心输入':payload.permissionMode==='read'&&(agent==='claude'||agent==='codex')?'描述你的任务以生成计划…':'继续提问…'} onChange={e=>setInput(e.target.value)} onPaste={e=>{const images=clipboardImages(e.clipboardData);if(images.length){e.preventDefault();void addAttachments(images).catch(report);}}} onKeyDown={e=>{if(e.key==='Enter'&&(enterSend||e.ctrlKey||e.metaKey)&&!e.shiftKey&&!e.nativeEvent.isComposing){e.preventDefault();void send();}}}/>
         </div>
         <div className="composer-toolbar"><div className="composer-options">
-          <AddMenu projectId={projectId} agent={agent} permissionMode={payload.permissionMode as PermissionMode} attachments={payload.attachments} busy={sending||importing} modeBusy={busy||configuring} addAttachments={addAttachments} onSkill={skill=>{if(skill.error){report(skill.error);return false;}try{updateOptions({...options.current,attachments:mergeAttachments(options.current.attachments,[{kind:'skill',name:skill.name,path:skill.path}])});textarea.current?.focus();return true;}catch(e){report(e);return false;}}} onPlan={enabled=>permission(enabled?'read':'ask')} onGoal={objective=>void startGoal(objective)}/>
+          <AddMenu projectId={projectId} agent={agent} permissionMode={payload.permissionMode as PermissionMode} attachments={payload.attachments} busy={sending||importing} modeBusy={busy||configuring} addAttachments={addAttachments} onSkill={skill=>{if(skill.error){report(skill.error);return false;}try{updateOptions({...options.current,attachments:mergeAttachments(options.current.attachments,[{kind:'skill',name:skill.name,path:skill.path}])});textarea.current?.focus();return true;}catch(e){report(e);return false;}}} onPlan={enabled=>permission(enabled?'read':executionPermission.current)} onGoal={objective=>void startGoal(objective)}/>
           <PermissionMenu value={payload.permissionMode as PermissionMode} agent={agent} busy={busy||configuring} onChange={permission} label="侧边聊天权限模式"/>
         </div><div className="composer-right">
           <span className="side-chat-agent" title={agentName}><AgentIcon agent={agent}/><span>{agentName}</span></span>
@@ -143,5 +161,5 @@ export default function SideChat({draft,projectId,agent,connectionId,defaults,cl
         </div></div>
       </form>
     </footer>
-  </aside>;
+  </aside></PlanDisplayContext.Provider>;
 }

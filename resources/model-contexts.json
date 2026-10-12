@@ -1,0 +1,41 @@
+{
+  "verifiedAt": "2026-10-12",
+  "sources": {
+    "openai": "https://developers.openai.com/api/docs/models/gpt-6.1-sol",
+    "glm": "https://docs.z.ai/guides/llm/glm-5.3",
+    "glmFlash": "https://docs.z.ai/guides/vlm/glm-5.3-flash",
+    "glmTurbo": "https://docs.z.ai/guides/llm/glm-5-turbo",
+    "kimi": "https://www.kimi.com/code/docs/en/kimi-code/models",
+    "claude": "https://platform.claude.com/docs/en/models/overview",
+    "minimax": "https://platform.minimax.io/docs/api-reference/text-anthropic-api",
+    "qwen": "https://help.aliyun.com/zh/model-studio/qwen3-6-plus"
+  },
+  "models": {
+    "gpt-6.1-sol": { "contextWindow": 1050000, "source": "openai" },
+    "gpt-6-sol": { "contextWindow": 1050000, "source": "openai" },
+    "gpt-6-astra": { "contextWindow": 1050000, "source": "openai" },
+    "gpt-6-luna": { "contextWindow": 1050000, "source": "openai" },
+    "glm-5.3": { "contextWindow": 1000000, "source": "glm" },
+    "glm-5.3-flash": { "contextWindow": 1000000, "source": "glmFlash" },
+    "glm-5.3-flashx": { "contextWindow": 1000000, "source": "glmFlash" },
+    "glm-5-turbo": { "contextWindow": 200000, "source": "glmTurbo" },
+    "k3": { "contextWindow": 262144, "longContextWindow": 1048576, "source": "kimi" },
+    "k3-256k": { "contextWindow": 262144, "source": "kimi" },
+    "kimi-for-coding": { "contextWindow": 1048576, "source": "kimi" },
+    "kimi-for-coding-highspeed": { "contextWindow": 262144, "source": "kimi" },
+    "claude-fable-5-1": { "contextWindow": 1000000, "source": "claude" },
+    "claude-opus-5-5": { "contextWindow": 1000000, "source": "claude" },
+    "claude-sonnet-5-5": { "contextWindow": 1000000, "source": "claude" },
+    "claude-haiku-5-5": { "contextWindow": 1000000, "source": "claude" },
+    "minimax-m3.1-flash-preview": { "contextWindow": 1000000, "source": "minimax" },
+    "minimax-m3": { "contextWindow": 1000000, "source": "minimax" },
+    "minimax-m2.7": { "contextWindow": 204800, "source": "minimax" },
+    "minimax-m2.7-highspeed": { "contextWindow": 204800, "source": "minimax" },
+    "minimax-m2.5": { "contextWindow": 204800, "source": "minimax" },
+    "minimax-m2.5-highspeed": { "contextWindow": 204800, "source": "minimax" },
+    "minimax-m2.1": { "contextWindow": 204800, "source": "minimax" },
+    "minimax-m2.1-highspeed": { "contextWindow": 204800, "source": "minimax" },
+    "minimax-m2": { "contextWindow": 204800, "source": "minimax" },
+    "qwen3.6-plus": { "contextWindow": 1000000, "source": "qwen" }
+  }
+}

@@ -21,12 +21,16 @@ function metadata(value: Record<string, any>): Record<string, any> {
     return v;
   }
   // Keep screenshots even when a tool has very large arguments or diagnostics.
-  const { media, ...details } = value;
+  const { media, changeSummary, ...details } = value;
   room = 16 * 1024;
   const mediaLimited = Array.isArray(media) ? trim(media.slice(0, 12), 0) : undefined;
-  room += limit - 16 * 1024;
+  const mediaUsed = 16 * 1024 - room;
+  room = 16 * 1024;
+  const summaryLimited = Array.isArray(changeSummary) ? trim(changeSummary.slice(0, 32), 0) : undefined;
+  room += limit - 16 * 1024 - mediaUsed;
   const result = trim(details, 0);
   if (mediaLimited) result.media = mediaLimited;
+  if (summaryLimited) result.changeSummary = summaryLimited;
   for (const key of ['id', 'type', 'status', 'tool', 'server', 'turnId', 'phase', 'messageId', 'startedAt', 'durationMs', 'exitCode', 'success']) if (key in value) result[key] = typeof value[key] === 'string' ? cut(value[key], 4096) : value[key];
   return result;
 }
@@ -152,7 +156,8 @@ export function mergeEvent(messages: Message[], event: RpcEvent, sessionId: stri
       sections[index] = bounded((sections[index] ?? '') + cut(String(p.delta ?? ''), available));
       data[key] = sections;
       text = parts(data.summary) || parts(data.content);
-    } else if (config.field === 'output') text = bounded(m.text + String(p.delta ?? ''));
+    } else if (config.field === 'output' && config.kind === 'fileChange') data.operationOutput = bounded(String(data.operationOutput ?? '') + String(p.delta ?? ''));
+    else if (config.field === 'output') text = bounded(m.text + String(p.delta ?? ''));
     else if (config.field) {
       const delta = config.field === 'progress' ? `${p.message ?? ''}\n` : config.field === 'terminalInput' ? p.stdin ?? '' : p.delta ?? '';
       data[config.field] = bounded(String(data[config.field] ?? '') + delta);
@@ -165,6 +170,8 @@ export function mergeEvent(messages: Message[], event: RpcEvent, sessionId: stri
   const id = String(item.id);
   const existing = messages.find(m => m.id === id);
   const data = { ...existing?.data, ...item, turnId: p.turnId, status: item.status ?? (event.method === 'item/completed' ? 'completed' : existing?.data?.status ?? 'inProgress'), startedAt: existing?.data?.startedAt ?? Date.now() };
+  if (item.type === 'fileChange' && item.aggregatedOutput != null) data.operationOutput = item.aggregatedOutput;
+  if (event.method === 'item/completed' && data.durationMs == null && existing?.data?.startedAt != null) data.durationMs = Math.max(0, Date.now() - Number(existing.data.startedAt));
   let text = item.type === 'commandExecution' ? `${item.command ?? ''}\n${item.aggregatedOutput ?? ''}`
     : item.type === 'claudeToolCall' ? item.output ?? existing?.text ?? ''
     : item.type === 'fileChange' ? (item.changes ?? []).map((c: { path: string }) => c.path).join('\n')

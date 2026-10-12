@@ -26,6 +26,8 @@
 .sidebar-chat-row .session-title { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .sidebar-chat-row.unread .session-title { font-weight:600; }
 .sidebar-chat-row .session-title small { display:block; color:var(--muted); font-size:11px; font-weight:400; margin-top:2px; overflow:hidden; text-overflow:ellipsis; }
+.sidebar-chat-row .session-row > .session-input-badge { display:inline-flex; align-items:center; flex:none; overflow:visible; padding:3px 8px; border-radius:999px; color:var(--chat-link); background:color-mix(in srgb,currentColor 14%,transparent); font-size:max(11px,calc(var(--ui-size) - 1px)); font-weight:500; line-height:18px; white-space:nowrap; }
+:root:is([data-theme=dark],[data-theme=graphite],[data-theme=contrast]) .session-input-badge { color:#3d8bfd; }
 .sidebar-chat-status .session-indicator { flex:none; overflow:visible; }
 .sidebar-chat-status > .session-spinner { color:var(--muted); }
 .sidebar-chat-status > .unread-dot { width:7px; height:7px; border-radius:50%; background:var(--chat-link); }

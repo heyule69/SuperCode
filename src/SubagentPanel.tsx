@@ -32,11 +32,11 @@ function Detail({agent,back,onStatus,sessionId,projectId,openFile,showDiff,openP
     </div>
   </>;
 }
-export default function SubagentPanel({agents,selected,select,close,onStatus,sessionId,projectId,openFile,showDiff,openPath,expanded,expand,resizeHandle}: {agents:Subagent[];selected:string|null;select:(key:string|null)=>void;close:()=>void;onStatus?:(key:string,status:SubagentStatus)=>void;sessionId:string;projectId?:string;openFile:(path:string,line?:number)=>void;showDiff:(name:string,text:string)=>void;openPath?:OpenPath;expanded:boolean;expand:()=>void;resizeHandle?:ReactNode}) {
+export default function SubagentPanel({agents,selected,select,close,onStatus,sessionId,projectId,openFile,showDiff,openPath,expanded,expand,resizeHandle,hidden=false,embedded=false}: {agents:Subagent[];selected:string|null;select:(key:string|null)=>void;close:()=>void;onStatus?:(key:string,status:SubagentStatus)=>void;sessionId:string;projectId?:string;openFile:(path:string,line?:number)=>void;showDiff:(name:string,text:string)=>void;openPath?:OpenPath;expanded:boolean;expand:()=>void;resizeHandle?:ReactNode;hidden?:boolean;embedded?:boolean}) {
   const agent=agents.find(value=>value.key===selected);
-  return <aside className="subagent-panel" aria-label="子智能体">
+  return <aside className="subagent-panel" aria-label="子智能体" hidden={hidden} inert={hidden}>
     {resizeHandle}
-    <div className="subagent-panel-tabs"><div className="subagent-panel-tab"><Users size={16}/><span>子智能体</span><button className="icon-button" aria-label="关闭子智能体" onClick={close}><X size={15}/></button></div><button className="icon-button" aria-label={expanded?'收窄子代理面板':'展开子代理面板'} onClick={expand}>{expanded?<Minimize2 size={16}/>:<Maximize2 size={16}/>}</button></div>
+    {!embedded ? <div className="subagent-panel-tabs"><div className="subagent-panel-tab"><Users size={16}/><span>子智能体</span><button className="icon-button" aria-label="关闭子智能体" onClick={close}><X size={15}/></button></div><button className="icon-button" aria-label={expanded?'收窄子代理面板':'展开子代理面板'} onClick={expand}>{expanded?<Minimize2 size={16}/>:<Maximize2 size={16}/>}</button></div> : null}
     {agent?<Detail key={agent.key} agent={agent} back={()=>select(null)} onStatus={onStatus} sessionId={sessionId} projectId={projectId} openFile={openFile} showDiff={showDiff} openPath={openPath}/>:<><div className="subagent-panel-heading"><strong>子代理 · {agents.length}</strong></div><div className="subagent-panel-scroll"><div className="subagent-panel-list">{agents.map(agent=><button key={agent.key} onClick={()=>select(agent.key)}><SubagentAvatar agentKey={agent.key} visual={agent.visual}/><span>{subagentLabel(agent)}</span><small className={['running','waiting'].includes(agent.status)?'pending-text':undefined}>{subagentStateText[agent.status]}</small></button>)}</div></div></>}
   </aside>;
 }

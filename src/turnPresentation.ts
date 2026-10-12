@@ -4,14 +4,35 @@ import { isActive, type Message } from './types';
 
 const visibleReply = (message: Message) => message.role === 'assistant' && (!!message.text.trim() || messageMedia(message).length > 0);
 
-// Only an explicit phase distinguishes progress from the answer. Native and
-// legacy replies can span messages, tools and media blocks; choosing the last
-// message hides valid answer sections when the execution process is collapsed.
+// A native response can contain several text/media blocks. Keep that complete
+// response, rather than every intermediate response from earlier tool rounds.
+function replyGroup(message: Message): string | undefined {
+  const native = message.data?.messageId;
+  if (typeof native === 'string' && native) return native;
+  // Older Pi history predates messageId, but its block IDs still identify the
+  // native message: <turn>-msg-<message>-<contentIndex>.
+  return /^(.*-msg-\d+)-\d+$/.exec(message.id)?.[1];
+}
 export function finalReply(items: Message[]): Message[] {
   const replies = items.filter(visibleReply);
   const explicit = replies.filter(message => message.data?.phase === 'final_answer');
   if (explicit.length) return explicit;
-  return replies.filter(message => message.data?.phase !== 'commentary');
+  const candidates = replies.filter(message => message.data?.phase !== 'commentary');
+  const last = candidates.at(-1);
+  if (!last) return [];
+  const group = replyGroup(last);
+  if (group) return candidates.filter(message => replyGroup(message) === group);
+  // Ungrouped legacy/ACP fragments remain together until an earlier tool,
+  // thought or explicit commentary marks a different response. A trailing
+  // cleanup operation must not hide the preceding answer.
+  const final: Message[] = [];
+  for (let index = items.lastIndexOf(last); index >= 0; index--) {
+    const message = items[index];
+    if (message.role === 'system') continue;
+    if (message.role !== 'assistant' || message.data?.phase === 'commentary' || replyGroup(message)) break;
+    if (visibleReply(message)) final.unshift(message);
+  }
+  return final;
 }
 
 export interface TurnLifecycle { sessionStatus?: string; activeTurnId?: string | null; latest?: boolean }

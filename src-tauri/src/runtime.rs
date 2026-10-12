@@ -605,6 +605,20 @@ pub(crate) fn publish_event(app: &AppHandle, mut message: Value) {
         }
     }
     crate::media::normalize_event(app, &mut message);
+    if matches!(message["method"].as_str(),Some("item/started"|"item/updated"|"item/completed")) {
+        crate::file_changes::normalize_native(&mut message["params"]["item"]);
+        if let Some(native)=message["params"]["threadId"].as_str() {
+            if let Ok(session)=app.state::<AppState>().store.for_native(native) {
+                let item=&message["params"]["item"];
+                if session.agent!="codex" && item["type"]=="claudeToolCall" && matches!(item["tool"].as_str(),Some("Edit"|"Write"|"MultiEdit"|"NotebookEdit"|"apply_patch"|"ApplyPatch")) {
+                    crate::client_features::capture_change(app,&session,&mut message["params"]);
+                }
+            }
+        }
+        // Native pre/post-write content is used only by the bounded diff tracker;
+        // retain the computed patch, never duplicate both full texts in history/UI.
+        if let Some(item)=message["params"]["item"].as_object_mut() { item.remove("fileSnapshot"); }
+    }
     persist_event(app, &message);
     crate::runtime_diagnostics::observe(app, &message);
     crate::desktop_control::observe(app, &message);
@@ -634,19 +648,9 @@ pub(crate) fn persist_event(app: &AppHandle, message: &Value) {
     let Ok(session) = state.store.for_native(native) else {
         return;
     };
-    if matches!(session.agent.as_str(), "claude" | "opencode" | "pi")
-        && matches!(method, "item/started" | "item/updated" | "item/completed")
-    {
-        let item = &params["item"];
-        if item["type"] == "claudeToolCall"
-            && matches!(item["tool"].as_str(), Some("Edit" | "Write"))
-        {
-            crate::client_features::capture_change(app, &session, params);
-        }
-    }
     if method == "turn/completed" {
         if let Ok(mut snapshots) = state.change_snapshots.lock() {
-            snapshots.retain(|(owner, _), _| owner != &session.id);
+            snapshots.finish_session(&session.id);
         }
     }
     if method == "thread/tokenUsage/updated" {

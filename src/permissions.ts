@@ -38,6 +38,28 @@ export function loadPermissionChoices(agent: string, defaultMode: unknown): Reco
   return choices;
 }
 
+// Planning is temporary: retain each Agent's execution choice across menu
+// toggles and reloads, without borrowing another Agent's full-access mode.
+export function loadExecutionPermissionChoices(choices: Record<string, PermissionMode>): Record<string, PermissionMode> {
+  let remembered: Record<string, PermissionMode> = {};
+  try {
+    const raw = JSON.parse(localStorage.getItem('supercode.execution-permissions.v1') ?? '{}');
+    if (raw && typeof raw === 'object' && !Array.isArray(raw)) remembered = Object.fromEntries(Object.entries(raw)
+      .filter(([agent, mode]) => ['claude', 'codex', 'opencode', 'pi'].includes(agent) && isPermissionMode(mode) && mode !== 'read')
+      .map(([agent, mode]) => [agent, compatiblePermission(mode, agent)]));
+  } catch { /* No prior execution choice is safer than a malformed choice. */ }
+  for (const [agent, mode] of Object.entries(choices)) if (mode !== 'read') remembered[agent] = mode;
+  return remembered;
+}
+
+export function planExecutionPermission(mode: unknown, agent: string): PermissionMode {
+  const selected = compatiblePermission(mode, agent);
+  // The user's explicit plan acceptance grants ordinary file editing. Keep
+  // explicit strict/deny/auto/full choices; don't silently grant full access.
+  if (agent === 'claude' && (selected === 'read' || selected === 'ask')) return 'edit';
+  return selected === 'read' ? 'ask' : selected;
+}
+
 export function permissionDescription(mode: PermissionMode, agent: string) {
   if (mode === 'read') return ['codex', 'claude'].includes(agent) ? '先分析和制定方案，确认后再执行；当前不修改工作区' : '分析和读取文件，不修改工作区';
   if (mode === 'full') return '可访问互联网和电脑上的文件，跳过工具审批';

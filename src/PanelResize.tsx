@@ -2,7 +2,7 @@ import { useLayoutEffect, useRef, useState, type KeyboardEvent, type PointerEven
 import './panel-resize.css';
 
 type Side = 'left' | 'right';
-type Panel = 'workspace' | 'browser' | 'conversation';
+type Panel = 'workspace' | 'browser' | 'conversation' | 'content';
 export type PanelWidths = Record<Side, number>;
 const key = 'supercode.panel-widths';
 export const defaultWidths: PanelWidths = { left: 288, right: 284 };
@@ -15,8 +15,8 @@ export function decodePanelWidths(raw: string | null, rightDefault = defaultWidt
 function valid(value: unknown, min: number, max: number, fallback: number) {
   return typeof value === 'number' && Number.isFinite(value) ? Math.max(min, Math.min(max, value)) : fallback;
 }
-export function panelLayout(widths: PanelWidths, available: number, left: boolean, right: boolean) {
-  const overlay = window.matchMedia('(max-width: 1100px)').matches;
+export function panelLayout(widths: PanelWidths, available: number, left: boolean, right: boolean, panel: Panel = 'workspace') {
+  const overlay = window.matchMedia(panel === 'content' ? '(max-width: 800px)' : '(max-width: 1100px)').matches;
   const minLeft = Math.min(180, Math.max(120, available - 320));
   const rightWidth = Math.min(widths.right, Math.max(240, available - (overlay ? 32 : (left ? minLeft : 0) + 360)));
   const leftWidth = Math.min(widths.left, Math.max(minLeft, available - (right && !overlay ? rightWidth : 0) - 360));
@@ -35,7 +35,7 @@ export function usePanelResize(left: boolean, right: boolean, disabled: boolean,
   function apply() {
     const el = root.current; if (!el) return;
     const o = options.current;
-    const size = panelLayout(preferred.current, el.clientWidth, o.left, o.right);
+    const size = panelLayout(preferred.current, el.clientWidth, o.left, o.right, panel);
     const rightWidth = o.expanded ? Math.max(size.right, Math.min(820, el.clientWidth - (o.left ? size.left : 0) - (size.overlay ? 32 : 360))) : size.right;
     el.style.setProperty('--context-width', `${rightWidth}px`);
     // Stable track count allows native CSS interpolation while panes open and close.
@@ -59,7 +59,7 @@ export function usePanelResize(left: boolean, right: boolean, disabled: boolean,
   }, [left, right, disabled, expanded]);
   function set(side: Side, value: number) {
     const el = root.current; if (!el) return;
-    const size = panelLayout(preferred.current, el.clientWidth, left, right);
+    const size = panelLayout(preferred.current, el.clientWidth, left, right, panel);
     const other = side === 'left' ? right && !size.overlay ? size.right : 0 : left ? size.left : 0;
     const min = side === 'left' ? Math.min(180, Math.max(120, el.clientWidth - 320)) : 240;
     const max = size.overlay && side === 'right' ? el.clientWidth - 32 : el.clientWidth - other - 360;
@@ -74,14 +74,14 @@ export function usePanelResize(left: boolean, right: boolean, disabled: boolean,
   function handle(side: Side) {
     return {
       role: 'separator', tabIndex: 0, 'aria-orientation': 'vertical' as const,
-      'aria-label': side === 'left' ? '调整侧栏宽度' : panel === 'browser' ? '调整浏览器宽度' : panel === 'conversation' ? '调整对话面板宽度' : '调整工作区宽度',
+      'aria-label': side === 'left' ? '调整侧栏宽度' : panel === 'browser' ? '调整浏览器宽度' : panel === 'conversation' ? '调整对话面板宽度' : panel === 'content' ? '调整右侧栏宽度' : '调整工作区宽度',
       'aria-valuemin': side === 'left' ? 180 : 240, 'aria-valuemax': side === 'left' ? 580 : 620,
       'aria-valuenow': widths[side], className: `panel-resize-handle ${side}`,
       title: '拖动调整宽度，双击恢复默认',
       onPointerDown: (e: PointerEvent<HTMLDivElement>) => {
         if (e.button !== 0) return; e.preventDefault(); e.currentTarget.focus();
         e.currentTarget.setPointerCapture(e.pointerId);
-        const size = panelLayout(preferred.current, root.current!.clientWidth, left, right);
+        const size = panelLayout(preferred.current, root.current!.clientWidth, left, right, panel);
         dragging.current = { side, x: e.clientX, initial: { ...preferred.current }, width: size[side] };
         root.current?.classList.add('panel-resizing');
       },
@@ -95,7 +95,7 @@ export function usePanelResize(left: boolean, right: boolean, disabled: boolean,
         if (e.key === 'Escape') { finish(true); return; }
         if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(e.key)) return;
         e.preventDefault();
-        const size = panelLayout(preferred.current, root.current!.clientWidth, left, right);
+        const size = panelLayout(preferred.current, root.current!.clientWidth, left, right, panel);
         set(side, e.key === 'Home' ? 0 : e.key === 'End' ? 10000 : size[side] + (e.key === 'ArrowRight' ? 1 : -1) * (side === 'left' ? 1 : -1) * (e.shiftKey ? 40 : 10)); commit();
       },
     };

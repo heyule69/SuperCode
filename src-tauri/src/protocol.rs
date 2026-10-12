@@ -75,6 +75,9 @@ pub fn item_message(item: &Value) -> Option<(String, String, String, Value)> {
         object.remove("summary");
         object.remove("content");
     }
+    if kind=="fileChange" {
+        if let Some(output)=item["aggregatedOutput"].as_str(){data["operationOutput"]=json!(output);}
+    }
     // Media references are small durable metadata. Reserve room before bounding
     // verbose tool arguments/results, so history does not lose its screenshots.
     let media = data
@@ -84,11 +87,15 @@ pub fn item_message(item: &Value) -> Option<(String, String, String, Value)> {
     let media_limited = media
         .as_ref()
         .map(|value| bounded_value(value, &mut media_budget, 0));
-    let mut budget = TEXT_LIMIT - (16 * 1024 - media_budget);
+    let summary=data.as_object_mut().and_then(|object|object.remove("changeSummary"));
+    let mut summary_budget=16*1024;
+    let summary_limited=summary.as_ref().map(|value|bounded_value(value,&mut summary_budget,0));
+    let mut budget = TEXT_LIMIT - (16 * 1024 - media_budget) - (16*1024-summary_budget);
     let mut data_limited = bounded_value(&data, &mut budget, 0);
     if let Some(media) = media_limited {
         data_limited["media"] = media;
     }
+    if let Some(summary)=summary_limited {data_limited["changeSummary"]=summary;}
     for key in [
         "id",
         "type",
@@ -98,6 +105,10 @@ pub fn item_message(item: &Value) -> Option<(String, String, String, Value)> {
         "turnId",
         "phase",
         "messageId",
+        "startedAt",
+        "durationMs",
+        "exitCode",
+        "cwd",
     ] {
         if let Some(value) = data.get(key) {
             data_limited[key] = value
@@ -366,6 +377,16 @@ fn millis() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn file_operation_output_and_exact_counts_survive_verbose_metadata_bounds() {
+        let item=serde_json::json!({"id":"edit","type":"fileChange","changes":[{"path":"a.ts","diff":"@@ -1 +1 @@\n-old\n+new\n"}],"aggregatedOutput":"PATCH_OUTPUT","durationMs":1300,"exitCode":0,"cwd":"D:/中文","arguments":{"a":"x".repeat(128*1024)},"changeSummary":[{"path":"a.ts","added":4000,"removed":1}]});
+        let (_,_,_,data)=super::item_message(&item).unwrap();
+        assert_eq!(data["operationOutput"],"PATCH_OUTPUT");
+        assert_eq!(data["changeSummary"][0]["added"],4000);
+        assert_eq!(data["durationMs"],1300);
+        assert_eq!(data["exitCode"],0);
+        assert_eq!(data["cwd"],"D:/中文");
+    }
     use super::*;
     #[test]
     fn interleaved_session_output_and_completion_keep_separate_buffers() {

@@ -32,6 +32,9 @@ async fn idle(app: &AppHandle, id: &str) -> Result<(), String> {
     }
 }
 async fn verify(app: &AppHandle) -> Result<Value, String> {
+    if cfg!(debug_assertions) && std::env::args().any(|arg|arg=="--activity-details-test") {
+        return verify_activity_details(app).await;
+    }
     let source = crate::storage::Store(std::sync::Mutex::new(
         rusqlite::Connection::open_with_flags(
             app.path()
@@ -421,6 +424,27 @@ async fn verify_updates(app: &AppHandle) -> Result<Value, String> {
     }
     Ok(json!({"agents":reports,"isolatedData":state.data_dir}))
 }
+async fn verify_activity_details(app: &AppHandle) -> Result<Value, String> {
+    let state=app.state::<AppState>();
+    let route=state.store.active_profile("pi")?.ok_or("测试数据未配置 Pi 连接")?;
+    if crate::providers::settings(&route).provider_id!="glm" {return Err("运行详情测试仅允许已授权的 GLM 连接".into());}
+    let model=crate::providers::settings(&route).model;
+    let directory=state.data_dir.join("activity-details-project").join(uuid::Uuid::new_v4().to_string());
+    std::fs::create_dir_all(&directory).map_err(|e|e.to_string())?;
+    let project=state.store.add_project(&directory)?;
+    let session=state.store.create_configured_session(&project.id,Some(model.clone()),"pi",Some(&route.id))?;
+    state.store.rename(&session.id,"运行详情验收（真实 GLM）")?;
+    let prompt="This is a disposable local UI test. Use write to create detail-sentinel.js with exactly three lines:\nconst limit = 10;\nconst title = \"alpha\";\nconsole.log(title, limit);\nThen use edit to change only 10 to 20. Then use edit a second time to change only alpha to beta. Finally use bash to run node detail-sentinel.js. Do not access other files or use other tools. Reply DETAILS_OK when these operations finish.";
+    commands::send_message(session.id.clone(),prompt.into(),Some(model),false,Some("full".into()),app.clone()).await?;
+    idle(app,&session.id).await?;
+    let rows=state.store.messages(&session.id,None)?;
+    let edits=rows.iter().filter(|m|m.kind=="claudeToolCall" && matches!(m.data["tool"].as_str(),Some("Write"|"Edit"))).collect::<Vec<_>>();
+    if edits.len()!=3 {return Err(format!("预计 3 次文件操作，实际 {}",edits.len()));}
+    let counts=edits.iter().map(|m|m.data["changeSummary"].clone()).collect::<Vec<_>>();
+    if counts[0][0]["added"]!=3 || counts[0][0]["removed"]!=0 || counts.iter().skip(1).any(|c|c[0]["added"]!=1 || c[0]["removed"]!=1) {return Err(format!("单次行数不符合实际文件：{counts:?}"));}
+    let bash=rows.iter().find(|m|m.data["tool"]=="Bash" && m.text.contains("beta 20")).ok_or("未保留真实命令输出")?;
+    Ok(json!({"realCli":true,"realModel":"glm","sessionId":session.id,"counts":counts,"command":bash.data["arguments"]["command"],"output":bash.text,"historyPersisted":true}))
+}
 pub async fn run(app: AppHandle) {
     let result = verify(&app).await;
     let report = match result {
@@ -432,7 +456,9 @@ pub async fn run(app: AppHandle) {
         .join(".supercode");
     let _ = std::fs::write(
         dir.join(
-            if std::env::args().any(|arg| arg == "--agent-updates-test") {
+            if std::env::args().any(|arg|arg=="--activity-details-test") {
+                "activity-details-report.json"
+            } else if std::env::args().any(|arg| arg == "--agent-updates-test") {
                 "agent-updates-report.json"
             } else if std::env::args().any(|arg| arg == "--provider-accounts-test") {
                 "provider-accounts-report.json"
@@ -442,5 +468,7 @@ pub async fn run(app: AppHandle) {
         ),
         serde_json::to_vec_pretty(&report).unwrap_or_default(),
     );
-    app.exit(if report["ok"] == true { 0 } else { 1 });
+    if !std::env::args().any(|arg|arg=="--activity-details-test" && cfg!(debug_assertions)) {
+        app.exit(if report["ok"] == true { 0 } else { 1 });
+    }
 }

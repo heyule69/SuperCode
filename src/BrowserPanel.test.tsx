@@ -51,3 +51,29 @@ it('does not let a delayed close from an unmounted panel close its replacement',
   await act(async()=>finish(undefined));
   expect(close).not.toHaveBeenCalled();
 });
+it('closes an opened native mount when the shared tab is removed without interrupting the agent',async()=>{
+  await render();vi.mocked(call).mockClear();
+  await act(async()=>root.render(null));
+  expect(call).toHaveBeenCalledWith('browser_close',{sessionId:'s',mountId:expect.any(String)});
+  expect(call).not.toHaveBeenCalledWith('browser_takeover',expect.anything());
+  expect(call).not.toHaveBeenCalledWith('interrupt_turn',expect.anything());
+});
+it('releases its native mount if the tab was closed before opening finished',async()=>{
+  let finish!:(value:unknown)=>void;
+  const pending=new Promise(resolve=>{finish=resolve;});
+  vi.mocked(call).mockReturnValueOnce(pending);
+  await render();
+  const mountId=vi.mocked(call).mock.calls.find(([command])=>command==='browser_open')?.[1]?.mountId;
+  await act(async()=>root.render(null));
+  await act(async()=>finish({sessionId:'s',url:'about:blank',title:'新标签页',status:'idle',action:''}));
+  expect(call).toHaveBeenCalledWith('browser_close',{sessionId:'s',mountId});
+  expect(close).not.toHaveBeenCalled();
+});
+it('does not intercept Escape or take over a working browser while another tab or menu is in front',async()=>{
+  await render();
+  await act(async()=>listeners.get('browser-state')?.({payload:{sessionId:'s',status:'working',action:'正在读取网页'}}));
+  await render(false);vi.mocked(call).mockClear();
+  await act(async()=>window.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',bubbles:true})));
+  expect(call).not.toHaveBeenCalledWith('browser_takeover',expect.anything());
+  expect(call).not.toHaveBeenCalledWith('interrupt_turn',expect.anything());
+});

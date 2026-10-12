@@ -17,6 +17,7 @@ let requests: RpcEvent[];
 const providerRequired = vi.fn();
 beforeEach(() => {
   (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
+  localStorage.clear();
   missing = true; sessions = []; requests = []; providerRequired.mockClear();
   vi.mocked(call).mockReset();
   vi.mocked(call).mockImplementation(async (command,args={}) => {
@@ -39,8 +40,9 @@ async function render(draft:SideDraft, options:Partial<ComponentProps<typeof Sid
   await act(async()=>root.render(<SideChat draft={draft} projectId="" agent="pi" connectionId={draft.connectionId??'@local'} defaults={defaults} close={()=>{}} opened={()=>{}} openFile={()=>{}} showDiff={()=>{}} providerRequired={providerRequired} {...options}/>));
 }
 async function send() {await act(async()=>{container.querySelector('form')!.dispatchEvent(new Event('submit',{bubbles:true,cancelable:true}));});}
-it.each(['execute','revise'] as const)('reviews a native side-chat plan as %s without replacing its unsent draft',async decision=>{
+it.each([['execute','ask'],['execute','full'],['execute','auto'],['revise','full']] as const)('reviews a native side-chat plan as %s preserving %s permission and its unsent draft',async (decision,remembered)=>{
   missing=false;
+  localStorage.setItem('supercode.execution-permissions.v1',JSON.stringify({codex:remembered}));
   const base=vi.mocked(call).getMockImplementation()!;
   vi.mocked(call).mockImplementation(async(command,args={})=>command==='list_messages'?[{id:'p',seq:1,sessionId:'side',role:'assistant',kind:'plan',text:'# 侧边计划\n\n包含边界验收。',data:{status:'completed'}},{id:'r',seq:2,sessionId:'side',role:'activity',kind:'runMarker',text:'',data:{status:'completed'}}]:base(command,args));
   await act(async()=>{await import('./ProposedPlan');});
@@ -49,9 +51,21 @@ it.each(['execute','revise'] as const)('reviews a native side-chat plan as %s wi
   await act(async()=>{Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype,'value')!.set!.call(input,'保留这份侧边草稿');input.dispatchEvent(new Event('input',{bubbles:true}));});
   vi.mocked(call).mockClear();
   await act(async()=>container.querySelector<HTMLButtonElement>(decision==='execute'?'.plan-request-execute':'.plan-request-revise')!.click());
-  expect(call).toHaveBeenCalledWith('enqueue_followup',{sessionId:'side',payload:expect.objectContaining({permissionMode:decision==='execute'?'ask':'read',readOnly:decision==='revise',attachments:[]})});
+  expect(call).toHaveBeenCalledWith('enqueue_followup',{sessionId:'side',payload:expect.objectContaining({permissionMode:decision==='execute'?remembered:'read',readOnly:decision==='revise',attachments:[]})});
   expect(input.value).toBe('保留这份侧边草稿');
 });
+it('restores full access when accepting a native Claude plan in the side chat',async()=>{
+  missing=false;
+  localStorage.setItem('supercode.execution-permissions.v1',JSON.stringify({claude:'full'}));
+  requests=[{id:'claude:side:plan',method:'claude/tool/requestApproval',params:{threadId:null,toolName:'ExitPlanMode',input:{plan:'# 侧边计划\n\n创建文件。'}}}];
+  await act(async()=>{await import('./PlanRequest');await import('./Markdown');});
+  await render({key:'draft',text:'先规划'},{agent:'claude'});await send();
+  await act(async()=>{await vi.dynamicImportSettled();});
+  await act(async()=>container.querySelector<HTMLButtonElement>('.plan-request-execute')!.click());
+  expect(call).toHaveBeenCalledWith('respond_request',{id:'claude:side:plan',result:{decision:'accept',executionPermission:'full'}});
+  expect(container.querySelector('[aria-label="侧边聊天权限模式"]')?.textContent).toContain('完全访问');
+});
+
 it('edits its own queued message in the side composer and keeps its position instead of enqueueing a duplicate',async()=>{
   missing=false;
   const rows:Followup[]=['first','second'].map(id=>({id,sessionId:'side',status:'queued',error:null,payload:{...defaults,text:id==='first'?'第一条侧边补充':'第二条侧边补充',attachments:id==='first'?[{kind:'skill',name:'Recall',path:'D:/skills/recall/SKILL.md'}]:[]}}));

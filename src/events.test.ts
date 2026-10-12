@@ -1,6 +1,16 @@
 import { describe, expect, it } from 'vitest';
 import { conversationTurns, mergeEvent, reconcileMessages } from './events';
 import type { Message, RpcEvent } from './types';
+it('retains patch output separately from paths and reserves exact statistics when details are large',()=>{
+  let rows=mergeEvent([],{method:'item/started',params:{turnId:'t',item:{id:'edit',type:'fileChange',status:'inProgress',changes:[{path:'a.ts'}]}}},'s');
+  rows=mergeEvent(rows,{method:'item/fileChange/outputDelta',params:{turnId:'t',itemId:'edit',delta:'PATCH_OUTPUT'}},'s');
+  expect(rows[0].text).toBe('a.ts');
+  expect(rows[0].data?.operationOutput).toBe('PATCH_OUTPUT');
+  rows=mergeEvent(rows,{method:'item/completed',params:{turnId:'t',item:{id:'edit',type:'fileChange',status:'completed',changes:[{path:'a.ts',diff:'@@ -1 +1 @@\n-old\n+new\n'}],arguments:{a:'x'.repeat(150000)},changeSummary:[{path:'a.ts',added:4000,removed:1}]}}},'s');
+  expect(rows[0].data?.operationOutput).toBe('PATCH_OUTPUT');
+  expect(rows[0].data?.changeSummary).toEqual([{path:'a.ts',added:4000,removed:1}]);
+  expect(rows[0].data?.durationMs).toBeGreaterThanOrEqual(0);
+});
 
 it('keeps paginated lifecycle context through native item updates and a later completion', () => {
   const historyRun = {id:'run-old',turnKey:'client-u',data:{turnId:'old',status:'inProgress'}};

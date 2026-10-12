@@ -1,0 +1,9 @@
+.activity-row .activity-file-path { font-family:var(--ui-font); text-decoration:underline; text-decoration-color:color-mix(in srgb,var(--muted) 40%,transparent); text-underline-offset:3px; }
+.activity-row .activity-command-preview { min-width:0; flex:1; }
+.activity-row .activity-line-counts { display:inline-flex; gap:5px; flex-shrink:0; font-size:11px; line-height:1.4; font-variant-numeric:tabular-nums; }
+.activity-items .activity-body { padding:4px 6px 12px 21px; }
+.activity-section .activity-command-text { white-space:pre-wrap; max-height:200px; }
+.activity-section .activity-change-note { font:11px/1.6 var(--ui-font); color:var(--muted); margin:6px 0; }
+.activity-row:focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
+.activity-line-counts .added-count { color:var(--diff-added); }
+@media(max-width:600px) { .activity-items .activity-body { padding-left:8px; }.activity-row .activity-line-counts { font-size:11px; } }

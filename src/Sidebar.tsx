@@ -239,7 +239,9 @@ export function Sidebar(props: SidebarProps) {
     const active = isActive(session.status);
     return <div className={`sidebar-chat-row ${session.id === sessionId ? 'selected' : ''} ${meta?.unread && !active ? 'unread' : ''}`} key={session.id} onContextMenu={e => show(e, { kind: 'session', item: session })}>
       <button className={`session-row ${session.id === sessionId ? 'selected' : ''}`} aria-current={session.id === sessionId ? 'page' : undefined} aria-haspopup="menu" onClick={() => void selectSession(session)} onKeyDown={event => { if (event.key === 'ContextMenu' || event.shiftKey && event.key === 'F10') show(event, { kind: 'session', item: session }); }} title={session.title}>
-        <span className="session-title">{session.title}{standalone && session.projectId ? <small>{projects.find(p => p.id === session.projectId)?.name}</small> : null}</span><span className="sidebar-chat-status"><SessionIndicator status={session.status} unread={meta?.unread}/>{session.status === 'waiting' ? <span className="waiting-badge" aria-label="需要确认">!</span> : null}</span>
+        <span className="session-title">{session.title}{standalone && session.projectId ? <small>{projects.find(p => p.id === session.projectId)?.name}</small> : null}</span>
+        {session.status === 'waiting' ? <span className="session-input-badge">需要用户输入</span> : null}
+        <span className="sidebar-chat-status"><SessionIndicator status={session.status} unread={meta?.unread}/></span>
       </button>
       <div className="sidebar-chat-actions">
         <button type="button" className="sidebar-chat-action" aria-label={`${meta?.pinned ? '取消置顶' : '置顶'} ${session.title}`} aria-pressed={!!meta?.pinned} title={meta?.pinned ? '取消置顶' : '置顶'} disabled={!ready || blocked || working} onClick={() => void update('session', session.id, 'pin', !meta?.pinned)}>{meta?.pinned ? <PinOff size={16}/> : <Pin size={16}/>}</button>

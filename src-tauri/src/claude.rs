@@ -30,7 +30,7 @@ pub struct Turn {
     session: String,
     native: String,
     turn: std::sync::Mutex<String>,
-    signature: String,
+    signature: std::sync::Mutex<String>,
     pub active: AtomicBool,
     alive: AtomicBool,
     last_used: AtomicU64,
@@ -183,7 +183,14 @@ impl Turn {
 }
 fn tool_response(tool_name: &Value, input: &Value, result: &Value) -> Result<Value, String> {
     if result["decision"] == "accept" {
-        return Ok(json!({"behavior":"allow","updatedInput":input}));
+        let mut response = json!({"behavior":"allow","updatedInput":input});
+        if let Some(permission) = plan_execution_permission(tool_name, result)? {
+            // Apply the user's execution choice in the same native reply as
+            // ExitPlanMode. Allowing only that call leaves subsequent Write
+            // requests under the old/manual policy.
+            response["updatedPermissions"] = json!([{"type":"setMode","mode":crate::client_features::claude_native_permission(permission)?,"destination":"session"}]);
+        }
+        return Ok(response);
     }
     if let Some(answers) = result.get("answers") {
         if tool_name != "AskUserQuestion" {
@@ -234,6 +241,26 @@ fn tool_response(tool_name: &Value, input: &Value, result: &Value) -> Result<Val
     Ok(json!({"behavior":"deny","message":message}))
 }
 
+fn plan_execution_permission<'a>(tool_name: &Value, result: &'a Value) -> Result<Option<&'a str>, String> {
+    if tool_name != "ExitPlanMode" || result["decision"] != "accept" { return Ok(None); }
+    let permission = match result.get("executionPermission") {
+        None => "edit",
+        Some(value) => value.as_str().ok_or("计划执行权限格式无效")?,
+    };
+    crate::client_features::validate_permission("claude", permission)?;
+    if permission == "read" { return Err("实施计划需要执行权限，不能继续使用计划模式".into()); }
+    Ok(Some(permission))
+}
+
+fn execution_signature(signature: &str, permission: &str) -> Result<String, String> {
+    let mut value: Value = serde_json::from_str(signature).map_err(|_| "活动任务配置无效")?;
+    let fields = value.as_array_mut().filter(|fields| fields.len() >= 3).ok_or("活动任务配置无效")?;
+    let len = fields.len();
+    fields[len - 3] = json!(false);
+    fields[len - 2] = json!(permission);
+    Ok(value.to_string())
+}
+
 impl Runtime {
     pub fn for_session(&self, id: &str) -> Arc<Runtime> { self.sessions.get(id) }
     pub async fn clients(&self) -> Vec<Arc<Turn>> {
@@ -262,7 +289,7 @@ impl Runtime {
             return Err("当前任务已结束或变化，请继续排队发送".into());
         }
         uuid::Uuid::parse_str(id).map_err(|_| "引导消息 ID 无效")?;
-        crate::client_features::validate_steering_settings(&turn.signature, permission, effort)?;
+        crate::client_features::validate_steering_settings(&turn.signature.lock().unwrap(), permission, effort)?;
         turn.inputs.lock().unwrap().pending.insert(id.into());
         let result = turn.write(json!({"type":"user","uuid":id,"priority":"next","session_id":turn.native,"parent_tool_use_id":null,"message":{"role":"user","content":content}})).await;
         if result.is_err() {
@@ -365,8 +392,11 @@ impl Runtime {
             );
             return Ok(());
         }
+        let permission = plan_execution_permission(&request["params"]["toolName"], &result)?;
+        let signature = permission.map(|permission| execution_signature(&turn.signature.lock().unwrap(), permission)).transpose()?;
         let response = tool_response(&request["params"]["toolName"], input, &result)?;
         turn.write(json!({"type":"control_response","response":{"subtype":"success","request_id":raw_id,"response":response}})).await?;
+        if let Some(signature) = signature { *turn.signature.lock().unwrap() = signature; }
         requests.remove(key);
         publish(
             app,
@@ -416,7 +446,7 @@ pub async fn send(
         if c.active.load(Ordering::Acquire) {
             return Err("Claude 的上一任务尚未结束".into());
         }
-        if c.alive.load(Ordering::Acquire) && c.signature == signature {
+        if c.alive.load(Ordering::Acquire) && *c.signature.lock().unwrap() == signature {
             state.store.set_model(&session.id, model.as_deref())?;
             state.store.save_message(
                 &crate::client_features::user_message_id(&metadata),
@@ -491,7 +521,9 @@ pub async fn send(
         crate::client_features::instructions(app),
     ];
     args.extend(permission_args);
-    if permission == "full" {
+    // This flag permits a later explicit plan confirmation to restore full
+    // access; it does not activate bypass while the process is in plan mode.
+    if permission == "full" || read_only || permission == "read" {
         args.push("--allow-dangerously-skip-permissions".into());
     }
     if let Some(effort) = effort.filter(|v| matches!(v.as_str(), "low" | "medium" | "high" | "max"))
@@ -570,7 +602,7 @@ pub async fn send(
         session: session.id.clone(),
         native: native.clone(),
         turn: std::sync::Mutex::new(uuid::Uuid::new_v4().to_string()),
-        signature,
+        signature: std::sync::Mutex::new(signature),
         active: AtomicBool::new(true),
         alive: AtomicBool::new(true),
         last_used: AtomicU64::new(crate::storage::now() as u64),
@@ -1450,7 +1482,7 @@ mod tests {
         assert!(result_failure(&json!({"is_error":true,"errors":["中文".repeat(10000)]})).unwrap().len() <= 4096);
     }
     #[test]
-    fn plan_confirmation_uses_native_approval_without_rewriting_the_plan_or_permissions() {
+    fn plan_confirmation_sets_execution_mode_without_rewriting_the_plan() {
         let input = json!({"plan":"# 完整计划\n\n1. 实现\n2. 验证","allowedPrompts":[{"tool":"Bash","prompt":"运行测试"}]});
         let reply = tool_response(
             &json!("ExitPlanMode"),
@@ -1458,7 +1490,7 @@ mod tests {
             &json!({"decision":"accept"}),
         )
         .unwrap();
-        assert_eq!(reply, json!({"behavior":"allow","updatedInput":input}));
+        assert_eq!(reply, json!({"behavior":"allow","updatedInput":input,"updatedPermissions":[{"type":"setMode","mode":"acceptEdits","destination":"session"}]}));
         let revised = tool_response(
             &json!("ExitPlanMode"),
             &input,
@@ -1479,6 +1511,32 @@ mod tests {
         .unwrap();
         assert_eq!(empty["behavior"], "deny");
         assert!(empty["message"].as_str().unwrap().contains("暂不执行"));
+    }
+
+    #[test]
+    fn explicit_plan_execution_permissions_are_validated_and_session_scoped() {
+        for (permission, native) in [("full", "bypassPermissions"), ("edit", "acceptEdits"), ("auto", "auto"), ("ask", "manual"), ("strict", "manual"), ("deny", "dontAsk")] {
+            let response = tool_response(&json!("ExitPlanMode"), &json!({"plan":"实现与验证"}), &json!({"decision":"accept","executionPermission":permission})).unwrap();
+            assert_eq!(response["updatedPermissions"], json!([{"type":"setMode","mode":native,"destination":"session"}]));
+        }
+        for permission in [json!("read"), json!("invalid"), json!(null), json!(123)] {
+            assert!(tool_response(&json!("ExitPlanMode"), &json!({}), &json!({"decision":"accept","executionPermission":permission})).is_err());
+        }
+        let ordinary = tool_response(&json!("Write"), &json!({"file_path":"index.html"}), &json!({"decision":"accept","executionPermission":"full"})).unwrap();
+        assert!(ordinary.get("updatedPermissions").is_none());
+        let denied = tool_response(&json!("ExitPlanMode"), &json!({}), &json!({"decision":"decline","executionPermission":"full"})).unwrap();
+        assert!(denied.get("updatedPermissions").is_none());
+    }
+
+    #[test]
+    fn confirmed_plan_updates_reuse_and_steering_configuration() {
+        let before = json!(["route",{"tools":[]},"session","D:/project","model",true,"read","high"]).to_string();
+        let after = execution_signature(&before, "full").unwrap();
+        let value: Value = serde_json::from_str(&after).unwrap();
+        assert_eq!(value, json!(["route",{"tools":[]},"session","D:/project","model",false,"full","high"]));
+        assert!(crate::client_features::validate_steering_settings(&after,"full",Some("high")).is_ok());
+        assert!(crate::client_features::validate_steering_settings(&after,"read",Some("high")).is_err());
+        assert!(execution_signature("{}", "edit").is_err());
     }
 
     #[test]

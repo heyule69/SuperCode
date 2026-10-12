@@ -7,11 +7,11 @@ import { agentNames, QuotaConnections, quotaConnectionKey } from './QuotaConnect
 import type { AgentProfile } from './types';
 
 const QuotaDetail = memo(function QuotaDetail({ connection, revision }: { connection: QuotaConnection; revision: string }) {
-  const { value, loading, refresh } = usePlatformUsage(connection.agent, connection.connectionId, revision);
+  const { value, loading, stale, refresh } = usePlatformUsage(connection.agent, connection.connectionId, revision);
   const source = connection.source;
   return <section className="quota-detail" aria-label={`${connection.connectionName} 额度`}>
     <div className="quota-detail-heading"><span className="quota-brand"><ProviderIcon provider={source.providerId} name={connection.connectionName} mark={source.mark}/></span><div><h3>{connection.connectionName}</h3><p>{value?.planName || source.planName || source.providerName}</p></div><button className="icon-button" aria-label="刷新所选平台额度" disabled={loading || !desktop} onClick={() => void refresh(true)}><RefreshCw size={15} className={loading ? 'spin' : undefined}/></button></div>
-    <div className="quota-meta"><span><AgentIcon agent={connection.agent}/>{agentNames[connection.agent]}</span><span role="status">{loading && value ? '更新中…' : value ? `${new Date(value.queriedAt * 1000).toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' })} 更新` : null}</span></div>
+    <div className="quota-meta"><span><AgentIcon agent={connection.agent}/>{agentNames[connection.agent]}</span><span role="status">{loading && value ? '更新中…' : stale && value ? '更新未成功 · 上次数据' : value ? `${new Date(value.queriedAt * 1000).toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' })} 更新` : null}</span></div>
     <div className="quota-detail-scroll" aria-busy={loading}>
     {value ? <>
       {value.windows.length ? <div className="quota-allowances">{value.windows.map((window, index) => <div className="quota-window" key={`${window.label}:${index}`}><div className="quota-window-heading"><h4>{window.label}</h4>{resetLabel(window.resetAt) ? <span>{resetLabel(window.resetAt)}</span> : null}</div><div className="quota-remaining"><strong>{Math.floor(window.remainingPercent)}<small>%</small></strong><span>剩余</span></div><progress className={window.remainingPercent <= 20 ? 'quota-low' : ''} max={100} value={window.remainingPercent} aria-label={`${window.label}剩余额度`}/></div>)}</div> : null}

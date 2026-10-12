@@ -11,7 +11,7 @@ pub struct WindowColors {
     border: String,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 struct Palette {
     background: u32,
     canvas: u32,
@@ -20,7 +20,13 @@ struct Palette {
 }
 
 #[derive(Default)]
-pub struct WindowTheme(Mutex<HashMap<String, Palette>>);
+pub struct WindowTheme(Mutex<HashMap<String, WindowPalette>>);
+
+#[derive(Clone, Copy)]
+struct WindowPalette {
+    palette: Palette,
+    frame_supported: bool,
+}
 
 fn color_ref(value: &str) -> Result<u32, String> {
     let hex = value
@@ -66,23 +72,67 @@ fn canvas_color(palette: Palette) -> Color {
     )
 }
 
+fn canvas_changed(previous: Option<Palette>, next: Palette) -> bool {
+    previous.is_none_or(|previous| previous.canvas != next.canvas)
+}
+
+fn attribute_changed(current: Option<u32>, previously_applied: Option<u32>, next: u32) -> bool {
+    // Some DWM versions accept setting a color but reject reading it. Use the
+    // last successful write in that case, rather than repaint on every focus.
+    current.or(previously_applied) != Some(next)
+}
+
 pub fn canvas_for_window(app: &tauri::AppHandle, label: &str) -> Option<Color> {
     let state = app.try_state::<WindowTheme>()?;
     let palettes = state.0.lock().ok()?;
-    palettes.get(label).copied().map(canvas_color)
+    palettes.get(label).map(|entry| canvas_color(entry.palette))
 }
 
 #[cfg(windows)]
-fn apply(window: &Window, palette: Palette) -> Result<bool, String> {
+fn apply(
+    window: &Window,
+    palette: Palette,
+    previous: Option<Palette>,
+    reason: &str,
+) -> Result<bool, String> {
     use windows_sys::Win32::Graphics::Dwm::{
-        DwmSetWindowAttribute, DWMWA_BORDER_COLOR, DWMWA_CAPTION_COLOR, DWMWA_TEXT_COLOR,
+        DwmGetWindowAttribute, DwmSetWindowAttribute, DWMWA_BORDER_COLOR, DWMWA_CAPTION_COLOR,
+        DWMWA_TEXT_COLOR,
     };
     let hwnd = window.hwnd().map_err(|e| e.to_string())?.0;
-    for (attribute, color) in [
-        (DWMWA_CAPTION_COLOR, palette.background),
-        (DWMWA_TEXT_COLOR, palette.text),
-        (DWMWA_BORDER_COLOR, palette.border),
+    let mut changed = 0;
+    let mut unreadable = 0;
+    for (attribute, color, prior) in [
+        (
+            DWMWA_CAPTION_COLOR,
+            palette.background,
+            previous.map(|p| p.background),
+        ),
+        (DWMWA_TEXT_COLOR, palette.text, previous.map(|p| p.text)),
+        (
+            DWMWA_BORDER_COLOR,
+            palette.border,
+            previous.map(|p| p.border),
+        ),
     ] {
+        // Focus and OS theme notifications need to repair colors only if Windows
+        // actually reset them. Reassigning all three attributes on every event
+        // unnecessarily invalidates the native frame, including while idle.
+        let mut current = 0u32;
+        let read = unsafe {
+            DwmGetWindowAttribute(
+                hwnd,
+                attribute as u32,
+                (&mut current as *mut u32).cast(),
+                std::mem::size_of::<u32>() as u32,
+            )
+        };
+        if read < 0 {
+            unreadable += 1;
+        }
+        if !attribute_changed((read >= 0).then_some(current), prior, color) {
+            continue;
+        }
         // The handle belongs to this live Tauri window, and DWM copies the u32
         // during this call. No custom painting or replacement window controls.
         let result = unsafe {
@@ -101,12 +151,26 @@ fn apply(window: &Window, palette: Palette) -> Result<bool, String> {
             }
             return Err(format!("同步窗口颜色失败：0x{:08X}", result as u32));
         }
+        changed += 1;
+    }
+    if changed > 0 {
+        crate::runtime_diagnostics::record(
+            window.app_handle(),
+            None,
+            "ui_frame_colors_changed",
+            serde_json::json!({"window":window.label(),"reason":reason,"attributes":changed,"unreadableAttributes":unreadable}),
+        );
     }
     Ok(true)
 }
 
 #[cfg(not(windows))]
-fn apply(_window: &Window, _palette: Palette) -> Result<bool, String> {
+fn apply(
+    _window: &Window,
+    _palette: Palette,
+    _previous: Option<Palette>,
+    _reason: &str,
+) -> Result<bool, String> {
     Ok(false)
 }
 
@@ -118,22 +182,48 @@ pub fn set_window_colors(
     colors: WindowColors,
 ) -> Result<bool, String> {
     let palette = Palette::try_from(colors)?;
-    let canvas = Some(canvas_color(palette));
-    // Caption colors alone do not change WebView2's white backing surface.
-    // Keep both layers opaque and themed when a renderer is repainting/reloading.
-    window
-        .set_background_color(canvas)
-        .map_err(|e| e.to_string())?;
-    webview
-        .set_background_color(canvas)
-        .map_err(|e| e.to_string())?;
-    state
+    let previous = state
         .inner()
         .0
         .lock()
         .map_err(|e| e.to_string())?
-        .insert(window.label().to_owned(), palette);
-    apply(&window, palette)
+        .get(window.label())
+        .copied();
+    // Caption colors alone do not change WebView2's white backing surface.
+    // Keep both layers opaque and themed when a renderer is repainting/reloading.
+    // Tao's background setter erases and repaints the complete HWND even when
+    // given the existing color. Caption-only or duplicate updates must skip it.
+    if canvas_changed(previous.map(|entry| entry.palette), palette) {
+        let canvas = Some(canvas_color(palette));
+        window
+            .set_background_color(canvas)
+            .map_err(|e| e.to_string())?;
+        webview
+            .set_background_color(canvas)
+            .map_err(|e| e.to_string())?;
+        crate::runtime_diagnostics::record(
+            window.app_handle(),
+            None,
+            "ui_canvas_color_changed",
+            serde_json::json!({"window":window.label()}),
+        );
+    }
+    let supported = apply(
+        &window,
+        palette,
+        previous
+            .filter(|entry| entry.frame_supported)
+            .map(|entry| entry.palette),
+        "preferences",
+    )?;
+    state.inner().0.lock().map_err(|e| e.to_string())?.insert(
+        window.label().to_owned(),
+        WindowPalette {
+            palette,
+            frame_supported: supported,
+        },
+    );
+    Ok(supported)
 }
 
 pub fn on_window_event(window: &Window, event: &WindowEvent) {
@@ -157,9 +247,24 @@ pub fn on_window_event(window: &Window, event: &WindowEvent) {
             .lock()
             .ok()
             .and_then(|p| p.get(window.label()).copied());
-        if let Some(palette) = palette {
-            if let Err(error) = apply(window, palette) {
-                eprintln!("{error}");
+        if let Some(entry) = palette.filter(|entry| entry.frame_supported) {
+            let reason = if matches!(event, WindowEvent::Focused(_)) {
+                "focus"
+            } else {
+                "system_theme"
+            };
+            // A theme change can reset DWM overrides; focus cannot. Read back
+            // when supported, with a cached fallback only for focus events.
+            let previous = matches!(event, WindowEvent::Focused(_)).then_some(entry.palette);
+            if let Err(error) = apply(window, entry.palette, previous, reason) {
+                crate::runtime_diagnostics::message(
+                    window.app_handle(),
+                    None,
+                    "window",
+                    "warn",
+                    "ui_colors_error",
+                    &error,
+                );
             }
         }
     }
@@ -168,6 +273,43 @@ pub fn on_window_event(window: &Window, event: &WindowEvent) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unreadable_dwm_colors_use_successful_writes_without_hiding_real_resets() {
+        assert!(!attribute_changed(None, Some(3), 3));
+        assert!(attribute_changed(None, None, 3));
+        assert!(attribute_changed(None, Some(2), 3));
+        assert!(!attribute_changed(Some(3), Some(2), 3));
+        assert!(attribute_changed(Some(2), Some(3), 3));
+    }
+
+    #[test]
+    fn duplicate_and_caption_only_updates_do_not_erase_the_canvas() {
+        let palette = Palette {
+            background: 1,
+            canvas: 2,
+            text: 3,
+            border: 4,
+        };
+        assert!(canvas_changed(None, palette));
+        assert!(!canvas_changed(Some(palette), palette));
+        assert!(!canvas_changed(
+            Some(palette),
+            Palette {
+                background: 5,
+                text: 6,
+                border: 7,
+                ..palette
+            }
+        ));
+        assert!(canvas_changed(
+            Some(palette),
+            Palette {
+                canvas: 8,
+                ..palette
+            }
+        ));
+    }
 
     #[test]
     fn css_colors_use_windows_byte_order() {

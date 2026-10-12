@@ -26,14 +26,32 @@ describe('final reply selection', () => {
     expect(finalReply([reply('progress', '先调查', { phase: 'commentary' }), final, reply('cleanup', '清理缓存', { phase: 'commentary' })])).toEqual([final]);
     expect(finalReply([reply('progress', '只有进度', { phase: 'commentary' })])).toEqual([]);
   });
-  it('keeps the complete unphased native answer across messages and tool calls without changing stored history', () => {
+  it('folds intermediate unphased responses with their tools without changing stored history', () => {
     const first = reply('first', '第一类报错：没有安装 Python 和 Node。');
     const tool = { ...reply('tool', '验证通过'), role:'tool', kind:'commandExecution' };
     const second = reply('second', '第二类报错：路径配置不正确。');
     const items = [first, tool, second];
-    expect(finalReply(items)).toEqual([first, second]);
-    expect(presentTurn({ id:'u', items }, { sessionStatus:'idle' })).toMatchObject({ final:[first, second], process:[tool] });
+    expect(finalReply(items)).toEqual([second]);
+    expect(presentTurn({ id:'u', items }, { sessionStatus:'idle' })).toMatchObject({ final:[second], process:[first, tool] });
     expect(items.map(item => item.text)).toEqual(['第一类报错：没有安装 Python 和 Node。', '验证通过', '第二类报错：路径配置不正确。']);
+  });
+  it('keeps all final native blocks together, including older Pi block IDs, and folds prior messages', () => {
+    for (const grouped of [false, true]) {
+      const native = (id:string) => grouped ? { messageId:id } : null;
+      const progress = reply('t-msg-1-0', '先检查，然后再继续。', native('t-msg-1'));
+      const tool = { ...reply('tool', '验证通过'), role:'tool', kind:'commandExecution' };
+      const first = reply('t-msg-2-0', '第一类问题', native('t-msg-2'));
+      const second = reply('t-msg-2-2', '第二类问题', native('t-msg-2'));
+      const thought = { ...reply('t-msg-2-1', '核对细节'), role:'activity', kind:'reasoning' };
+      const items = [progress,tool,first,thought,second];
+      expect(presentTurn({ id:'u', items }, { sessionStatus:'idle' })).toMatchObject({ final:[first,second], process:[progress,tool,thought] });
+    }
+  });
+  it('keeps contiguous ungrouped answer fragments and media even when cleanup follows', () => {
+    const progress = reply('progress', '继续运行');
+    const tool = { ...reply('tool', '输出'), role:'tool', kind:'commandExecution' };
+    const final = [reply('text1','第一段'),reply('text2','第二段'),reply('picture','',{media:[{kind:'image',path:'D:/output/result.png'}]})];
+    expect(finalReply([progress,tool,...final,{...tool,id:'cleanup'}])).toEqual(final);
   });
   it('keeps all native content blocks and attachments together while excluding explicit commentary', () => {
     const items = [reply('old', '进度', { messageId: 'm1', phase:'commentary' }), reply('text', '完成', { messageId: 'm2' }), reply('picture', '', { messageId: 'm2', media: [{ kind: 'image', path: 'D:/output/结果.png' }] })];
