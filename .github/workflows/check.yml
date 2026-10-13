@@ -54,7 +54,19 @@ jobs:
       - run: npm run check:catalogs
       - run: npm run build
       - run: npm test
-      - run: cargo test --locked --manifest-path src-tauri/Cargo.toml
+      - name: Test application Rust
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path '.supercode/ci' -Force | Out-Null
+          cargo test --locked --manifest-path src-tauri/Cargo.toml 2>&1 | Tee-Object -FilePath '.supercode/ci/application-rust.log' -Encoding utf8NoBOM
+          $testExitCode = $LASTEXITCODE
+          if ($testExitCode -ne 0) {
+            $testFailure = Get-Content -LiteralPath '.supercode/ci/application-rust.log' -Encoding UTF8 | Select-Object -Last 140 | Out-String
+            if ($testFailure.Length -gt 24000) { $testFailure = $testFailure.Substring($testFailure.Length - 24000) }
+            $testFailure = $testFailure.Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
+            Write-Output "::error title=Application Rust test failure::$testFailure"
+            exit $testExitCode
+          }
       - run: cargo test --locked --manifest-path installer/Cargo.toml --target-dir src-tauri/target
       - run: npm run release:test
       - run: npm run benchmark
