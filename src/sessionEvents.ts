@@ -4,7 +4,7 @@ import type { RpcEvent, Session } from './types';
 export function canBindMainThread(session: Pick<Session, 'id' | 'agent' | 'nativeId'>, event: RpcEvent, native: unknown) {
   if (typeof native !== 'string' || !native || !['thread/started', 'turn/started'].includes(event.method)) return false;
   if (!session.nativeId || session.nativeId === native) return !event.params.thread?.source?.subAgent;
-  return ['pi', 'opencode'].includes(session.agent) && event.params.appSessionId === session.id && !event.params.thread?.source?.subAgent;
+  return ['pi', 'opencode', 'gemini'].includes(session.agent) && event.params.appSessionId === session.id && !event.params.thread?.source?.subAgent;
 }
 
 export function requestBelongsToSession(request: RpcEvent, sessionId: string, natives: readonly (string | null | undefined)[], allowUnscoped = false) {

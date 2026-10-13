@@ -93,6 +93,9 @@ pub struct Route {
 }
 impl Route {
     pub fn source(&self, agent: &str) -> Value {
+        if self.config["deleted"] == true {
+            return json!({"providerId":"unknown","providerName":"已删除连接","connectionName":"已删除连接","mark":"?","available":false});
+        }
         let mut source = crate::providers::model_source(
             &self.config,
             agent,
@@ -135,6 +138,27 @@ impl Route {
         self.id.hash(&mut hash);
         self.config.to_string().hash(&mut hash);
         hash.finish()
+    }
+}
+
+// Removing an idle connection keeps its transcript. A later explicit model
+// selection can still hand that history to the new route without resurrecting
+// credentials or silently choosing another supplier.
+fn previous_route(store: &Store, session: &Session) -> Result<Route, String> {
+    match store.route(&session.agent, Some(&session.id)) {
+        Ok(route) => Ok(route),
+        Err(error) => {
+            let id = session.connection_id.as_deref().ok_or(error.clone())?;
+            if !matches!(id, LOCAL | OFFICIAL) && store.profile(&session.agent, id)?.is_none() {
+                Ok(Route {
+                    id: id.into(),
+                    config: json!({"deleted":true}),
+                    profile: None,
+                })
+            } else {
+                Err(error)
+            }
+        }
     }
 }
 
@@ -236,7 +260,7 @@ impl Store {
             crate::ccswitch::local_claude_configuration()?
         } else if agent == "codex" {
             json!({"config":crate::process::read_codex_config()?})
-        } else if matches!(agent, "opencode" | "pi") {
+        } else if matches!(agent, "opencode" | "pi" | "gemini") {
             json!({"native":true})
         } else {
             return Err("Agent 尚未接入".into());
@@ -469,13 +493,17 @@ async fn change_session_model(
     {
         return Ok(session);
     }
-    let previous = state.store.route(&session.agent, Some(&session_id))?;
+    let previous = previous_route(&state.store, &session)?;
     state.store.claim_configuration_change(&session_id)?;
     let _ = app.emit("workspace-updated", ());
     let result = async {
         let input = state.store.handoff_input(&session_id)?;
-        let mode = context_mode(force_compact, previous.id == next.id, session.native_id.is_some(), input.as_ref().map(|(s,_)|s.as_str()));
-        let summary = if mode == "summary" { if let Some((input, seq)) = &input { Some((crate::handoff::summarize(&app,&session,&previous,input).await?,*seq)) } else { None } } else { None };
+        let mode = context_mode(force_compact, previous.id == next.id && previous.config["deleted"] != true, session.native_id.is_some(), input.as_ref().map(|(s,_)|s.as_str()));
+        let summary = if mode == "summary" { if let Some((input, seq)) = &input {
+            let mut summarizing = session.clone();
+            let route = if previous.config["deleted"] == true { summarizing.model = Some(model.into()); &next } else { &previous };
+            Some((crate::handoff::summarize(&app,&summarizing,route,input).await?,*seq))
+        } else { None } } else { None };
         let marker = json!({"from":previous.source(&session.agent),"to":next.source(&session.agent),"fromModel":session.model,"toModel":model,"status":"completed","compactOnly":force_compact,"contextMode":mode,"hasHistory":input.is_some()});
         state.store.commit_model_switch(&session,&next,model,summary.as_ref().map(|(s,seq)|(s.as_str(),*seq)),&marker)
     }.await;
@@ -501,6 +529,53 @@ mod tests {
             Profile { id:"kimi".into(),agent:"claude".into(),name:"Kimi".into(),config:json!({"model":"k3","env":{"ANTHROPIC_BASE_URL":"https://api.kimi.com/coding/","ANTHROPIC_MODEL":"k3","ANTHROPIC_AUTH_TOKEN":"test-kimi-key"}}) },
             Profile { id:"glm".into(),agent:"claude".into(),name:"智谱".into(),config:json!({"model":"glm-test","env":{"ANTHROPIC_BASE_URL":"https://open.bigmodel.cn/api/anthropic","ANTHROPIC_MODEL":"glm-test","ANTHROPIC_AUTH_TOKEN":"test-glm-key"}}) },
         ]).unwrap();
+    }
+    #[test]
+    fn deleted_idle_connection_can_handoff_without_erasing_history_or_recovering_credentials() {
+        let store = store();
+        profiles(&store);
+        let project = store
+            .add_project(Path::new("D:/deleted-route-test"))
+            .unwrap();
+        let chat = store
+            .create_configured_session(&project.id, Some("k3".into()), "claude", Some("kimi"))
+            .unwrap();
+        store.bind_native(&chat.id, "previous-native").unwrap();
+        store
+            .save_message(
+                "saved-request",
+                &chat.id,
+                "user",
+                "keep this request",
+                "userMessage",
+                &Value::Null,
+            )
+            .unwrap();
+        let old = store.session(&chat.id).unwrap();
+        assert!(previous_route(&store, &old).unwrap().profile.is_some());
+        store.delete_profiles("claude", &["kimi".into()]).unwrap();
+        assert!(store.route("claude", Some(&chat.id)).is_err());
+        let previous = previous_route(&store, &old).unwrap();
+        assert_eq!(previous.config, json!({"deleted":true}));
+        assert_eq!(previous.source("claude")["available"], false);
+        store.claim_configuration_change(&chat.id).unwrap();
+        let switched = store
+            .commit_model_switch(
+                &old,
+                &store.route_for("claude", "glm").unwrap(),
+                "glm-test",
+                None,
+                &json!({"contextMode":"history","hasHistory":true}),
+            )
+            .unwrap();
+        assert_eq!(switched.connection_id.as_deref(), Some("glm"));
+        assert!(switched.native_id.is_none());
+        assert!(store
+            .history_context(&chat.id)
+            .unwrap()
+            .unwrap()
+            .contains("keep this request"));
+        assert!(store.profile("claude", "kimi").unwrap().is_none());
     }
     #[test]
     fn model_discovery_uses_the_draft_connection_and_preserves_a_pinned_chat() {
@@ -685,14 +760,16 @@ mod tests {
             .contains("test-kimi-key"));
     }
     #[test]
-    fn bound_connection_allows_key_rotation_but_requires_new_route_for_endpoint_changes() {
+    fn bound_idle_connection_preserves_history_on_endpoint_changes_and_blocks_active_edits() {
         let store = store();
         profiles(&store);
         let project = store.add_project(Path::new("D:/route-test")).unwrap();
         store.select_profile("claude", Some("kimi")).unwrap();
-        store
+        let chat = store
             .create_agent_session(&project.id, Some("k3".into()), "claude")
             .unwrap();
+        store.bind_native(&chat.id, "original-native").unwrap();
+        store.save_message("request", &chat.id, "user", "continue my original goal", "userMessage", &Value::Null).unwrap();
         let mut profile = store
             .profiles()
             .unwrap()
@@ -701,8 +778,10 @@ mod tests {
             .unwrap();
         profile.config["env"]["ANTHROPIC_AUTH_TOKEN"] = json!("rotated-key");
         store.import_profiles(&[profile.clone()]).unwrap();
+        assert_eq!(store.session(&chat.id).unwrap().native_id.as_deref(), Some("original-native"));
         profile.config["env"]["ANTHROPIC_BASE_URL"] = json!("https://another-provider.invalid");
-        assert!(store.import_profiles(&[profile]).is_err());
+        store.claim(&chat.id).unwrap();
+        assert!(store.import_profiles(&[profile.clone()]).is_err());
         let retained = store.route("claude", None).unwrap();
         assert_eq!(
             retained.config["env"]["ANTHROPIC_AUTH_TOKEN"],
@@ -712,6 +791,13 @@ mod tests {
             retained.config["env"]["ANTHROPIC_BASE_URL"],
             "https://api.kimi.com/coding/"
         );
+        store.set_status(&chat.id, "idle", None).unwrap();
+        store.import_profiles(&[profile]).unwrap();
+        let changed = store.session(&chat.id).unwrap();
+        assert!(changed.native_id.is_none());
+        assert_eq!(changed.connection_id.as_deref(), Some("kimi"));
+        assert_eq!(store.route("claude", Some(&chat.id)).unwrap().config["env"]["ANTHROPIC_BASE_URL"], "https://another-provider.invalid");
+        assert!(store.history_context(&chat.id).unwrap().unwrap().contains("continue my original goal"));
     }
     #[test]
     fn compressed_switch_preserves_history_and_fork_keeps_newer_dialogue() {

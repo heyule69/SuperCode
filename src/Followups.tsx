@@ -22,7 +22,7 @@ export function useFollowups(sessionId:string, report:(e:unknown)=>void) {
   return {rows,reload,steeringMode};
 }
 export function FollowupQueue({rows,agent,turnId,steeringMode,change,steer,openSide,edit,editingId}:{rows:Followup[];agent:string;turnId?:string|null;steeringMode?:string;change:(id:string,action:string,text?:string)=>Promise<void>;steer:(id:string)=>Promise<void>;openSide:(row:Followup)=>void;edit:(row:Followup)=>Promise<void>;editingId?:string}) {
-  const interrupt=steeringMode==='interrupt'||(steeringMode===undefined&&agent==='opencode');
+  const interrupt=steeringMode==='interrupt'||(steeringMode===undefined&&['opencode','gemini'].includes(agent));
   const [working,setWorking]=useState('');
   async function run(id:string,fn:()=>Promise<void>){if(working)return;setWorking(id);try{await fn();}catch{/* The caller displays the error and retains the message. */}finally{setWorking('');}}
   const visible=rows.filter(row=>row.id!==editingId);

@@ -28,6 +28,14 @@
       "unsupportedBelow": "1.0.0",
       "fixtureTests": ["native_agents::tests::pi_automatic_compaction_keeps_the_native_thread_and_continues_the_turn", "native_agents::tests::pi_questions_validate_choices"],
       "note": "RPC fixtures cover local continuation and approvals. Versions below 1.0.0 lack the current MCP integration; other releases remain unverified."
+    },
+    {
+      "id": "gemini",
+      "referenceVersion": "0.63.0",
+      "coveredVersions": ["0.63.0"],
+      "unsupportedBelow": "0.63.0",
+      "fixtureTests": ["native_agents::gemini::tests::endpoint_version_and_authentication_do_not_duplicate_api_path", "native_agents::gemini::tests::managed_modes_enforce_read_only_and_summary_even_in_plan_mode", "native_agents::gemini::tests::session_homes_are_separate_and_untrusted_ids_never_become_paths", "native_agents::tests::gemini_acp_peer_restores_models_streams_and_waits_for_user_approval", "native_agents::tests::gemini_peer_restart_cancel_and_rejection_preserve_other_sessions", "native_agents::tests::gemini_initialization_rejects_unknown_or_older_cli_permissions"],
+      "note": "Official npm 0.63.0 source and controlled ACP peers cover local handling. No real model, provider or desktop execution is asserted. Structured ask_user answers are not supported by this CLI ACP release."
     }
   ]
 }

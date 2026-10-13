@@ -1,14 +1,14 @@
 import type { AgentProfile, ModelSource } from './types';
 
 export type ConnectionOrder = Record<string, string[]>;
-export const providerAgents = [{ id: 'claude', name: 'Claude Code' }, { id: 'codex', name: 'Codex' }, { id: 'opencode', name: 'OpenCode' }, { id: 'pi', name: 'Pi' }];
+export const providerAgents = [{ id: 'claude', name: 'Claude Code' }, { id: 'codex', name: 'Codex' }, { id: 'opencode', name: 'OpenCode' }, { id: 'pi', name: 'Pi' }, { id: 'gemini', name: 'Gemini CLI' }];
 
 export function connectionIds(agent: string, profiles: AgentProfile[], officialAgents: string[], order?: ConnectionOrder): string[] {
   const saved = order?.[agent];
   const own = profiles.filter(p => p.agent === agent);
   const defaultId = own.find(p => p.current)?.id ?? (officialAgents.includes(agent) ? '@official' : '@local');
   const canonical = (id: string) => agent === 'codex' && (id === '@local' || own.some(p => p.id === id && p.officialAccount && !p.accountId)) ? '@official' : id;
-  const nativeIds = ['opencode', 'pi'].includes(agent) ? ['@local'] : ['@official'];
+  const nativeIds = ['opencode', 'pi', 'gemini'].includes(agent) ? ['@local'] : ['@official'];
   const available = new Set([...own.map(p => canonical(p.id)), ...nativeIds]);
   if (agent !== 'codex' && (saved?.includes('@local') || !saved && defaultId === '@local')) available.add('@local');
   return [...new Set([...(saved ?? [defaultId]), ...own.map(p => p.id), ...nativeIds].map(canonical))].filter(id => available.has(id));

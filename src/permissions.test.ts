@@ -1,5 +1,5 @@
 import { afterEach, expect, it, vi } from 'vitest';
-import { compatiblePermission, isPermissionMode, loadPermissionChoices, loadExecutionPermissionChoices, planExecutionPermission } from './permissions';
+import { compatiblePermission, isPermissionMode, loadPermissionChoices, loadExecutionPermissionChoices, permissionDescription, permissionDetails, permissionOrder, planExecutionPermission } from './permissions';
 
 function stored(values: Record<string, string>) {
   vi.stubGlobal('localStorage', { getItem: (key: string) => values[key] ?? null });
@@ -48,4 +48,17 @@ it('accepts ordinary Claude plan edits without granting full access or replacing
   for (const mode of ['strict', 'edit', 'auto', 'deny', 'full'] as const) expect(planExecutionPermission(mode, 'claude')).toBe(mode);
   expect(planExecutionPermission('read', 'codex')).toBe('ask');
   expect(planExecutionPermission('full', 'codex')).toBe('full');
+});
+
+it('stores Gemini permissions separately and only offers its native read, ask and full modes', () => {
+  stored({ 'supercode.permissions.v2': JSON.stringify({ claude: 'full', gemini: 'read' }), 'supercode.execution-permissions.v1': JSON.stringify({ claude: 'full', gemini: 'ask' }) });
+  expect(loadPermissionChoices('gemini', 'full')).toEqual({ claude: 'full', gemini: 'read' });
+  expect(loadExecutionPermissionChoices({ gemini: 'read' })).toEqual({ claude: 'full', gemini: 'ask' });
+  expect(permissionOrder('gemini')).toEqual(['read', 'ask', 'full']);
+  for (const mode of ['auto', 'edit', 'deny']) expect(compatiblePermission(mode, 'gemini')).toBe('ask');
+  expect(permissionDescription('ask', 'gemini')).toContain('Gemini CLI');
+  expect(permissionDescription('read', 'gemini')).toContain('不修改');
+  expect(permissionDetails('gemini')).not.toContain('Claude');
+  stored({ 'supercode.permissions.v2': JSON.stringify({ claude: 'full' }) });
+  expect(loadPermissionChoices('gemini', 'ask')).toEqual({ claude: 'full', gemini: 'ask' });
 });

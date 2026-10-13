@@ -132,7 +132,7 @@ it('keeps official model IDs in the single login group and distinct API connecti
   expect(groups[1].options[1]).toMatchObject({ connectionId: '@official', selected: true });
 });
 
-it.each(['claude', 'codex', 'opencode', 'pi'])('does not turn stale catalogs or session model IDs into an unconfigured %s connection', agent => {
+it.each(['claude', 'codex', 'opencode', 'pi', 'gemini'])('does not turn stale catalogs or session model IDs into an unconfigured %s connection', agent => {
   for (const connectionId of ['@local', 'removed', '@official']) {
     expect(modelGroups({ models: [model('k3[1M]')], profiles: [], source: { ...kimi, available: false }, agent, value: 'k3[1M]', connectionId, order: { [agent]: [connectionId] } })).toEqual([]);
   }

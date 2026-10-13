@@ -8,9 +8,9 @@
 
 Windows CI 还运行 `npm audit`，并用固定版本 cargo-audit 检查主程序与安装器的两份 Cargo.lock。已发布漏洞会使验证失败；停止维护、内存安全等 informational 提示保留在日志中，不添加忽略公告列表。
 
-把 Codex、Claude Code、OpenCode 和 Pi 放进一个桌面工作台，管理项目、模型连接和工具，直接用对话完成开发任务。
+把 Codex、Claude Code、OpenCode、Pi 和 Gemini CLI 放进一个桌面工作台，管理项目、模型连接和工具，直接用对话完成开发任务。
 
-当前版本 **0.2.3**，主要支持 **Windows**。基于 Tauri 2、Rust、React + TypeScript 和 SQLite。
+当前版本 **0.2.4**，主要支持 **Windows**。基于 Tauri 2、Rust、React + TypeScript 和 SQLite。
 
 [下载 Windows 安装包](https://github.com/heyule69/SuperCode/releases/latest) · [版本记录](https://github.com/heyule69/SuperCode/releases)
 
@@ -19,7 +19,7 @@ Windows CI 还运行 `npm audit`，并用固定版本 cargo-audit 检查主程�
 ## 功能
 
 - **Agent 管理**：自动发现本机 Agent，显示已安装和最新版本，支持一键安装、更新与连接测试。
-- **模型连接**：Codex、Claude 官方多账号登录，按 Agent 配置 API 协议，支持从 CC Switch 导入连接。任务运行时可新增连接；主任务或子任务正在使用的连接暂不能编辑或删除。
+- **模型连接**：Codex、Claude 官方多账号登录，按 Agent 配置 API 协议，支持从 CC Switch 导入连接。OpenCode / Pi 可更改已有连接的协议；自定义连接可在保存前获取模型，列表支持单项或多选删除。任务运行时可新增连接；主任务或子任务正在使用的连接暂不能编辑或删除。
 - **对话工作台**：流式回复、工具记录、文件差异、历史会话和侧边聊天；任务运行中可以追加消息、排队或引导。
 - **计划与子代理**：显示原生计划文档并选择执行或继续修改；子代理有独立图标和详情，完整任务与步骤摘要持续可见，具体工具输出按需展开。能力以所选引擎支持为准。
 - **图片与媒体**：上传、粘贴图片，在对话中查看图片、播放视频和音频。
@@ -29,7 +29,7 @@ Windows CI 还运行 `npm audit`，并用固定版本 cargo-audit 检查主程�
 - **上下文管理**：按模型、接口与引擎提供的实际限额显示上下文，支持引擎原生自动压缩。
 - **软件更新**：启动约 10 秒后检查 GitHub Releases，之后每 6 小时检查；恢复窗口焦点时补查到期更新。新版本弹窗提醒，同次启动同版本只提醒一次；可稍后处理，任务完成后重启安装，保留聊天与配置。
 
-Codex、Claude Code、OpenCode、Pi 均支持多个聊天同时运行，同一种 Agent 也可并行开启多个会话，没有应用设置的 Agent 数量或任务并发上限。各聊天独立处理停止、审批和输出；向同一个活动聊天追加消息时，按原生能力引导或按该聊天的顺序发送。
+Codex、Claude Code、OpenCode、Pi、Gemini CLI 均使用独立的聊天运行通道，同一种 Agent 可开启多个会话，没有应用设置的 Agent 数量或任务并发上限。各聊天独立处理停止、审批和输出；向同一个活动聊天追加消息时，按原生能力引导或按该聊天的顺序发送。Gemini CLI 本轮以 0.63.0 官方源码和受控 ACP 测试验证，未进行真实模型运行验证。
 
 ## 开始使用
 
@@ -39,7 +39,7 @@ Codex、Claude Code、OpenCode、Pi 均支持多个聊天同时运行，同一�
 2. 在「模型供应商」选择官方账号登录，或添加 API 连接。
 3. 选择 Agent 和模型，输入任务即可。项目可选；未选择时，聊天文件保存在文档目录的 `SuperCode` 文件夹中。
 
-已有 Agent 的登录和配置会继续使用。下载与更新使用独立目录，测试通过后再启用。
+Codex、Claude Code、OpenCode、Pi 的已有登录与配置按各引擎能力接入。Gemini CLI 需在模型供应商页添加 Gemini 原生 API 连接，支持 API Key 和兼容网关。下载与更新使用独立目录，测试通过后再启用。
 
 ## 界面截图
 

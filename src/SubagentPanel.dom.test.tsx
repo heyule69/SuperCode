@@ -26,7 +26,8 @@ it('shows an async child as working until its correlated report arrives, without
   const launch=message('task','tool','Async agent launched successfully.\nagentId: a (internal ID)','claudeToolCall',{tool:'Agent',status:'completed',subagentAsync:true,subagentStatus:'running',subagentResult:'',arguments:{description:'normal-demo'}});
   const draw=async(child:Message)=>act(async()=>root.render(<SubagentPanel {...props} agents={collectSubagents([child])} selected="task"/>));
   await draw(launch);
-  expect(node.textContent).toContain('正在思考');
+  expect(node.textContent).toContain('正在处理');
+  expect(node.textContent).not.toContain('正在思考');
   expect(node.textContent).not.toContain('Async agent launched');
   expect(node.querySelector('[aria-label="复制回复"]')).toBeNull();
   const completed={...launch,data:{...launch.data,subagentStatus:'completed',subagentResult:'# 完整报告\n\n| 场景 | 结果 |\n|---|---|\n| 边界 | TypeError |\n\nCHILD_DONE',subagentDurationMs:40000}};
@@ -36,12 +37,13 @@ it('shows an async child as working until its correlated report arrives, without
   expect(node.querySelector('[aria-label="任务运行状态"]')).toBeNull();
   expect(call).not.toHaveBeenCalled();
 });
-it('keeps a completed child clickable while its parent continues thinking, without raw JSON or duplicate wait rows',async()=>{
+it('keeps a completed child clickable while its parent continues working without a reasoning event',async()=>{
   const open=vi.fn();const wait=message('wait','tool','','collabAgentToolCall',{status:'completed',agentsStates:{a:{status:'completed'},b:{status:'running'}}});
   await act(async()=>root.render(<Conversation messages={[message('run','activity','','runMarker',{status:'inProgress'}),spawn,wait]} sessionStatus="running" agentName="Codex" autoExpand={false} openFile={()=>{}} showDiff={()=>{}} openSubagent={open}/>));
   expect(node.querySelectorAll('.subagent-row')).toHaveLength(2);
   expect(node.textContent).toContain('Agent demo已完成');
-  expect(node.textContent).toContain('正在思考');
+  expect(node.textContent).toContain('正在处理');
+  expect(node.textContent).not.toContain('正在思考');
   expect(node.textContent).not.toContain('agentsStates');
   await act(async()=>node.querySelector<HTMLButtonElement>('.subagent-row')!.click());
   expect(open).toHaveBeenCalledWith('a');

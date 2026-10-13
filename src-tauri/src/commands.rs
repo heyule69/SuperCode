@@ -229,7 +229,7 @@ pub async fn list_models(
     let Some(route) = route else {
         return Ok(json!({"data":[],"source":source}));
     };
-    if matches!(agent, "opencode" | "pi") {
+    if matches!(agent, "opencode" | "pi" | "gemini") {
         let mut catalog = crate::providers::catalog_models(&route.config);
         catalog["source"] = source;
         return Ok(catalog);
@@ -446,7 +446,7 @@ async fn send_inner(
             _ => state.native.for_session(session_id).shutdown().await,
         }
     }
-    if matches!(session.agent.as_str(), "opencode" | "pi") {
+    if matches!(session.agent.as_str(), "opencode" | "pi" | "gemini") {
         return crate::native_agents::send(
             app,
             &session,
@@ -641,7 +641,7 @@ pub async fn interrupt_turn(session_id: String, app: AppHandle) -> Result<(), St
         "interrupt_requested",
         json!({"turnId":session.turn_id}),
     );
-    if matches!(session.agent.as_str(), "opencode" | "pi") {
+    if matches!(session.agent.as_str(), "opencode" | "pi" | "gemini") {
         return state.native.interrupt(&session_id).await;
     }
     if session.agent == "claude" {
@@ -674,10 +674,9 @@ pub async fn interrupt_turn(session_id: String, app: AppHandle) -> Result<(), St
 #[tauri::command]
 pub async fn respond_request(id: Value, result: Value, app: AppHandle) -> Result<(), String> {
     let state = app.state::<AppState>();
-    if id
-        .as_str()
-        .is_some_and(|id| id.starts_with("opencode:") || id.starts_with("pi:"))
-    {
+    if id.as_str().is_some_and(|id| {
+        id.starts_with("opencode:") || id.starts_with("pi:") || id.starts_with("gemini:")
+    }) {
         return state.native.respond(&app, id, result).await;
     }
     if id.as_str().is_some_and(|id| id.starts_with("claude:")) {
@@ -901,10 +900,6 @@ pub async fn workspace_changes(
     })
 }
 
-fn contained_file(root: &Path, path: &str) -> Result<PathBuf, String> {
-    contained_workspace_path(root, path, false)
-}
-
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkspaceEntry {
@@ -1003,6 +998,66 @@ fn contained_workspace_path(root: &Path, path: &str, directory: bool) -> Result<
     Ok(candidate)
 }
 
+fn referenced_path(
+    store: &crate::storage::Store,
+    project_id: &str,
+    session_id: Option<&str>,
+    value: &str,
+    directory: bool,
+) -> Result<PathBuf, String> {
+    let path = if value.to_ascii_lowercase().starts_with("file:") {
+        tauri::Url::parse(value)
+            .map_err(|_| "文件路径无效")?
+            .to_file_path()
+            .map_err(|_| "文件路径无效")?
+    } else {
+        PathBuf::from(value)
+    };
+    // An explicit file reference can point outside the chat's workspace.
+    // Absolute references also work without an existing project/session.
+    let candidate = if path.is_absolute() {
+        path
+    } else {
+        Path::new(&store.workspace(project_id, session_id)?.path).join(path)
+    };
+    let resolved = std::fs::canonicalize(candidate).map_err(|e| e.to_string())?;
+    if !(resolved.is_file() || directory && resolved.is_dir()) {
+        return Err(if directory {
+            "请选择文件或文件夹"
+        } else {
+            "请选择普通文件"
+        }
+        .into());
+    }
+    Ok(resolved)
+}
+
+fn read_file_preview(path: &Path) -> Result<String, String> {
+    use std::io::Read;
+    const LIMIT: u64 = 1024 * 1024;
+    let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+    if file.metadata().map_err(|e| e.to_string())?.len() > LIMIT {
+        return Err("文件超过 1 MB，请在外部编辑器中查看".into());
+    }
+    // Bound the actual read as well: a referenced file can grow after metadata.
+    let mut bytes = Vec::new();
+    file.take(LIMIT + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| e.to_string())?;
+    if bytes.len() as u64 > LIMIT {
+        return Err("文件超过 1 MB，请在外部编辑器中查看".into());
+    }
+    if bytes.starts_with(&[0xef, 0xbb, 0xbf]) {
+        return Err("该文件使用 UTF-8 BOM，未转换或修改文件编码".into());
+    }
+    let text = String::from_utf8(bytes)
+        .map_err(|_| "该文件不是有效的 UTF-8 文本，未转换或修改文件编码")?;
+    if text.contains('\0') {
+        return Err("该文件是二进制内容，不能作为文本预览".into());
+    }
+    Ok(text)
+}
+
 fn system_document(path: &Path) -> bool {
     let extension = path
         .extension()
@@ -1048,58 +1103,57 @@ fn system_document(path: &Path) -> bool {
 }
 
 #[tauri::command]
-pub fn open_project_path(
+pub async fn open_project_path(
     project_id: String,
     session_id: Option<String>,
     path: String,
     action: String,
     app: AppHandle,
 ) -> Result<(), String> {
-    let root = app
-        .state::<AppState>()
-        .store
-        .workspace(&project_id, session_id.as_deref())?
-        .path;
-    let file = contained_workspace_path(Path::new(&root), &path, action == "reveal")?;
-    match action.as_str() {
-        "reveal" => app
-            .opener()
-            .reveal_item_in_dir(file)
-            .map_err(|error| error.to_string()),
-        "open" if system_document(&file) => app
-            .opener()
-            .open_path(file.to_string_lossy().into_owned(), None::<&str>)
-            .map_err(|error| error.to_string()),
-        "open" => Err("请在应用中查看源代码，不能直接运行程序或脚本".into()),
-        _ => Err("不支持的文件操作".into()),
-    }
+    tauri::async_runtime::spawn_blocking(move || {
+        let file = referenced_path(
+            &app.state::<AppState>().store,
+            &project_id,
+            session_id.as_deref(),
+            &path,
+            action == "reveal",
+        )?;
+        match action.as_str() {
+            "reveal" => app
+                .opener()
+                .reveal_item_in_dir(file)
+                .map_err(|error| error.to_string()),
+            "open" if system_document(&file) => app
+                .opener()
+                .open_path(file.to_string_lossy().into_owned(), None::<&str>)
+                .map_err(|error| error.to_string()),
+            "open" => Err("请在应用中查看源代码，不能直接运行程序或脚本".into()),
+            _ => Err("不支持的文件操作".into()),
+        }
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-pub fn read_project_file(
+pub async fn read_project_file(
     project_id: String,
     session_id: Option<String>,
     path: String,
-    state: State<'_, AppState>,
+    app: AppHandle,
 ) -> Result<String, String> {
-    let root = state
-        .store
-        .workspace(&project_id, session_id.as_deref())?
-        .path;
-    let path = contained_file(Path::new(&root), &path)?;
-    if std::fs::metadata(&path).map_err(|e| e.to_string())?.len() > 1024 * 1024 {
-        return Err("文件超过 1 MB，请在外部编辑器中查看".into());
-    }
-    let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
-    if bytes.starts_with(&[0xef, 0xbb, 0xbf]) {
-        return Err("该文件使用 UTF-8 BOM，未转换或修改文件编码".into());
-    }
-    let text = String::from_utf8(bytes)
-        .map_err(|_| "该文件不是有效的 UTF-8 文本，未转换或修改文件编码")?;
-    if text.contains('\0') {
-        return Err("该文件是二进制内容，不能作为文本预览".into());
-    }
-    Ok(text)
+    tauri::async_runtime::spawn_blocking(move || {
+        let path = referenced_path(
+            &app.state::<AppState>().store,
+            &project_id,
+            session_id.as_deref(),
+            &path,
+            false,
+        )?;
+        read_file_preview(&path)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -1204,16 +1258,49 @@ mod tests {
         }
     }
     #[test]
-    fn preview_rejects_paths_outside_the_project() {
+    fn file_references_can_resolve_outside_workspace_while_the_directory_tree_stays_scoped() {
         let base = std::env::temp_dir().join(format!("supercode-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(base.join("project")).unwrap();
         std::fs::write(base.join("project/中文.txt"), "中文").unwrap();
-        std::fs::write(base.join("outside.txt"), "private").unwrap();
-        assert!(contained_file(&base.join("project"), "中文.txt").is_ok());
-        assert!(contained_file(&base.join("project"), "../outside.txt").is_err());
+        std::fs::write(base.join("目录外 with spaces.txt"), "目录外的文件内容").unwrap();
+        let store =
+            crate::storage::Store::from_connection(rusqlite::Connection::open_in_memory().unwrap())
+                .unwrap();
+        let project = store.add_project(&base.join("project")).unwrap();
+        let session = store.create_session(&project.id, None).unwrap();
+        let outside = base.join("目录外 with spaces.txt");
+        let absolute = outside.to_str().unwrap();
+        let uri = tauri::Url::from_file_path(&outside).unwrap().to_string();
+        assert!(referenced_path(&store, &project.id, None, "中文.txt", false).is_ok());
+        for (project_id, path) in [
+            (&project.id[..], "../目录外 with spaces.txt"),
+            ("", absolute),
+            ("deleted-project", uri.as_str()),
+        ] {
+            let resolved = referenced_path(&store, project_id, None, path, false).unwrap();
+            assert_eq!(resolved, outside.canonicalize().unwrap());
+            assert_eq!(read_file_preview(&resolved).unwrap(), "目录外的文件内容");
+        }
+        assert!(referenced_path(&store, "", None, "relative.txt", false).is_err());
+        assert!(referenced_path(&store, &project.id, None, "missing.txt", false).is_err());
+        assert_eq!(
+            referenced_path(
+                &store,
+                "",
+                Some(&session.id),
+                "../目录外 with spaces.txt",
+                false
+            )
+            .unwrap(),
+            outside.canonicalize().unwrap()
+        );
         assert!(contained_workspace_path(&base.join("project"), ".", true).is_ok());
         assert!(contained_workspace_path(&base.join("project"), "..", true).is_err());
-        assert!(contained_file(&base.join("project"), ".").is_err());
+        assert!(referenced_path(&store, &project.id, None, ".", false).is_err());
+        assert_eq!(
+            referenced_path(&store, &project.id, None, "..", true).unwrap(),
+            base.canonicalize().unwrap()
+        );
         std::fs::create_dir_all(base.join("project/nested")).unwrap();
         std::fs::create_dir_all(base.join("project/node_modules")).unwrap();
         std::fs::write(base.join("project/nested/result.html"), "<p>result</p>").unwrap();
@@ -1225,7 +1312,33 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["nested/result.html", "中文.txt"]
         );
-        // The exact temporary directory is owned by this test.
+        // The resolved UUID test directory must be directly inside the temp root.
+        assert_eq!(
+            base.canonicalize().unwrap().parent(),
+            Some(std::env::temp_dir().canonicalize().unwrap().as_path())
+        );
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn external_preview_keeps_utf8_binary_and_size_handling_without_rewriting_files() {
+        let base = std::env::temp_dir().join(format!("supercode-preview-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&base).unwrap();
+        for (name, bytes, error) in [
+            ("bom.txt", vec![0xef, 0xbb, 0xbf, b'x'], "UTF-8 BOM"),
+            ("invalid.txt", vec![0xff], "有效的 UTF-8"),
+            ("binary.dat", vec![b'x', 0, b'y'], "二进制"),
+            ("large.txt", vec![b'x'; 1024 * 1024 + 1], "1 MB"),
+        ] {
+            let path = base.join(name);
+            std::fs::write(&path, &bytes).unwrap();
+            assert!(read_file_preview(&path).unwrap_err().contains(error));
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        }
+        assert_eq!(
+            base.canonicalize().unwrap().parent(),
+            Some(std::env::temp_dir().canonicalize().unwrap().as_path())
+        );
         std::fs::remove_dir_all(base).unwrap();
     }
 

@@ -1,8 +1,8 @@
 import type { Provider } from './types';
 
-export const protocolLabels: Record<string, string> = { anthropic: 'Anthropic Messages', responses: 'OpenAI Responses', chat: 'OpenAI Chat Completions' };
+export const protocolLabels: Record<string, string> = { anthropic: 'Anthropic Messages', responses: 'OpenAI Responses', chat: 'OpenAI Chat Completions', gemini: 'Gemini API' };
 export const agentProtocols: Record<string, string[]> = {
-  claude: ['anthropic'], codex: ['responses'], opencode: ['anthropic', 'responses', 'chat'], pi: ['anthropic', 'responses', 'chat'],
+  claude: ['anthropic'], codex: ['responses'], opencode: ['anthropic', 'responses', 'chat', 'gemini'], pi: ['anthropic', 'responses', 'chat', 'gemini'], gemini: ['gemini'],
 };
 export function providersForAgent(providers: Provider[], agent: string): Provider[] {
   const protocols = agentProtocols[agent] ?? [];

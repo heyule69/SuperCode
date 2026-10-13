@@ -3,6 +3,7 @@ import brands from '../resources/provider-brands.json';
 
 export function AgentIcon({ agent }: { agent: string }) {
   if (agent === 'claude') return <img className="agent-logo" src="/brands/claude.png" alt="" aria-hidden="true"/>;
+  if (agent === 'gemini') return <img className="agent-logo" src="/brands/google.png" alt="" aria-hidden="true"/>;
   if (agent === 'opencode' || agent === 'pi') return <img className="agent-logo" src={`/brands/${agent}.svg`} alt="" aria-hidden="true"/>;
   if (agent !== 'codex') return <span className="agent-logo" aria-hidden="true">{agent.slice(0, 1).toUpperCase()}</span>;
   return <span className="agent-logo codex-logo" aria-hidden="true"><img className="codex-logo-light" src="/brands/codex-light.png" alt=""/><img className="codex-logo-dark" src="/brands/codex-dark.png" alt=""/></span>;

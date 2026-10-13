@@ -16,7 +16,7 @@ describe('agent command routing', () => {
   });
   it('offers local skills in both Agents and gives skills priority over native aliases', () => {
     const skills = [{name:'recall',path:'C:/skills/recall/SKILL.md',description:'恢复项目状态'}, {name:'save',path:'C:/skills/save/SKILL.md',description:'保存项目状态'}];
-    for (const agent of ['claude','codex']) {
+    for (const agent of ['claude','codex','opencode','pi','gemini']) {
       expect(commandMatches('/re',agent,['recall'],skills).map(c=>c.name)).toEqual(['/recall']);
       expect(commandMatches('/save',agent,[],skills)[0].skill?.path).toBe(skills[1].path);
       expect(commandMatches('/recall task',agent,[],skills)).toEqual([]);
@@ -28,5 +28,12 @@ describe('agent command routing', () => {
     expect(commands.find(c=>c.name==='/status')?.skill).toBeUndefined();
     expect(commands.filter(c=>c.skill).map(c=>c.name)).toEqual(['/skill:status','/save','/skill:save','/plugin:save']);
     expect(parseCommand('/plugin:save 请保存\n项目状态')).toEqual({command:'/plugin:save',argument:'请保存\n项目状态'});
+  });
+  it('discovers Gemini native commands without advertising unsupported manual compaction', () => {
+    const commands = commandMatches('/', 'gemini', ['review', 'mcp:list', 'compact', '../../bad']);
+    expect(commands.find(command => command.name === '/review')?.detail).toContain('Gemini CLI');
+    expect(commands.some(command => command.name === '/mcp:list')).toBe(true);
+    expect(commands.some(command => command.name === '/compact')).toBe(false);
+    expect(commands.some(command => command.name === '/goal')).toBe(false);
   });
 });

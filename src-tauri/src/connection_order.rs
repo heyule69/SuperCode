@@ -80,7 +80,7 @@ pub(crate) fn order(conn: &Connection, agent: &str) -> Result<Vec<String>> {
     }
     // Keep the pre-existing CLI route available, without adding it to accounts
     // that have always used explicit connections.
-    if matches!(agent, "opencode" | "pi")
+    if matches!(agent, "opencode" | "pi" | "gemini")
         || agent != "codex"
             && (previous.is_none() && default == LOCAL
                 || previous
@@ -136,7 +136,7 @@ fn write_order(conn: &Connection, agent: &str, ids: &[String]) -> Result<()> {
 }
 
 pub(crate) fn reconcile(conn: &Connection) -> Result<()> {
-    for agent in ["claude", "codex", "opencode", "pi"] {
+    for agent in ["claude", "codex", "opencode", "pi", "gemini"] {
         write_order(conn, agent, &order(conn, agent)?)?;
     }
     Ok(())
@@ -145,7 +145,7 @@ pub(crate) fn reconcile(conn: &Connection) -> Result<()> {
 impl Store {
     pub fn connection_orders(&self) -> Result<BTreeMap<String, Vec<String>>> {
         let conn = self.0.lock().map_err(|e| e.to_string())?;
-        ["claude", "codex", "opencode", "pi"]
+        ["claude", "codex", "opencode", "pi", "gemini"]
             .into_iter()
             .map(|agent| Ok((agent.into(), order(&conn, agent)?)))
             .collect()
@@ -159,7 +159,7 @@ impl Store {
     }
 
     pub fn reorder_connections(&self, agent: &str, ids: &[String]) -> Result<()> {
-        if !matches!(agent, "claude" | "codex" | "opencode" | "pi") {
+        if !matches!(agent, "claude" | "codex" | "opencode" | "pi" | "gemini") {
             return Err("Agent 无效".into());
         }
         let mut conn = self.0.lock().map_err(|e| e.to_string())?;
@@ -177,7 +177,7 @@ impl Store {
     }
 
     pub(crate) fn make_connection_default(&self, agent: &str, id: &str) -> Result<()> {
-        if !matches!(agent, "claude" | "codex" | "opencode" | "pi") {
+        if !matches!(agent, "claude" | "codex" | "opencode" | "pi" | "gemini") {
             return Err("Agent 无效".into());
         }
         let mut conn = self.0.lock().map_err(|e| e.to_string())?;

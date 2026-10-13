@@ -126,6 +126,16 @@
 .saved-provider-list { display: flex; flex-direction: column; }
 .provider-order-hint { margin: 0 0 18px; font-size: 11px; line-height: 1.6; color: var(--muted); }
 .provider-runtime-hint { margin: 0 0 18px; padding: 10px 12px; background: var(--surface2); border: 1px solid var(--line); border-radius: 8px; font-size: 12px; line-height: 1.7; color: var(--muted); }
+.provider-selection-controls { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; margin: 0 0 10px; color: var(--muted); font-size: 11px; }
+.provider-selection-controls label { display: inline-flex; align-items: center; gap: 7px; cursor: pointer; }
+.provider-selection-controls .quiet-button { margin-left: auto; }
+.provider-selection-controls input, .provider-row-select { accent-color: var(--accent); cursor: pointer; }
+.provider-row-select, .provider-row-select-placeholder { width: 14px; flex: 0 0 14px; margin: 0 4px; }
+.provider-row-select:disabled { cursor: default; }
+.provider-row-delete { flex: 0 0 30px; margin: 0 4px; }
+.provider-delete-confirm { border: 1px solid var(--line); border-radius: 8px; padding: 12px; margin: 0 0 12px; background: var(--surface2); font-size: 12px; }
+.provider-delete-confirm p { margin: 0 0 8px; line-height: 1.6; overflow-wrap: anywhere; }
+.provider-delete-confirm > div { display: flex; justify-content: flex-end; gap: 8px; }
 .provider-sort-row { display: flex; align-items: center; position: relative; border-bottom: 1px solid var(--line); border-radius: 6px; min-width: 0; }
 .provider-sort-row:hover { background: var(--hover); }
 .provider-sort-row.is-dragging { opacity: .4; }

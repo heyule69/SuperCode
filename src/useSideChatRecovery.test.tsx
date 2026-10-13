@@ -82,7 +82,7 @@ it('keeps a new approval received while the runtime snapshot is pending', async 
   await act(async () => { notify(approval); finish({ requests: [] }); await read; });
   expect(api.requests).toEqual([approval]);
 });
-it.each(['pi','opencode'])('rebinds %s boot native ID and keeps owner-scoped startup requests', async agent => {
+it.each(['pi','opencode','gemini'])('rebinds %s boot native ID and keeps owner-scoped startup requests', async agent => {
   const boot = {...initial,agent,nativeId:'boot-native',status:'starting'};
   await act(async () => {root.render(null);});
   await act(async () => root.render(<Harness boot={boot}/>));

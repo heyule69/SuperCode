@@ -167,3 +167,146 @@ it('permits default reordering without modifying a connection used by a task', a
   expect(mocks.call).toHaveBeenCalledWith('reorder_provider_connections', {agent:'claude',ids:['glm','kimi','@local','@official']});
   expect(mocks.call).not.toHaveBeenCalledWith('save_provider_profile', expect.anything());
 });
+
+async function inputValue(id: string, value: string) {
+  await act(async () => {
+    const input = node.querySelector<HTMLInputElement>(`#${id}`)!;
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')!.set!.call(input, value);
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+  });
+}
+async function selectValue(id: string, value: string) {
+  await act(async () => {
+    const select = node.querySelector<HTMLSelectElement>(`#${id}`)!;
+    select.value = value; select.dispatchEvent(new Event('change', { bubbles: true }));
+  });
+}
+
+it.each(['opencode', 'pi'].flatMap(agent => [false, true].map(hasCredential => ({ agent, hasCredential }))))('allows $agent saved protocol changes with saved credential=$hasCredential, preserving the connection and key', async ({ agent, hasCredential }) => {
+  const own: AgentProfile = { id: 'api', agent, name: 'API', model: 'test-model', current: false, hasCredential };
+  const settings: Config = { ...config('api'), agent, name: 'API', protocol: 'responses', plan: 'responses', hasCredential };
+  const original = mocks.call.getMockImplementation()!;
+  mocks.call.mockImplementation(async (command: string, args: any) => command === 'get_provider_profile' ? settings : command === 'save_provider_profile' ? own : original(command, args));
+  await act(async () => root.render(<ProviderSettings profiles={[own]} officialAgents={[]} initialAgent={agent} updated={async () => {}}/>));
+  await act(async () => savedCard('api').click());
+  expect(node.querySelector<HTMLSelectElement>('#provider-protocol')!.disabled).toBe(false);
+  await selectValue('provider-protocol', 'gemini');
+  await act(async () => button('保存').click());
+  expect(mocks.call).toHaveBeenCalledWith('save_provider_profile', { settings: expect.objectContaining({ id: 'api', protocol: 'gemini', plan: 'gemini', hasCredential, apiKey: null }), activate: false });
+});
+
+it('fetches models from an unsaved draft without a default model and retains its entered key and name', async () => {
+  const original = mocks.call.getMockImplementation()!;
+  mocks.call.mockImplementation(async (command: string, args: any) => command === 'fetch_provider_models_for_settings' ? ['returned-model', 'second-model'] : command === 'save_provider_profile' ? { id: 'new', agent: 'opencode', hasCredential: true, current: false } : original(command, args));
+  await render(); await act(async () => tab('opencode').click()); await act(async () => button('添加').click()); await act(async () => providerCard('自定义 / 兼容 API').click());
+  await inputValue('provider-name', '我的未保存连接'); await inputValue('provider-url', 'https://example.com/v1beta'); await inputValue('provider-key', 'draft-key'); await inputValue('provider-default-model', ''); await selectValue('provider-protocol', 'gemini');
+  expect(button('获取模型').disabled).toBe(false);
+  await act(async () => button('获取模型').click());
+  expect(mocks.call).toHaveBeenCalledWith('fetch_provider_models_for_settings', { settings: expect.objectContaining({ id: null, name: '我的未保存连接', model: '', apiKey: 'draft-key', protocol: 'gemini', baseUrl: 'https://example.com/v1beta' }) });
+  expect(mocks.call.mock.calls.some(([command]) => command === 'save_provider_profile')).toBe(false);
+  expect(node.querySelector<HTMLInputElement>('#provider-default-model')!.value).toBe('returned-model');
+  expect(node.querySelector<HTMLInputElement>('#provider-name')!.value).toBe('我的未保存连接');
+  expect(node.querySelector<HTMLInputElement>('#provider-key')!.value).toBe('draft-key');
+  expect(node.querySelector('.provider-editor-heading .connection-state')!.textContent).toBe('新连接');
+  await act(async () => button('保存').click());
+  expect(mocks.call).toHaveBeenCalledWith('save_provider_profile', { settings: expect.objectContaining({ id: null, apiKey: 'draft-key', model: 'returned-model', models: ['returned-model', 'second-model'] }), activate: false });
+});
+
+it('uses a saved key for unsaved protocol discovery without silently saving or replacing the default model', async () => {
+  const original = mocks.call.getMockImplementation()!;
+  const settings = { ...config('api'), agent: 'pi', name: 'API', protocol: 'responses', plan: 'responses' };
+  const own = { id: 'api', agent: 'pi', name: 'API', model: 'test-model', current: false, hasCredential: true };
+  mocks.call.mockImplementation(async (command: string, args: any) => command === 'get_provider_profile' ? settings : command === 'fetch_provider_models_for_settings' ? ['another-model'] : original(command, args));
+  await act(async () => root.render(<ProviderSettings profiles={[own]} officialAgents={[]} initialAgent="pi" updated={async () => {}}/>));
+  await act(async () => savedCard('api').click()); await selectValue('provider-protocol', 'chat'); await act(async () => button('获取模型').click());
+  expect(mocks.call).toHaveBeenCalledWith('fetch_provider_models_for_settings', { settings: expect.objectContaining({ id: 'api', protocol: 'chat', apiKey: null, hasCredential: true }) });
+  expect(mocks.call.mock.calls.some(([command]) => command === 'save_provider_profile')).toBe(false);
+  expect(node.querySelector<HTMLInputElement>('#provider-default-model')!.value).toBe('test-model');
+  expect(node.querySelector('.provider-model-list')!.textContent).toContain('another-model');
+  expect(node.querySelector<HTMLInputElement>('#provider-key')!.readOnly).toBe(true);
+});
+
+it('retains a draft on model-discovery failure without creating a connection', async () => {
+  const original = mocks.call.getMockImplementation()!;
+  mocks.call.mockImplementation(async (command: string, args: any) => command === 'fetch_provider_models_for_settings' ? Promise.reject(new Error('HTTP 404')) : original(command, args));
+  await render(); await act(async () => button('添加').click()); await act(async () => providerCard('自定义 / 兼容 API').click()); await inputValue('provider-url', 'https://example.com'); await inputValue('provider-key', 'draft-key'); await inputValue('provider-default-model', '');
+  await act(async () => button('获取模型').click());
+  expect(node.querySelector('[role="alert"]')!.textContent).toContain('HTTP 404');
+  expect(node.querySelector<HTMLInputElement>('#provider-key')!.value).toBe('draft-key');
+  expect(mocks.call.mock.calls.some(([command]) => command === 'save_provider_profile')).toBe(false);
+});
+
+it('deletes a connection directly from its list row only after naming it in the confirmation', async () => {
+  const updated = vi.fn(async () => {}); await render({}, updated);
+  expect(node.querySelector('button button')).toBeNull();
+  await act(async () => node.querySelector<HTMLButtonElement>('[aria-label="删除 Kimi"]')!.click());
+  expect(node.querySelector('[aria-label="确认删除连接"]')!.textContent).toContain('Kimi');
+  expect(node.querySelector('[aria-label="确认删除连接"]')!.textContent).toContain('API Key');
+  expect(mocks.call.mock.calls.some(([command]) => command === 'delete_provider_profiles')).toBe(false);
+  await act(async () => button('确认删除 1 个连接').click());
+  expect(mocks.call).toHaveBeenCalledWith('delete_provider_profiles', { agent: 'claude', ids: ['kimi'] });
+  expect(updated).toHaveBeenCalledOnce();
+});
+
+it('selects and atomically deletes multiple connections, with select-all and partial selection accessible', async () => {
+  await render(); const all = () => node.querySelector<HTMLInputElement>('[aria-label="全选当前可删除连接"]')!;
+  await act(async () => node.querySelector<HTMLInputElement>('[aria-label="选择 Kimi"]')!.click());
+  expect(all().indeterminate).toBe(true); expect(button('删除所选 (1)').disabled).toBe(false);
+  await act(async () => all().click()); expect(all().checked).toBe(true); expect(all().indeterminate).toBe(false);
+  await act(async () => button('删除所选 (2)').click());
+  expect(node.querySelector('[aria-label="确认删除连接"]')!.textContent).toContain('Kimi、GLM');
+  await act(async () => button('确认删除 2 个连接').click());
+  expect(mocks.call).toHaveBeenCalledWith('delete_provider_profiles', { agent: 'claude', ids: ['kimi', 'glm'] });
+  expect(mocks.call.mock.calls.filter(([command]) => command === 'delete_provider_profiles')).toHaveLength(1);
+});
+
+it('select-all targets only visible idle connections, and rechecks task use before deletion', async () => {
+  await render({ claude: ['kimi'] });
+  expect(node.querySelector<HTMLInputElement>('[aria-label="选择 Kimi"]')!.disabled).toBe(true);
+  expect(node.querySelector<HTMLButtonElement>('[aria-label="删除 Kimi"]')!.disabled).toBe(true);
+  await act(async () => node.querySelector<HTMLInputElement>('[aria-label="全选当前可删除连接"]')!.click()); await act(async () => button('删除所选 (1)').click());
+  expect(node.querySelector('[aria-label="确认删除连接"]')!.textContent).toContain('GLM');
+  await render({ claude: ['kimi', 'glm'] }); expect(button('确认删除 1 个连接').disabled).toBe(true);
+  await act(async () => button('确认删除 1 个连接').click()); expect(mocks.call.mock.calls.some(([command]) => command === 'delete_provider_profiles')).toBe(false);
+  await act(async () => button('取消').click()); await render();
+  await act(async () => { const input = node.querySelector<HTMLInputElement>('[aria-label="搜索模型连接"]')!; Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')!.set!.call(input, 'Kimi'); input.dispatchEvent(new Event('input', { bubbles: true })); });
+  await act(async () => node.querySelector<HTMLInputElement>('[aria-label="全选当前可删除连接"]')!.click()); await act(async () => button('删除所选 (1)').click()); await act(async () => button('确认删除 1 个连接').click());
+  expect(mocks.call).toHaveBeenCalledWith('delete_provider_profiles', { agent: 'claude', ids: ['kimi'] });
+});
+
+it('keeps native official accounts out of deletion and opens account management without logging out', async () => {
+  await render(); await act(async () => tab('codex').click());
+  expect(node.querySelector<HTMLInputElement>('[aria-label="全选当前可删除连接"]')!.disabled).toBe(true);
+  expect(node.querySelector('.provider-row-delete')).toBeNull(); expect(node.querySelector('.provider-row-select')).toBeNull();
+  await act(async () => savedCard('@official').click()); expect(mocks.call).toHaveBeenCalledWith('list_official_accounts', { agent: 'codex', force: false });
+  expect(mocks.call.mock.calls.some(([command]) => ['delete_provider_profiles', 'remove_official_account', 'logout_agent_account'].includes(command))).toBe(false);
+});
+
+it('offers Gemini CLI with its native protocol and no unrelated official-account login', async () => {
+  await render(); expect(tab('gemini')).toBeDefined(); await act(async () => tab('gemini').click()); await act(async () => button('添加').click());
+  expect(node.querySelector('.provider-api-heading')!.textContent).toContain('Gemini API');
+  expect(node.querySelector('.official-login-card')).toBeNull();
+});
+
+it.each(['opencode', 'pi'])('protects %s protocol changes only while that saved connection is in use', async agent => {
+  const own: AgentProfile = { id: 'api', agent, name: 'API', model: 'test-model', current: false, hasCredential: true };
+  const settings: Config = { ...config('api'), agent, name: 'API', protocol: 'responses', plan: 'responses' };
+  const original = mocks.call.getMockImplementation()!;
+  mocks.call.mockImplementation(async (command: string, args: any) => command === 'get_provider_profile' ? settings : original(command, args));
+  const paint = async (runningConnections: Record<string, string[]>) => act(async () => root.render(<ProviderSettings profiles={[own]} officialAgents={[]} initialAgent={agent} runningConnections={runningConnections} updated={async () => {}}/>));
+  await paint({}); await act(async () => savedCard('api').click()); await selectValue('provider-protocol', 'chat');
+  await paint({ [agent]: ['api'] }); expect(node.querySelector<HTMLSelectElement>('#provider-protocol')!.disabled).toBe(true);
+  await paint({ [agent === 'pi' ? 'opencode' : 'pi']: ['api'] }); expect(node.querySelector<HTMLSelectElement>('#provider-protocol')!.disabled).toBe(false);
+  expect(node.querySelector<HTMLSelectElement>('#provider-protocol')!.value).toBe('chat');
+});
+
+it('keeps all selected rows and the confirmation when an atomic deletion fails', async () => {
+  const original = mocks.call.getMockImplementation()!;
+  mocks.call.mockImplementation(async (command: string, args: any) => command === 'delete_provider_profiles' ? Promise.reject(new Error('任务使用中的连接不能删除')) : original(command, args));
+  const updated = vi.fn(async () => {}); await render({}, updated);
+  await act(async () => node.querySelector<HTMLInputElement>('[aria-label="全选当前可删除连接"]')!.click()); await act(async () => button('删除所选 (2)').click()); await act(async () => button('确认删除 2 个连接').click());
+  expect(node.querySelector('[role="alert"]')!.textContent).toContain('任务使用中');
+  expect(node.querySelectorAll('.provider-sort-row')).toHaveLength(2);
+  expect(node.querySelectorAll<HTMLInputElement>('.provider-row-select:checked')).toHaveLength(2);
+  expect(button('确认删除 2 个连接').disabled).toBe(false); expect(updated).not.toHaveBeenCalled();
+});

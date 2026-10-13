@@ -1038,7 +1038,7 @@ async fn cancel_request(
     if request.id.len() > 192
         || !matches!(
             request.agent.as_str(),
-            "codex" | "claude" | "opencode" | "pi"
+            "codex" | "claude" | "opencode" | "pi" | "gemini"
         )
     {
         return axum::http::StatusCode::BAD_REQUEST;
@@ -1088,7 +1088,7 @@ async fn request(
     if request.id.len() > 192
         || !matches!(
             request.agent.as_str(),
-            "codex" | "claude" | "opencode" | "pi"
+            "codex" | "claude" | "opencode" | "pi" | "gemini"
         )
     {
         return Err(axum::http::StatusCode::BAD_REQUEST);

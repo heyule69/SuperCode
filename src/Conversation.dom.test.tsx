@@ -238,9 +238,9 @@ it('shows animated current reasoning, editing and running after a tool failure w
   const trace = [items[0], failed, thinking];
   for (const [current, label] of [
     [thinking, '正在思考'],
-    [message('edit', 'tool', '', 'claudeToolCall', { tool: 'Write', arguments: { file_path: 'scripts/test.mjs' }, status: 'preparing' }), '正在编辑文件'],
+    [message('edit', 'tool', '', 'claudeToolCall', { tool: 'Write', arguments: { file_path: 'scripts/test.mjs' }, status: 'preparing' }), '正在准备写文件'],
     [message('edit', 'tool', '', 'fileChange', { changes: [{ path: 'scripts/test.mjs' }], status: 'inProgress' }), '正在编辑文件'],
-    [message('command', 'tool', '', 'commandExecution', { command: 'node scripts/test.mjs', status: 'running' }), '正在运行命令'],
+    [message('command', 'tool', '', 'commandExecution', { command: 'node scripts/test.mjs', status: 'running' }), '正在执行命令'],
     [message('native-tool', 'tool', '', 'mcpToolCall', { tool: 'test', status: 'inProgress' }), '正在调用工具'],
   ] as const) {
     await render([...trace.filter(message => message.id !== current.id), current], true, { sessionStatus: 'running' });
@@ -257,11 +257,11 @@ it('keeps one animated status across tool completion and text output, then remov
   const failed = message('failure', 'tool', '失败', 'commandExecution', { status: 'completed', exitCode: 1 });
   const trace = [items[0], failed];
   await render(trace, false, { sessionStatus: 'running' });
-  expect(node.querySelector('.activity-group-summary .pending-text')?.textContent).toBe('正在思考');
+  expect(node.querySelector('.activity-group-summary .pending-text')?.textContent).toBe('正在处理');
   expect(node.querySelector('.working-indicator')).toBeNull();
   const commentary = message('commentary', 'assistant', '正在检查失败原因。', 'agentMessage', { phase: 'commentary' });
   await render([...trace, commentary], false, { sessionStatus: 'running' });
-  expect(node.querySelector('.working-indicator .pending-text')?.textContent).toBe('正在思考');
+  expect(node.querySelector('.working-indicator .pending-text')?.textContent).toBe('正在处理');
   expect(node.querySelectorAll('.working-indicator')).toHaveLength(1);
   expect(node.querySelector('.turn-footer')).toBeNull();
   await render([...trace, commentary, items[3], run('completed')], false, { sessionStatus: 'idle' });
@@ -278,7 +278,35 @@ it('keeps one animated status across tool completion and text output, then remov
 it('keeps active tool progress visible when assistant text arrives while the tool is still running', async () => {
   const tool = message('command', 'tool', '', 'commandExecution', { command: 'npm run build', status: 'running' });
   await render([items[0], tool, items[1]], false, { sessionStatus: 'running' });
-  expect(node.querySelector('.working-indicator .pending-text')?.textContent).toBe('正在运行命令');
+  expect(node.querySelector('.working-indicator .pending-text')?.textContent).toBe('正在执行命令');
+});
+
+it('tracks actual write preparation, execution, completion and the next action instead of a fixed thinking heading', async () => {
+  let rows = mergeEvent([items[0]], { method: 'turn/started', params: { turn: { id: 'write-turn' } } }, 's');
+  rows = mergeEvent(rows, { method: 'item/completed', params: { turnId: 'write-turn', item: { id: 'thought', type: 'reasoning', summary: ['I am planning an HTML file.'], status: 'completed' } } }, 's');
+  const write = { id: 'write', type: 'claudeToolCall', tool: 'Write', arguments: { file_path: 'test/pelican-bike.html' } };
+  for (const [status, label] of [['preparing', '正在准备写文件'], ['inProgress', '正在写文件']] as const) {
+    rows = mergeEvent(rows, { method: 'item/started', params: { turnId: 'write-turn', item: { ...write, status } } }, 's');
+    await render(rows, true, { sessionStatus: 'running', activeTurnId: 'write-turn' });
+    expect(node.querySelector('.activity-group-summary .pending-text')?.textContent).toBe(label);
+    expect(node.querySelector('.activity-item:not(.reasoning) .activity-row strong')?.textContent).toBe(label);
+  }
+  rows = mergeEvent(rows, { method: 'item/completed', params: { turnId: 'write-turn', item: { ...write, status: 'completed' } } }, 's');
+  await render(rows, true, { sessionStatus: 'running', activeTurnId: 'write-turn' });
+  expect(node.querySelector('.activity-group-summary .pending-text')?.textContent).toBe('正在处理');
+  expect(node.textContent).toContain('写入了文件');
+  expect(node.querySelector('.activity-group-summary')?.textContent).not.toContain('正在思考');
+  rows = mergeEvent(rows, { method: 'item/started', params: { turnId: 'write-turn', item: { id: 'command', type: 'commandExecution', command: 'npm run build', status: 'running' } } }, 's');
+  await render(rows, true, { sessionStatus: 'running', activeTurnId: 'write-turn' });
+  expect(node.querySelector('.activity-group-summary .pending-text')?.textContent).toBe('正在执行命令');
+});
+
+it('shows reply output separately from completed thought and tool history', async () => {
+  const rows = [items[0], message('thought', 'activity', '已完成思考摘要', 'reasoning', { status: 'completed' }), items[2],
+    message('reply', 'assistant', '文件已写好，正在说明结果。', 'agentMessage', { status: 'inProgress' })];
+  await render(rows, false, { sessionStatus: 'running' });
+  expect(node.querySelector('.working-indicator .pending-text')?.textContent).toBe('正在回复');
+  expect(node.querySelector('.working-indicator')?.textContent).not.toContain('正在思考');
 });
 
 it('shows progress before any assistant event arrives in both empty and optimistic user-message histories', async () => {

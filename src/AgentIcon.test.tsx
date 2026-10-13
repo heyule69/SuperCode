@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { renderToStaticMarkup } from 'react-dom/server';
-import { ProviderIcon, providerInitial } from './AgentIcon';
+import { AgentIcon, ProviderIcon, providerInitial } from './AgentIcon';
 import brands from '../resources/provider-brands.json';
 import catalog from '../resources/providers.json';
 
@@ -19,5 +19,9 @@ describe('local provider identities', () => {
       expect(html).not.toContain('src="https:');
     }
     expect(Object.values(brands).every(src => src.startsWith('/brands/'))).toBe(true);
+  });
+  it('uses the bundled Google identity for Gemini CLI without external requests', () => {
+    const html = renderToStaticMarkup(<AgentIcon agent="gemini"/>);
+    expect(html).toContain('/brands/google.png'); expect(html).not.toContain('src="https:');
   });
 });

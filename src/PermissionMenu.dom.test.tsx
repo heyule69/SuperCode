@@ -95,6 +95,7 @@ it('shows only supported choices for each Agent, including all six native Claude
   for (const [agent, names] of [
     ['claude', ['计划模式（只读）', '请求批准', '自动接受编辑', '自动模式', '不询问', '完全访问权限']],
     ['opencode', ['只读', '请求批准', '完全访问权限']],
+    ['gemini', ['只读', '请求批准', '完全访问权限']],
     ['pi', ['只读', '逐项批准', '读取自动批准', '完全访问权限']],
   ] as const) {
     await render('ask', false, agent); await click('[aria-label="权限模式"]');

@@ -31,7 +31,8 @@ assert.equal(compatibility.liveAgentValidation, false);
 for (const entry of compatibility.agents) {
   for (const path of entry.fixtureTests) {
     const parts = path.split('::');
-    const source = read(`src-tauri/src/${parts[0]}.rs`);
+    assert.equal(parts.at(-2), 'tests', `Invalid compatibility fixture ${path}`);
+    const source = read(`src-tauri/src/${parts.slice(0, -2).join('/')}.rs`);
     assert.match(source, new RegExp(`\\bfn\\s+${parts.at(-1)}\\s*\\(`), `Missing compatibility fixture ${path}`);
   }
 }

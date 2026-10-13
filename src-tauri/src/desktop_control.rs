@@ -256,7 +256,7 @@ async fn connection(app: AppHandle, socket: tokio::net::TcpStream) {
     };
     let Some(agent) = hello["agent"]
         .as_str()
-        .filter(|agent| matches!(*agent, "codex" | "claude" | "opencode" | "pi"))
+        .filter(|agent| matches!(*agent, "codex" | "claude" | "opencode" | "pi" | "gemini"))
     else {
         return;
     };

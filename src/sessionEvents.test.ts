@@ -2,7 +2,7 @@ import { expect, it } from 'vitest';
 import { canBindMainThread, requestBelongsToSession } from './sessionEvents';
 import type { RpcEvent } from './types';
 
-it.each(['pi','opencode'])('accepts %s authoritative startup rebinding but requires an exact owner', agent => {
+it.each(['pi','opencode','gemini'])('accepts %s authoritative startup rebinding but requires an exact owner', agent => {
   const session = { id:'chat',agent,nativeId:'boot' };
   expect(canBindMainThread(session,{method:'thread/started',params:{appSessionId:'chat',thread:{id:'actual'}}},'actual')).toBe(true);
   expect(canBindMainThread(session,{method:'turn/started',params:{appSessionId:'chat',threadId:'actual'}},'actual')).toBe(true);

@@ -66,14 +66,14 @@ describe('task replies and execution history', () => {
       items = mergeEvent(items, { method: 'item/started', params: { turnId: 't', item: { id: 'read', type: kind, ...tool, status: 'inProgress' } } }, 's');
       expect(render(items)).toContain('aria-label="正在读取文件，1 条记录"');
       items = mergeEvent(items, { method: 'item/completed', params: { turnId: 't', item: { id: 'read', type: kind, ...tool, status: 'completed' } } }, 's');
-      expect(render(items)).toContain('aria-label="正在思考，1 条记录"');
+      expect(render(items)).toContain('aria-label="正在处理，1 条记录"');
       items = mergeEvent(items, { method: 'item/started', params: { turnId: 't', item: { id: 'thinking', type: 'reasoning', summary: [], status: 'inProgress' } } }, 's');
       const thinking = render(items, true);
       expect(thinking).toContain('aria-label="正在思考，2 条记录"');
       expect(thinking).toContain('读取了文件');
       expect(thinking).not.toContain('class="spin"');
       items = mergeEvent(items, { method: 'item/started', params: { turnId: 't', item: { id: 'command', type: 'commandExecution', command: 'build', status: 'inProgress' } } }, 's');
-      expect(render(items)).toContain('aria-label="正在运行命令，3 条记录"');
+      expect(render(items)).toContain('aria-label="正在执行命令，3 条记录"');
       items = mergeEvent(items, { method: 'turn/completed', params: { turn: { id: 't', status: 'completed' } } }, 's');
       expect(render(items)).not.toContain('正在思考');
     }

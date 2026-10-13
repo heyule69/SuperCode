@@ -27,7 +27,7 @@ async function input(value: string) {
 }
 async function key(key: string, target: HTMLElement = node.querySelector('section')!) { await act(async () => target.dispatchEvent(new KeyboardEvent('keydown', { key, bubbles: true }))); }
 
-it.each(['codex','claude','opencode','pi'])('submits a single %s question directly on an explicit option click', async agent => {
+it.each(['codex','claude','opencode','pi','gemini'])('submits a single %s question directly on an explicit option click', async agent => {
   await render(request({}, `${agent}:ask`));
   expect(button('发送').disabled).toBe(true); expect(respond).not.toHaveBeenCalled();
   await click('.question-request-option');

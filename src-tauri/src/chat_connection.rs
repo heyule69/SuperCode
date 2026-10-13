@@ -22,7 +22,7 @@ fn connection_kind(
     session_id: Option<&str>,
     connection_id: Option<&str>,
 ) -> Result<ConnectionKind, String> {
-    if !matches!(agent, "claude" | "codex" | "opencode" | "pi") {
+    if !matches!(agent, "claude" | "codex" | "opencode" | "pi" | "gemini") {
         return Err("该 Agent 尚未接入执行".into());
     }
     // Existing conversations are pinned. A different draft/default connection
@@ -108,8 +108,13 @@ pub(crate) async fn check(
     connection_id: Option<&str>,
 ) -> Result<(), String> {
     let state = app.state::<AppState>();
-    let route = state.store.route_with_connection(agent, session_id, connection_id);
-    let account_id = route.as_ref().ok().and_then(|r| r.config["accountId"].as_str());
+    let route = state
+        .store
+        .route_with_connection(agent, session_id, connection_id);
+    let account_id = route
+        .as_ref()
+        .ok()
+        .and_then(|r| r.config["accountId"].as_str());
     check_with(&state.store, agent, session_id, connection_id, || async {
         // Accounts caches read-only login checks; API connections need no Agent
         // process or network request for this preflight.

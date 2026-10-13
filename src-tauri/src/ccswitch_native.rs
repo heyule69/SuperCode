@@ -87,7 +87,8 @@ fn pi_protocol(api: &str) -> Result<&'static str, String> {
         "anthropic-messages" => Ok("anthropic"),
         "openai-responses" => Ok("responses"),
         "openai-completions" => Ok("chat"),
-        _ => Err("暂不支持此 Pi API 协议；目前支持 Anthropic Messages、OpenAI Responses 和 OpenAI Completions".into()),
+        "google-generative-ai" => Ok("gemini"),
+        _ => Err("暂不支持此 Pi API 协议；目前支持 Anthropic Messages、OpenAI Responses、OpenAI Completions 和 Gemini API".into()),
     }
 }
 fn fragment<'a>(raw: &'a Value, agent: &str, id: &str) -> Result<&'a Value, String> {
@@ -124,7 +125,8 @@ pub(super) fn sanitize(agent: &str, id: &str, raw: &Value) -> Result<Value, Stri
             "@ai-sdk/anthropic" => "anthropic",
             "@ai-sdk/openai" => "responses",
             "@ai-sdk/openai-compatible" => "chat",
-            _ => return Err("暂不支持此 OpenCode SDK；目前支持 Anthropic、OpenAI Responses 和 OpenAI Compatible".into()),
+            "@ai-sdk/google" => "gemini",
+            _ => return Err("暂不支持此 OpenCode SDK；目前支持 Anthropic、OpenAI Responses、OpenAI Compatible 和 Google Gemini".into()),
         };
         let options = &source["options"];
         let base = super::imported_base_url(
@@ -293,6 +295,7 @@ mod tests {
             ("@ai-sdk/anthropic", "anthropic-messages", "anthropic"),
             ("@ai-sdk/openai", "openai-responses", "responses"),
             ("@ai-sdk/openai-compatible", "openai-completions", "chat"),
+            ("@ai-sdk/google", "google-generative-ai", "gemini"),
         ] {
             let open = sanitize("opencode", "x", &json!({"npm":npm,"options":{"baseURL":"http://gateway.local/v1/","apiKey":"private-key","headers":{"X-Project":"private-header"}},"models":{"z":{"reasoning":false,"limit":{"context":200000,"output":4096}},"a":{"name":"另一个"}},"model":"z","plugins":["unsafe"],"permission":"allow","mcp":{"unsafe":{}}})).unwrap();
             assert_eq!(open["protocol"], protocol);

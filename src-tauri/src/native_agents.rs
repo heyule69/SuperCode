@@ -1,4 +1,4 @@
-//! Native OpenCode ACP and Pi RPC adapters. Prompts/answers are JSONL, never shell commands.
+//! Native OpenCode/Gemini ACP and Pi RPC adapters. Prompts/answers are JSONL, never shell commands.
 use crate::{
     agents::Launch, client_features, process, protocol, runtime, storage::Session, AppState,
 };
@@ -18,6 +18,7 @@ use tokio::{
     process::{Child, ChildStdin},
     sync::{mpsc, oneshot, Mutex, Notify},
 };
+mod gemini;
 mod mapper;
 mod requests;
 use mapper::*;
@@ -25,6 +26,24 @@ use requests::*;
 
 fn init() -> Value {
     json!({"protocolVersion":1,"clientInfo":{"name":"SuperCode","version":env!("CARGO_PKG_VERSION")},"clientCapabilities":{"fs":{"readTextFile":false,"writeTextFile":false},"terminal":false}})
+}
+fn is_acp(agent: &str) -> bool {
+    matches!(agent, "opencode" | "gemini")
+}
+fn validate_acp(agent: &str, initialized: &Value) -> Result<(), String> {
+    if initialized["protocolVersion"] != 1 {
+        return Err(format!(
+            "{} ACP 版本不兼容，请更新",
+            crate::agents::name(agent)
+        ));
+    }
+    if agent == "gemini" {
+        let version = initialized["agentInfo"]["version"]
+            .as_str()
+            .ok_or("Gemini CLI 未提供版本，无法验证受管权限；请修复安装后使用")?;
+        crate::agents::compatible_version(agent, version)?;
+    }
+    Ok(())
 }
 pub async fn probe_cancel(
     agent: &str,
@@ -37,9 +56,19 @@ pub async fn probe_cancel(
         crate::agents::compatible_version(agent, &version)?;
     }
     match agent {
-        "opencode" | "pi" | "codex" => {
+        "opencode" | "gemini" | "pi" | "codex" => {
             let pi = agent == "pi";
-            let args = if pi {
+            let mut env = vec![];
+            let args = if agent == "gemini" {
+                let home = gemini::home(
+                    &std::env::temp_dir().join("supercode-native-probes"),
+                    None,
+                    true,
+                );
+                let (args, values) = gemini::configure(&home, &json!({}), "summary").await?;
+                env = values;
+                args
+            } else if pi {
                 vec![
                     "--mode".into(),
                     "rpc".into(),
@@ -53,7 +82,7 @@ pub async fn probe_cancel(
             } else {
                 vec!["acp".into()]
             };
-            let (client, mut events) = Client::start(launch, &args, cwd, &[], pi, None).await?;
+            let (client, mut events) = Client::start(launch, &args, cwd, &env, pi, None).await?;
             let drain = tokio::spawn(async move {
                 while let Some(v) = events.recv().await {
                     if v["type"] == "supercode_disconnected" {
@@ -71,8 +100,8 @@ pub async fn probe_cancel(
             client.close().await;
             drain.abort();
             let data = result?;
-            if agent == "opencode" && data["protocolVersion"] != 1 {
-                return Err("OpenCode ACP 版本不兼容，请更新".into());
+            if is_acp(agent) {
+                validate_acp(agent, &data)?;
             }
             Ok(())
         }
@@ -416,10 +445,10 @@ impl Runtime {
 }
 fn permission_reply(request: &Value, result: &Value, agent: &str) -> Result<Value, String> {
     let raw = &request["params"]["nativeRequest"];
-    if agent == "opencode" {
+    if is_acp(agent) {
         let options = raw["params"]["options"]
             .as_array()
-            .ok_or("OpenCode 审批选项无效")?;
+            .ok_or("ACP 审批选项无效")?;
         let accepted = result["decision"] == "accept";
         let option = options.iter().find(|o| {
             o["kind"]
@@ -470,9 +499,12 @@ fn user_request(t: &Turn, raw: Value) -> Option<Value> {
             .map(str::to_owned)
             .unwrap_or_else(|| rawid.to_string())
     );
-    if t.agent == "opencode" && raw["method"] == "session/request_permission" {
+    if is_acp(&t.agent) && raw["method"] == "session/request_permission" {
+        if raw["params"]["sessionId"] != t.native && t.accepting.load(Ordering::Acquire) {
+            return None;
+        }
         return Some(
-            json!({"id":id,"method":"claude/tool/requestApproval","params":{"threadId":t.native,"turnId":t.turn,"reason":raw["params"]["toolCall"]["title"],"input":raw["params"]["toolCall"],"nativeRequest":raw}}),
+            json!({"id":id,"method":"claude/tool/requestApproval","params":{"threadId":t.native,"turnId":t.turn,"appSessionId":t.session,"reason":raw["params"]["toolCall"]["title"],"input":raw["params"]["toolCall"],"nativeRequest":raw}}),
         );
     }
     if t.agent == "pi" && raw["type"] == "extension_ui_request" {
@@ -506,26 +538,50 @@ async fn setup_events<T>(
     tokio::pin!(future);
     loop {
         tokio::select! {
-            result=&mut future=>return result,
+            result=&mut future=>{
+                let result=result?;
+                // The reader queues replay before resolving the session RPC.
+                // Consume those queued rows here, preserving requests/commands,
+                // so resumed history cannot appear as new turn output.
+                while let Ok(value)=rx.try_recv(){consume_setup_event(app,t,value).await?;}
+                return Ok(result);
+            },
             value=rx.recv()=>{
                 let value=value.ok_or("Agent 在准备会话时退出")?;
-                native_capabilities(app,&t.session,&value);
-                if value["type"]=="supercode_disconnected" { return Err("Agent 在准备会话时退出".into()); }
-                if let Some(request)=user_request(t,value.clone()) { t.requests.lock().await.insert(request["id"].as_str().unwrap().into(),request.clone());publish(app,request); }
-                else if value.get("method").is_some()&&value.get("id").is_some() { t.client.write(json!({"jsonrpc":"2.0","id":value["id"],"error":{"code":-32601,"message":"Client capability not supported"}})).await?; }
-                else if value["type"]=="extension_error" { return Err(protocol::bounded(value["error"].as_str().unwrap_or("Pi 扩展加载失败"),4096)); }
-                // Replay, model catalogs, and startup notifications are intentionally consumed here.
+                consume_setup_event(app,t,value).await?;
             },
             _=tokio::time::sleep(Duration::from_millis(200)),if t.stopped.load(Ordering::Relaxed)=>return Err("已停止准备会话".into()),
         }
     }
 }
-fn mcp(app: &AppHandle, acp: bool) -> Result<Value, String> {
+async fn consume_setup_event(app: &AppHandle, t: &Arc<Turn>, value: Value) -> Result<(), String> {
+    native_capabilities(app, &t.session, &value);
+    if value["type"] == "supercode_disconnected" {
+        return Err("Agent 在准备会话时退出".into());
+    }
+    if let Some(request) = user_request(t, value.clone()) {
+        t.requests
+            .lock()
+            .await
+            .insert(request["id"].as_str().unwrap().into(), request.clone());
+        publish(app, request);
+    } else if value.get("method").is_some() && value.get("id").is_some() {
+        t.client.write(json!({"jsonrpc":"2.0","id":value["id"],"error":{"code":-32601,"message":"Client capability not supported"}})).await?;
+    } else if value["type"] == "extension_error" {
+        return Err(protocol::bounded(
+            value["error"].as_str().unwrap_or("Pi 扩展加载失败"),
+            4096,
+        ));
+    }
+    Ok(())
+}
+fn mcp(app: &AppHandle, agent: &str) -> Result<Value, String> {
+    let acp = is_acp(agent);
     let servers = client_features::servers(app)?;
     let mut rows = vec![];
     let mut object = serde_json::Map::new();
     for s in servers.into_iter().filter(|s| s.enabled) {
-        let s = crate::desktop_control::wrap(app, s, if acp { "opencode" } else { "pi" })?;
+        let s = crate::desktop_control::wrap(app, s, agent)?;
         let name = format!(
             "supercode_{}",
             s.id.chars()
@@ -567,6 +623,7 @@ fn opencode_config(config: &Value, permission: &str) -> Value {
         let npm = match config["protocol"].as_str() {
             Some("anthropic") => "@ai-sdk/anthropic",
             Some("responses") => "@ai-sdk/openai",
+            Some("gemini") => "@ai-sdk/google",
             _ => "@ai-sdk/openai-compatible",
         };
         let native = &config["opencodeProvider"];
@@ -592,7 +649,7 @@ fn opencode_config(config: &Value, permission: &str) -> Value {
         let mut options = native["options"].as_object().cloned().unwrap_or_default();
         options.insert(
             "baseURL".into(),
-            if native.is_object() {
+            if native.is_object() && config["protocol"] != "gemini" {
                 config["baseUrl"].clone()
             } else {
                 json!(sdk_base(config))
@@ -624,7 +681,11 @@ fn sdk_base(config: &Value) -> String {
         .as_str()
         .unwrap_or("")
         .trim_end_matches('/');
-    if config["protocol"] == "anthropic" && !base.ends_with("/v1") {
+    if config["protocol"] == "gemini" {
+        // OpenCode's Google SDK and Pi set apiVersion="" and append /models.
+        // Their base includes the version, unlike Gemini CLI's Google GenAI SDK.
+        crate::providers::gemini_api_base(base)
+    } else if config["protocol"] == "anthropic" && !base.ends_with("/v1") {
         format!("{base}/v1")
     } else {
         base.to_owned()
@@ -680,10 +741,24 @@ fn pi_provider_config(config: &Value) -> Option<Value> {
                     definition["cost"] = Value::Object(cost);
                 }
             }
+            if definition["api"] == "google-generative-ai"
+                || (config["protocol"] == "gemini" && definition["api"].is_null())
+            {
+                if let Some(base) = definition["baseUrl"].as_str() {
+                    definition["baseUrl"] = json!(crate::providers::gemini_api_base(base));
+                }
+            }
             Some(definition)
         })
         .collect::<Vec<_>>();
-    provider.insert("baseUrl".into(), json!(base));
+    provider.insert(
+        "baseUrl".into(),
+        json!(if config["protocol"] == "gemini" {
+            sdk_base(config)
+        } else {
+            base.to_owned()
+        }),
+    );
     provider.insert(
         "apiKey".into(),
         json!(crate::providers::key(config).unwrap_or("")),
@@ -693,6 +768,7 @@ fn pi_provider_config(config: &Value) -> Option<Value> {
         json!(match config["protocol"].as_str() {
             Some("anthropic") => "anthropic-messages",
             Some("responses") => "openai-responses",
+            Some("gemini") => "google-generative-ai",
             _ => "openai-completions",
         }),
     );
@@ -791,6 +867,15 @@ async fn start_configured(
     if agent == "opencode" {
         args.push("acp".into());
         env.extend(opencode_environment(&config, permission));
+    } else if agent == "gemini" {
+        let home = gemini::home(
+            &app.state::<AppState>().data_dir,
+            session.map(|s| s.id.as_str()),
+            permission == "summary" || session.is_none(),
+        );
+        let (values, environment) = gemini::configure(&home, &config, permission).await?;
+        args.extend(values);
+        env.extend(environment);
     } else if agent == "pi" {
         let dir = app.state::<AppState>().data_dir.join("agents/pi-runtime");
         tokio::fs::create_dir_all(&dir)
@@ -829,7 +914,7 @@ async fn start_configured(
         } else {
             args.push("--no-session".into());
         }
-        let mut settings = json!({"permission":permission,"mcp":if permission=="summary"{json!({})}else{mcp(app,false)?}});
+        let mut settings = json!({"permission":permission,"mcp":if permission=="summary"{json!({})}else{mcp(app,"pi")?}});
         if let Some(provider) = pi_provider_config(&config) {
             settings["provider"] = provider;
         }
@@ -955,8 +1040,18 @@ async fn probe_completion(
         )
         .await?;
         String::new()
-    } else if agent == "opencode" {
-        probe_request(client, events, "initialize", init()).await?;
+    } else if is_acp(agent) {
+        let initialized = probe_request(client, events, "initialize", init()).await?;
+        validate_acp(agent, &initialized)?;
+        if agent == "gemini" {
+            probe_request(
+                client,
+                events,
+                "authenticate",
+                gemini::authentication(config),
+            )
+            .await?;
+        }
         let session = probe_request(
             client,
             events,
@@ -966,13 +1061,13 @@ async fn probe_completion(
         .await?;
         let id = session["sessionId"]
             .as_str()
-            .ok_or("OpenCode 未返回测试会话 ID")?
+            .ok_or("ACP 未返回测试会话 ID")?
             .to_owned();
         probe_request(
             client,
             events,
             "session/set_model",
-            json!({"sessionId":id,"modelId":format!("supercode/{wire}")}),
+            json!({"sessionId":id,"modelId":if agent=="gemini" {wire.clone()}else{format!("supercode/{wire}")}}),
         )
         .await?;
         id
@@ -993,7 +1088,7 @@ async fn probe_completion(
     let prompt = "Reply only OK. Do not use tools.";
     let (method, params) = match agent {
         "pi" => ("prompt", json!({"message":prompt,"images":[]})),
-        "opencode" => (
+        "opencode" | "gemini" => (
             "session/prompt",
             json!({"sessionId":native,"prompt":[{"type":"text","text":prompt}]}),
         ),
@@ -1011,8 +1106,8 @@ async fn probe_completion(
         tokio::select! {
             result = &mut request, if !acknowledged => {
                 let result = result?;
-                if agent == "opencode" {
-                    if result["stopReason"] == "cancelled" { return Err("OpenCode 取消了连接测试".into()); }
+                if is_acp(agent) {
+                    if result["stopReason"] == "cancelled" { return Err("ACP 取消了连接测试".into()); }
                     break;
                 }
                 acknowledged = true;
@@ -1076,7 +1171,7 @@ fn probe_output(
         }
         return Ok(event["type"] == "agent_settled");
     }
-    if agent == "opencode" {
+    if is_acp(agent) {
         if event["params"]["sessionId"] != native {
             return Ok(false);
         }
@@ -1244,13 +1339,23 @@ pub async fn send(
             } else {
                 let init = client.request("initialize", init(), 60).await?;
                 client.concurrent_prompt.store(
-                    verified_concurrent_prompt(init["agentInfo"]["version"].as_str()),
+                    s.agent == "opencode"
+                        && verified_concurrent_prompt(init["agentInfo"]["version"].as_str()),
                     Ordering::Release,
                 );
-                let mut p = json!({"cwd":cwd,"mcpServers":mcp(app,true)?});
+                validate_acp(&s.agent, &init)?;
+                if s.agent == "gemini" {
+                    client
+                        .request("authenticate", gemini::authentication(&config), 60)
+                        .await?;
+                }
+                let mut p = json!({"cwd":cwd,"mcpServers":mcp(app,&s.agent)?});
                 let method = if let Some(native) = &s.native_id {
                     if init["agentCapabilities"]["loadSession"] != true {
-                        return Err("本机 OpenCode 不支持恢复会话，请更新".into());
+                        return Err(format!(
+                            "本机 {} 不支持恢复会话，请更新",
+                            crate::agents::name(&s.agent)
+                        ));
                     }
                     p["sessionId"] = native.clone().into();
                     "session/load"
@@ -1262,7 +1367,7 @@ pub async fn send(
                     .native_id
                     .clone()
                     .or_else(|| v["sessionId"].as_str().map(str::to_owned))
-                    .ok_or("OpenCode 未返回会话 ID")?;
+                    .ok_or("ACP 未返回会话 ID")?;
                 Ok((native, v))
             }
         })
@@ -1287,8 +1392,7 @@ pub async fn send(
             return Err(e);
         }
     };
-    // setup_events consumes load replay without re-persisting it. Leave remaining
-    // notifications queued so late startup questions and approvals cannot be lost.
+    // setup_events consumes load replay and preserves pending startup requests.
     let selected = model
         .or(s.model.clone())
         .or_else(|| config["model"].as_str().map(str::to_owned))
@@ -1306,13 +1410,31 @@ pub async fn send(
             }
         });
     let selected_wire = selected.as_ref().map(|m| {
-        if config["baseUrl"].is_string() {
+        if s.agent == "gemini" {
+            wire_model(&config, m)
+        } else if config["baseUrl"].is_string() {
             format!("supercode/{}", wire_model(&config, m))
         } else {
             m.clone()
         }
     });
     let configure = setup_events(app, &boot, &mut rx, async {
+        if s.agent == "gemini" {
+            let mode = gemini::mode(permission);
+            if !defaults["modes"]["availableModes"]
+                .as_array()
+                .is_some_and(|modes| modes.iter().any(|m| m["id"] == mode))
+            {
+                return Err(format!("本机 Gemini CLI 不支持 {mode} 模式，请更新"));
+            }
+            client
+                .request(
+                    "session/set_mode",
+                    json!({"sessionId":native,"modeId":mode}),
+                    30,
+                )
+                .await?;
+        }
         if let Some(model) = &selected_wire {
             if s.agent == "pi" {
                 let (provider, id) = model
@@ -1448,7 +1570,11 @@ pub async fn send(
         publish(app, request);
     }
     drop(pending_requests);
-    let model_context_window = if turn.agent == "pi" {
+    let model_context_window = if turn.agent == "gemini" {
+        selected
+            .as_deref()
+            .and_then(|model| crate::model_context::for_model(&config, model))
+    } else if turn.agent == "pi" {
         selected
             .as_deref()
             .and_then(|model| crate::model_context::for_model(&config, model))
@@ -1490,7 +1616,7 @@ pub async fn send(
                     if value["type"]=="supercode_disconnected"{failure=Some("Agent 意外退出".into());break;}
                     if value["type"]=="agent_start" || (value["method"]=="session/update" && value["params"]["sessionId"]==turn.native && matches!(value["params"]["update"]["sessionUpdate"].as_str(),Some("agent_message_chunk"|"agent_thought_chunk"|"tool_call"))) {turn.started.store(true,Ordering::Release);}
                     if let Some(request)=user_request(&turn,value.clone()){turn.requests.lock().await.insert(request["id"].as_str().unwrap().into(),request.clone());publish(&app,request);continue;}
-                    if turn.agent=="opencode"&&value.get("method").is_some()&&value.get("id").is_some(){let _=client.write(json!({"jsonrpc":"2.0","id":value["id"],"error":{"code":-32601,"message":"Client capability not supported"}})).await;continue;}
+                    if is_acp(&turn.agent)&&value.get("method").is_some()&&value.get("id").is_some(){let _=client.write(json!({"jsonrpc":"2.0","id":value["id"],"error":{"code":-32601,"message":"Client capability not supported"}})).await;continue;}
                     for e in mapped.map(&turn,&value){if e["method"]!="error" || !turn.stopped.load(Ordering::Relaxed){publish(&app,e);}}
                     native_capabilities(&app,&turn.session,&value);
                     if turn.agent=="pi" {
@@ -1498,7 +1624,7 @@ pub async fn send(
                         if value["type"]=="agent_settled"{turn.settled.store(true,Ordering::Release);}
                     }
                 },
-                result=&mut done,if !completed=>{turn.prompt_accepted.store(true,Ordering::Release);turn.prompt_ready.notify_one();match result{Ok(Ok(v))=>{if turn.agent=="opencode"{if v["stopReason"]=="cancelled"{turn.stopped.store(true,Ordering::Relaxed);}protocol_finished=true;}else if v["disposition"]=="handled"{turn.settled.store(true,Ordering::Release);}}Ok(Err(e))=>{failure=Some(e);break;}Err(_)=>{failure=Some("Agent 请求中断".into());break;}}completed=true;},
+                result=&mut done,if !completed=>{turn.prompt_accepted.store(true,Ordering::Release);turn.prompt_ready.notify_one();match result{Ok(Ok(v))=>{if turn.agent=="gemini"{if let Some(usage)=mapped.observe_gemini_completion(&v){publish(&app,event(&turn,"thread/tokenUsage/updated",json!({"tokenUsage":usage})));}}if is_acp(&turn.agent){if v["stopReason"]=="cancelled"{turn.stopped.store(true,Ordering::Relaxed);}protocol_finished=true;}else if v["disposition"]=="handled"{turn.settled.store(true,Ordering::Release);}}Ok(Err(e))=>{failure=Some(e);break;}Err(_)=>{failure=Some("Agent 请求中断".into());break;}}completed=true;},
                 _=&mut prompt_timeout,if !completed=>{failure=Some("Agent 原生 prompt 请求超时".into());break;},
                 _=turn.input_done.notified()=>{},
                 _=tokio::time::sleep(Duration::from_secs(5)),if turn.stopped.load(Ordering::Relaxed)=>{break;}
@@ -1612,7 +1738,12 @@ fn completion_payload(id: &str, interrupted: bool, failed: bool, error: Option<S
     json!({"id":id,"status":status,"error":if interrupted {None} else {error}.map(|message|json!({"message":message}))})
 }
 // A fresh native session generates a portable handoff; no original history/binding is changed.
-pub async fn summary(app: &AppHandle, session: &Session, input: &str) -> Result<String, String> {
+pub async fn summary(
+    app: &AppHandle,
+    session: &Session,
+    input: &str,
+    route: Option<&crate::session_config::Route>,
+) -> Result<String, String> {
     let mut fresh = session.clone();
     fresh.native_id = None;
     let cwd = app
@@ -1620,23 +1751,46 @@ pub async fn summary(app: &AppHandle, session: &Session, input: &str) -> Result<
         .store
         .session_workspace(&session)?
         .path;
-    let (client, mut rx, config) = start_for(
-        app,
-        &session.agent,
-        Path::new(&cwd),
-        Some(&fresh),
-        "summary",
-    )
-    .await?;
+    let (client, mut rx, config) = if let Some(route) = route {
+        if route
+            .profile
+            .as_ref()
+            .is_some_and(|profile| profile.agent != session.agent)
+        {
+            return Err("摘要连接与会话引擎不匹配".into());
+        }
+        let launch = crate::agents::resolve(app, &session.agent)?;
+        start_configured(
+            app,
+            &session.agent,
+            Path::new(&cwd),
+            Some(&fresh),
+            "summary",
+            route.config.clone(),
+            &launch,
+        )
+        .await?
+    } else {
+        start_for(
+            app,
+            &session.agent,
+            Path::new(&cwd),
+            Some(&fresh),
+            "summary",
+        )
+        .await?
+    };
     let result=tokio::time::timeout(Duration::from_secs(120),async {
         let native=if session.agent=="pi" {
             summary_request(&client,&mut rx,"get_state",json!({})).await?["sessionId"].as_str().ok_or("Pi 未返回会话 ID")?.to_owned()
         } else {
-            summary_request(&client,&mut rx,"initialize",init()).await?;
-            summary_request(&client,&mut rx,"session/new",json!({"cwd":cwd,"mcpServers":[]})).await?["sessionId"].as_str().ok_or("OpenCode 未返回会话 ID")?.to_owned()
+            let initialized=summary_request(&client,&mut rx,"initialize",init()).await?;validate_acp(&session.agent,&initialized)?;
+            if session.agent=="gemini" {summary_request(&client,&mut rx,"authenticate",gemini::authentication(&config)).await?;}
+            summary_request(&client,&mut rx,"session/new",json!({"cwd":cwd,"mcpServers":[]})).await?["sessionId"].as_str().ok_or("ACP 未返回会话 ID")?.to_owned()
         };
+        if session.agent=="gemini" {summary_request(&client,&mut rx,"session/set_mode",json!({"sessionId":native,"modeId":"plan"})).await?;}
         if let Some(model)=session.model.as_deref() {
-            let model=if config["baseUrl"].is_string(){format!("supercode/{}",wire_model(&config,model))}else{model.to_owned()};
+            let model=if session.agent=="gemini" {wire_model(&config,model)}else if config["baseUrl"].is_string(){format!("supercode/{}",wire_model(&config,model))}else{model.to_owned()};
             if session.agent=="pi" { let(p,id)=model.split_once('/').ok_or("Pi 模型缺少供应商")?;summary_request(&client,&mut rx,"set_model",json!({"provider":p,"modelId":id})).await?; }
             else { summary_request(&client,&mut rx,"session/set_model",json!({"sessionId":native,"modelId":model})).await?; }
         }
@@ -1652,15 +1806,30 @@ pub async fn summary(app: &AppHandle, session: &Session, input: &str) -> Result<
                 for e in mapper.map(&t,&value) {let item=&e["params"]["item"];if item["type"]=="claudeToolCall" { return Err("压缩尝试调用工具，切换已取消".into()); }if item["type"]=="agentMessage" {if let (Some(id),Some(text))=(item["id"].as_str(),item["text"].as_str()){texts.insert(id.to_owned(),protocol::bounded(text,24*1024));}} }
                 if value["type"]=="agent_settled" {break;}
             },
-            value=&mut request,if !acknowledged=>{value?;if session.agent=="opencode"{break;}acknowledged=true;}
+            value=&mut request,if !acknowledged=>{let value=value?;if session.agent=="gemini"{mapper.observe_gemini_completion(&value);}if is_acp(&session.agent){break;}acknowledged=true;}
         }}
-        while let Ok(value)=rx.try_recv(){summary_notification(&value)?;for e in mapper.map(&t,&value){let i=&e["params"]["item"];if i["type"]=="agentMessage"{if let(Some(id),Some(text))=(i["id"].as_str(),i["text"].as_str()){texts.insert(id.to_owned(),protocol::bounded(text,24*1024));}}}}
+        while let Ok(value)=rx.try_recv(){summary_notification(&value)?;for e in mapper.map(&t,&value){collect_summary_item(&mut texts,&e["params"]["item"])?;}}
+        for item in mapper.finish(false){collect_summary_item(&mut texts,&item)?;}
         if mapper.failed {return Err(mapper.failure.unwrap_or("模型未完成压缩".into()));}
         if mapper.usage.is_object(){let mut usage=mapper.usage;usage["purpose"]="handoff".into();app.state::<AppState>().store.record_usage(session,&t.turn,usage)?;}
         Ok(texts.into_values().collect::<Vec<_>>().join("\n"))
     }).await.map_err(|_|"上下文压缩超时".to_owned());
     client.close().await;
     result?
+}
+fn collect_summary_item(
+    texts: &mut std::collections::BTreeMap<String, String>,
+    item: &Value,
+) -> Result<(), String> {
+    if item["type"] == "claudeToolCall" {
+        return Err("压缩尝试调用工具，切换已取消".into());
+    }
+    if item["type"] == "agentMessage" {
+        if let (Some(id), Some(text)) = (item["id"].as_str(), item["text"].as_str()) {
+            texts.insert(id.to_owned(), protocol::bounded(text, 24 * 1024));
+        }
+    }
+    Ok(())
 }
 fn summary_notification(value: &Value) -> Result<(), String> {
     if value["type"] == "supercode_disconnected" {
@@ -1799,6 +1968,324 @@ mod tests {
         );
     }
     #[tokio::test]
+    async fn gemini_acp_peer_restores_models_streams_and_waits_for_user_approval() {
+        let Some(program) = process::find_program("node") else {
+            return;
+        };
+        // A deliberately controlled ACP peer, never Gemini CLI or a provider.
+        let script = r#"const rl=require('readline').createInterface({input:process.stdin});
+const out=v=>process.stdout.write(JSON.stringify(v)+'\n');
+const fs=require('fs'),path=require('path');
+const settings=JSON.parse(fs.readFileSync(process.env.GEMINI_CLI_SYSTEM_SETTINGS_PATH,'utf8'));
+if(settings.security.auth.selectedType!=='gateway'||settings.hooksConfig.enabled!==false||process.env.GOOGLE_GENAI_API_VERSION!=='v1beta'||process.env.GOOGLE_GEMINI_BASE_URL!=='https://fixture.invalid/google')process.exit(11);
+let pending=null,model='gemini-fixture';
+const update=u=>out({method:'session/update',params:{sessionId:'gemini-native',update:u}});
+const modes={availableModes:[{id:'default'},{id:'plan'},{id:'yolo'}],currentModeId:'default'};
+rl.on('line',line=>{const v=JSON.parse(line),p=v.params||{},m=v.method;
+const reply=result=>out({jsonrpc:'2.0',id:v.id,result});
+if(m==='initialize'){if(p.clientCapabilities.fs.readTextFile!==false||p.clientCapabilities.fs.writeTextFile!==false||p.clientCapabilities.terminal!==false)process.exit(12);return reply({protocolVersion:1,agentInfo:{name:'gemini-cli',version:'0.63.0'},agentCapabilities:{loadSession:true,promptCapabilities:{image:true}}});}
+if(m==='authenticate'){if(p.methodId!=='gateway'||p._meta['api-key']!=='fixture-key'||p._meta.gateway.baseUrl!=='https://fixture.invalid/google')process.exit(13);return reply({});}
+if(m==='session/new')return reply({sessionId:'gemini-native',models:{currentModelId:model},modes});
+if(m==='session/load'){if(p.sessionId!=='gemini-native')process.exit(14);update({sessionUpdate:'agent_message_chunk',content:{type:'text',text:'old replay'}});return reply({models:{currentModelId:model},modes});}
+if(m==='session/set_model'){if(p.modelId.startsWith('supercode/'))process.exit(15);model=p.modelId;return reply({});}
+if(m==='session/set_mode'){if(!modes.availableModes.some(x=>x.id===p.modeId))process.exit(16);return reply({});}
+if(m==='session/prompt'){if(p.prompt[1]?.type!=='image')process.exit(17);pending=v.id;update({sessionUpdate:'agent_thought_chunk',content:{type:'text',text:'thinking'}});update({sessionUpdate:'tool_call',toolCallId:'write',kind:'edit',title:'Write fixture.txt',status:'pending',locations:[{path:'fixture.txt'}],content:[{type:'diff',path:'fixture.txt',oldText:'',newText:'test',_meta:{kind:'add'}}]});return out({jsonrpc:'2.0',id:'approval',method:'session/request_permission',params:{sessionId:'gemini-native',toolCall:{title:'Write fixture.txt',kind:'edit'},options:[{kind:'allow_always',optionId:'always'},{kind:'allow_once',optionId:'once'},{kind:'reject_once',optionId:'reject'}]}});}
+if(v.id==='approval'&&v.result){if(v.result.outcome.optionId!=='once')process.exit(18);update({sessionUpdate:'tool_call_update',toolCallId:'write',kind:'edit',status:'completed',content:[{type:'content',content:{type:'text',text:'written'}}]});update({sessionUpdate:'agent_message_chunk',content:{type:'text',text:'完成'}});update({sessionUpdate:'agent_message_chunk',content:{type:'text',text:'🧋'}});return out({jsonrpc:'2.0',id:pending,result:{stopReason:'end_turn',_meta:{quota:{token_count:{input_tokens:1200,output_tokens:30}}}}});}
+process.exit(19);
+});"#;
+        let launch = Launch {
+            program,
+            prefix: vec!["-e".into(), script.into(), "--".into()],
+            source: "controlled-gemini-acp-peer".into(),
+        };
+        let home = gemini::home(
+            &std::env::temp_dir().join("supercode-gemini-fixture"),
+            Some("controlled-chat"),
+            true,
+        );
+        let config = json!({"protocol":"gemini","baseUrl":"https://fixture.invalid/google/v1beta","apiKey":"fixture-key","model":"gemini-fixture"});
+        let (args, env) = gemini::configure(&home, &config, "strict").await.unwrap();
+        let (client, mut rx) = Client::start(&launch, &args, Path::new("."), &env, false, None)
+            .await
+            .unwrap();
+        let result = async {
+            let initialized = probe_request(&client, &mut rx, "initialize", init()).await?;
+            assert_eq!(initialized["agentCapabilities"]["loadSession"], true);
+            probe_request(
+                &client,
+                &mut rx,
+                "authenticate",
+                gemini::authentication(&config),
+            )
+            .await?;
+            let created = probe_request(
+                &client,
+                &mut rx,
+                "session/new",
+                json!({"cwd":".","mcpServers":[]}),
+            )
+            .await?;
+            assert_eq!(created["sessionId"], "gemini-native");
+            probe_request(
+                &client,
+                &mut rx,
+                "session/load",
+                json!({"sessionId":"gemini-native","cwd":".","mcpServers":[]}),
+            )
+            .await?;
+            probe_request(
+                &client,
+                &mut rx,
+                "session/set_model",
+                json!({"sessionId":"gemini-native","modelId":"gemini-custom"}),
+            )
+            .await?;
+            probe_request(
+                &client,
+                &mut rx,
+                "session/set_mode",
+                json!({"sessionId":"gemini-native","modeId":"default"}),
+            )
+            .await?;
+            let turn = Turn {
+                client: client.clone(),
+                requests: Arc::new(Mutex::new(HashMap::new())),
+                session: "chat".into(),
+                native: "gemini-native".into(),
+                turn: "turn".into(),
+                agent: "gemini".into(),
+                stopped: AtomicBool::new(false),
+                accepting: AtomicBool::new(true),
+                inputs_pending: AtomicU64::new(0),
+                input_done: Notify::new(),
+                settled: AtomicBool::new(false),
+                prompt_accepted: AtomicBool::new(false),
+                prompt_ready: Notify::new(),
+                started: AtomicBool::new(false),
+                stop_done: AtomicBool::new(true),
+                signature: String::new(),
+            };
+            let prompt = prompt_content(
+                "gemini",
+                &[
+                    json!({"type":"text","text":"hello"}),
+                    json!({"type":"image","source":{"data":"Zg==","media_type":"image/png"}}),
+                ],
+                "fixture instructions",
+            );
+            let (_, mut done) = client
+                .begin_request(
+                    "session/prompt",
+                    json!({"sessionId":"gemini-native","prompt":prompt}),
+                )
+                .await?;
+            let mut mapper = Mapper {
+                model_context_window: Some(1_048_576),
+                ..Mapper::default()
+            };
+            let mut tool_started = false;
+            loop {
+                let value = rx.recv().await.ok_or("fixture closed")?;
+                if let Some(request) = user_request(&turn, value.clone()) {
+                    assert_eq!(request["params"]["appSessionId"], "chat");
+                    assert_eq!(request["params"]["nativeRequest"], value);
+                    assert!(
+                        matches!(done.try_recv(), Err(oneshot::error::TryRecvError::Empty)),
+                        "prompt cannot finish before user decides"
+                    );
+                    client
+                        .write(permission_reply(
+                            &request,
+                            &json!({"decision":"accept"}),
+                            "gemini",
+                        )?)
+                        .await?;
+                    break;
+                }
+                for mapped in mapper.map(&turn, &value) {
+                    if mapped["params"]["item"]["type"] == "claudeToolCall" {
+                        assert_eq!(mapped["params"]["item"]["tool"], "Write");
+                        assert_eq!(
+                            mapped["params"]["item"]["arguments"]["file_path"],
+                            "fixture.txt"
+                        );
+                        tool_started = true;
+                    }
+                }
+            }
+            assert!(tool_started);
+            let completed = done.await.map_err(|_| "fixture request lost")??;
+            assert_eq!(completed["stopReason"], "end_turn");
+            let usage = mapper.observe_gemini_completion(&completed).unwrap();
+            assert_eq!(usage["total"]["totalTokens"], 1230);
+            assert!(usage["contextTokens"].is_null());
+            assert_eq!(usage["modelContextWindow"], 1_048_576);
+            let mut tool_completed = false;
+            while let Ok(value) = rx.try_recv() {
+                for mapped in mapper.map(&turn, &value) {
+                    if mapped["method"] == "item/completed"
+                        && mapped["params"]["item"]["type"] == "claudeToolCall"
+                    {
+                        assert_eq!(mapped["params"]["item"]["status"], "completed");
+                        assert_eq!(mapped["params"]["item"]["tool"], "Write");
+                        tool_completed = true;
+                    }
+                }
+            }
+            assert!(tool_completed);
+            let items = mapper.finish(false);
+            assert!(items.iter().any(|item| item["text"] == "完成🧋"));
+            let mut summary = std::collections::BTreeMap::new();
+            for item in &items {
+                collect_summary_item(&mut summary, item)?;
+            }
+            assert_eq!(
+                summary.into_values().collect::<Vec<_>>().join("\n"),
+                "完成🧋"
+            );
+            assert!(user_request(&turn,json!({"id":"foreign","method":"session/request_permission","params":{"sessionId":"different-chat"}})).is_none());
+            Ok::<_, String>(())
+        };
+        let result = tokio::time::timeout(Duration::from_secs(10), result).await;
+        client.close().await;
+        assert!(
+            !home.exists(),
+            "transient homes are removed after their controlled process exits"
+        );
+        result.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn gemini_peer_restart_cancel_and_rejection_preserve_other_sessions() {
+        let Some(program) = process::find_program("node") else {
+            return;
+        };
+        // Persistent controlled fixture state tests restart/load without running
+        // Gemini, network services, user commands, or the advertised MCP command.
+        let script = r#"const fs=require('fs'),path=require('path'),rl=require('readline').createInterface({input:process.stdin});
+const file=path.join(process.env.GEMINI_CLI_HOME,'.gemini','controlled-record.json');
+let record=fs.existsSync(file)?JSON.parse(fs.readFileSync(file,'utf8')):{id:process.env.SUPERCODE_SESSION_ID+'-native',model:'gemini-fixture',history:[]};
+let pending=null;
+const save=()=>fs.writeFileSync(file,JSON.stringify(record),'utf8'),out=v=>process.stdout.write(JSON.stringify(v)+'\n');
+const update=u=>out({method:'session/update',params:{sessionId:record.id,update:u}});
+const answer=(id,result)=>out({jsonrpc:'2.0',id,result});
+const modes={availableModes:[{id:'default'},{id:'plan'},{id:'yolo'}]};
+rl.on('line',line=>{const v=JSON.parse(line),p=v.params||{},m=v.method;
+if(m==='initialize')return answer(v.id,{protocolVersion:1,agentInfo:{name:'gemini-cli',version:'0.63.0'},agentCapabilities:{loadSession:true}});
+if(m==='authenticate')return answer(v.id,{});
+if(m==='session/new'||m==='session/load'){
+ if(p.mcpServers[0]?.name!=='fixture-mcp'||p.mcpServers[0]?.command!=='never-executed-fixture')process.exit(21);
+ if(m==='session/load'&&p.sessionId!==record.id)process.exit(22);
+ if(m==='session/load')for(const text of record.history)update({sessionUpdate:'agent_message_chunk',content:{type:'text',text}});
+ save();return answer(v.id,{sessionId:record.id,models:{currentModelId:record.model},modes});
+}
+if(m==='session/set_model'){record.model=p.modelId;save();return answer(v.id,{});}
+if(m==='session/prompt'){
+ pending=v.id;const text=p.prompt[0].text;
+ if(text==='cancel-fixture'){update({sessionUpdate:'agent_message_chunk',content:{type:'text',text:'waiting'}});return;}
+ if(text==='deny-fixture'){return out({jsonrpc:'2.0',id:'same-native-request',method:'session/request_permission',params:{sessionId:record.id,toolCall:{title:'Permission fixture'},options:[{kind:'allow_once',optionId:'once'},{kind:'reject_once',optionId:'reject'}]}});}
+ record.history.push('restored answer');save();update({sessionUpdate:'agent_message_chunk',content:{type:'text',text:'restored answer'}});return answer(pending,{stopReason:'end_turn'});
+}
+if(m==='session/cancel'){if(p.sessionId!==record.id)process.exit(23);return answer(pending,{stopReason:'cancelled'});}
+if(v.id==='same-native-request'&&v.result){if(v.result.outcome.optionId!=='reject')process.exit(24);return answer(pending,{stopReason:'end_turn'});}
+if(m==='fixture/fail')return out({jsonrpc:'2.0',id:v.id,error:{code:-32000,message:'controlled provider failure'}});
+process.exit(25);
+});"#;
+        let launch = Launch {
+            program,
+            prefix: vec!["-e".into(), script.into(), "--".into()],
+            source: "controlled-gemini-acp-peer".into(),
+        };
+        let root =
+            std::env::temp_dir().join(format!("supercode-gemini-restart-{}", uuid::Uuid::new_v4()));
+        let home_a = gemini::home(&root, Some("a"), false);
+        let home_b = gemini::home(&root, Some("b"), false);
+        let config = json!({"baseUrl":"https://fixture.invalid/v1beta","protocol":"gemini","apiKey":"fixture-key"});
+        let (args_a, mut env_a) = gemini::configure(&home_a, &config, "strict").await.unwrap();
+        let (args_b, mut env_b) = gemini::configure(&home_b, &config, "strict").await.unwrap();
+        env_a.push(("SUPERCODE_SESSION_ID".into(), "a".into()));
+        env_b.push(("SUPERCODE_SESSION_ID".into(), "b".into()));
+        let servers =
+            json!([{"name":"fixture-mcp","command":"never-executed-fixture","args":[],"env":[]}]);
+        let (a, mut rx_a) = Client::start(&launch, &args_a, Path::new("."), &env_a, false, None)
+            .await
+            .unwrap();
+        let (b, mut rx_b) = Client::start(&launch, &args_b, Path::new("."), &env_b, false, None)
+            .await
+            .unwrap();
+        let result=tokio::time::timeout(Duration::from_secs(10),async {
+            for (client,rx) in [(&a,&mut rx_a),(&b,&mut rx_b)] {
+                probe_request(client,rx,"initialize",init()).await?;
+                probe_request(client,rx,"authenticate",gemini::authentication(&config)).await?;
+                probe_request(client,rx,"session/new",json!({"cwd":".","mcpServers":servers})).await?;
+            }
+            probe_request(&a,&mut rx_a,"session/set_model",json!({"sessionId":"a-native","modelId":"gemini-changed"})).await?;
+            let (_,cancelled)=a.begin_request("session/prompt",json!({"sessionId":"a-native","prompt":[{"type":"text","text":"cancel-fixture"}]})).await?;
+            assert_eq!(rx_a.recv().await.unwrap()["params"]["sessionId"],"a-native");
+            let (_,waiting_b)=b.begin_request("session/prompt",json!({"sessionId":"b-native","prompt":[{"type":"text","text":"deny-fixture"}]})).await?;
+            let raw_b=rx_b.recv().await.unwrap();
+            a.write(json!({"jsonrpc":"2.0","method":"session/cancel","params":{"sessionId":"a-native"}})).await?;
+            assert_eq!(cancelled.await.map_err(|_|"cancel lost")??["stopReason"],"cancelled");
+            a.close().await;
+            assert!(home_a.exists(),"persisted native recordings survive process release");
+            assert!(b.alive.load(Ordering::Acquire));
+            let request=json!({"params":{"nativeRequest":raw_b}});
+            b.write(permission_reply(&request,&json!({"decision":"decline"}),"gemini")?).await?;
+            assert_eq!(waiting_b.await.map_err(|_|"deny lost")??["stopReason"],"end_turn");
+            assert!(b.request("fixture/fail",json!({}),5).await.unwrap_err().contains("controlled provider failure"));
+            // A request failure leaves the transport available for later turns.
+            let value=b.request("session/set_model",json!({"sessionId":"b-native","modelId":"gemini-other"}),5).await?;
+            assert!(value.is_object());
+            Ok::<_,String>(())
+        }).await;
+        a.close().await;
+        b.close().await;
+        result.unwrap().unwrap();
+        let (restarted, mut replay) =
+            Client::start(&launch, &args_a, Path::new("."), &env_a, false, None)
+                .await
+                .unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(10), async {
+            probe_request(&restarted, &mut replay, "initialize", init()).await?;
+            probe_request(
+                &restarted,
+                &mut replay,
+                "authenticate",
+                gemini::authentication(&config),
+            )
+            .await?;
+            let restored = probe_request(
+                &restarted,
+                &mut replay,
+                "session/load",
+                json!({"sessionId":"a-native","cwd":".","mcpServers":servers}),
+            )
+            .await?;
+            assert_eq!(restored["sessionId"], "a-native");
+            assert_eq!(restored["models"]["currentModelId"], "gemini-changed");
+            restarted
+                .request(
+                    "session/prompt",
+                    json!({"sessionId":"a-native","prompt":[{"type":"text","text":"continue"}]}),
+                    5,
+                )
+                .await?;
+            assert_eq!(
+                replay.recv().await.unwrap()["params"]["update"]["content"]["text"],
+                "restored answer"
+            );
+            Ok::<_, String>(())
+        })
+        .await;
+        restarted.close().await;
+        let expected = std::env::temp_dir().canonicalize().unwrap();
+        let actual = root.canonicalize().unwrap();
+        assert_eq!(actual.parent(), Some(expected.as_path()));
+        std::fs::remove_dir_all(&actual).unwrap();
+        result.unwrap().unwrap();
+    }
+
+    #[tokio::test]
     async fn provider_probes_use_the_configured_model_and_wait_for_actual_completion() {
         let Some(program) = process::find_program("node") else {
             return;
@@ -1926,7 +2413,7 @@ out({type:'agent_end'});out({type:'agent_settled'});
         );
         active.requests.lock().await.remove(&request_id);
         assert!(turn.requests.lock().await.is_empty());
-        for agent in ["pi", "opencode"] {
+        for agent in ["pi", "opencode", "gemini"] {
             let mut t = active.after_setup("native-existing".into());
             t.agent = agent.into();
             let mut mapper = Mapper::default();
@@ -2096,13 +2583,19 @@ write(v.type?{type:'response',command:method,id:v.id,success:true,data:{session:
 });"#;
         let launch = Launch {
             program,
-            prefix: vec!["-e".into(), script.into()],
+            prefix: vec!["-e".into(), script.into(), "--".into()],
             source: "protocol-test".into(),
         };
-        for pi in [false, true] {
+        for agent in ["opencode", "pi", "gemini"] {
+            let pi = agent == "pi";
+            let args = if agent == "gemini" {
+                vec!["--acp".into()]
+            } else {
+                vec![]
+            };
             let (a, mut events_a) = Client::start(
                 &launch,
-                &[],
+                &args,
                 Path::new("."),
                 &[("SUPERCODE_SESSION_ID".into(), "a".into())],
                 pi,
@@ -2112,7 +2605,7 @@ write(v.type?{type:'response',command:method,id:v.id,success:true,data:{session:
             .unwrap();
             let (b, mut events_b) = Client::start(
                 &launch,
-                &[],
+                &args,
                 Path::new("."),
                 &[("SUPERCODE_SESSION_ID".into(), "b".into())],
                 pi,
@@ -2183,6 +2676,100 @@ write(v.type?{type:'response',command:method,id:v.id,success:true,data:{session:
         assert_eq!(mcp_entry(&server, "remote", true)["type"], "http");
         assert!(mcp_entry(&server, "remote", false).get("command").is_none());
     }
+    #[test]
+    fn gemini_initialization_rejects_unknown_or_older_cli_permissions() {
+        assert!(validate_acp(
+            "gemini",
+            &json!({"protocolVersion":1,"agentInfo":{"version":"0.63.0"}})
+        )
+        .is_ok());
+        assert!(validate_acp(
+            "gemini",
+            &json!({"protocolVersion":1,"agentInfo":{"version":"0.62.0"}})
+        )
+        .unwrap_err()
+        .contains("0.63.0"));
+        assert!(validate_acp("gemini", &json!({"protocolVersion":1}))
+            .unwrap_err()
+            .contains("未提供版本"));
+        assert!(validate_acp(
+            "gemini",
+            &json!({"protocolVersion":2,"agentInfo":{"version":"0.63.0"}})
+        )
+        .is_err());
+        assert!(validate_acp("opencode", &json!({"protocolVersion":1})).is_ok());
+    }
+
+    #[test]
+    fn google_native_adapters_share_versioned_prefixes_without_changing_chat_routes() {
+        for (base, expected) in [
+            (
+                "https://generativelanguage.googleapis.com",
+                "https://generativelanguage.googleapis.com/v1beta",
+            ),
+            (
+                "https://fixture.invalid/proxy",
+                "https://fixture.invalid/proxy/v1beta",
+            ),
+            (
+                "https://fixture.invalid/proxy/v1alpha/",
+                "https://fixture.invalid/proxy/v1alpha",
+            ),
+            ("https://fixture.invalid/v1", "https://fixture.invalid/v1"),
+        ] {
+            let config = json!({"protocol":"gemini","baseUrl":base,"model":"gemini-fixture"});
+            assert_eq!(sdk_base(&config), expected);
+            assert_eq!(
+                opencode_config(&config, "edit")["provider"]["supercode"]["npm"],
+                "@ai-sdk/google"
+            );
+            assert_eq!(
+                opencode_config(&config, "edit")["provider"]["supercode"]["options"]["baseURL"],
+                expected
+            );
+            let pi = pi_provider_config(&config).unwrap();
+            assert_eq!(pi["api"], "google-generative-ai");
+            assert_eq!(pi["baseUrl"], expected);
+        }
+        let declared = json!({"protocol":"gemini","baseUrl":"https://fixture.invalid","model":"m","opencodeProvider":{"options":{}},"piProvider":{"models":[{"id":"m","baseUrl":"https://specific.invalid/google","api":"google-generative-ai"}]}});
+        assert_eq!(
+            opencode_config(&declared, "edit")["provider"]["supercode"]["options"]["baseURL"],
+            "https://fixture.invalid/v1beta"
+        );
+        assert_eq!(
+            pi_provider_config(&declared).unwrap()["models"][0]["baseUrl"],
+            "https://specific.invalid/google/v1beta"
+        );
+        let chat = json!({"protocol":"chat","baseUrl":"https://fixture.invalid/v1beta/openai","model":"m"});
+        assert_eq!(sdk_base(&chat), "https://fixture.invalid/v1beta/openai");
+        assert_eq!(
+            pi_provider_config(&chat).unwrap()["api"],
+            "openai-completions"
+        );
+    }
+
+    #[test]
+    fn handoff_summary_keeps_final_incremental_text_and_rejects_late_tool_rows() {
+        let mut texts = std::collections::BTreeMap::new();
+        collect_summary_item(
+            &mut texts,
+            &json!({"id":"message","type":"agentMessage","text":"partial"}),
+        )
+        .unwrap();
+        collect_summary_item(
+            &mut texts,
+            &json!({"id":"message","type":"agentMessage","text":"complete🧋"}),
+        )
+        .unwrap();
+        assert_eq!(texts.values().next().unwrap(), "complete🧋");
+        assert!(collect_summary_item(
+            &mut texts,
+            &json!({"id":"tool","type":"claudeToolCall","status":"completed"})
+        )
+        .is_err());
+        assert_eq!(texts.len(), 1);
+    }
+
     #[test]
     fn anthropic_endpoints_and_cli_context_annotations_are_translated_without_changing_other_ids() {
         let c = json!({"protocol":"anthropic","baseUrl":"https://api.example/coding/"});

@@ -98,6 +98,7 @@ fn package_matches(id: &str, name: &str) -> bool {
                 || name.starts_with("@anthropic-ai/claude-code-win32-")
         }
         "opencode" => name == "opencode-ai" || name.starts_with("opencode-windows-"),
+        "gemini" => name == "@google/gemini-cli",
         "pi" => matches!(
             name,
             "@earendil-works/pi-coding-agent" | "@mariozechner/pi-coding-agent"
@@ -142,7 +143,7 @@ fn static_version(id: &str, launch: &Launch) -> Option<String> {
 fn launch(id: &str, text: &str) -> Result<Launch, String> {
     let launch: Launch =
         serde_json::from_str(text).map_err(|_| "上一 Agent 配置无效".to_owned())?;
-    let prefix_valid = if id == "pi" {
+    let prefix_valid = if matches!(id, "pi" | "gemini") {
         launch.prefix.len() == 1
             && launch.prefix.first().is_some_and(|path| {
                 Path::new(path).is_absolute()
@@ -473,11 +474,40 @@ mod tests {
         assert_eq!(compatibility("pi", Some("0.60.0")).0, "unsupported");
         assert_eq!(compatibility("pi", Some("1.0.4")).0, "unverified");
         assert_eq!(compatibility("pi", None).0, "unverified");
+        assert_eq!(compatibility("gemini", Some("0.63.0")).0, "covered");
+        assert_eq!(compatibility("gemini", Some("0.62.0")).0, "unsupported");
+        assert_eq!(compatibility("gemini", Some("0.64.0")).0, "unverified");
         let evidence: serde_json::Value =
             serde_json::from_str(include_str!("../../resources/agent-compatibility.json")).unwrap();
         assert_eq!(evidence["evidenceScope"], "controlled_protocol_fixtures");
         assert_eq!(evidence["liveAgentValidation"], false);
         assert_eq!(catalog().agents.len(), agents::IDS.len());
+    }
+
+    #[test]
+    fn gemini_recovery_reads_bundled_metadata_and_preserves_node_script_arguments() {
+        let fixture = Fixture::new();
+        let package = fixture.root.join("node_modules/@google/gemini-cli");
+        let script = package.join("bundle/gemini.js");
+        fs::create_dir_all(script.parent().unwrap()).unwrap();
+        fs::write(&script, b"// fixture, never executed").unwrap();
+        fs::write(
+            package.join("package.json"),
+            br#"{"name":"@google/gemini-cli","version":"0.63.0"}"#,
+        )
+        .unwrap();
+        let selected = Launch {
+            program: fixture.old.program.clone(),
+            prefix: vec![script.to_string_lossy().into_owned()],
+            source: "managed".into(),
+        };
+        assert_eq!(
+            static_version("gemini", &selected).as_deref(),
+            Some("0.63.0")
+        );
+        let saved = serde_json::to_string(&selected).unwrap();
+        assert_eq!(launch("gemini", &saved).unwrap().prefix, selected.prefix);
+        assert!(launch("codex", &saved).is_err());
     }
 
     #[test]

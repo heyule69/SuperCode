@@ -260,13 +260,59 @@ pub(crate) fn sanitize_provider(agent: &str, id: &str, raw: Value) -> Result<Val
         // MAX_CONTEXT declares this selected model's window. It is not a safe
         // global override for differently sized child models on this connection.
         // AUTO_COMPACT_WINDOW is only a trigger window, never model capacity.
-        if let (Some(model),Some(window))=(safe["model"].as_str().map(str::to_owned),crate::model_context::positive(&raw["env"]["CLAUDE_CODE_MAX_CONTEXT_TOKENS"])) {
-            safe["modelMetadata"]=json!({model:{"contextWindow":window}});
+        if let (Some(model), Some(window)) = (
+            safe["model"].as_str().map(str::to_owned),
+            crate::model_context::positive(&raw["env"]["CLAUDE_CODE_MAX_CONTEXT_TOKENS"]),
+        ) {
+            safe["modelMetadata"] = json!({model:{"contextWindow":window}});
         }
         return Ok(safe);
     }
     if matches!(agent, "opencode" | "pi") {
         return native::sanitize(agent, id, &raw);
+    }
+    if agent == "gemini" {
+        let base = raw["baseUrl"]
+            .as_str()
+            .or(raw["env"]["GOOGLE_GEMINI_BASE_URL"].as_str())
+            .unwrap_or("https://generativelanguage.googleapis.com/v1beta");
+        let model = raw["model"]
+            .as_str()
+            .or(raw["env"]["GEMINI_MODEL"].as_str())
+            .filter(|model| {
+                !model.is_empty() && model.len() <= 200 && !model.chars().any(char::is_control)
+            })
+            .ok_or("Gemini 配置缺少有效模型 ID")?;
+        let key = raw["apiKey"]
+            .as_str()
+            .or(raw["env"]["GEMINI_API_KEY"].as_str())
+            .or(raw["env"]["GOOGLE_API_KEY"].as_str())
+            .unwrap_or("");
+        if key.len() > 8192 || key.chars().any(char::is_control) {
+            return Err("Gemini API Key 格式无效".into());
+        }
+        let mut models = vec![model.to_owned()];
+        if let Some(rows) = raw["models"].as_array() {
+            if rows.len() > 200 {
+                return Err("单个连接最多导入 200 个模型".into());
+            }
+            for row in rows {
+                let value = row
+                    .as_str()
+                    .filter(|model| {
+                        !model.is_empty()
+                            && model.len() <= 200
+                            && !model.chars().any(char::is_control)
+                    })
+                    .ok_or("Gemini 模型 ID 无效")?;
+                if !models.iter().any(|model| model == value) {
+                    models.push(value.to_owned());
+                }
+            }
+        }
+        return Ok(
+            json!({"baseUrl":imported_base_url(base)?,"protocol":"gemini","apiKey":key,"model":model,"models":models,"source":"ccswitch"}),
+        );
     }
     let cfg: toml::Table =
         toml::from_str(raw["config"].as_str().ok_or("Codex 配置缺少 config TOML")?)
@@ -429,7 +475,7 @@ pub struct ScanResult {
     pub warnings: Vec<String>,
 }
 fn read(path: Option<String>, agent: &str) -> Result<ReadResult, String> {
-    if !matches!(agent, "claude" | "codex" | "opencode" | "pi") {
+    if !matches!(agent, "claude" | "codex" | "opencode" | "pi" | "gemini") {
         return Err("不支持的 Agent，请重新选择供应商标签".into());
     }
     let path = database(path)?;
@@ -673,17 +719,56 @@ pub fn codex_overrides(config: &Value) -> Result<Vec<String>, String> {
 mod tests {
     use super::*;
     #[test]
+    fn imported_gemini_api_profiles_keep_only_model_route_and_credentials() {
+        let profile = sanitize_provider("gemini", "x", json!({"model":"gemini-fixture","models":["gemini-second"],"env":{"GEMINI_API_KEY":"fixture-key","GOOGLE_GEMINI_BASE_URL":"https://gateway.example/v1beta/","OTHER_SECRET":"do-not-import"},"mcpServers":{"unsafe":{}},"hooks":{"unsafe":"execute"},"approvalMode":"yolo"})).unwrap();
+        assert_eq!(profile["baseUrl"], "https://gateway.example/v1beta");
+        assert_eq!(profile["protocol"], "gemini");
+        assert_eq!(profile["apiKey"], "fixture-key");
+        assert_eq!(
+            profile["models"],
+            json!(["gemini-fixture", "gemini-second"])
+        );
+        assert!(!profile.to_string().contains("do-not-import"));
+        for field in ["mcpServers", "hooks", "approvalMode", "env"] {
+            assert!(profile.get(field).is_none());
+        }
+        assert!(sanitize_provider(
+            "gemini",
+            "x",
+            json!({"model":"gemini-fixture","apiKey":"bad\nkey"})
+        )
+        .is_err());
+        assert!(sanitize_provider("gemini", "x", json!({"apiKey":"fixture-key"})).is_err());
+    }
+    #[test]
     fn imported_claude_max_context_is_metadata_for_selected_model_not_a_global_child_override() {
         let config=sanitize("claude",json!({"env":{"ANTHROPIC_MODEL":"sonnet","ANTHROPIC_DEFAULT_SONNET_MODEL":"private-provider-model","ANTHROPIC_DEFAULT_HAIKU_MODEL":"glm-5-turbo","CLAUDE_CODE_MAX_CONTEXT_TOKENS":"1000000","CLAUDE_CODE_AUTO_COMPACT_WINDOW":"500000"}})).unwrap();
-        assert_eq!(config["model"],"private-provider-model");
-        assert_eq!(config["modelMetadata"]["private-provider-model"]["contextWindow"],1000000);
+        assert_eq!(config["model"], "private-provider-model");
+        assert_eq!(
+            config["modelMetadata"]["private-provider-model"]["contextWindow"],
+            1000000
+        );
         assert!(config["modelMetadata"]["glm-5-turbo"].is_null());
         assert!(config["env"]["CLAUDE_CODE_MAX_CONTEXT_TOKENS"].is_null());
         assert!(config["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"].is_null());
-        let trigger_only=sanitize("claude",json!({"model":"private","env":{"CLAUDE_CODE_AUTO_COMPACT_WINDOW":"1000000"}})).unwrap();
+        let trigger_only = sanitize(
+            "claude",
+            json!({"model":"private","env":{"CLAUDE_CODE_AUTO_COMPACT_WINDOW":"1000000"}}),
+        )
+        .unwrap();
         assert!(trigger_only["modelMetadata"].is_null());
-        for invalid in [json!(0),json!(-1),json!(100000001),json!(true),json!("broken")] {
-            let invalid=sanitize("claude",json!({"model":"private","env":{"CLAUDE_CODE_MAX_CONTEXT_TOKENS":invalid}})).unwrap();
+        for invalid in [
+            json!(0),
+            json!(-1),
+            json!(100000001),
+            json!(true),
+            json!("broken"),
+        ] {
+            let invalid = sanitize(
+                "claude",
+                json!({"model":"private","env":{"CLAUDE_CODE_MAX_CONTEXT_TOKENS":invalid}}),
+            )
+            .unwrap();
             assert!(invalid["modelMetadata"].is_null());
         }
     }
@@ -1139,10 +1224,16 @@ mod tests {
             store.select_profile(agent, Some(&profiles[0].id)).unwrap();
         }
         let project = store.add_project(&dir).unwrap();
-        store.create_configured_session(&project.id, None, "pi", Some("pi:same")).unwrap();
+        let chat = store
+            .create_configured_session(&project.id, None, "pi", Some("pi:same"))
+            .unwrap();
+        store
+            .bind_native(&chat.id, "native-import-fixture")
+            .unwrap();
         let mut updated = store.active_profile("pi").unwrap().unwrap();
         updated.config["piProvider"]["models"][0]["baseUrl"] = json!("https://changed.example/v1");
-        assert!(store.import_profiles(&[updated]).unwrap_err().contains("已绑定聊天"));
+        store.import_profiles(&[updated]).unwrap();
+        assert!(store.session(&chat.id).unwrap().native_id.is_none());
         drop(store);
         let store = crate::storage::Store::open(&db).unwrap();
         let open = store.route("opencode", None).unwrap().config;
@@ -1154,6 +1245,10 @@ mod tests {
             200000
         );
         assert_eq!(pi["apiKey"], "pi-secret");
+        assert_eq!(
+            pi["piProvider"]["models"][0]["baseUrl"],
+            "https://changed.example/v1"
+        );
         assert_eq!(pi["piProvider"]["models"][0]["contextWindow"], 32768);
         for agent in ["opencode", "pi"] {
             let profile = store.active_profile(agent).unwrap().unwrap();

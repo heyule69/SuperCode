@@ -38,6 +38,7 @@ pub(super) struct Client {
     pub(super) pi: bool,
     pub(super) alive: AtomicBool,
     pub(super) concurrent_prompt: AtomicBool,
+    transient_home: Option<std::path::PathBuf>,
 }
 impl Client {
     pub(super) async fn start(
@@ -49,6 +50,47 @@ impl Client {
         diagnostics: Option<(AppHandle, String, Option<String>)>,
     ) -> Result<(Arc<Self>, mpsc::Receiver<Value>), String> {
         let mut command = launch.command(&[]);
+        let gemini = args.first().is_some_and(|arg| arg == "--acp");
+        if gemini {
+            // A managed API connection must not inherit Google login, Vertex,
+            // API keys, hooks or another CLI's settings from its parent process.
+            for name in [
+                "GEMINI_API_KEY",
+                "GOOGLE_API_KEY",
+                "GOOGLE_APPLICATION_CREDENTIALS",
+                "GOOGLE_GENAI_USE_VERTEXAI",
+                "GOOGLE_GENAI_USE_GCA",
+                "GOOGLE_VERTEX_BASE_URL",
+                "GOOGLE_CLOUD_PROJECT",
+                "GOOGLE_CLOUD_PROJECT_ID",
+                "GOOGLE_CLOUD_LOCATION",
+                "GOOGLE_GEMINI_BASE_URL",
+                "GOOGLE_GENAI_API_VERSION",
+                "GEMINI_CLI_CUSTOM_HEADERS",
+                "GEMINI_API_KEY_AUTH_MECHANISM",
+                "GEMINI_SYSTEM_MD",
+                "GEMINI_FORCE_FILE_STORAGE",
+                "GEMINI_CLI_USE_COMPUTE_ADC",
+                "GEMINI_CLI_HOME",
+                "GEMINI_CLI_SYSTEM_SETTINGS_PATH",
+                "GEMINI_CLI_SYSTEM_DEFAULTS_PATH",
+            ] {
+                command.env_remove(name);
+            }
+        }
+        let transient_home = gemini
+            .then(|| {
+                let home = std::path::PathBuf::from(
+                    env.iter()
+                        .find(|(key, _)| key == "GEMINI_CLI_HOME")?
+                        .1
+                        .clone(),
+                );
+                let name = home.file_name()?.to_str()?;
+                (uuid::Uuid::parse_str(name).is_ok() && home.parent()?.file_name()? == "transient")
+                    .then_some(home)
+            })
+            .flatten();
         if let Some((app, _, _)) = &diagnostics {
             let values = env
                 .iter()
@@ -82,6 +124,7 @@ impl Client {
             alive: AtomicBool::new(true),
             pi,
             concurrent_prompt: AtomicBool::new(false),
+            transient_home,
         });
         let reader = client.clone();
         let (tx, rx) = mpsc::channel(16);
@@ -97,7 +140,18 @@ impl Client {
         tokio::spawn(async move {
             let (app, source, session) = diagnostics
                 .map(|(app, source, session)| (Some(app), source, session))
-                .unwrap_or((None, if pi { "pi" } else { "opencode" }.into(), None));
+                .unwrap_or((
+                    None,
+                    if pi {
+                        "pi"
+                    } else if gemini {
+                        "gemini"
+                    } else {
+                        "opencode"
+                    }
+                    .into(),
+                    None,
+                ));
             crate::runtime_diagnostics::stderr(app, session, &source, stderr).await;
         });
         tokio::spawn(async move {
@@ -218,6 +272,28 @@ impl Client {
     pub(super) async fn close(&self) {
         self.alive.store(false, Ordering::Release);
         let _ = self.child.lock().await.kill().await;
+        if let Some(home) = &self.transient_home {
+            // The exact owned UUID directory must still be beneath its expected
+            // parent before recursive cleanup. Never remove a reparse target.
+            let expected = home.parent().and_then(|p| p.canonicalize().ok());
+            let resolved = home.canonicalize().ok();
+            let ordinary = std::fs::symlink_metadata(home).ok().is_some_and(|m| {
+                #[cfg(windows)]
+                {
+                    use std::os::windows::fs::MetadataExt;
+                    m.file_attributes() & 0x400 == 0 && m.is_dir()
+                }
+                #[cfg(not(windows))]
+                {
+                    m.is_dir() && !m.file_type().is_symlink()
+                }
+            });
+            if let (true, Some(resolved), Some(expected)) = (ordinary, resolved, expected) {
+                if resolved.parent() == Some(expected.as_path()) {
+                    let _ = tokio::fs::remove_dir_all(&resolved).await;
+                }
+            }
+        }
     }
 }
 pub(super) fn is_response(v: &Value, pi: bool) -> bool {
@@ -239,9 +315,7 @@ pub(super) fn response(v: &Value, pi: bool) -> Result<Value, String> {
         }
     } else if v.get("error").is_some() {
         Err(protocol::bounded(
-            v["error"]["message"]
-                .as_str()
-                .unwrap_or("OpenCode 请求失败"),
+            v["error"]["message"].as_str().unwrap_or("ACP 请求失败"),
             4096,
         ))
     } else {
@@ -254,7 +328,7 @@ mod tests {
     use super::*;
     #[test]
     fn startup_requests_rebind_to_actual_native_session_without_changing_wire_or_children() {
-        for agent in ["pi", "opencode"] {
+        for agent in ["pi", "opencode", "gemini"] {
             let raw = if agent == "pi" {
                 json!({"type":"extension_ui_request","method":"confirm","id":"native-request","title":"Startup"})
             } else {

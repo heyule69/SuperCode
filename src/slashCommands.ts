@@ -16,7 +16,7 @@ export const slashCommands: SlashCommand[] = [
 ];
 export function commandMatches(input: string, agent: string, native: string[] = [], skills: Skill[] = []) {
   if (!/^\/[\p{L}\p{N}_:.-]*$/iu.test(input)) return [];
-  const commands = slashCommands.filter(c => !c.agent || c.agent === agent);
+  const commands = slashCommands.filter(c => (!c.agent || c.agent === agent) && !(agent === 'gemini' && c.name === '/compact'));
   for (const skill of skills) {
     if (skill.error) continue;
     const name = skill.name.trim().toLowerCase().replace(/[^\p{L}\p{N}_:.-]+/gu, '-');
@@ -30,9 +30,10 @@ export function commandMatches(input: string, agent: string, native: string[] = 
     while (commands.some(c => c.name === command)) command = `${unique}:${suffix++}`;
     commands.push({ name: command, detail: skill.description || '使用此技能', arguments: '任务内容', skill });
   }
-  if (['claude', 'opencode', 'pi'].includes(agent)) for (const name of native) {
+  if (['claude', 'opencode', 'pi', 'gemini'].includes(agent)) for (const name of native) {
     const command = `/${name}`;
-    if (/^\/[\w:-]+$/.test(command) && !commands.some(c => c.name === command)) commands.push({ name: command, detail: `本机 ${({ claude: 'Claude', opencode: 'OpenCode', pi: 'Pi' } as Record<string,string>)[agent]} 提供的命令` });
+    if (agent === 'gemini' && command === '/compact') continue;
+    if (/^\/[\w:-]+$/.test(command) && !commands.some(c => c.name === command)) commands.push({ name: command, detail: `本机 ${({ claude: 'Claude', opencode: 'OpenCode', pi: 'Pi', gemini: 'Gemini CLI' } as Record<string,string>)[agent]} 提供的命令` });
   }
   return commands.filter(c => c.name.startsWith(input.toLowerCase()));
 }

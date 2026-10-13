@@ -115,7 +115,7 @@ export function mergeEvent(messages: Message[], event: RpcEvent, sessionId: stri
       last = index;
       if (m.kind === 'runMarker') marker = true;
       if (m.kind === 'runMarker') return { ...m, data: { ...m.data, status, durationMs: Math.max(0, Date.now() - Number(m.data.startedAt ?? Date.now())) } };
-      if (['inProgress', 'preparing'].includes(String(m.data.status))) return { ...m, data: { ...m.data, status: status === 'failed' ? 'failed' : 'interrupted' } };
+      if (['inProgress', 'running', 'preparing'].includes(String(m.data.status))) return { ...m, data: { ...m.data, status: status === 'failed' ? 'failed' : 'interrupted' } };
       return m;
     });
     // Restored/paginated history may not contain the start event. Record the
@@ -169,7 +169,9 @@ export function mergeEvent(messages: Message[], event: RpcEvent, sessionId: stri
   if (!item?.id || !['agentMessage', 'plan'].includes(item.type) && !activityKinds.has(item.type) && !toolKinds.has(item.type)) return messages;
   const id = String(item.id);
   const existing = messages.find(m => m.id === id);
-  const data = { ...existing?.data, ...item, turnId: p.turnId, status: item.status ?? (event.method === 'item/completed' ? 'completed' : existing?.data?.status ?? 'inProgress'), startedAt: existing?.data?.startedAt ?? Date.now() };
+  const status = event.method === 'item/completed' && ['inProgress', 'running', 'preparing'].includes(String(item.status))
+    ? 'completed' : item.status ?? (event.method === 'item/completed' ? 'completed' : existing?.data?.status ?? 'inProgress');
+  const data = { ...existing?.data, ...item, turnId: p.turnId, status, startedAt: existing?.data?.startedAt ?? Date.now() };
   if (item.type === 'fileChange' && item.aggregatedOutput != null) data.operationOutput = item.aggregatedOutput;
   if (event.method === 'item/completed' && data.durationMs == null && existing?.data?.startedAt != null) data.durationMs = Math.max(0, Date.now() - Number(existing.data.startedAt));
   let text = item.type === 'commandExecution' ? `${item.command ?? ''}\n${item.aggregatedOutput ?? ''}`

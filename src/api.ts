@@ -22,6 +22,7 @@ const defaultPreview: Bootstrap = {
     { id: 'claude', name: 'Claude Code', installed: false, connected: true, path: null },
     { id: 'opencode', name: 'OpenCode', installed: false, connected: false, path: null },
     { id: 'pi', name: 'Pi', installed: false, connected: false, path: null },
+    { id: 'gemini', name: 'Gemini CLI', installed: false, connected: false, path: null },
   ],
 };
 function readPreview(): Bootstrap {

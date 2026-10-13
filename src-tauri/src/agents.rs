@@ -15,13 +15,14 @@ use std::{
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::{io::AsyncReadExt, sync::RwLock};
 
-pub const IDS: [&str; 4] = ["codex", "claude", "opencode", "pi"];
+pub const IDS: [&str; 5] = ["codex", "claude", "opencode", "pi", "gemini"];
 pub fn name(id: &str) -> &str {
     match id {
         "codex" => "Codex",
         "claude" => "Claude Code",
         "opencode" => "OpenCode",
         "pi" => "Pi",
+        "gemini" => "Gemini CLI",
         _ => id,
     }
 }
@@ -117,11 +118,19 @@ fn native_paths(id: &str) -> Vec<String> {
     }
 }
 fn at_root(id: &str, root: &Path, node: Option<&Path>, source: &str) -> Option<Launch> {
-    if id == "pi" {
-        for relative in [
-            "node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js",
-            "node_modules/@mariozechner/pi-coding-agent/dist/cli.js",
-        ] {
+    if matches!(id, "pi" | "gemini") {
+        let scripts: &[&str] = if id == "gemini" {
+            &[
+                "node_modules/@google/gemini-cli/bundle/gemini.js",
+                "node_modules/@google/gemini-cli/dist/index.js",
+            ]
+        } else {
+            &[
+                "node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js",
+                "node_modules/@mariozechner/pi-coding-agent/dist/cli.js",
+            ]
+        };
+        for relative in scripts {
             let script = root.join(relative);
             if script.is_file() {
                 if let Some(node) = node {
@@ -196,7 +205,7 @@ fn from_path(id: &str, path: &Path, node: Option<&Path>, source: &str) -> Option
     if matches!(suffix.to_ascii_lowercase().as_str(), "cmd" | "ps1" | "bat") {
         return at_root(id, path.parent()?, node, source);
     }
-    if id == "pi" && matches!(suffix, "js" | "mjs") {
+    if matches!(id, "pi" | "gemini") && matches!(suffix, "js" | "mjs") {
         return Some(Launch {
             program: node?.into(),
             prefix: vec![ordinary(path.into()).to_string_lossy().into()],
@@ -367,6 +376,13 @@ pub async fn list_agents(app: AppHandle) -> Result<Vec<AgentStatus>, String> {
     Ok(result)
 }
 pub(crate) fn compatible_version(id: &str, version: &str) -> Result<(), String> {
+    if id == "gemini" {
+        let parsed = crate::agent_versions::installed_version(version)
+            .ok_or("无法识别 Gemini CLI 版本，请修复安装后使用")?;
+        if parsed < semver::Version::new(0, 63, 0) {
+            return Err("Gemini CLI 需要 0.63.0 或以上版本，请更新或修复安装后使用".into());
+        }
+    }
     if id == "pi"
         && version
             .trim()
@@ -615,7 +631,8 @@ mod tests {
         let a = agents.operation.try_read().unwrap();
         let b = agents.operation.try_read().unwrap();
         assert!(agents.operation.try_write().is_err());
-        drop(a); drop(b);
+        drop(a);
+        drop(b);
         let install = agents.operation.try_write().unwrap();
         assert!(agents.operation.try_read().is_err());
         drop(install);
@@ -635,11 +652,44 @@ mod tests {
     #[test]
     fn only_allowlisted_agents_can_install() {
         assert!(validate("pi").is_ok());
+        assert!(validate("gemini").is_ok());
         assert!(validate("codex & evil").is_err());
         assert_eq!(
             crate::agent_versions::package_name("pi").unwrap(),
             "@earendil-works/pi-coding-agent"
         );
+        assert_eq!(
+            crate::agent_versions::package_spec("gemini", "0.63.0").unwrap(),
+            "@google/gemini-cli@0.63.0"
+        );
+    }
+    #[test]
+    fn gemini_discovers_current_bundle_and_legacy_script_without_execution() {
+        let root = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        let legacy = root.join("node_modules/@google/gemini-cli/dist/index.js");
+        let bundle = root.join("node_modules/@google/gemini-cli/bundle/gemini.js");
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(bundle.parent().unwrap()).unwrap();
+        std::fs::write(&legacy, b"// fixture, never executed").unwrap();
+        let node = root.join("node.exe");
+        assert_eq!(
+            at_root("gemini", &root, Some(&node), "managed")
+                .unwrap()
+                .prefix,
+            [ordinary(legacy).to_string_lossy().into_owned()]
+        );
+        std::fs::write(&bundle, b"// fixture, never executed").unwrap();
+        let launch = at_root("gemini", &root, Some(&node), "managed").unwrap();
+        assert_eq!(launch.program, node);
+        assert_eq!(
+            launch.prefix,
+            [ordinary(bundle).to_string_lossy().into_owned()]
+        );
+        assert!(at_root("gemini", &root, None, "managed").is_none());
+        assert!(compatible_version("gemini", "gemini-cli 0.63.0").is_ok());
+        assert!(compatible_version("gemini", "0.62.0").is_err());
+        assert!(compatible_version("gemini", "unknown").is_err());
+        std::fs::remove_dir_all(root).unwrap();
     }
     #[test]
     fn discovery_ignores_shell_wrappers_without_real_program() {

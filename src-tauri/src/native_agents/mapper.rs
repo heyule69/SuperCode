@@ -269,10 +269,12 @@ impl Mapper {
                         t.turn,
                         u["toolCallId"].as_str().unwrap_or("unknown")
                     );
-                    let row=self.items.entry(id.clone()).or_insert(json!({"id":id,"type":"claudeToolCall","tool":acp_tool(u),"arguments":tool_args(&u["rawInput"]),"status":"inProgress"}));
+                    let row=self.items.entry(id.clone()).or_insert(json!({"id":id,"type":"claudeToolCall","tool":acp_tool(u),"arguments":acp_arguments(u),"cwd":t.client.cwd,"status":"inProgress"}));
                     update_acp_tool(row, u);
                     if let Some(c) = u.get("rawInput") {
                         row["arguments"] = tool_args(c);
+                    } else if row["arguments"].is_null() && u["locations"].is_array() {
+                        row["arguments"] = acp_arguments(u);
                     }
                     if let Some(c) = u.get("content") {
                         row["output"] = blocks_text(c).into();
@@ -380,6 +382,21 @@ impl Mapper {
             crate::model_context::positive(&native["size"]).or(self.model_context_window);
         json!({"total":{},"last":{},"contextTokens":used,"modelContextWindow":self.model_context_window,"cumulative":false})
     }
+    pub(super) fn observe_gemini_completion(&mut self, native: &Value) -> Option<Value> {
+        let count = &native["_meta"]["quota"]["token_count"];
+        let input = crate::usage_tokens::count(&count["input_tokens"]);
+        let output = crate::usage_tokens::count(&count["output_tokens"]);
+        if input.is_none() && output.is_none() {
+            return None;
+        }
+        let input = input.unwrap_or(0);
+        let output = output.unwrap_or(0);
+        let totals = json!({"inputTokens":input,"outputTokens":output,"totalTokens":input.saturating_add(output)});
+        // Gemini's quota sums every model invocation in this prompt. It is not
+        // the final context size, so never use that sum as context occupancy.
+        self.usage = json!({"total":totals,"last":totals,"cumulative":false,"contextTokens":null,"modelContextWindow":self.model_context_window});
+        Some(self.usage.clone())
+    }
     pub(super) fn observe_pi_usage(&mut self, native: &Value) -> bool {
         let last = crate::usage_tokens::pi_usage(native);
         let context = crate::usage_tokens::pi_context(&last);
@@ -432,16 +449,37 @@ pub(super) fn acp_tool(v: &Value) -> &str {
     }
     match v["kind"].as_str() {
         Some("read") => "Read",
+        Some("edit")
+            if v["content"].as_array().is_some_and(|blocks| {
+                blocks
+                    .iter()
+                    .any(|b| b["type"] == "diff" && b["_meta"]["kind"] == "add")
+            }) =>
+        {
+            "Write"
+        }
         Some("edit") => "Edit",
         Some("execute") => "Bash",
         Some("search") => "Grep",
         _ => v["title"].as_str().unwrap_or("Tool"),
     }
 }
+pub(super) fn acp_arguments(v: &Value) -> Value {
+    if v["rawInput"].is_object() {
+        return tool_args(&v["rawInput"]);
+    }
+    if let Some(path) = v["locations"]
+        .as_array()
+        .and_then(|locations| locations.iter().find_map(|l| l["path"].as_str()))
+    {
+        return json!({"file_path":path});
+    }
+    Value::Null
+}
 pub(super) fn update_acp_tool(row: &mut Value, update: &Value) {
     // OpenCode replaces a Task's title with its description after approval.
     // Keep the native tool identity so progress and completion still reach its row.
-    if matches!(row["tool"].as_str(), Some("Task" | "task")) {
+    if matches!(row["tool"].as_str(), Some("Task" | "task" | "Write")) {
         return;
     }
     if update["kind"].is_string() || update["rawInput"]["subagent_type"].is_string() {

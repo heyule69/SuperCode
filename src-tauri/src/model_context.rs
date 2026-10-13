@@ -21,6 +21,7 @@ pub fn metadata(row: &Value) -> Value {
         "contextLength",
         "max_context_tokens",
         "max_input_tokens",
+        "inputTokenLimit",
     ]
     .iter()
     .find_map(|key| positive(&row[*key]))

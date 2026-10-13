@@ -1,6 +1,7 @@
 import type { Message } from './types';
 
 export type ActivityCategory = 'command' | 'edit' | 'read' | 'search' | 'web' | 'browser' | 'computer' | 'plan' | 'reasoning' | 'context' | 'tool';
+interface ActivitySummary { label: string; category: ActivityCategory; status: string }
 
 export function activityStatus(message: Message) {
   const data = message.data;
@@ -10,7 +11,7 @@ export function activityStatus(message: Message) {
 
 const activeStatuses = new Set(['inProgress', 'running', 'preparing']);
 const activityLabels: Record<ActivityCategory, [string, string]> = {
-  command: ['运行了命令', '正在运行命令'],
+  command: ['运行了命令', '正在执行命令'],
   edit: ['编辑了文件', '正在编辑文件'],
   read: ['读取了文件', '正在读取文件'],
   search: ['搜索了代码', '正在搜索代码'],
@@ -23,20 +24,44 @@ const activityLabels: Record<ActivityCategory, [string, string]> = {
   tool: ['调用了工具', '正在调用工具'],
 };
 
+function currentActivity(message: Message): ActivitySummary {
+  const summary = summarizeActivities([message]);
+  const data = message.data ?? {};
+  const tool = String(data.tool ?? '');
+  let label = summary.label;
+  if (message.kind === 'claudeToolCall' && tool === 'Write') label = '正在写文件';
+  else if (message.kind === 'claudeToolCall' && tool === 'Glob') label = '正在查找文件';
+  else if (message.kind === 'imageView') label = '正在查看图片';
+  else if (message.kind === 'fileChange' && Array.isArray(data.changes) && data.changes.length) {
+    const kinds = data.changes.map(change => typeof change?.kind === 'string' ? change.kind : change?.kind?.type);
+    if (kinds.every(kind => ['add', 'create', 'added'].includes(kind))) label = '正在写文件';
+    else if (kinds.every(kind => ['delete', 'remove', 'deleted'].includes(kind))) label = '正在删除文件';
+  }
+  if (summary.status === 'preparing') label = tool === 'ExitPlanMode' ? '正在生成计划' : label.replace(/^正在/, '正在准备');
+  return { ...summary, label };
+}
+
 /** Summarize actual event metadata without inferring actions from arbitrary shell code. */
-export function summarizeActivities(messages: Message[], live = false) {
+export function summarizeActivities(messages: Message[], live = false): ActivitySummary {
   if (live) {
-    // During a turn, show the newest ongoing action instead of completed history.
-    // A plan stays in progress across tools; it is current only when it is latest.
-    let current: Message | undefined;
+    // An executing tool takes priority over reasoning that an engine has not
+    // closed yet. Completed tools and old thought/plan rows are history.
+    let latest: Message | undefined;
     for (let index = messages.length - 1; index >= 0; index--) {
       const message = messages[index];
-      if (activeStatuses.has(activityStatus(message)) && (message.kind !== 'executionPlan' || index === messages.length - 1)) { current = message; break; }
+      if (message.kind === 'runMarker' || message.role === 'user' || message.role === 'system') continue;
+      latest ??= message;
+      if (activeStatuses.has(activityStatus(message)) && message.role !== 'assistant'
+        && !['reasoning', 'executionPlan'].includes(message.kind)) return currentActivity(message);
     }
-    if (current) return summarizeActivities([current]);
-    // Tool completion is followed by the model's next step, often before any
-    // public reasoning fragment arrives. Keep the old tool result in the details.
-    return { label: '正在思考', category: 'reasoning' as ActivityCategory, status: 'inProgress' };
+    if (latest && activeStatuses.has(activityStatus(latest))) {
+      if (latest.kind === 'reasoning' || latest.kind === 'executionPlan') return currentActivity(latest);
+      if (latest.kind === 'agentMessage' || latest.kind === 'plan') return {
+        label: latest.kind === 'plan' ? '正在生成计划' : '正在回复', category: 'tool' as ActivityCategory, status: activityStatus(latest),
+      };
+    }
+    // A running turn alone does not reveal whether the model is thinking.
+    return { label: '正在处理', category: 'tool' as ActivityCategory, status: 'inProgress' };
   }
   const categories = new Map<ActivityCategory, { active: boolean; paths: Set<string> }>();
   let status = 'completed';

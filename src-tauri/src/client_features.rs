@@ -65,6 +65,7 @@ pub fn validate_permission(agent: &str, mode: &str) -> Result<(), String> {
             "read" | "ask" | "strict" | "auto" | "edit" | "deny" | "full"
         ),
         "opencode" | "pi" => matches!(mode, "read" | "ask" | "strict" | "full"),
+        "gemini" => matches!(mode, "read" | "ask" | "full"),
         _ => false,
     };
     if valid {
@@ -780,6 +781,12 @@ mod tests {
     }
     #[test]
     fn agents_reject_unsupported_modes_and_claude_uses_native_permission_names() {
+        for mode in ["read", "ask", "full"] {
+            assert!(validate_permission("gemini", mode).is_ok());
+        }
+        for mode in ["strict", "auto", "edit", "deny"] {
+            assert!(validate_permission("gemini", mode).is_err());
+        }
         for (mode, native) in [
             ("read", "plan"),
             ("ask", "manual"),

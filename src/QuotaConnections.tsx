@@ -4,7 +4,7 @@ import { ProviderIcon } from './AgentIcon';
 import type { QuotaConnection } from './platformUsage';
 
 export const quotaRowHeight = 68;
-export const agentNames: Record<string, string> = { claude: 'Claude Code', codex: 'Codex', opencode: 'OpenCode', pi: 'Pi' };
+export const agentNames: Record<string, string> = { claude: 'Claude Code', codex: 'Codex', opencode: 'OpenCode', pi: 'Pi', gemini: 'Gemini CLI' };
 export const quotaConnectionKey = (connection: QuotaConnection) => JSON.stringify([connection.agent, connection.connectionId]);
 
 export function quotaListWindow(count: number, scrollTop: number, height: number) {

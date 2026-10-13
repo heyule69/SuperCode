@@ -18,11 +18,12 @@ pub async fn summarize(
     route: &Route,
     input: &str,
 ) -> Result<String, String> {
-    let result = if matches!(session.agent.as_str(), "opencode" | "pi") {
+    let result = if matches!(session.agent.as_str(), "opencode" | "pi" | "gemini") {
         crate::native_agents::summary(
             app,
             session,
             &format!("{INSTRUCTIONS}\n\n<history>\n{input}\n</history>"),
+            Some(route),
         )
         .await
         .and_then(|s| validate_summary(&s))

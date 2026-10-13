@@ -1,8 +1,8 @@
 import { expect, it } from 'vitest';
 import { connectionIds, mergeVisibleOrder, moveConnection, visibleProviderIds } from './providerOrder';
 import type { AgentProfile } from './types';
-it('keeps native OpenCode and Pi routes, orders their providers, and never invents an official account', () => {
-  for (const agent of ['opencode', 'pi']) {
+it('keeps native OpenCode, Pi and Gemini routes, orders their providers, and never invents an official account', () => {
+  for (const agent of ['opencode', 'pi', 'gemini']) {
     expect(connectionIds(agent, [], [], {})).toEqual(['@local']);
     const own = { id: 'api', agent, name: 'API', model: 'm', current: true, hasCredential: true };
     expect(connectionIds(agent, [own], [], { [agent]: ['api', '@official', '@local'] })).toEqual(['api', '@local']);
@@ -47,7 +47,7 @@ it('preserves distinct API connections and the official login position in saved 
 });
 
 it('shows configured suppliers and confirmed accounts instead of CLI or unconfigured official placeholders', () => {
-  for (const agent of ['claude', 'codex', 'opencode', 'pi']) {
+  for (const agent of ['claude', 'codex', 'opencode', 'pi', 'gemini']) {
     expect(visibleProviderIds(agent, [], [], { [agent]: ['@local', '@official'] })).toEqual([]);
   }
   expect(visibleProviderIds('claude', profiles, [], { claude: ['@official', 'glm', '@local', 'kimi'] })).toEqual(['glm', 'kimi']);

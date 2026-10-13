@@ -154,6 +154,21 @@ describe('Codex event replay', () => {
     messages = mergeEvent(messages, { method: 'turn/started', params: { turn: { id: 't2' } } }, 's');
     expect(conversationTurns(messages)).toHaveLength(2); expect(conversationTurns(messages)[1].run?.data?.turnId).toBe('t2');
   });
+  it('closes running tools when their turn ends without affecting a different active turn', () => {
+    for (const status of ['inProgress', 'running', 'preparing']) {
+      let messages = mergeEvent([], { method: 'item/started', params: { turnId: 'old', item: { id: 'old-tool', type: 'commandExecution', status } } }, 's');
+      messages = mergeEvent(messages, { method: 'item/started', params: { turnId: 'new', item: { id: 'new-tool', type: 'claudeToolCall', tool: 'Write', status: 'inProgress' } } }, 's');
+      messages = mergeEvent(messages, { method: 'turn/completed', params: { turn: { id: 'old', status: 'interrupted' } } }, 's');
+      expect(messages.find(message => message.id === 'old-tool')?.data?.status).toBe('interrupted');
+      expect(messages.find(message => message.id === 'new-tool')?.data?.status).toBe('inProgress');
+    }
+  });
+  it('treats an explicit item completion as terminal even when its payload repeats an ongoing status', () => {
+    for (const status of ['inProgress', 'running', 'preparing', 'failed', 'declined', 'interrupted']) {
+      const messages = mergeEvent([], { method: 'item/completed', params: { turnId: 't', item: { id: 'write', type: 'claudeToolCall', tool: 'Write', status } } }, 's');
+      expect(messages[0].data?.status).toBe(['inProgress', 'running', 'preparing'].includes(status) ? 'completed' : status);
+    }
+  });
   it('bounds large tool payloads while preserving status and Unicode boundaries', () => {
     const output = '中'.repeat(128 * 1024 - 1) + '🧋';
     const messages = mergeEvent([], { method: 'item/completed', params: { turnId: 't', item: { id: 'large', type: 'claudeToolCall', tool: 'Write', status: 'failed', arguments: { content: 'x'.repeat(4 * 1024 * 1024) }, output } } }, 's');

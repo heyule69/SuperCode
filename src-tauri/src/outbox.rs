@@ -217,7 +217,7 @@ pub async fn followup_capabilities(
     app: AppHandle,
 ) -> Result<serde_json::Value, String> {
     let session = app.state::<AppState>().store.session(&session_id)?;
-    let mode = if session.agent == "opencode" {
+    let mode = if matches!(session.agent.as_str(), "opencode" | "gemini") {
         app.state::<AppState>()
             .native
             .steering_mode(&session.id)
@@ -330,7 +330,7 @@ pub async fn steer_followup(
     drop(_gate);
     let native_mode = session.agent == "claude"
         || session.agent == "pi"
-        || (session.agent == "opencode"
+        || (matches!(session.agent.as_str(), "opencode" | "gemini")
             && app
                 .state::<AppState>()
                 .native

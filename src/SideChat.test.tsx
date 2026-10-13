@@ -40,6 +40,53 @@ async function render(draft:SideDraft, options:Partial<ComponentProps<typeof Sid
   await act(async()=>root.render(<SideChat draft={draft} projectId="" agent="pi" connectionId={draft.connectionId??'@local'} defaults={defaults} close={()=>{}} opened={()=>{}} openFile={()=>{}} showDiff={()=>{}} providerRequired={providerRequired} {...options}/>));
 }
 async function send() {await act(async()=>{container.querySelector('form')!.dispatchEvent(new Event('submit',{bubbles:true,cancelable:true}));});}
+it('sends a Gemini side chat with its own name and approval mode while keeping other Agent permissions separate', async () => {
+  missing = false;
+  localStorage.setItem('supercode.execution-permissions.v1', JSON.stringify({ claude: 'full' }));
+  await render({ key: 'gemini-draft', text: 'Gemini 侧边任务', connectionId: 'gemini-api' }, { agent: 'gemini' });
+  expect(container.querySelector('.side-chat-agent')!.textContent).toBe('Gemini CLI');
+  expect(container.querySelector('.side-chat-agent img')!.getAttribute('src')).toBe('/brands/google.png');
+  await act(async () => container.querySelector<HTMLButtonElement>('[aria-label="侧边聊天权限模式"]')!.click());
+  const options = [...container.querySelectorAll<HTMLButtonElement>('[role="menuitemradio"]')];
+  expect(options.map(option => option.querySelector('strong')!.textContent)).toEqual(['只读', '请求批准', '完全访问权限']);
+  await act(async () => options.find(option => option.querySelector('strong')!.textContent === '请求批准')!.click());
+  await send();
+  expect(call).toHaveBeenCalledWith('check_chat_connection', { agent: 'gemini', connectionId: 'gemini-api', sessionId: null });
+  expect(call).toHaveBeenCalledWith('create_session', expect.objectContaining({ agent: 'gemini', connectionId: 'gemini-api' }));
+  expect(call).toHaveBeenCalledWith('enqueue_followup', expect.objectContaining({ payload: expect.objectContaining({ text: 'Gemini 侧边任务', permissionMode: 'ask', readOnly: false }) }));
+  expect(JSON.parse(localStorage.getItem('supercode.execution-permissions.v1')!)).toEqual({ claude: 'full', gemini: 'ask' });
+});
+it.each([
+  ['D:/外部目录/报告.pdf','open','打开文件'],
+  ['D:/外部目录/记录.md','reveal','在文件夹中显示'],
+  ['../其他目录/报告.pdf','open','打开文件'],
+  ['../其他目录/记录.md','reveal','在文件夹中显示'],
+] as const)('opens %s through its own side-chat workspace when requesting %s',async(path,action,label)=>{
+  missing=false;
+  const base=vi.mocked(call).getMockImplementation()!;
+  vi.mocked(call).mockImplementation(async(command,args={})=>command==='list_messages'?[{id:'outside',seq:1,sessionId:'side',role:'assistant',kind:'agentMessage',text:`[查看文件](<${path}>)`,data:{status:'completed'}}]:base(command,args));
+  await render({key:'draft',text:'开始侧边聊天'},{projectId:'main-project'});await send();
+  await act(async()=>{await vi.dynamicImportSettled();});
+  const link=container.querySelector<HTMLAnchorElement>('a.markdown-link')!;
+  expect(link).not.toBeNull();
+  await act(async()=>link.dispatchEvent(new MouseEvent('contextmenu',{bubbles:true,cancelable:true,clientX:20,clientY:20})));
+  const item=[...document.querySelectorAll<HTMLButtonElement>('[role="menuitem"]')].find(button=>button.textContent===label)!;
+  expect(item.disabled).toBe(false);
+  await act(async()=>item.click());
+  expect(call).toHaveBeenCalledWith('open_project_path',{projectId:'',sessionId:'side',path,action});
+  expect(container.querySelector('.resource-action-error')).toBeNull();
+  expect(call).not.toHaveBeenCalledWith('interrupt_turn',expect.anything());
+});
+it('previews an external text file and keeps its line and side-chat owner',async()=>{
+  missing=false;
+  const base=vi.mocked(call).getMockImplementation()!,openFile=vi.fn();
+  vi.mocked(call).mockImplementation(async(command,args={})=>command==='list_messages'?[{id:'outside',seq:1,sessionId:'side',role:'assistant',kind:'agentMessage',text:'[查看源码](<D:/外部目录/源文件.ts:24>)',data:{status:'completed'}}]:base(command,args));
+  await render({key:'draft',text:'开始侧边聊天'},{projectId:'main-project',openFile});await send();
+  await act(async()=>{await vi.dynamicImportSettled();});
+  await act(async()=>container.querySelector<HTMLAnchorElement>('a.markdown-link')!.click());
+  expect(openFile).toHaveBeenCalledWith('D:/外部目录/源文件.ts',24,'side');
+  expect(call).not.toHaveBeenCalledWith('open_project_path',expect.anything());
+});
 it('blocks Enter while a side model switch is pending and uses the new model afterwards', async () => {
   missing = false;
   const base = vi.mocked(call).getMockImplementation()!; let finish!: (session: Session) => void;

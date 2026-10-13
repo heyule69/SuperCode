@@ -214,18 +214,19 @@ impl Store {
                     .map_err(|_| "本地配置 JSON 无效")?,
             });
         }
-        let orders: std::collections::HashMap<_, _> = ["claude", "codex", "opencode", "pi"]
-            .into_iter()
-            .map(|agent| {
-                let ranks: std::collections::HashMap<_, _> =
-                    crate::connection_order::order(&conn, agent)?
-                        .into_iter()
-                        .enumerate()
-                        .map(|(rank, id)| (id, rank))
-                        .collect();
-                Ok((agent, ranks))
-            })
-            .collect::<Result<_>>()?;
+        let orders: std::collections::HashMap<_, _> =
+            ["claude", "codex", "opencode", "pi", "gemini"]
+                .into_iter()
+                .map(|agent| {
+                    let ranks: std::collections::HashMap<_, _> =
+                        crate::connection_order::order(&conn, agent)?
+                            .into_iter()
+                            .enumerate()
+                            .map(|(rank, id)| (id, rank))
+                            .collect();
+                    Ok((agent, ranks))
+                })
+                .collect::<Result<_>>()?;
         profiles.sort_by_cached_key(|p| {
             (
                 p.agent.clone(),
@@ -300,9 +301,49 @@ impl Store {
         Ok(true)
     }
     pub fn import_profiles(&self, profiles: &[crate::ccswitch::Profile]) -> Result<()> {
+        self.write_profiles(profiles, false, None)
+    }
+    pub fn save_profile(
+        &self,
+        profile: &crate::ccswitch::Profile,
+        expected: Option<&crate::ccswitch::Profile>,
+    ) -> Result<()> {
+        self.write_profiles(std::slice::from_ref(profile), true, expected)
+    }
+    fn write_profiles(
+        &self,
+        profiles: &[crate::ccswitch::Profile],
+        compare: bool,
+        expected: Option<&crate::ccswitch::Profile>,
+    ) -> Result<()> {
         let mut conn = self.0.lock().map_err(|e| e.to_string())?;
         let tx = conn.transaction().map_err(|e| e.to_string())?;
         for profile in profiles {
+            if compare {
+                let row: Option<(String, String, String)> = tx
+                    .query_row(
+                        "SELECT agent,name,config FROM agent_profiles WHERE id=?1",
+                        [&profile.id],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    )
+                    .optional()
+                    .map_err(|e| e.to_string())?;
+                let unchanged = match (expected, row) {
+                    (None, None) => true,
+                    (Some(expected), Some((agent, name, raw))) => {
+                        expected.id == profile.id
+                            && expected.agent == agent
+                            && expected.name == name
+                            && expected.config
+                                == serde_json::from_str::<Value>(&crate::credentials::open(&raw)?)
+                                    .map_err(|_| "本地配置 JSON 无效")?
+                    }
+                    _ => false,
+                };
+                if !unchanged {
+                    return Err("连接已被其他窗口修改或删除，请刷新后再保存".into());
+                }
+            }
             // Claiming a turn uses the same Store lock. Check inside this
             // transaction so a concurrent send cannot start between the guard
             // and the update, and an import batch fails without partial edits.
@@ -315,27 +356,44 @@ impl Store {
                 )
                 .map_err(|e| e.to_string())?;
             if bound > 0 {
-                let (agent, raw): (String, String) = tx
+                let old: Option<(String, String)> = tx
                     .query_row(
                         "SELECT agent,config FROM agent_profiles WHERE id=?1",
                         [&profile.id],
                         |r| Ok((r.get(0)?, r.get(1)?)),
                     )
+                    .optional()
                     .map_err(|e| e.to_string())?;
-                let old = crate::ccswitch::Profile {
-                    id: profile.id.clone(),
-                    agent,
-                    name: String::new(),
-                    config: serde_json::from_str(&crate::credentials::open(&raw)?)
-                        .map_err(|_| "已保存连接格式无效")?,
-                };
-                if crate::session_config::routing_identity(&old)
-                    != crate::session_config::routing_identity(profile)
+                let foreign: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM sessions WHERE connection_id=?1 AND agent<>?2)", params![profile.id,profile.agent], |row| row.get(0)).map_err(|e| e.to_string())?;
+                if foreign
+                    || old
+                        .as_ref()
+                        .is_some_and(|(agent, _)| agent != &profile.agent)
                 {
-                    return Err(
-                        "此连接已绑定聊天。更换供应商、API 地址或协议请添加新连接；密钥仍可更新"
-                            .into(),
-                    );
+                    return Err("连接已绑定聊天，不能更换 Agent，请新增连接".into());
+                }
+                let changed = if let Some((agent, raw)) = old {
+                    let old = crate::ccswitch::Profile {
+                        id: profile.id.clone(),
+                        agent,
+                        name: String::new(),
+                        config: serde_json::from_str(&crate::credentials::open(&raw)?)
+                            .map_err(|_| "已保存连接格式无效")?,
+                    };
+                    crate::session_config::routing_identity(&old)
+                        != crate::session_config::routing_identity(profile)
+                } else {
+                    true
+                };
+                if changed {
+                    // Idle chats keep their visible history and compression
+                    // checkpoints. The next send creates a native session and
+                    // injects portable history through the existing handoff.
+                    tx.execute(
+                        "UPDATE sessions SET native_id=NULL,turn_id=NULL WHERE connection_id=?1",
+                        [&profile.id],
+                    )
+                    .map_err(|e| e.to_string())?;
                 }
             }
             let config = crate::credentials::seal(&profile.config.to_string())?;
@@ -385,6 +443,67 @@ impl Store {
         .map_err(|e| e.to_string())?;
         tx.execute("DELETE FROM agent_profiles WHERE id=?1", [id])
             .map_err(|e| e.to_string())?;
+        crate::connection_order::reconcile(&tx)?;
+        tx.commit().map_err(|e| e.to_string())
+    }
+    pub fn delete_profiles(&self, agent: &str, ids: &[String]) -> Result<()> {
+        if !matches!(agent, "claude" | "codex" | "opencode" | "pi" | "gemini") {
+            return Err("Agent 无效".into());
+        }
+        let unique: std::collections::HashSet<_> = ids.iter().collect();
+        if ids.is_empty()
+            || ids.len() > 500
+            || unique.len() != ids.len()
+            || ids
+                .iter()
+                .any(|id| id.is_empty() || matches!(id.as_str(), "@local" | "@official"))
+        {
+            return Err("请选择有效且不重复的供应商连接".into());
+        }
+        let mut conn = self.0.lock().map_err(|e| e.to_string())?;
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        // Validate the whole batch under the same lock that claims turns. No
+        // selected row is removed when another row is busy or belongs elsewhere.
+        for id in ids {
+            let owner: Option<(String, String, String)> = tx
+                .query_row(
+                    "SELECT agent,name,config FROM agent_profiles WHERE id=?1",
+                    [id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()
+                .map_err(|e| e.to_string())?;
+            if owner.as_ref().map(|(agent, _, _)| agent.as_str()) != Some(agent) {
+                return Err("连接不存在或不属于当前 Agent，请刷新供应商列表".into());
+            }
+            let (owner, name, raw) = owner.unwrap();
+            let profile = crate::ccswitch::Profile {
+                id: id.clone(),
+                agent: owner,
+                name,
+                config: serde_json::from_str(&crate::credentials::open(&raw)?)
+                    .map_err(|_| "本地配置 JSON 无效")?,
+            };
+            if profile.is_official() {
+                return Err("官方账号请通过账号管理移除，不能批量删除供应商连接".into());
+            }
+            ensure_connection_idle(&tx, id)?;
+        }
+        for id in ids {
+            tx.execute(
+                "DELETE FROM agent_profiles WHERE id=?1 AND agent=?2",
+                params![id, agent],
+            )
+            .map_err(|e| e.to_string())?;
+            tx.execute(
+                "DELETE FROM settings WHERE key=?1 AND value=?2",
+                params![format!("profile_{agent}"), id],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        // Keep historical chats and their binding. route_for reports a missing
+        // connection and asks the user to choose a model rather than silently
+        // routing those chats through another provider or credential.
         crate::connection_order::reconcile(&tx)?;
         tx.commit().map_err(|e| e.to_string())
     }
@@ -545,7 +664,7 @@ impl Store {
         if !root.is_absolute() {
             return Err("聊天目录必须是绝对路径".into());
         }
-        if !matches!(agent, "codex" | "claude" | "opencode" | "pi") {
+        if !matches!(agent, "codex" | "claude" | "opencode" | "pi" | "gemini") {
             return Err("该 Agent 尚未接入执行".into());
         }
         let connection = match connection_id {
@@ -591,7 +710,7 @@ impl Store {
         agent: &str,
         connection_id: Option<&str>,
     ) -> Result<Session> {
-        if !matches!(agent, "codex" | "claude" | "opencode" | "pi") {
+        if !matches!(agent, "codex" | "claude" | "opencode" | "pi" | "gemini") {
             return Err("该 Agent 尚未接入执行".into());
         }
         self.project(project_id)?;
@@ -1448,7 +1567,7 @@ mod tests {
     fn separately_reported_context_and_billing_restore_for_every_agent() {
         let store = Store::from_connection(Connection::open_in_memory().unwrap()).unwrap();
         let project = store.add_project(Path::new("D:/usage-fixture")).unwrap();
-        for agent in ["claude", "codex", "opencode", "pi"] {
+        for agent in ["claude", "codex", "opencode", "pi", "gemini"] {
             let session = store
                 .create_configured_session(&project.id, None, agent, Some("@local"))
                 .unwrap();
@@ -1570,6 +1689,207 @@ mod tests {
         }
     }
     #[test]
+    fn idle_route_edits_reset_native_session_but_keep_history_and_summary() {
+        let store = Store::from_connection(Connection::open_in_memory().unwrap()).unwrap();
+        let original = connection_fixture("editable", "pi");
+        store.import_profiles(&[original.clone()]).unwrap();
+        let project = store
+            .add_project(Path::new("D:/route-edit-fixture"))
+            .unwrap();
+        let chat = store
+            .create_configured_session(
+                &project.id,
+                Some("fixture-model".into()),
+                "pi",
+                Some("editable"),
+            )
+            .unwrap();
+        store.bind_native(&chat.id, "original-native").unwrap();
+        store
+            .save_message(
+                "history",
+                &chat.id,
+                "user",
+                "keep my goal",
+                "userMessage",
+                &serde_json::json!({}),
+            )
+            .unwrap();
+        store.0.lock().unwrap().execute("INSERT INTO session_context(session_id,summary,through_seq) VALUES(?1,'preserved summary',1)", [&chat.id]).unwrap();
+        let mut edit = original.clone();
+        edit.name = "renamed".into();
+        edit.config["apiKey"] = "new-key".into();
+        store.import_profiles(&[edit.clone()]).unwrap();
+        assert_eq!(
+            store.session(&chat.id).unwrap().native_id.as_deref(),
+            Some("original-native")
+        );
+        edit.config["protocol"] = "gemini".into();
+        edit.config["baseUrl"] = "https://gateway.example/v1beta".into();
+        store.import_profiles(&[edit.clone()]).unwrap();
+        let saved = store.session(&chat.id).unwrap();
+        assert!(saved.native_id.is_none());
+        assert!(saved.turn_id.is_none());
+        assert_eq!(saved.connection_id.as_deref(), Some("editable"));
+        assert_eq!(saved.model, chat.model);
+        assert_eq!(
+            store.messages(&chat.id, None).unwrap()[0].text,
+            "keep my goal"
+        );
+        assert!(store
+            .compressed_context(&chat.id)
+            .unwrap()
+            .unwrap()
+            .contains("preserved summary"));
+        assert_eq!(
+            store.route("pi", Some(&chat.id)).unwrap().config,
+            edit.config
+        );
+        store.bind_native(&chat.id, "updated-native").unwrap();
+        store.claim(&chat.id).unwrap();
+        edit.config["protocol"] = "chat".into();
+        assert!(store
+            .import_profiles(&[connection_fixture("new", "pi"), edit])
+            .is_err());
+        assert!(store.profile("pi", "new").unwrap().is_none());
+        assert_eq!(
+            store.session(&chat.id).unwrap().native_id.as_deref(),
+            Some("updated-native")
+        );
+        assert_eq!(
+            store.profile("pi", "editable").unwrap().unwrap().config["protocol"],
+            "gemini"
+        );
+    }
+    #[test]
+    fn profile_saves_compare_existing_config_and_never_resurrect_deleted_credentials() {
+        let store = Store::from_connection(Connection::open_in_memory().unwrap()).unwrap();
+        let original = connection_fixture("saved", "pi");
+        store.save_profile(&original, None).unwrap();
+        let project = store
+            .add_project(Path::new("D:/compare-and-save-fixture"))
+            .unwrap();
+        let chat = store
+            .create_configured_session(&project.id, None, "pi", Some("saved"))
+            .unwrap();
+        store.bind_native(&chat.id, "native-before-delete").unwrap();
+        let mut draft = original.clone();
+        draft.name = "stale edit".into();
+        let mut newer = original.clone();
+        newer.config["apiKey"] = "other-window-key".into();
+        store.save_profile(&newer, Some(&original)).unwrap();
+        assert!(store
+            .save_profile(&draft, Some(&original))
+            .unwrap_err()
+            .contains("其他窗口"));
+        assert_eq!(
+            store.profile("pi", "saved").unwrap().unwrap().config["apiKey"],
+            "other-window-key"
+        );
+        store.delete_profiles("pi", &["saved".into()]).unwrap();
+        assert!(store.save_profile(&draft, Some(&original)).is_err());
+        assert!(store.profile("pi", "saved").unwrap().is_none());
+        // Explicit import remains an upsert chosen by the user.
+        store.import_profiles(&[draft.clone()]).unwrap();
+        assert!(store.profile("pi", "saved").unwrap().is_some());
+        assert!(store.session(&chat.id).unwrap().native_id.is_none());
+        assert!(store.save_profile(&original, None).is_err());
+    }
+    #[test]
+    fn official_account_in_batch_prevents_all_connection_deletions() {
+        let store = Store::from_connection(Connection::open_in_memory().unwrap()).unwrap();
+        let api = connection_fixture("api", "codex");
+        let account = crate::ccswitch::Profile {
+            id: "account".into(),
+            agent: "codex".into(),
+            name: "account".into(),
+            config: serde_json::json!({"official":true,"accountId":"official-fixture","model":"fixture-model"}),
+        };
+        store.import_profiles(&[api, account]).unwrap();
+        let order = store.connection_orders().unwrap();
+        assert!(store
+            .delete_profiles("codex", &["api".into(), "account".into()])
+            .unwrap_err()
+            .contains("账号管理"));
+        assert!(store.profile("codex", "api").unwrap().is_some());
+        assert!(store.profile("codex", "account").unwrap().is_some());
+        assert_eq!(store.connection_orders().unwrap(), order);
+    }
+    #[test]
+    fn batch_provider_delete_is_atomic_keeps_history_and_reconciles_all_defaults() {
+        for agent in ["claude", "codex", "opencode", "pi", "gemini"] {
+            let store = Store::from_connection(Connection::open_in_memory().unwrap()).unwrap();
+            let a = connection_fixture("a", agent);
+            let b = connection_fixture("b", agent);
+            let other = connection_fixture("foreign", if agent == "pi" { "codex" } else { "pi" });
+            store.import_profiles(&[a, b, other]).unwrap();
+            store.select_profile(agent, Some("a")).unwrap();
+            let project = store
+                .add_project(Path::new("D:/batch-delete-fixture"))
+                .unwrap();
+            let chat = store
+                .create_configured_session(
+                    &project.id,
+                    Some("fixture-model".into()),
+                    agent,
+                    Some("a"),
+                )
+                .unwrap();
+            store
+                .save_message(
+                    "original-message",
+                    &chat.id,
+                    "assistant",
+                    "keep historical content",
+                    "text",
+                    &serde_json::json!({}),
+                )
+                .unwrap();
+            let order = store.connection_orders().unwrap();
+            for ids in [
+                vec!["a".into(), "foreign".into()],
+                vec!["a".into(), "missing".into()],
+                vec!["a".into(), "a".into()],
+                vec!["a".into(), "@local".into()],
+            ] {
+                assert!(store.delete_profiles(agent, &ids).is_err());
+                assert!(store.profile(agent, "a").unwrap().is_some());
+                assert_eq!(store.connection_orders().unwrap(), order);
+            }
+            for status in ["starting", "running", "waiting"] {
+                store.set_status(&chat.id, status, Some("turn")).unwrap();
+                assert!(store
+                    .delete_profiles(agent, &["b".into(), "a".into()])
+                    .unwrap_err()
+                    .contains("运行中的任务"));
+                assert!(store.profile(agent, "b").unwrap().is_some());
+            }
+            store.set_status(&chat.id, "idle", None).unwrap();
+            store
+                .delete_profiles(agent, &["a".into(), "b".into()])
+                .unwrap();
+            assert!(store.profile(agent, "a").unwrap().is_none());
+            assert!(store.profile(agent, "b").unwrap().is_none());
+            assert!(store.active_profile(agent).unwrap().is_none());
+            assert!(store.connection_orders().unwrap()[agent]
+                .iter()
+                .all(|id| id != "a" && id != "b"));
+            assert_eq!(
+                store.session(&chat.id).unwrap().connection_id.as_deref(),
+                Some("a")
+            );
+            assert!(store
+                .route(agent, Some(&chat.id))
+                .err()
+                .unwrap()
+                .contains("已删除或不匹配"));
+            assert_eq!(
+                store.messages(&chat.id, None).unwrap()[0].text,
+                "keep historical content"
+            );
+        }
+    }
+    #[test]
     fn active_connection_is_locked_while_other_connections_remain_editable() {
         for agent in ["codex", "claude", "opencode", "pi"] {
             let store = Store::from_connection(Connection::open_in_memory().unwrap()).unwrap();
@@ -1638,12 +1958,9 @@ mod tests {
                 store.profile(agent, &active.id).unwrap().unwrap().config["apiKey"],
                 "new-key"
             );
-            // Inactive history still pins routing identity and connection existence.
+            // Inactive history allows rerouting through a fresh native session.
             active_edit.config["baseUrl"] = "https://another.example.test/v1".into();
-            assert!(store
-                .import_profiles(&[active_edit])
-                .unwrap_err()
-                .contains("已绑定聊天"));
+            store.import_profiles(&[active_edit]).unwrap();
             assert!(store
                 .delete_profile(&active.id)
                 .unwrap_err()

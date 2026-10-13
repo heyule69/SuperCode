@@ -1,4 +1,4 @@
-//! On-demand stable release checks. Four small cache entries, no agent startup.
+//! On-demand stable release checks. Small bounded cache entries, no agent startup.
 use crate::agents::IDS;
 use futures_util::{future::join_all, StreamExt};
 use semver::Version;
@@ -23,7 +23,7 @@ struct Cached {
 pub struct Versions {
     http: reqwest::Client,
     cache: Mutex<BTreeMap<String, Cached>>,
-    fetches: [Mutex<()>; 4],
+    fetches: [Mutex<()>; IDS.len()],
 }
 impl Default for Versions {
     fn default() -> Self {
@@ -46,6 +46,7 @@ pub fn package_name(id: &str) -> Result<&'static str, String> {
         "claude" => Ok("@anthropic-ai/claude-code"),
         "opencode" => Ok("opencode-ai"),
         "pi" => Ok("@earendil-works/pi-coding-agent"),
+        "gemini" => Ok("@google/gemini-cli"),
         _ => Err("Agent 无效".into()),
     }
 }

@@ -12,7 +12,7 @@ import type { AgentProfile, ModelCatalog, ModelSource, PermissionMode } from './
 import { compatiblePermission, loadExecutionPermissionChoices, planExecutionPermission } from './permissions';
 
 const emptyProfiles: AgentProfile[] = [];
-const agentNames: Record<string, string> = { claude: 'Claude Code', codex: 'Codex', opencode: 'OpenCode', pi: 'Pi' };
+const agentNames: Record<string, string> = { claude: 'Claude Code', codex: 'Codex', opencode: 'OpenCode', pi: 'Pi', gemini: 'Gemini CLI' };
 import { createChatSession } from './chatSession';
 import { isProviderRequired, requireChatConnection } from './chatConnection';
 import { planFollowup, type PlanDecision } from './planPresentation';
@@ -56,6 +56,7 @@ export default function SideChat({draft,projectId,agent,connectionId,defaults,cl
   useEffect(()=>()=>{if(pendingConnections.current.size){pendingConnections.current.clear();pendingChanged.current?.(null);}},[]);
   const { messages, requests, refresh, resolve: resolveRequest } = useSideChatRecovery(current, setSession, report);
   const openSessionFile = useCallback((path:string,line?:number)=>openFile(path,line,session?.id),[openFile,session?.id]);
+  const openSessionPath = useCallback((path:string,action:'open'|'reveal')=>call<void>('open_project_path',{projectId:session?.id?'':projectId,sessionId:session?.id??null,path,action}),[projectId,session?.id]);
   function savedDraft():SideDraft{return {...draft,text:inputRef.current,connectionId:selection,payload:options.current,sourceId:source.current};}
   function updateOptions(next:FollowupPayload){options.current=next;setPayload(next);}
   function permission(mode:PermissionMode){
@@ -161,7 +162,7 @@ export default function SideChat({draft,projectId,agent,connectionId,defaults,cl
       {!embedded ? <button className="icon-button" aria-label="关闭侧边聊天" title="关闭侧边聊天" onClick={()=>{if(session)opened(session);close();}}><X size={16}/></button> : null}
     </header>
     <div className="side-chat-scroll" ref={area} onClickCapture={e=>{if((e.target as Element).closest('.turn-process-toggle, .activity-group-summary, .activity-row, .activity-toggle-more'))stickToBottom.current=false;}} onScroll={()=>{const el=area.current;if(el)stickToBottom.current=el.scrollHeight-el.scrollTop-el.clientHeight<100;}}>
-      {messages.length||busy?<Conversation messages={messages} agentName={agentName} autoExpand={false} projectId={projectId} sessionId={session?.id} sessionStatus={sending&&!isActive(session?.status)?'starting':session?.status} pendingLabel={sending&&!isActive(session?.status)?'正在发送…':undefined} activeTurnId={session?.turnId} openFile={openSessionFile} showDiff={showDiff} onPlanAction={agent==='codex' && !busy && !configuring && !followups.rows.length ? respondPlan : undefined}/>
+      {messages.length||busy?<Conversation messages={messages} agentName={agentName} autoExpand={false} projectId={projectId} sessionId={session?.id} sessionStatus={sending&&!isActive(session?.status)?'starting':session?.status} pendingLabel={sending&&!isActive(session?.status)?'正在发送…':undefined} activeTurnId={session?.turnId} openFile={openSessionFile} openPath={openSessionPath} showDiff={showDiff} onPlanAction={agent==='codex' && !busy && !configuring && !followups.rows.length ? respondPlan : undefined}/>
         :<div className="side-chat-welcome"><MessageSquare size={24} strokeWidth={1.5}/><h2>继续探讨</h2><p>围绕选中内容开启一个独立对话</p></div>}
       {requests.filter(r=>r.method!=='item/tool/requestUserInput').map(r=><Suspense key={String(r.id)} fallback={<p>正在加载确认请求…</p>}><RequestCard request={r} respond={result=>respondRequest(r,result)} openFile={openSessionFile} messages={messages}/></Suspense>)}
     </div>

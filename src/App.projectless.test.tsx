@@ -78,7 +78,7 @@ it('does not resurrect a resolved approval when initial recovery returns late', 
   expect(container.querySelector('.request-card')).toBeNull();
 });
 
-it.each(['pi','opencode'])('rebinds %s provisional native startup and keeps its boot approval visible by exact owner', async agent => {
+it.each(['pi','opencode','gemini'])('rebinds %s provisional native startup and keeps its boot approval visible by exact owner', async agent => {
   localStorage.setItem('supercode.session','native-chat');
   data.sessions = [{id:'native-chat',projectId:'existing',title:'原生启动',agent,connectionId:`api:${agent}`,model:'test-model',status:'starting',nativeId:'boot-native',turnId:null,updatedAt:1}];
   data.profiles.push({id:`api:${agent}`,agent,name:'Native API',model:'test-model',hasCredential:true,current:true});
@@ -460,7 +460,7 @@ it('releases a delayed edit reservation that arrives after the window has alread
   expect(rows[0].status).toBe('queued');
 });
 
-it.each(['claude', 'codex', 'opencode', 'pi'])('starts two %s sessions before either startup finishes without queuing or crossing events', async agent => {
+it.each(['claude', 'codex', 'opencode', 'pi', 'gemini'])('starts two %s sessions before either startup finishes without queuing or crossing events', async agent => {
   localStorage.setItem('supercode.session', 'a');
   data.profiles = [{ ...data.profiles[0], id:`api:${agent}`, agent }];
   data.sessions = ['a', 'b'].map(id => ({ id, projectId:'existing', title:`会话 ${id}`, agent, connectionId:`api:${agent}`, model:'test-model', nativeId:null, status:'idle', turnId:null, updatedAt:1 }));
@@ -503,7 +503,7 @@ it.each(['claude', 'codex', 'opencode', 'pi'])('starts two %s sessions before ei
 
 it('allows a new conversation and Agent selection while other conversations are running or waiting', async () => {
   localStorage.setItem('supercode.session', 'a');
-  data.agents = ['claude','codex','opencode','pi'].map(id => ({id, name:id, installed:true, path:'agent.exe', connected:true}));
+  data.agents = ['claude','codex','opencode','pi','gemini'].map(id => ({id, name:id, installed:true, path:'agent.exe', connected:true}));
   data.profiles = data.agents.map(a => ({ ...data.profiles[0], id:`api:${a.id}`, agent:a.id }));
   data.sessions = ['a','b'].map((id, n) => ({id,projectId:'existing',title:`运行中的 ${id}`,agent:'claude',connectionId:'api:claude',model:'test-model',nativeId:`native-${id}`,status:n?'waiting':'running',turnId:`t-${id}`,updatedAt:1}));
   await render();
@@ -546,7 +546,7 @@ it('starts fresh chats concurrently and restores a pending bubble when returning
   await act(async () => { finish.get('new-1')!(); finish.get('new-2')!(); });
 });
 
-it.each(['claude','codex','opencode','pi'])('shows the submitted %s message before connection checks, session creation and native startup finish', async agent => {
+it.each(['claude','codex','opencode','pi','gemini'])('shows the submitted %s message before connection checks, session creation and native startup finish', async agent => {
   localStorage.setItem('supercode.agent', agent);
   data.profiles = [{...data.profiles[0], id:`api:${agent}`, agent}];
   let finishCheck!: () => void, finishCreate!: () => void, finishSend!: () => void;
@@ -664,7 +664,7 @@ it('does not turn an accepted send into a retry draft when the subsequent histor
   expect(container.querySelector('[aria-label="你的消息"]')?.textContent).toContain('已经发送的消息');
   expect(container.querySelector<HTMLTextAreaElement>('.composer textarea')?.value).toBe('');
 });
-it.each(['claude', 'codex', 'opencode', 'pi'] as const)('shows persisted, live and completed context without a guessed model capacity for %s', async agent => {
+it.each(['claude', 'codex', 'opencode', 'pi', 'gemini'] as const)('shows persisted, live and completed context without a guessed model capacity for %s', async agent => {
   localStorage.setItem('supercode.session', 'context-chat');
   data.sessions = [{ id: 'context-chat', projectId: 'existing', title: '上下文测试', agent, connectionId: `api:${agent}`, model: 'provider-specific-model', nativeId: 'native-context', status: 'running', turnId: 'turn-context', updatedAt: 1 }];
   let tokens = 12345;
@@ -901,6 +901,22 @@ it('shares right-side tabs without remounting the browser and collapses the last
   expect(call).not.toHaveBeenCalledWith('interrupt_turn',expect.anything());
   media.mockRestore();
 });
+it('previews an explicitly referenced external file with its line without changing the current chat', async () => {
+  localStorage.setItem('supercode.session', 'preview-chat');
+  data.sessions = [{ id: 'preview-chat', projectId: 'existing', title: '文件预览', agent: 'claude', connectionId: 'api:claude', model: 'test-model', status: 'idle', nativeId: null, turnId: null, updatedAt: 1 }];
+  messages = [{ id: 'reference', seq: 1, sessionId: 'preview-chat', role: 'assistant', kind: 'agentMessage', text: '[查看报告](<D:/外部目录 with spaces/报告.md:7>)', data: { status: 'completed' } }];
+  const base = vi.mocked(call).getMockImplementation()!;
+  vi.mocked(call).mockImplementation(async (command, args = {}) => command === 'read_project_file' ? '1\n2\n3\n4\n5\n6\n目录外文件内容' : base(command, args));
+  await render(); await act(async () => { await vi.dynamicImportSettled(); });
+  await act(async () => container.querySelector<HTMLAnchorElement>('a.markdown-link')!.click());
+  await act(async () => { await vi.dynamicImportSettled(); });
+  expect(call).toHaveBeenCalledWith('read_project_file', { projectId: 'existing', sessionId: 'preview-chat', path: 'D:/外部目录 with spaces/报告.md' });
+  expect(container.querySelector('.document-panel .source-selected')?.textContent).toContain('目录外文件内容');
+  expect(container.querySelector('.document-panel .error-banner')).toBeNull();
+  expect(localStorage.getItem('supercode.session')).toBe('preview-chat');
+  expect(call).not.toHaveBeenCalledWith('interrupt_turn', expect.anything());
+});
+
 it.each(['close','switch'] as const)('does not reopen or select a delayed file after the user chooses to %s its view',async action=>{
   localStorage.setItem('supercode.context','true');localStorage.setItem('supercode.workspace-view','files');localStorage.setItem('supercode.session','slow-file');
   data.sessions=[{id:'slow-file',projectId:'existing',title:'慢文件',agent:'claude',connectionId:'api:claude',model:'test-model',status:'running',nativeId:'native',turnId:'t',updatedAt:1}];
@@ -973,7 +989,7 @@ it('starts an unbound draft from the direct chat section even when a project is 
   expect(call).not.toHaveBeenCalledWith('create_session', expect.anything());
 });
 
-it.each(['claude','codex','opencode','pi'])('prompts before creating or sending an unconfigured %s conversation, with an actionable supplier tab', async agent => {
+it.each(['claude','codex','opencode','pi','gemini'])('prompts before creating or sending an unconfigured %s conversation, with an actionable supplier tab', async agent => {
   localStorage.setItem('supercode.agent',agent); data.profiles = []; providerMissing = true;
   await render();
   expect(container.querySelector('[role="dialog"]')).toBeNull();
@@ -1050,7 +1066,7 @@ it('keeps empty idle and starting chats in disabled send mode until a turn exist
   expect(call).not.toHaveBeenCalledWith('interrupt_turn',expect.anything());
 });
 
-it.each(['codex','claude','opencode','pi'])('does not show a stop icon for an empty %s chat without an active turn',async agent=>{
+it.each(['codex','claude','opencode','pi','gemini'])('does not show a stop icon for an empty %s chat without an active turn',async agent=>{
   localStorage.setItem('supercode.session','starting');
   data.sessions=[{id:'starting',projectId:'existing',title:'正在启动',agent,connectionId:'@local',model:'test-model',status:'starting',nativeId:null,turnId:null,updatedAt:1}];
   await render();
@@ -1094,6 +1110,40 @@ it('keeps local help usable without a supplier and permits retrying the draft af
   await send();
   expect(call).toHaveBeenCalledWith('create_session',expect.objectContaining({connectionId:'api:claude'}));
   expect(call).toHaveBeenCalledWith('send_chat_message',expect.objectContaining({text:'待配置后发送'}));
+});
+
+it('selects the connected Gemini Agent and opens its model supplier tab without borrowing another account', async () => {
+  data.agents = [{ id: 'claude', name: 'Claude Code', installed: true, path: 'claude.exe', connected: true }, { id: 'gemini', name: 'Gemini CLI', installed: true, path: 'gemini.exe', connected: true }];
+  data.profiles.push({ id: 'api:gemini', agent: 'gemini', name: 'Gemini API', model: 'gemini-test', hasCredential: true, current: true });
+  await render(); await act(async () => container.querySelector<HTMLButtonElement>('[aria-label="Agent"]')!.click());
+  const option = [...container.querySelectorAll<HTMLButtonElement>('[aria-label="选择 Agent"] [role="menuitemradio"]')].find(button => button.textContent?.includes('Gemini CLI'))!;
+  expect(option.textContent).toContain('Gemini API');
+  await act(async () => option.click());
+  expect(container.querySelector('[aria-label="Agent"]')!.textContent).toContain('Gemini CLI');
+  await type('使用 Gemini 执行'); await send();
+  expect(call).toHaveBeenCalledWith('create_session', expect.objectContaining({ agent: 'gemini', connectionId: 'api:gemini' }));
+  expect(call).toHaveBeenCalledWith('send_chat_message', expect.objectContaining({ text: '使用 Gemini 执行', model: 'gemini-test', permissionMode: 'ask' }));
+});
+
+it('sends reported Gemini native commands and shows its correct local status', async () => {
+  localStorage.setItem('supercode.session', 'gemini-chat');
+  data.agents = [{ id: 'gemini', name: 'Gemini CLI', installed: true, path: 'gemini.exe', connected: true }];
+  data.profiles = [{ id: 'api:gemini', agent: 'gemini', name: 'Gemini API', model: 'gemini-test', hasCredential: true, current: true }];
+  data.sessions = [{ id: 'gemini-chat', projectId: 'existing', title: 'Gemini 对话', agent: 'gemini', connectionId: 'api:gemini', model: 'gemini-test', nativeId: 'gemini-native', status: 'idle', turnId: null, updatedAt: 1 }];
+  await render(); await act(async () => notify({ method: 'agent/commands', params: { appSessionId: 'gemini-chat', threadId: 'gemini-native', commands: ['review', 'compact'] } }));
+  await type('/review 当前文件'); await send();
+  expect(call).toHaveBeenCalledWith('send_message', expect.objectContaining({ sessionId: 'gemini-chat', text: '/review 当前文件' }));
+  await type('/status'); await send(); expect(container.textContent).toContain('Gemini CLI ·');
+  expect(call).not.toHaveBeenCalledWith('execute_agent_command', expect.anything());
+});
+
+it('reports unsupported Gemini manual compaction without calling the runtime or clearing the draft', async () => {
+  localStorage.setItem('supercode.agent', 'gemini');
+  await render(); await type('/compact'); await send();
+  expect(container.querySelector('[role="alert"]')!.textContent).toContain('Gemini CLI 当前不支持手动压缩');
+  expect(container.querySelector<HTMLTextAreaElement>('.composer textarea')!.value).toBe('/compact');
+  expect(call).not.toHaveBeenCalledWith('compact_session_context', expect.anything());
+  expect(call).not.toHaveBeenCalledWith('create_session', expect.anything());
 });
 
 it('hides the stale model, supplier icon and quota before sending an unconfigured historical chat', async () => {

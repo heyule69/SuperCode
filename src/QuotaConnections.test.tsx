@@ -24,5 +24,8 @@ describe('large quota connection lists', () => {
     const source = { providerId: 'custom', providerName: 'API', mark: 'A' };
     const claude = { agent: 'claude', connectionId: '@local', connectionName: 'API', source };
     expect(quotaConnectionKey(claude)).not.toBe(quotaConnectionKey({ ...claude, agent: 'pi' }));
+    const gemini = { ...claude, agent: 'gemini' };
+    expect(quotaConnectionKey(claude)).not.toBe(quotaConnectionKey(gemini));
+    expect(renderToStaticMarkup(<QuotaConnections connections={[gemini]} activeKey={quotaConnectionKey(gemini)} choose={() => {}}/>)).toContain('Gemini CLI');
   });
 });
