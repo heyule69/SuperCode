@@ -71,7 +71,22 @@ jobs:
             }
             exit $testExitCode
           }
-      - run: cargo test --locked --manifest-path installer/Cargo.toml --target-dir src-tauri/target
+      - name: Test installer Rust with isolated inputs
+        shell: pwsh
+        run: |
+          node scripts/test-installer-clean.mjs 2>&1 | Tee-Object -FilePath '.supercode/ci/installer-rust.log' -Encoding utf8NoBOM
+          $testExitCode = $LASTEXITCODE
+          if ($testExitCode -ne 0) {
+            $testFailure = Get-Content -LiteralPath '.supercode/ci/installer-rust.log' -Encoding UTF8 | Select-Object -Last 140 | Out-String
+            if ($testFailure.Length -gt 24000) { $testFailure = $testFailure.Substring($testFailure.Length - 24000) }
+            for ($testOffset = 0; $testOffset -lt $testFailure.Length; $testOffset += 3000) {
+              $testChunk = $testFailure.Substring($testOffset, [Math]::Min(3000, $testFailure.Length - $testOffset))
+              $testChunk = $testChunk.Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
+              $testPart = [int]($testOffset / 3000) + 1
+              Write-Output "::error title=Installer Rust test failure part ${testPart}::$testChunk"
+            }
+            exit $testExitCode
+          }
       - run: npm run release:test
       - run: npm run benchmark
       - uses: actions/upload-artifact@v4
