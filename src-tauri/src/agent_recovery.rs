@@ -163,6 +163,18 @@ fn launch(id: &str, text: &str) -> Result<Launch, String> {
     Ok(launch)
 }
 
+fn installation_link(metadata: &fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        metadata.file_attributes() & 0x400 != 0
+    }
+    #[cfg(not(windows))]
+    {
+        metadata.file_type().is_symlink()
+    }
+}
+
 fn managed_root(data: &Path, id: &str, current: &Launch) -> Result<PathBuf, String> {
     let data = agents::ordinary(data.canonicalize().map_err(|_| "Agent 数据目录无效")?);
     let base = agents::ordinary(
@@ -174,19 +186,61 @@ fn managed_root(data: &Path, id: &str, current: &Launch) -> Result<PathBuf, Stri
     if !base.starts_with(&data) {
         return Err("Agent 安装目录越界".into());
     }
-    let candidate = current
+    let saved_candidate = current
         .prefix
         .first()
         .map(Path::new)
         .unwrap_or(&current.program);
+    if !saved_candidate.is_absolute()
+        || saved_candidate
+            .components()
+            .any(|component| matches!(component, Component::ParentDir))
+    {
+        return Err("Agent 安装路径无效".into());
+    }
+    if fs::symlink_metadata(saved_candidate).is_ok_and(|metadata| installation_link(&metadata)) {
+        return Err("Agent 安装目录不能通过链接跳转".into());
+    }
+    // Saved Windows paths may use RUNNER~1, another 8.3 alias, or a verbatim
+    // prefix. Compare resolved locations without rewriting the saved Launch.
+    // Resolve the parent first so a missing/broken current executable can still
+    // recover its installation record; missing ancestors remain invalid.
+    let parent = agents::ordinary(
+        saved_candidate
+            .parent()
+            .ok_or("Agent 安装路径无效")?
+            .canonicalize()
+            .map_err(|_| "Agent 安装路径无效")?,
+    );
+    let candidate = match saved_candidate.canonicalize() {
+        Ok(path) => agents::ordinary(path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            parent.join(saved_candidate.file_name().ok_or("Agent 安装路径无效")?)
+        }
+        Err(_) => return Err("Agent 安装路径无效".into()),
+    };
+    if candidate.parent() != Some(parent.as_path()) {
+        return Err("Agent 安装目录不能通过链接跳转".into());
+    }
     let relative = candidate
         .strip_prefix(&base)
         .map_err(|_| "当前安装不是 SuperCode 管理的版本")?;
-    if relative
-        .components()
-        .any(|component| matches!(component, Component::ParentDir))
-    {
-        return Err("Agent 安装路径无效".into());
+    // Canonicalization must not turn a foreign directory or a linked UUID
+    // installation into a trusted managed installation.
+    let mut through_base = false;
+    for ancestor in saved_candidate.ancestors().skip(1) {
+        let metadata = fs::symlink_metadata(ancestor).map_err(|_| "Agent 安装路径无效")?;
+        if installation_link(&metadata) {
+            return Err("Agent 安装目录不能通过链接跳转".into());
+        }
+        if agents::ordinary(ancestor.canonicalize().map_err(|_| "Agent 安装路径无效")?) == base
+        {
+            through_base = true;
+            break;
+        }
+    }
+    if !through_base {
+        return Err("当前安装不是 SuperCode 管理的版本".into());
     }
     let Some(Component::Normal(root)) = relative.components().next() else {
         return Err("Agent 安装路径无效".into());
@@ -482,6 +536,172 @@ mod tests {
         assert_eq!(evidence["evidenceScope"], "controlled_protocol_fixtures");
         assert_eq!(evidence["liveAgentValidation"], false);
         assert_eq!(catalog().agents.len(), agents::IDS.len());
+    }
+
+    #[cfg(windows)]
+    fn short_verbatim_path(path: &Path) -> PathBuf {
+        use std::os::windows::ffi::{OsStrExt, OsStringExt};
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn GetShortPathNameW(long: *const u16, short: *mut u16, capacity: u32) -> u32;
+        }
+        let path = agents::ordinary(path.canonicalize().unwrap());
+        let input: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        let required = unsafe { GetShortPathNameW(input.as_ptr(), std::ptr::null_mut(), 0) };
+        assert!(required > 0, "{}", std::io::Error::last_os_error());
+        let mut output = vec![0; required as usize];
+        let length = unsafe { GetShortPathNameW(input.as_ptr(), output.as_mut_ptr(), required) };
+        assert!(length > 0 && length < required);
+        let path = PathBuf::from(std::ffi::OsString::from_wide(&output[..length as usize]));
+        // Volumes without 8.3 names still exercise an equivalent saved-path
+        // alias via the verbatim prefix; CI also exercises its RUNNER~1 parent.
+        PathBuf::from(format!(r"\\?\{}", agents::ordinary(path).display()))
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_saved_path_aliases_recover_native_and_script_installations_without_rewriting_launches(
+    ) {
+        let fixture = Fixture::new();
+        let mut selected = fixture.current.clone();
+        selected.program = short_verbatim_path(&selected.program);
+        let saved = serde_json::to_string(&selected).unwrap();
+        fixture
+            .store
+            .set_setting("agent_install_codex", &saved)
+            .unwrap();
+        let aliased_data = short_verbatim_path(&fixture.root);
+        let recovered = rollback_record(&fixture.store, &aliased_data, "codex").unwrap();
+        assert_eq!(recovered.current, saved);
+        assert_eq!(recovered.target.program, fixture.old.program);
+        assert_eq!(
+            managed_root(&aliased_data, "codex", &selected).unwrap(),
+            agents::ordinary(
+                fixture
+                    .current
+                    .program
+                    .parent()
+                    .unwrap()
+                    .canonicalize()
+                    .unwrap()
+            )
+        );
+        fs::remove_file(&fixture.current.program).unwrap();
+        // Resolving an existing parent still recovers a missing current leaf.
+        assert_eq!(
+            rollback_record(&fixture.store, &aliased_data, "codex")
+                .unwrap()
+                .current,
+            saved
+        );
+
+        let root = fixture
+            .root
+            .join("agents/gemini")
+            .join(uuid::Uuid::new_v4().to_string());
+        let script = root.join("node_modules/@google/gemini-cli/bundle/gemini.js");
+        fs::create_dir_all(script.parent().unwrap()).unwrap();
+        fs::write(&script, b"// fixture, never executed").unwrap();
+        let selected = Launch {
+            program: fixture.old.program.clone(),
+            prefix: vec![short_verbatim_path(&script).to_string_lossy().into_owned()],
+            source: "managed".into(),
+        };
+        let previous = serde_json::to_string(&selected).unwrap();
+        fs::write(
+            root.join("previous-installation.json"),
+            serde_json::to_vec(&json!({"agent":"gemini","previous":previous})).unwrap(),
+        )
+        .unwrap();
+        let saved = serde_json::to_string(&selected).unwrap();
+        fixture
+            .store
+            .set_setting("agent_install_gemini", &saved)
+            .unwrap();
+        let recovered = rollback_record(&fixture.store, &aliased_data, "gemini").unwrap();
+        assert_eq!(recovered.current, saved);
+        assert_eq!(recovered.target.prefix, selected.prefix);
+        assert_eq!(recovered.target.program, selected.program);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn linked_installation_directories_cannot_become_managed_through_canonicalization() {
+        use std::os::windows::process::CommandExt;
+        let fixture = Fixture::new();
+        let external = Fixture::executable(&fixture.root.join("external-selection"), "0.160.0");
+        let base = fixture.root.join("agents/codex");
+        // Junction creation does not require developer mode. This fixed test
+        // command creates only links between UUID-owned fixture directories.
+        for (link, target, relative) in [
+            (
+                base.join(uuid::Uuid::new_v4().to_string()),
+                fixture.old.program.parent().unwrap().to_path_buf(),
+                PathBuf::from("codex.exe"),
+            ),
+            (
+                base.join(uuid::Uuid::new_v4().to_string()),
+                external.program.parent().unwrap().to_path_buf(),
+                PathBuf::from("codex.exe"),
+            ),
+            (
+                fixture.root.join("foreign-alias"),
+                base.clone(),
+                fixture
+                    .current
+                    .program
+                    .strip_prefix(&base)
+                    .unwrap()
+                    .to_path_buf(),
+            ),
+        ] {
+            // mklink expects native separators. The fixtures intentionally use
+            // portable slash-separated components elsewhere in their paths.
+            let native_link = agents::ordinary(link.parent().unwrap().canonicalize().unwrap())
+                .join(link.file_name().unwrap());
+            let native_target = agents::ordinary(target.canonicalize().unwrap());
+            let result = std::process::Command::new("cmd.exe")
+                .args(["/d", "/c", "mklink", "/J"])
+                .arg(&native_link)
+                .arg(&native_target)
+                .creation_flags(0x08000000)
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "Fixture junction creation failed: {}, stderr bytes {:?}",
+                result.status,
+                &result.stderr[..result.stderr.len().min(256)]
+            );
+            let selected = Launch {
+                program: link.join(relative),
+                prefix: vec![],
+                source: "managed".into(),
+            };
+            assert!(managed_root(&fixture.root, "codex", &selected).is_err());
+            fs::remove_dir(&link).unwrap();
+        }
+        assert!(managed_root(&fixture.root, "codex", &external).is_err());
+        let mut selected = fixture.current.clone();
+        selected.program = base.join("missing-parent/codex.exe");
+        assert!(managed_root(&fixture.root, "codex", &selected).is_err());
+        selected.program = fixture
+            .current
+            .program
+            .parent()
+            .unwrap()
+            .join("../")
+            .join(
+                fixture
+                    .current
+                    .program
+                    .parent()
+                    .unwrap()
+                    .file_name()
+                    .unwrap(),
+            )
+            .join("codex.exe");
+        assert!(managed_root(&fixture.root, "codex", &selected).is_err());
     }
 
     #[test]
