@@ -63,8 +63,12 @@ jobs:
           if ($testExitCode -ne 0) {
             $testFailure = Get-Content -LiteralPath '.supercode/ci/application-rust.log' -Encoding UTF8 | Select-Object -Last 140 | Out-String
             if ($testFailure.Length -gt 24000) { $testFailure = $testFailure.Substring($testFailure.Length - 24000) }
-            $testFailure = $testFailure.Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
-            Write-Output "::error title=Application Rust test failure::$testFailure"
+            for ($testOffset = 0; $testOffset -lt $testFailure.Length; $testOffset += 3000) {
+              $testChunk = $testFailure.Substring($testOffset, [Math]::Min(3000, $testFailure.Length - $testOffset))
+              $testChunk = $testChunk.Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
+              $testPart = [int]($testOffset / 3000) + 1
+              Write-Output "::error title=Application Rust test failure part ${testPart}::$testChunk"
+            }
             exit $testExitCode
           }
       - run: cargo test --locked --manifest-path installer/Cargo.toml --target-dir src-tauri/target
