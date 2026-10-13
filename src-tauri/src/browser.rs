@@ -223,15 +223,16 @@ pub(crate) fn active_tab(app: &AppHandle) -> Option<Arc<Tab>> {
         && matches!(tab.status.lock().unwrap().as_str(), "working" | "error"))
         .max_by_key(|tab| *tab.used.lock().unwrap()).cloned()
 }
-pub fn stop(app: &AppHandle, session: &str, interrupt: bool) {
-    stop_with_reason(app, session, interrupt, "browser_control_revoked");
+pub fn stop(app: &AppHandle, session: &str) {
+    stop_with_reason(app, session, "browser_control_revoked");
 }
-pub(crate) fn stop_with_reason(app: &AppHandle, session: &str, interrupt: bool, reason: &'static str) {
+fn revoke_control(browser: &Browser, session: &str) -> bool {
+    browser.leases.lock().unwrap().get(session)
+        .is_some_and(|lease| lease.gate.swap(false, Ordering::AcqRel))
+}
+pub(crate) fn stop_with_reason(app: &AppHandle, session: &str, reason: &'static str) {
     let state = app.state::<Browser>();
-    let had_owner = {
-        let leases = state.leases.lock().unwrap();
-        leases.get(session).is_some_and(|l| l.gate.swap(false, Ordering::AcqRel))
-    };
+    let had_owner = revoke_control(&state, session);
     if let Ok(tab) = tab(app, session) {
         status(app, &tab, "stopped", "已由你接管");
         let app = app.clone();
@@ -239,12 +240,13 @@ pub(crate) fn stop_with_reason(app: &AppHandle, session: &str, interrupt: bool, 
             let _ = cue(&app, &tab, None, false, None).await;
         });
     }
-    if interrupt && had_owner {
+    // Taking over browser input cancels its tools, while the agent can continue
+    // other work. Only the chat's Stop action may interrupt the whole turn.
+    if had_owner {
         let app = app.clone();
         let session = session.to_owned();
         tauri::async_runtime::spawn(async move {
             crate::runtime_diagnostics::record(&app, Some(&session), "browser_takeover", json!({"reason":reason}));
-            let _ = crate::commands::interrupt_turn(session, app).await;
         });
     }
 }
@@ -480,7 +482,7 @@ pub async fn browser_layout(
 }
 #[tauri::command]
 pub fn browser_takeover(session_id: String, app: AppHandle) {
-    stop_with_reason(&app, &session_id, true, "takeover_button_or_escape");
+    stop_with_reason(&app, &session_id, "takeover_button_or_escape");
 }
 #[tauri::command]
 pub async fn browser_close(
@@ -517,7 +519,7 @@ pub async fn browser_manual(
     if tab.window != webview.window().label() {
         return Err("浏览器不属于此窗口".into());
     }
-    stop_with_reason(&app, &session_id, true, "manual_browser_navigation");
+    stop_with_reason(&app, &session_id, "manual_browser_navigation");
     let _operation = tab.operation.lock().await;
     match action.as_str() {
         "navigate" => {
@@ -976,10 +978,7 @@ async fn execute(
     }.await;
     match action {
         Ok(value) => Ok(value),
-        Err(error) if error == "user_takeover" => Ok(browser_bridge::text_result(
-            json!({"status":"stopped","code":"user_takeover","actionMayHaveRun":may_have_run,"nextStep":"The user took control. Stop and wait for a new user message. Never retry or use another browser to bypass this stop."}),
-            false,
-        )),
+        Err(error) if error == "user_takeover" => Ok(browser_bridge::takeover_result(may_have_run)),
         Err(error) => {
             status(app, tab, "error", &error);
             Ok(browser_bridge::text_result(
@@ -1059,7 +1058,7 @@ async fn cancel_request(
             .find(|l| Arc::ptr_eq(&l.gate, &gate))
             .map(|l| l.session.clone());
         if let Some(session) = session {
-            stop(&app, &session, false);
+            stop(&app, &session);
         }
     } else {
         let mut pending = state.cancelled_calls.lock().unwrap();
@@ -1102,10 +1101,7 @@ async fn request(
         )));
     };
     if lease.check().is_err() {
-        return Ok(axum::Json(browser_bridge::text_result(
-            json!({"status":"stopped","code":"user_takeover","nextStep":"Wait for a new user message; do not retry."}),
-            false,
-        )));
+        return Ok(axum::Json(browser_bridge::takeover_result(false)));
     }
     if let Err(error) = browser_bridge::validate(&request.name, &request.arguments) {
         return Ok(axum::Json(browser_bridge::text_result(
@@ -1120,10 +1116,7 @@ async fn request(
         pending.retain(|(_, at)| at.elapsed() < Duration::from_secs(60));
         if let Some(index) = pending.iter().position(|(cancelled, _)| cancelled == &key) {
             pending.remove(index);
-            return Ok(axum::Json(browser_bridge::text_result(
-                json!({"status":"stopped","code":"user_takeover","nextStep":"This call was cancelled before dispatch. Never repeat it."}),
-                false,
-            )));
+            return Ok(axum::Json(browser_bridge::takeover_result(false)));
         }
         if calls.values().filter(|gate| Arc::ptr_eq(gate, &lease.gate)).count() >= 16 || calls.contains_key(&key) {
             return Err(axum::http::StatusCode::CONFLICT);
@@ -1160,7 +1153,7 @@ async fn request(
     }
     .await
     .unwrap_or_else(|error: String| {
-        if error=="user_takeover"{browser_bridge::text_result(json!({"status":"stopped","code":"user_takeover","nextStep":"Wait for a new user message. Never retry or reclaim control."}),false)}
+        if error=="user_takeover"{browser_bridge::takeover_result(false)}
         else{browser_bridge::text_result(json!({"error":error}), true)}
     });
     Ok(axum::Json(value))
@@ -1406,6 +1399,52 @@ mod tests {
         assert!(select_lease(&leases, "codex", Some("a")).unwrap().check().is_err());
         assert!(select_lease(&leases, "codex", Some("b")).unwrap().check().is_ok());
         assert!(select_lease(&leases, "claude", Some("c")).unwrap().check().is_ok());
+    }
+    #[test]
+    fn browser_takeover_revokes_only_its_owner_until_new_authorization() {
+        let browser = Browser::default();
+        let make = |session: &str| Lease {
+            session: session.into(), agent: "codex".into(), turn: Some("turn".into()),
+            gate: Arc::new(AtomicBool::new(true)), presented: Arc::new(AtomicBool::new(true)),
+        };
+        let owner = make("owned");
+        let other = make("other");
+        browser.leases.lock().unwrap().extend([
+            (owner.session.clone(), owner.clone()), (other.session.clone(), other.clone()),
+        ]);
+        assert!(revoke_control(&browser, "owned"));
+        assert_eq!(owner.check().unwrap_err(), "user_takeover");
+        assert!(other.check().is_ok());
+        assert!(!revoke_control(&browser, "owned"));
+        assert!(!revoke_control(&browser, "unknown"));
+        assert!(select_lease(&browser.leases.lock().unwrap(), "codex", Some("owned"))
+            .unwrap().check().is_err());
+    }
+    #[tokio::test]
+    async fn cancelling_browser_tool_keeps_parent_session_and_turn_running() {
+        let store = crate::storage::Store::from_connection(rusqlite::Connection::open_in_memory().unwrap()).unwrap();
+        let project = store.add_project(std::path::Path::new("D:/browser-cancellation-fixture")).unwrap();
+        let session = store.create_session(&project.id, None).unwrap();
+        store.bind_native(&session.id, "native-fixture").unwrap();
+        store.set_status(&session.id, "running", Some("parent-turn")).unwrap();
+        let browser = Browser::default();
+        let lease = Lease {
+            session: session.id.clone(), agent: "codex".into(), turn: Some("parent-turn".into()),
+            gate: Arc::new(AtomicBool::new(true)), presented: Arc::new(AtomicBool::new(true)),
+        };
+        browser.leases.lock().unwrap().insert(session.id.clone(), lease.clone());
+        let tab = test_tab(&session.id, true);
+        let _layout = tab.operation.lock().await;
+        let takeover = async {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            assert!(revoke_control(&browser, &session.id));
+        };
+        let (result, _) = tokio::join!(operation(&tab, &lease), takeover);
+        assert_eq!(result.unwrap_err(), "user_takeover");
+        let parent = store.session(&session.id).unwrap();
+        assert_eq!(parent.status, "running");
+        assert_eq!(parent.turn_id.as_deref(), Some("parent-turn"));
+        assert_eq!(parent.native_id.as_deref(), Some("native-fixture"));
     }
     fn test_tab(session: &str, visible: bool) -> Arc<Tab> {
         Arc::new(Tab {

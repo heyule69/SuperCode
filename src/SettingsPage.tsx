@@ -1,4 +1,4 @@
-import { useState, type ReactNode } from 'react';
+import { lazy, Suspense, useState, type ReactNode } from 'react';
 import { Bell, ChartNoAxesColumn, Cpu, Gauge, Globe, Info, Palette, Puzzle, Search, Settings2, Sparkles, SquareTerminal, UserRound, Zap } from 'lucide-react';
 import type { ClientTab } from './ClientSettings';
 import type { Preferences } from './preferences';
@@ -6,6 +6,7 @@ import type { Agent } from './types';
 import { compatiblePermission } from './permissions';
 import { PermissionMenu } from './ComposerMenus';
 import { AgentMenu } from './AgentMenu';
+const DataSettings = lazy(() => import('./DataSettings'));
 
 export type SettingsTab = 'general' | 'providers' | 'agents' | 'resources' | 'usage' | 'quota' | 'about' | ClientTab;
 const groups = [
@@ -63,5 +64,6 @@ export function GeneralSettings({ prefs, setPrefs, busy, autoExpand, setAutoExpa
       <SettingRow title="默认展开执行详情" description="展开思考摘要与工具记录。"><SettingsSwitch label="默认展开思考摘要与工具详情" checked={autoExpand} change={setAutoExpand} /></SettingRow>
     </SettingsGroup>
     <SettingsGroup title="键盘快捷键">{[['新建聊天', 'Ctrl N'], ['搜索聊天', 'Ctrl K'], ['设置', 'Ctrl ,'], ['切换侧栏', 'Ctrl B']].map(([title, key]) => <SettingRow key={title} title={title}><kbd>{key}</kbd></SettingRow>)}</SettingsGroup>
+    <Suspense fallback={null}><DataSettings busy={busy}/></Suspense>
   </>;
 }

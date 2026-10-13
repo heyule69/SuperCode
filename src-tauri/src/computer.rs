@@ -107,9 +107,33 @@ fn text_result(value: Value) -> Value {
 pub(crate) fn takeover_result(action_may_have_run: bool) -> Value {
     text_result(
         json!({"status":"stopped","code":"user_takeover","actionMayHaveRun":action_may_have_run,
+        "scope":"desktop_control",
         "message":"User took control. Desktop operation cancelled; the tool connection is still available.",
-        "nextStep":"Stop and wait for a new user request. Do not retry, refocus, or use shell commands to regain control."}),
+        "nextStep":CONTROL_STOP_NEXT_STEP}),
     )
+}
+const CONTROL_STOP_NEXT_STEP: &str = "Continue the user's task through conversation and permitted non-control tools. Ask the user only if the task is blocked. Do not retry desktop/browser operations, refocus, or bypass the stop with shell commands or another control tool without renewed user authorization.";
+pub(crate) fn control_unavailable_result(message: &str) -> Value {
+    text_result(json!({"status":"stopped","code":"computer_control_unavailable","scope":"desktop_control","actionMayHaveRun":false,
+        "message":message,"nextStep":CONTROL_STOP_NEXT_STEP}))
+}
+fn foreground_revoked_result(action_may_have_run: bool) -> Value {
+    text_result(json!({"status":"stopped","code":"computer_control_revoked","reason":"foreground_changed",
+        "scope":"desktop_control","actionMayHaveRun":action_may_have_run,
+        "message":"The target window lost foreground focus. Desktop control was revoked; the tool connection is still available.",
+        "nextStep":CONTROL_STOP_NEXT_STEP}))
+}
+fn desktop_call_result(result: Result<Value, String>, gate_stopped: bool, foreground_revoked: &mut bool) -> Value {
+    if result.as_ref().err().is_some_and(|error| error.starts_with(crate::computer_gate::FOREGROUND_CHANGED)) {
+        *foreground_revoked = true;
+    }
+    if *foreground_revoked {
+        foreground_revoked_result(true)
+    } else if gate_stopped {
+        takeover_result(true)
+    } else {
+        result.unwrap_or_else(|error| json!({"isError":true,"content":[{"type":"text","text":error}]}))
+    }
 }
 fn settle(cancel: &dyn Fn() -> bool) -> Result<(), String> {
     let started = Instant::now();
@@ -233,7 +257,7 @@ impl Engine {
                 }
                 Err(error) => {
                     return Ok(text_result(
-                        json!({"completed":true,"action":value,"observationWarning":error,"nextStep":"The action already ran. Do not repeat it. Obtain a fresh snapshot before another action; if the user took control, stop and wait."}),
+                        json!({"completed":true,"action":value,"observationWarning":error,"nextStep":"The action already ran. Do not repeat it. If control remains authorized, obtain a fresh snapshot before another action. After user takeover, continue conversation or permitted non-control tools; ask the user only if blocked."}),
                     ));
                 }
             }
@@ -405,6 +429,7 @@ pub fn run() -> Result<(), String> {
     });
     let mut engine = Engine::default();
     let mut lease: Option<String> = None;
+    let mut foreground_revoked = false;
     while let Ok(v) = rx.recv() {
         if closed.load(Ordering::Acquire) {
             break;
@@ -418,7 +443,7 @@ pub fn run() -> Result<(), String> {
         }
         let result = match v["method"].as_str() {
             Some("initialize") => Ok(
-                json!({"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"SuperCode Computer","version":VERSION},"instructions":"SuperCode's bundled desktop engine. Discover windows, focus the intended window, then observe before acting. Use screenshot image pixels and fresh snapshot IDs; verify actions. User approvals remain required according to the Agent's policy. SuperCode arms visible blue desktop/pointer cues and a native stop mechanism before calls. User keyboard/mouse input or Esc immediately stops control. Stop and wait for a new user request after takeover; never refocus to regain control or use shell/PowerShell to bypass desktop tools. Modifying actions return a fresh screenshot and snapshotId. Use that new ID; old IDs expire after actions. A foreground mismatch means control changed: stop instead of retrying focus."}),
+                json!({"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"SuperCode Computer","version":VERSION},"instructions":"SuperCode's bundled desktop engine. Discover windows, focus the intended window, then observe before acting. Use screenshot image pixels and fresh snapshot IDs; verify actions. User approvals remain required according to the Agent's policy. SuperCode arms visible blue desktop/pointer cues and a native stop mechanism before calls. User keyboard/mouse input or Esc immediately cancels desktop control only; the agent task and tool connection remain available. Continue conversation and permitted non-control tools, and ask the user only if the task is blocked. Do not retry desktop/browser operations, refocus, or use shell/PowerShell or other control tools to bypass takeover without renewed user authorization. Modifying actions return a fresh screenshot and snapshotId. Use that new ID; old IDs expire after actions. A foreground mismatch means control changed: cancel desktop control instead of retrying focus."}),
             ),
             Some("ping") => Ok(json!({})),
             Some("tools/list") => Ok(json!({"tools":tools()})),
@@ -429,6 +454,7 @@ pub fn run() -> Result<(), String> {
                         if lease.as_deref() != Some(name) {
                             engine.observation = None;
                             lease = Some(name.into());
+                            foreground_revoked = false;
                         }
                         // Single execution thread; each disposable worker inherits
                         // this exact gate, even if the host has already started a later turn.
@@ -447,6 +473,10 @@ pub fn run() -> Result<(), String> {
                     );
                     continue;
                 }
+                if foreground_revoked {
+                    send(&out, json!({"jsonrpc":"2.0","id":id,"result":foreground_revoked_result(false)}));
+                    continue;
+                }
                 let cancel = || {
                     #[cfg(windows)]
                     if gate.as_ref().is_some_and(|gate| gate.stopped()) {
@@ -460,13 +490,11 @@ pub fn run() -> Result<(), String> {
                     &cancel,
                 );
                 cancelled.lock().unwrap().remove(&key);
-                Ok(result.unwrap_or_else(|e| {
-                    #[cfg(windows)]
-                    if gate.as_ref().is_some_and(|gate| gate.stopped()) {
-                        return takeover_result(true);
-                    }
-                    json!({"isError":true,"content":[{"type":"text","text":e}]})
-                }))
+                #[cfg(windows)]
+                let gate_stopped = gate.as_ref().is_some_and(|gate| gate.stopped());
+                #[cfg(not(windows))]
+                let gate_stopped = false;
+                Ok(desktop_call_result(result, gate_stopped, &mut foreground_revoked))
             }
             _ => Err(error(id.clone(), -32601, "Method not found")),
         };
@@ -485,6 +513,22 @@ pub fn run() -> Result<(), String> {
 mod tests {
     use super::*;
     #[test]
+    fn foreground_revocation_is_structured_and_preserves_conversation_even_if_kernel_revocation_fails() {
+        let mut revoked = false;
+        let result = desktop_call_result(Err(format!("{} gate unavailable", crate::computer_gate::FOREGROUND_CHANGED)), false, &mut revoked);
+        assert!(revoked);
+        assert_eq!(result["isError"], false);
+        let detail: Value = serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(detail["code"], "computer_control_revoked");
+        assert_eq!(detail["reason"], "foreground_changed");
+        assert!(detail["nextStep"].as_str().unwrap().contains("Continue the user's task"));
+        assert!(!detail["message"].as_str().unwrap().contains("User took control"));
+        let retry = foreground_revoked_result(false);
+        let detail: Value = serde_json::from_str(retry["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(detail["actionMayHaveRun"], false);
+        assert_eq!(detail["code"], "computer_control_revoked");
+    }
+    #[test]
     fn takeover_is_a_control_result_with_no_instruction_to_reconnect_or_retry() {
         let result = takeover_result(false);
         assert_eq!(result["isError"], false);
@@ -493,6 +537,20 @@ mod tests {
         assert_eq!(detail["code"], "user_takeover");
         assert_eq!(detail["actionMayHaveRun"], false);
         assert_eq!(detail["status"], "stopped");
+        assert_eq!(detail["scope"], "desktop_control");
+        assert!(detail["nextStep"].as_str().unwrap().contains("Continue the user's task"));
+        assert!(!detail["nextStep"].as_str().unwrap().contains("Stop and wait"));
+    }
+    #[test]
+    fn unavailable_control_is_distinct_from_user_takeover_and_keeps_conversation_available() {
+        let result=control_unavailable_result("The desktop cue connection closed; no further computer input was sent.");
+        assert_eq!(result["isError"],false);
+        let detail:Value=serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(detail["code"],"computer_control_unavailable");
+        assert_eq!(detail["scope"],"desktop_control");
+        assert_eq!(detail["actionMayHaveRun"],false);
+        assert!(!detail["message"].as_str().unwrap().contains("User took control"));
+        assert!(detail["nextStep"].as_str().unwrap().contains("renewed user authorization"));
     }
     #[test]
     fn paint_settling_can_be_cancelled_without_waiting_for_the_timeout() {

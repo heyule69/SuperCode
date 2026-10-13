@@ -2,6 +2,19 @@ import { createHash, createPublicKey, verify } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 
+const utf8 = new TextDecoder('utf-8', { fatal: true });
+function decodeText(bytes, name) {
+  if (bytes.subarray(0, 3).equals(Buffer.from([0xef, 0xbb, 0xbf]))) throw new Error(`${name} must be UTF-8 without BOM`);
+  return utf8.decode(bytes);
+}
+function freezeJson(value) {
+  if (value && typeof value === 'object') {
+    for (const child of Object.values(value)) freezeJson(child);
+    Object.freeze(value);
+  }
+  return value;
+}
+
 export function verifySignedBytes(bytes, signatureBase64, publicKeyBase64, version) {
   const keyLines = Buffer.from(publicKeyBase64.trim(), 'base64').toString('utf8').trim().split(/\r?\n/);
   const sigLines = Buffer.from(signatureBase64.trim(), 'base64').toString('utf8').trim().split(/\r?\n/);
@@ -23,7 +36,11 @@ export function verifyRelease(directory, root, version) {
   if (!/^\d+\.\d+\.\d+$/.test(version)) throw new Error('Only stable release versions are supported');
   const name = `SuperCode_${version}_x64-setup.exe`;
   const bytes = readFileSync(join(directory, name));
-  const manifest = JSON.parse(readFileSync(join(directory, 'latest.json'), 'utf8'));
+  const manifestBytes = readFileSync(join(directory, 'latest.json'));
+  const metadataBytes = readFileSync(join(directory, 'installer-build.json'));
+  const metadataSignatureBytes = readFileSync(join(directory, 'installer-build.json.sig'));
+  const publicKey = decodeText(readFileSync(join(root, 'src-tauri/update-public-key.txt')), 'Update public key');
+  const manifest = JSON.parse(decodeText(manifestBytes, 'Update manifest'));
   const packageInfo = manifest.platforms?.['windows-x86_64'];
   const digest = createHash('sha256').update(bytes).digest('hex');
   const signature = packageInfo?.signature;
@@ -31,6 +48,17 @@ export function verifyRelease(directory, root, version) {
     || packageInfo?.size !== bytes.length || packageInfo?.sha256 !== digest || typeof signature !== 'string' || !signature.trim()
     || packageInfo?.url !== `https://github.com/heyule69/SuperCode/releases/download/v${version}/${name}`
   ) throw new Error('Release assets do not match their manifest');
-  verifySignedBytes(bytes, signature, readFileSync(join(root, 'src-tauri/update-public-key.txt'), 'utf8'), version);
-  return { name, digest, bytes: bytes.length, manifest, assets: [name, 'latest.json'] };
+  verifySignedBytes(bytes, signature, publicKey, version);
+  verifySignedBytes(metadataBytes, decodeText(metadataSignatureBytes, 'Build metadata signature'), publicKey, version);
+  const metadata = JSON.parse(decodeText(metadataBytes, 'Build metadata'));
+  if (metadata.version !== version || metadata.sha256 !== digest || metadata.bytes !== bytes.length) throw new Error('Signed build metadata does not match the installer');
+  // Keep the exact verified bytes private. Buffer itself is mutable, so each
+  // consumer receives a copy; neither disk changes nor a caller can alter the
+  // snapshot subsequently used for Git staging or upload.
+  const snapshot = new Map([[name, bytes], ['latest.json', manifestBytes], ['installer-build.json', metadataBytes], ['installer-build.json.sig', metadataSignatureBytes]]);
+  const readAsset = asset => {
+    if (!snapshot.has(asset)) throw new Error('Unknown verified release asset');
+    return Buffer.from(snapshot.get(asset));
+  };
+  return Object.freeze({ name, digest, bytes: bytes.length, manifest: freezeJson(manifest), metadata: freezeJson(metadata), assets: Object.freeze([...snapshot.keys()]), readAsset });
 }

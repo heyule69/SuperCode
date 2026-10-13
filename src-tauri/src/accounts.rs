@@ -346,7 +346,6 @@ pub async fn use_official_account(
     if status["loggedIn"] != true {
         return Err("请先完成此账号的官方登录".into());
     }
-    state.runtime.release(&app).await?;
     if let Some(id) = account_id {
         let connection = format!("account:{id}");
         state

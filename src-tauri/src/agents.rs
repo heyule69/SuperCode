@@ -56,7 +56,7 @@ impl Launch {
         c.args(&self.prefix).args(args);
         c
     }
-    fn valid(&self) -> bool {
+    pub(crate) fn valid(&self) -> bool {
         native_binary(&self.program) && self.prefix.first().is_none_or(|p| Path::new(p).is_file())
     }
 }

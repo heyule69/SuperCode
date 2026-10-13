@@ -763,7 +763,7 @@ async fn inspect_panels_and_escape(
     let start = Instant::now();
     while *page.status.lock().unwrap() != "stopped" {
         if start.elapsed() > Duration::from_secs(180) {
-            stop(app, session, false);
+            stop(app, session);
             return Err("Waiting for actual Esc input timed out".into());
         }
         tokio::time::sleep(Duration::from_millis(100)).await;

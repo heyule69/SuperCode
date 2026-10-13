@@ -28,9 +28,10 @@ it('waits for native creation before sending layout, including a visibility chan
 it('shows real operation state, stops on Esc and keeps other chats isolated',async()=>{
   await render();
   await act(async()=>listeners.get('browser-state')?.({payload:{sessionId:'other',status:'working',action:'OTHER'}}));expect(node.textContent).not.toContain('OTHER');
-  await act(async()=>listeners.get('browser-state')?.({payload:{sessionId:'s',status:'working',action:'正在点击'}}));expect(node.textContent).toContain('正在点击');expect(node.textContent).toContain('Esc 停止');
+  await act(async()=>listeners.get('browser-state')?.({payload:{sessionId:'s',status:'working',action:'正在点击'}}));expect(node.textContent).toContain('正在点击');expect(node.textContent).toContain('Esc 接管');
   await act(async()=>window.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',bubbles:true})));
   expect(call).toHaveBeenCalledWith('browser_takeover',{sessionId:'s'});
+  expect(call).not.toHaveBeenCalledWith('interrupt_turn',expect.anything());
   await act(async()=>listeners.get('browser-state')?.({payload:{sessionId:'s',status:'stopped',action:'已由你接管'}}));expect(node.textContent).toContain('你正在控制浏览器');expect(node.querySelector('.browser-takeover')).toBeNull();
 });
 it('hides the native surface behind app modals and closes only the panel while working',async()=>{
@@ -76,4 +77,18 @@ it('does not intercept Escape or take over a working browser while another tab o
   await act(async()=>window.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',bubbles:true})));
   expect(call).not.toHaveBeenCalledWith('browser_takeover',expect.anything());
   expect(call).not.toHaveBeenCalledWith('interrupt_turn',expect.anything());
+});
+it('takes over only browser control and keeps navigation failures in the browser panel',async()=>{
+  await render();
+  await act(async()=>listeners.get('browser-state')?.({payload:{sessionId:'s',status:'working',action:'正在读取网页'}}));
+  expect(node.querySelector('.browser-takeover')?.getAttribute('title')).toBe('停止浏览器操作，其他任务继续');
+  await act(async()=>node.querySelector<HTMLButtonElement>('.browser-takeover')!.click());
+  expect(call).toHaveBeenCalledWith('browser_takeover',{sessionId:'s'});
+  vi.mocked(call).mockRejectedValueOnce(new Error('网页响应超时'));
+  await act(async()=>node.querySelector<HTMLButtonElement>('[aria-label="刷新网页"]')!.click());
+  expect(call).toHaveBeenCalledWith('browser_manual',{sessionId:'s',action:'reload',address:null});
+  expect(node.querySelector('[role="alert"]')?.textContent).toContain('网页响应超时');
+  expect(close).not.toHaveBeenCalled();
+  expect(call).not.toHaveBeenCalledWith('interrupt_turn',expect.anything());
+  expect(node.querySelector<HTMLButtonElement>('[aria-label="刷新网页"]')!.disabled).toBe(false);
 });

@@ -19,8 +19,8 @@ npm run installer:build
 
 1. 同步根目录 `package.json`、两个 Cargo 项目和两个 Tauri 配置中的版本号。
 2. 在 `.github/release-notes/<版本>.md` 中填写版本说明。
-3. 设置 `TAURI_SIGNING_PRIVATE_KEY_PATH`，构建并验证安装包。
-4. 提交源码，运行 `npm run release:publish`。
+3. 提交源码，再设置 `TAURI_SIGNING_PRIVATE_KEY_PATH`，构建并验证安装包。
+4. 保持源码不变，运行 `npm run release:publish`。构建时会签名记录来源提交和安装包摘要；源码有后续修改时必须提交并重新构建。
 
 发布脚本通过 Git SSH 上传临时构建产物，GitHub Actions 校验后发布安装包和 `latest.json`，并清理临时分支。更新签名和校验值包含在 `latest.json` 中。签名私钥单独保管，后续版本使用同一密钥。
 

@@ -33,8 +33,7 @@ input:focus-visible, textarea:focus-visible, select:focus-visible { outline:0; b
 .composer-footnote { min-height:26px; }
 .composer-footnote > div { min-width:0; gap:12px; }
 .composer-footnote > div > span { white-space:nowrap; }
-.usage-trigger { padding:4px 3px; border-radius:4px; }
-.usage-trigger:hover { background:var(--hover); color:var(--text); }
+.usage-trigger { padding:4px 3px; border-radius:4px; cursor:default; }
 .context-ring.context-high { background:conic-gradient(var(--danger) var(--context-percent),var(--line) 0); }
 .composer-popover:not(.model-popover), .usage-popover { max-height:var(--layer-height,calc(100vh - 28px)); max-width:calc(100vw - 24px); overflow:auto; translate:var(--layer-shift,0px) 0; overscroll-behavior:contain; }
 .composer-popover button:focus-visible { outline-offset:-2px; }

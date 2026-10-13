@@ -60,9 +60,23 @@ pub fn now() -> i64 {
         .as_secs() as i64
 }
 
+fn connection_in_use(conn: &Connection, id: &str) -> Result<bool> {
+    crate::connection_usage::in_use(conn, id)
+}
+
+fn ensure_connection_idle(conn: &Connection, id: &str) -> Result<()> {
+    if connection_in_use(conn, id)? {
+        return Err("此连接正被运行中的任务使用，请等待任务完成或停止后再修改".into());
+    }
+    Ok(())
+}
+
 impl Store {
     pub fn open(path: &Path) -> std::result::Result<Self, rusqlite::Error> {
-        Self::from_connection(Connection::open(path)?)
+        crate::backup::before_open(path)?;
+        let store = Self::from_connection(Connection::open(path)?)?;
+        crate::backup::after_open(&store)?;
+        Ok(store)
     }
 
     pub(crate) fn from_connection(
@@ -86,6 +100,8 @@ impl Store {
              CREATE TABLE IF NOT EXISTS sidebar_sections(id TEXT PRIMARY KEY,name TEXT NOT NULL,position INTEGER NOT NULL);
              CREATE TABLE IF NOT EXISTS sidebar_items(kind TEXT NOT NULL,id TEXT NOT NULL,pinned INTEGER NOT NULL DEFAULT 0,unread INTEGER NOT NULL DEFAULT 0,section_id TEXT REFERENCES sidebar_sections(id) ON DELETE SET NULL,removed INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(kind,id));
              CREATE TABLE IF NOT EXISTS usage_records(session_id TEXT NOT NULL REFERENCES sessions(id),turn_id TEXT NOT NULL,agent TEXT NOT NULL,model TEXT NOT NULL,data TEXT NOT NULL,updated_at INTEGER NOT NULL,PRIMARY KEY(session_id,turn_id));
+             CREATE INDEX IF NOT EXISTS usage_recent ON usage_records(updated_at);
+             CREATE INDEX IF NOT EXISTS usage_session_recent ON usage_records(session_id,updated_at);
              CREATE TABLE IF NOT EXISTS session_context(session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,summary TEXT NOT NULL,through_seq INTEGER NOT NULL);
              CREATE TABLE IF NOT EXISTS agent_profiles(id TEXT PRIMARY KEY,agent TEXT NOT NULL,name TEXT NOT NULL,config TEXT NOT NULL);
              UPDATE messages SET data=json_set(data,'$.status','interrupted') WHERE json_valid(data) AND json_extract(data,'$.status') IN ('inProgress','running','preparing') AND session_id IN (SELECT id FROM sessions WHERE status IN ('starting','running','waiting'));
@@ -123,6 +139,9 @@ impl Store {
             migrated?;
         }
         conn.execute_batch("CREATE TABLE IF NOT EXISTS session_workspaces(session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,path TEXT NOT NULL)")?;
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS sessions_connection ON sessions(connection_id)",
+        )?;
         #[cfg(windows)]
         {
             let tx = conn.transaction()?;
@@ -242,28 +261,52 @@ impl Store {
         })
         .transpose()
     }
-    pub(crate) fn save_model_metadata(&self, expected: &crate::ccswitch::Profile, metadata: &Value) -> Result<bool> {
+    pub(crate) fn save_model_metadata(
+        &self,
+        expected: &crate::ccswitch::Profile,
+        metadata: &Value,
+    ) -> Result<bool> {
         let conn = self.0.lock().map_err(|e| e.to_string())?;
-        let raw: Option<String> = conn.query_row(
-            "SELECT config FROM agent_profiles WHERE id=?1 AND agent=?2",
-            params![expected.id, expected.agent], |row| row.get(0),
-        ).optional().map_err(|e| e.to_string())?;
-        let Some(raw) = raw else { return Ok(false); };
+        // Catalog reads may finish during a turn. Preserve the live runtime's
+        // configuration fingerprint and let a later refresh save the metadata.
+        if connection_in_use(&conn, &expected.id)? {
+            return Ok(false);
+        }
+        let raw: Option<String> = conn
+            .query_row(
+                "SELECT config FROM agent_profiles WHERE id=?1 AND agent=?2",
+                params![expected.id, expected.agent],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        let Some(raw) = raw else {
+            return Ok(false);
+        };
         let mut config: Value = serde_json::from_str(&crate::credentials::open(&raw)?)
             .map_err(|_| "本地配置 JSON 无效")?;
         // An asynchronous catalog response must never undo a newer settings edit
         // or recreate a connection deleted while the request was in flight.
-        if config != expected.config { return Ok(false); }
+        if config != expected.config {
+            return Ok(false);
+        }
         config["modelMetadata"] = metadata.clone();
         let sealed = crate::credentials::seal(&config.to_string())?;
-        conn.execute("UPDATE agent_profiles SET config=?1 WHERE id=?2 AND agent=?3",
-            params![sealed, expected.id, expected.agent]).map_err(|e|e.to_string())?;
+        conn.execute(
+            "UPDATE agent_profiles SET config=?1 WHERE id=?2 AND agent=?3",
+            params![sealed, expected.id, expected.agent],
+        )
+        .map_err(|e| e.to_string())?;
         Ok(true)
     }
     pub fn import_profiles(&self, profiles: &[crate::ccswitch::Profile]) -> Result<()> {
         let mut conn = self.0.lock().map_err(|e| e.to_string())?;
         let tx = conn.transaction().map_err(|e| e.to_string())?;
         for profile in profiles {
+            // Claiming a turn uses the same Store lock. Check inside this
+            // transaction so a concurrent send cannot start between the guard
+            // and the update, and an import batch fails without partial edits.
+            ensure_connection_idle(&tx, &profile.id)?;
             let bound: usize = tx
                 .query_row(
                     "SELECT count(*) FROM sessions WHERE connection_id=?1",
@@ -322,6 +365,7 @@ impl Store {
     pub fn delete_profile(&self, id: &str) -> Result<()> {
         let mut conn = self.0.lock().map_err(|e| e.to_string())?;
         let tx = conn.transaction().map_err(|e| e.to_string())?;
+        ensure_connection_idle(&tx, id)?;
         let bound: usize = tx
             .query_row(
                 "SELECT count(*) FROM sessions WHERE connection_id=?1",
@@ -606,6 +650,17 @@ impl Store {
         Ok(())
     }
 
+    pub fn claim_configuration_change(&self, id: &str) -> Result<()> {
+        let mut conn = self.0.lock().map_err(|e| e.to_string())?;
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        crate::connection_usage::ensure_session_idle(&tx, id)?;
+        let changed = tx.execute("UPDATE sessions SET status='starting',turn_id=NULL,updated_at=?2 WHERE id=?1 AND archived=0 AND status NOT IN ('starting','running','waiting')", params![id, now()]).map_err(|e| e.to_string())?;
+        if changed != 1 {
+            return Err("会话已归档或状态已改变".into());
+        }
+        tx.commit().map_err(|e| e.to_string())
+    }
+
     pub fn bind_native(&self, id: &str, native: &str) -> Result<()> {
         self.0
             .lock()
@@ -717,6 +772,7 @@ impl Store {
 
     pub fn archive(&self, id: &str) -> Result<()> {
         let conn = self.0.lock().map_err(|e| e.to_string())?;
+        crate::connection_usage::ensure_session_idle(&conn, id)?;
         let changed=conn.execute("UPDATE sessions SET archived=1 WHERE id=?1 AND status NOT IN ('starting','running','waiting')",[id]).map_err(|e|e.to_string())?;
         if changed == 0 {
             return Err("请先停止运行中的任务".into());
@@ -830,15 +886,8 @@ impl Store {
     }
 
     pub fn running(&self) -> Result<usize> {
-        self.0
-            .lock()
-            .map_err(|e| e.to_string())?
-            .query_row(
-                "SELECT count(*) FROM sessions WHERE status IN ('starting','running','waiting')",
-                [],
-                |r| r.get(0),
-            )
-            .map_err(|e| e.to_string())
+        let conn = self.0.lock().map_err(|e| e.to_string())?;
+        crate::connection_usage::running(&conn)
     }
 
     pub fn fail_active(&self) {
@@ -918,6 +967,11 @@ impl Store {
             .optional()
             .map_err(|e| e.to_string())?;
         let existing = existing.and_then(|text| serde_json::from_str::<Value>(&text).ok());
+        // Cumulative counters belong to one native thread, not the portable
+        // conversation that can switch suppliers, workspaces or native IDs.
+        if data.is_object() {
+            data["counterEpoch"] = serde_json::json!(session.native_id);
+        }
         if data["total"].as_object().is_none_or(|v| v.is_empty()) {
             if let Some(mut existing) = existing {
                 for key in ["contextTokens", "modelContextWindow"] {
@@ -956,7 +1010,7 @@ impl Store {
             }
         }
         if data["cumulative"] == true {
-            let prior: Option<String> = conn.query_row("SELECT data FROM usage_records WHERE session_id=?1 AND rowid<COALESCE((SELECT rowid FROM usage_records WHERE session_id=?1 AND turn_id=?2),9223372036854775807) ORDER BY rowid DESC LIMIT 1", params![session.id,turn], |r| r.get(0)).optional().map_err(|e| e.to_string())?;
+            let prior: Option<String> = conn.query_row("SELECT data FROM usage_records WHERE session_id=?1 AND json_extract(data,'$.counterEpoch') IS ?3 AND rowid<COALESCE((SELECT rowid FROM usage_records WHERE session_id=?1 AND turn_id=?2),9223372036854775807) ORDER BY rowid DESC LIMIT 1", params![session.id,turn,session.native_id], |r| r.get(0)).optional().map_err(|e| e.to_string())?;
             let prior: Value = prior
                 .and_then(|s| serde_json::from_str(&s).ok())
                 .unwrap_or(Value::Null);
@@ -981,7 +1035,12 @@ impl Store {
     }
     pub fn usage_records(&self, session_id: Option<&str>) -> Result<Vec<Value>> {
         let conn = self.0.lock().map_err(|e| e.to_string())?;
-        let mut stmt = conn.prepare("SELECT u.session_id,u.turn_id,u.agent,u.model,u.data,u.updated_at,s.title FROM usage_records u JOIN sessions s ON s.id=u.session_id WHERE (?1 IS NULL OR u.session_id=?1) ORDER BY u.updated_at DESC,u.rowid DESC LIMIT 1000").map_err(|e| e.to_string())?;
+        let sql = if session_id.is_some() {
+            "SELECT u.session_id,u.turn_id,u.agent,u.model,u.data,u.updated_at,s.title FROM usage_records u JOIN sessions s ON s.id=u.session_id WHERE u.session_id=?1 ORDER BY u.updated_at DESC,u.rowid DESC LIMIT 1000"
+        } else {
+            "SELECT u.session_id,u.turn_id,u.agent,u.model,u.data,u.updated_at,s.title FROM usage_records u JOIN sessions s ON s.id=u.session_id WHERE ?1 IS NULL ORDER BY u.updated_at DESC,u.rowid DESC LIMIT 1000"
+        };
+        let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
         let rows = stmt.query_map([session_id], |r| { let data: String=r.get(4)?; Ok(serde_json::json!({"sessionId":r.get::<_,String>(0)?,"turnId":r.get::<_,String>(1)?,"agent":r.get::<_,String>(2)?,"model":r.get::<_,String>(3)?,"data":serde_json::from_str::<Value>(&data).unwrap_or(Value::Null),"at":r.get::<_,i64>(5)?,"title":r.get::<_,String>(6)?})) }).map_err(|e|e.to_string())?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(|e| e.to_string())
@@ -997,11 +1056,29 @@ mod tests {
         let parent = store.create_session(&project.id, None).unwrap();
         let other = store.create_session(&project.id, None).unwrap();
         let child = "child\".'";
-        store.save_message("spawn", &parent.id, "tool", "", "collabAgentToolCall", &serde_json::json!({"receiverThreadIds":[child]})).unwrap();
+        store
+            .save_message(
+                "spawn",
+                &parent.id,
+                "tool",
+                "",
+                "collabAgentToolCall",
+                &serde_json::json!({"receiverThreadIds":[child]}),
+            )
+            .unwrap();
         assert!(store.has_subagent(&parent.id, child).unwrap());
         assert!(!store.has_subagent(&other.id, child).unwrap());
         assert!(!store.has_subagent(&parent.id, "undeclared").unwrap());
-        store.save_message("wait", &parent.id, "tool", "", "collabToolCall", &serde_json::json!({"agentsStates":{"second":{"status":"completed"}}})).unwrap();
+        store
+            .save_message(
+                "wait",
+                &parent.id,
+                "tool",
+                "",
+                "collabToolCall",
+                &serde_json::json!({"agentsStates":{"second":{"status":"completed"}}}),
+            )
+            .unwrap();
         assert!(store.has_subagent(&parent.id, "second").unwrap());
     }
 
@@ -1096,23 +1173,46 @@ mod tests {
     use super::*;
     #[test]
     fn all_agents_can_claim_multiple_sessions_and_failure_is_local() {
-        let store = std::sync::Arc::new(Store::from_connection(Connection::open_in_memory().unwrap()).unwrap());
+        let store = std::sync::Arc::new(
+            Store::from_connection(Connection::open_in_memory().unwrap()).unwrap(),
+        );
         let project = store.add_project(Path::new("D:/并发会话")).unwrap();
         let mut sessions = Vec::new();
         for agent in ["codex", "claude", "opencode", "pi"] {
-            for _ in 0..2 { sessions.push(store.create_agent_session(&project.id, None, agent).unwrap()); }
+            for _ in 0..2 {
+                sessions.push(
+                    store
+                        .create_agent_session(&project.id, None, agent)
+                        .unwrap(),
+                );
+            }
         }
         let barrier = std::sync::Arc::new(std::sync::Barrier::new(sessions.len()));
-        let tasks = sessions.iter().map(|session| {
-            let (store, barrier, id) = (store.clone(), barrier.clone(), session.id.clone());
-            std::thread::spawn(move || { barrier.wait(); store.claim(&id) })
-        }).collect::<Vec<_>>();
-        for task in tasks { task.join().unwrap().unwrap(); }
+        let tasks = sessions
+            .iter()
+            .map(|session| {
+                let (store, barrier, id) = (store.clone(), barrier.clone(), session.id.clone());
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    store.claim(&id)
+                })
+            })
+            .collect::<Vec<_>>();
+        for task in tasks {
+            task.join().unwrap().unwrap();
+        }
         assert_eq!(store.running().unwrap(), 8);
-        for session in &sessions { assert!(store.claim(&session.id).is_err()); }
-        store.set_status(&sessions[1].id, "waiting", Some("approval")).unwrap();
+        for session in &sessions {
+            assert!(store.claim(&session.id).is_err());
+        }
+        store
+            .set_status(&sessions[1].id, "waiting", Some("approval"))
+            .unwrap();
         store.fail_session(&sessions[0].id);
-        assert_eq!(store.session(&sessions[0].id).unwrap().status, "interrupted");
+        assert_eq!(
+            store.session(&sessions[0].id).unwrap().status,
+            "interrupted"
+        );
         assert_eq!(store.session(&sessions[1].id).unwrap().status, "waiting");
         assert_eq!(store.running().unwrap(), 7);
         store.claim(&sessions[0].id).unwrap();
@@ -1120,15 +1220,29 @@ mod tests {
     }
     #[test]
     fn concurrent_duplicate_sends_claim_a_session_only_once() {
-        let store = std::sync::Arc::new(Store::from_connection(Connection::open_in_memory().unwrap()).unwrap());
+        let store = std::sync::Arc::new(
+            Store::from_connection(Connection::open_in_memory().unwrap()).unwrap(),
+        );
         let project = store.add_project(Path::new("D:/重复发送")).unwrap();
         let id = store.create_session(&project.id, None).unwrap().id;
         let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
-        let tasks = (0..2).map(|_| {
-            let (store, barrier, id) = (store.clone(), barrier.clone(), id.clone());
-            std::thread::spawn(move || { barrier.wait(); store.claim(&id).is_ok() })
-        }).collect::<Vec<_>>();
-        assert_eq!(tasks.into_iter().filter_map(|task| task.join().ok()).filter(|claimed| *claimed).count(), 1);
+        let tasks = (0..2)
+            .map(|_| {
+                let (store, barrier, id) = (store.clone(), barrier.clone(), id.clone());
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    store.claim(&id).is_ok()
+                })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            tasks
+                .into_iter()
+                .filter_map(|task| task.join().ok())
+                .filter(|claimed| *claimed)
+                .count(),
+            1
+        );
     }
     #[test]
     fn agent_update_never_switches_selection_during_an_active_turn() {
@@ -1302,6 +1416,35 @@ mod tests {
         );
     }
     #[test]
+    fn cumulative_usage_baselines_follow_native_threads_across_rebinding() {
+        let store = Store::from_connection(Connection::open_in_memory().unwrap()).unwrap();
+        let project = store.add_project(Path::new("D:/usage-epochs")).unwrap();
+        let chat = store.create_session(&project.id, None).unwrap();
+        let usage = |total| serde_json::json!({"cumulative":true,"total":{"totalTokens":total}});
+        store.bind_native(&chat.id, "old-thread").unwrap();
+        store
+            .record_usage(&store.session(&chat.id).unwrap(), "old", usage(100))
+            .unwrap();
+        store.bind_native(&chat.id, "new-thread").unwrap();
+        let current = store.session(&chat.id).unwrap();
+        store
+            .record_usage(&current, "new-first", usage(200))
+            .unwrap();
+        store
+            .record_usage(&current, "new-next", usage(350))
+            .unwrap();
+        store
+            .record_usage(&current, "new-first", usage(200))
+            .unwrap();
+        let rows = store.usage_records(Some(&chat.id)).unwrap();
+        for (id, total) in [("old", 100), ("new-first", 200), ("new-next", 150)] {
+            assert_eq!(
+                rows.iter().find(|row| row["turnId"] == id).unwrap()["data"]["turn"]["totalTokens"],
+                total
+            );
+        }
+    }
+    #[test]
     fn separately_reported_context_and_billing_restore_for_every_agent() {
         let store = Store::from_connection(Connection::open_in_memory().unwrap()).unwrap();
         let project = store.add_project(Path::new("D:/usage-fixture")).unwrap();
@@ -1396,22 +1539,212 @@ mod tests {
     #[test]
     fn delayed_model_metadata_cannot_overwrite_settings_or_recreate_a_deleted_connection() {
         let store = Store::from_connection(Connection::open_in_memory().unwrap()).unwrap();
-        let original = crate::ccswitch::Profile {id:"models".into(),agent:"pi".into(),name:"Original".into(),config:serde_json::json!({"apiKey":"old-key","model":"glm-5.3"})};
+        let original = crate::ccswitch::Profile {
+            id: "models".into(),
+            agent: "pi".into(),
+            name: "Original".into(),
+            config: serde_json::json!({"apiKey":"old-key","model":"glm-5.3"}),
+        };
         store.import_profiles(&[original.clone()]).unwrap();
-        let metadata=serde_json::json!({"glm-5.3":{"contextWindow":1000000}});
-        assert!(store.save_model_metadata(&original,&metadata).unwrap());
-        let mut newer=store.profile("pi","models").unwrap().unwrap();
-        assert_eq!(newer.config["modelMetadata"],metadata);
-        newer.config["apiKey"]="new-key".into();
-        newer.name="New name".into();
+        let metadata = serde_json::json!({"glm-5.3":{"contextWindow":1000000}});
+        assert!(store.save_model_metadata(&original, &metadata).unwrap());
+        let mut newer = store.profile("pi", "models").unwrap().unwrap();
+        assert_eq!(newer.config["modelMetadata"], metadata);
+        newer.config["apiKey"] = "new-key".into();
+        newer.name = "New name".into();
         store.import_profiles(&[newer.clone()]).unwrap();
-        assert!(!store.save_model_metadata(&original,&metadata).unwrap());
-        let saved=store.profile("pi","models").unwrap().unwrap();
-        assert_eq!(saved.config["apiKey"],"new-key");
-        assert_eq!(saved.name,"New name");
+        assert!(!store.save_model_metadata(&original, &metadata).unwrap());
+        let saved = store.profile("pi", "models").unwrap().unwrap();
+        assert_eq!(saved.config["apiKey"], "new-key");
+        assert_eq!(saved.name, "New name");
         store.delete_profile("models").unwrap();
-        assert!(!store.save_model_metadata(&newer,&metadata).unwrap());
-        assert!(store.profile("pi","models").unwrap().is_none());
+        assert!(!store.save_model_metadata(&newer, &metadata).unwrap());
+        assert!(store.profile("pi", "models").unwrap().is_none());
+    }
+    fn connection_fixture(id: &str, agent: &str) -> crate::ccswitch::Profile {
+        crate::ccswitch::Profile {
+            id: id.into(),
+            agent: agent.into(),
+            name: id.into(),
+            config: serde_json::json!({"baseUrl":"https://api.example.test/v1","protocol":"responses","model":"fixture-model","apiKey":"old-key"}),
+        }
+    }
+    #[test]
+    fn active_connection_is_locked_while_other_connections_remain_editable() {
+        for agent in ["codex", "claude", "opencode", "pi"] {
+            let store = Store::from_connection(Connection::open_in_memory().unwrap()).unwrap();
+            let active = connection_fixture("active", agent);
+            let unrelated = connection_fixture("unrelated", agent);
+            store
+                .import_profiles(&[active.clone(), unrelated.clone()])
+                .unwrap();
+            let project = store
+                .add_project(Path::new("D:/connection-guards"))
+                .unwrap();
+            let chat = store
+                .create_configured_session(&project.id, None, agent, Some(&active.id))
+                .unwrap();
+            let mut active_edit = active.clone();
+            active_edit.name = "Edited name".into();
+            active_edit.config["apiKey"] = "new-key".into();
+            for status in ["starting", "running", "waiting"] {
+                store
+                    .set_status(&chat.id, status, Some("turn-fixture"))
+                    .unwrap();
+                assert!(store
+                    .import_profiles(&[active_edit.clone()])
+                    .unwrap_err()
+                    .contains("运行中的任务"));
+                assert!(store
+                    .delete_profile(&active.id)
+                    .unwrap_err()
+                    .contains("运行中的任务"));
+                assert_eq!(
+                    store.profile(agent, &active.id).unwrap().unwrap().config,
+                    active.config
+                );
+                let mut other_edit = unrelated.clone();
+                other_edit.name = format!("Edited during {status}");
+                other_edit.config["apiKey"] = "updated-unrelated-key".into();
+                store
+                    .import_profiles(&[other_edit.clone(), connection_fixture(status, agent)])
+                    .unwrap();
+                assert_eq!(
+                    store.profile(agent, &unrelated.id).unwrap().unwrap().name,
+                    other_edit.name
+                );
+                store.select_profile(agent, Some(status)).unwrap();
+                let mut order = store.connection_orders().unwrap()[agent].clone();
+                order.reverse();
+                store.reorder_connections(agent, &order).unwrap();
+                store.delete_profile(status).unwrap();
+                assert_eq!(
+                    store.session(&chat.id).unwrap().connection_id.as_deref(),
+                    Some("active")
+                );
+                assert_eq!(store.session(&chat.id).unwrap().status, status);
+                assert_eq!(
+                    store.session(&chat.id).unwrap().turn_id.as_deref(),
+                    Some("turn-fixture")
+                );
+                assert_eq!(
+                    store.route(agent, Some(&chat.id)).unwrap().config,
+                    active.config
+                );
+            }
+            store.set_status(&chat.id, "idle", None).unwrap();
+            store.import_profiles(&[active_edit.clone()]).unwrap();
+            assert_eq!(
+                store.profile(agent, &active.id).unwrap().unwrap().config["apiKey"],
+                "new-key"
+            );
+            // Inactive history still pins routing identity and connection existence.
+            active_edit.config["baseUrl"] = "https://another.example.test/v1".into();
+            assert!(store
+                .import_profiles(&[active_edit])
+                .unwrap_err()
+                .contains("已绑定聊天"));
+            assert!(store
+                .delete_profile(&active.id)
+                .unwrap_err()
+                .contains("还有聊天使用此连接"));
+        }
+    }
+    #[test]
+    fn reimport_batch_rolls_back_all_changes_when_one_connection_is_active() {
+        let store = Store::from_connection(Connection::open_in_memory().unwrap()).unwrap();
+        let active = connection_fixture("active", "codex");
+        let unrelated = connection_fixture("unrelated", "codex");
+        store
+            .import_profiles(&[active.clone(), unrelated.clone()])
+            .unwrap();
+        let project = store.add_project(Path::new("D:/import-guards")).unwrap();
+        let chat = store
+            .create_configured_session(&project.id, None, "codex", Some(&active.id))
+            .unwrap();
+        store.claim(&chat.id).unwrap();
+        let before = store.connection_orders().unwrap();
+        let mut edited = unrelated;
+        edited.name = "Should roll back".into();
+        assert!(store
+            .import_profiles(&[edited, connection_fixture("new", "codex"), active])
+            .is_err());
+        assert_eq!(
+            store.profile("codex", "unrelated").unwrap().unwrap().name,
+            "unrelated"
+        );
+        assert!(store.profile("codex", "new").unwrap().is_none());
+        assert_eq!(store.connection_orders().unwrap(), before);
+    }
+    #[test]
+    fn concurrent_connection_edit_and_turn_claim_have_a_serial_order() {
+        let store = std::sync::Arc::new(
+            Store::from_connection(Connection::open_in_memory().unwrap()).unwrap(),
+        );
+        let original = connection_fixture("active", "pi");
+        store.import_profiles(&[original.clone()]).unwrap();
+        let project = store
+            .add_project(Path::new("D:/claim-edit-guards"))
+            .unwrap();
+        let chat = store
+            .create_configured_session(&project.id, None, "pi", Some(&original.id))
+            .unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let claim = {
+            let store = store.clone();
+            let barrier = barrier.clone();
+            let id = chat.id.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                store.claim(&id)
+            })
+        };
+        let mut updated = original;
+        updated.config["apiKey"] = "new-key".into();
+        let edit = {
+            let store = store.clone();
+            let barrier = barrier.clone();
+            let updated = updated.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                store.import_profiles(&[updated])
+            })
+        };
+        claim.join().unwrap().unwrap();
+        let edited_first = edit.join().unwrap().is_ok();
+        let route = store.route("pi", Some(&chat.id)).unwrap();
+        assert_eq!(
+            route.config["apiKey"],
+            if edited_first { "new-key" } else { "old-key" }
+        );
+        assert_eq!(store.session(&chat.id).unwrap().status, "starting");
+        assert!(store.import_profiles(&[updated]).is_err());
+    }
+    #[test]
+    fn catalog_metadata_does_not_change_an_active_connection_fingerprint() {
+        let store = Store::from_connection(Connection::open_in_memory().unwrap()).unwrap();
+        let profile = connection_fixture("models", "codex");
+        store.import_profiles(&[profile.clone()]).unwrap();
+        let project = store.add_project(Path::new("D:/catalog-guards")).unwrap();
+        let chat = store
+            .create_configured_session(&project.id, None, "codex", Some(&profile.id))
+            .unwrap();
+        let before = store.route("codex", Some(&chat.id)).unwrap().fingerprint();
+        let metadata = serde_json::json!({"fixture-model":{"contextWindow":1000000}});
+        for status in ["starting", "running", "waiting"] {
+            store.set_status(&chat.id, status, None).unwrap();
+            assert!(!store.save_model_metadata(&profile, &metadata).unwrap());
+            assert_eq!(
+                store.route("codex", Some(&chat.id)).unwrap().fingerprint(),
+                before
+            );
+        }
+        store.set_status(&chat.id, "idle", None).unwrap();
+        assert!(store.save_model_metadata(&profile, &metadata).unwrap());
+        assert_ne!(
+            store.route("codex", Some(&chat.id)).unwrap().fingerprint(),
+            before
+        );
     }
     #[test]
     fn encrypted_connections_crud_and_official_selection() {

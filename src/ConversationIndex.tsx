@@ -5,13 +5,20 @@ import { useFloatingLayer } from './useFloatingLayer';
 import { scrollToConversationTurn } from './chatScroll';
 import { finalReply } from './turnPresentation';
 
-export function indexedTurns(turns: ConversationTurn[]) {
-  return turns.filter(turn => turn.user).map(turn => ({
+type IndexedTurn = { id: string; question: string; reply: string; command: boolean };
+export function indexedTurns(turns: ConversationTurn[], cache?: WeakMap<ConversationTurn, IndexedTurn>) {
+  return turns.filter(turn => turn.user).map(turn => {
+    const saved = cache?.get(turn);
+    if (saved) return saved;
+    const row = {
     id: turn.id,
     question: turn.user!.text || '附件消息',
     reply: (turn.run?.data?.status === 'completed' ? finalReply(turn.items).map(item => item.text).join('\n') : turn.items.filter(item => item.role === 'assistant' && item.text).at(-1)?.text ?? '').replace(/\[([^\]]+)\]\([^)]+\)/g, '$1').replace(/(\*\*|__)(.*?)\1/g, '$2').replace(/`+/g, '').replace(/(^|\n)\s*(?:[-*+] |#{1,6} )/g, '$1').replace(/\s+/g, ' ').slice(0, 220),
     command: turn.items.some(item => item.kind === 'commandExecution' || item.kind === 'claudeToolCall' && item.data?.tool === 'Bash'),
-  }));
+    };
+    cache?.set(turn, row);
+    return row;
+  });
 }
 
 type ScrollViewport = { top: number; height: number; scrollTop: number; scrollHeight: number };
@@ -30,7 +37,8 @@ export function visibleTurnIndex(positions: number[], viewport: ScrollViewport) 
 }
 
 export function ConversationIndex({ turns }: { turns: ConversationTurn[] }) {
-  const items = indexedTurns(turns);
+  const cache = useRef(new WeakMap<ConversationTurn, IndexedTurn>());
+  const items = indexedTurns(turns, cache.current);
   const [active, setActive] = useState(items.at(-1)?.id);
   const [preview, setPreview] = useState<number | null>(null);
   const [bounds, setBounds] = useState({ left: 0, top: 0, height: 0, width: 320 });

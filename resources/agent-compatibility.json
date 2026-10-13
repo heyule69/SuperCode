@@ -1,0 +1,33 @@
+{
+  "schemaVersion": 1,
+  "evidenceScope": "controlled_protocol_fixtures",
+  "liveAgentValidation": false,
+  "agents": [
+    {
+      "id": "codex",
+      "coveredVersions": [],
+      "fixtureTests": ["runtime::tests::request_ids_are_isolated_and_resolved_with_the_same_namespace", "runtime::tests::context_refresh_never_restarts_a_parent_turn_child_task_or_pending_approval"],
+      "note": "App-server protocol fixtures cover local handling. No exact CLI release is asserted by these fixtures."
+    },
+    {
+      "id": "claude",
+      "coveredVersions": [],
+      "fixtureTests": ["claude::tests::native_auto_compaction_resets_usage_and_continues_the_same_turn", "claude::tests::native_run_waits_for_idle_after_all_background_children_finish"],
+      "note": "SDK event fixtures cover local translation. No exact CLI release is asserted by these fixtures."
+    },
+    {
+      "id": "opencode",
+      "referenceVersion": "1.18.23",
+      "coveredVersions": ["1.18.23"],
+      "fixtureTests": ["native_agents::tests::concurrency_requires_the_audited_opencode_release", "native_agents::tests::independent_protocol_processes_do_not_block_or_cancel_each_other"],
+      "note": "The adapter's explicitly audited concurrency reference and controlled ACP peers cover this release. This does not assert real model, provider, or desktop execution."
+    },
+    {
+      "id": "pi",
+      "coveredVersions": [],
+      "unsupportedBelow": "1.0.0",
+      "fixtureTests": ["native_agents::tests::pi_automatic_compaction_keeps_the_native_thread_and_continues_the_turn", "native_agents::tests::pi_questions_validate_choices"],
+      "note": "RPC fixtures cover local continuation and approvals. Versions below 1.0.0 lack the current MCP integration; other releases remain unverified."
+    }
+  ]
+}

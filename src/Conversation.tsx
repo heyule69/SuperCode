@@ -1,4 +1,4 @@
-import { lazy, memo, Suspense, useEffect, useMemo, useState } from 'react';
+import { lazy, memo, Suspense, useEffect, useMemo, useRef, useState } from 'react';
 import { ArrowDown, Brain, Check, ChevronDown, ChevronRight, Circle, FileCode2, FileDiff, FileSearch, Globe, ListChecks, MessageCircleQuestion, Monitor, Network, Pencil, Shield, Square, SquareTerminal, Wrench, X } from 'lucide-react';
 import { conversationTurns, isActivity, type ConversationTurn } from './events';
 import { isActive, type Message } from './types';
@@ -17,6 +17,7 @@ import { QuestionHistory } from './QuestionHistory';
 import { planText, type PlanDecision } from './planPresentation';
 import { collectSubagents, isSubagent } from './subagents';
 import { SubagentContext, SubagentRows } from './SubagentRow';
+import { shareConversationTurns } from './conversationCache';
 const PlanCard = lazy(() => import('./PlanCard').then(module => ({ default: module.PlanCard })));
 const ProposedPlan = lazy(() => import('./ProposedPlan'));
 
@@ -170,7 +171,7 @@ function TurnProgress({ label }: { label: string }) {
   return <div className="working-indicator" role="status" aria-label="任务运行状态"><span className="pending-text">{label}</span></div>;
 }
 
-function TurnView({ turn, lifecycle, pendingLabel, agentName, autoExpand, processDisplay, showDiff, openFile, onPlanAction }: { turn: ConversationTurn; lifecycle: TurnLifecycle; pendingLabel: string; agentName: string; autoExpand: boolean; processDisplay: ProcessDisplay; showDiff:(name:string,text:string)=>void; openFile:(path:string,line?:number)=>void; onPlanAction?:(message:Message,decision:PlanDecision,feedback:string)=>Promise<void> }) {
+const TurnView = memo(function TurnView({ turn, lifecycle, pendingLabel, agentName, autoExpand, processDisplay, showDiff, openFile, onPlanAction }: { turn: ConversationTurn; lifecycle: TurnLifecycle; pendingLabel: string; agentName: string; autoExpand: boolean; processDisplay: ProcessDisplay; showDiff:(name:string,text:string)=>void; openFile:(path:string,line?:number)=>void; onPlanAction?:(message:Message,decision:PlanDecision,feedback:string)=>Promise<void> }) {
   const [allChanges, setAllChanges] = useState(false);
   const [expandedProcess, setExpandedProcess] = useState<string | null>(null);
   const presentation = presentTurn(turn, lifecycle);
@@ -182,7 +183,6 @@ function TurnView({ turn, lifecycle, pendingLabel, agentName, autoExpand, proces
   const marker = turn.run;
   const processKey = marker?.id ?? turn.id;
   useEffect(() => { setExpandedProcess(null); }, [processKey, presentation.completed]);
-  if (!turn.user && turn.items.length === 1 && turn.items[0].kind === 'modelSwitch') return <MessageView message={turn.items[0]} openFile={openFile} />;
   const completed = presentation.settled;
   const generating = !completed && (lifecycle.sessionStatus
     ? lifecycle.latest && isActive(lifecycle.sessionStatus)
@@ -190,12 +190,13 @@ function TurnView({ turn, lifecycle, pendingLabel, agentName, autoExpand, proces
   const latestPlan = turn.items.filter(message=>message.kind === 'plan').at(-1);
   const processOpen = processDisplay === 'timeline' || expandedProcess === processKey;
   const reply = (presentation.completed ? presentation.final : turn.items).filter(m => m.role === 'assistant' && m.text).map(m => m.text).join('\n\n');
-  const diff = turn.items.filter(m=>m.kind==='turnDiff').map(m=>m.text).join('\n');
-  const files = [...new Map(diffFiles(diff).map(f=>[f.path,f])).values()];
+  const diff = useMemo(() => turn.items.filter(m=>m.kind==='turnDiff').map(m=>m.text).join('\n'), [turn.items]);
+  const files = useMemo(() => [...new Map(diffFiles(diff).map(f=>[f.path,f])).values()], [diff]);
   const added = files.reduce((count, file) => count + file.added, 0);
   const removed = files.reduce((count, file) => count + file.removed, 0);
   const resultText = marker?.data?.status === 'interrupted' ? '已停止' : marker?.data?.status === 'failed' ? '运行失败' : '';
   const summary = <>{marker?.data?.durationMs != null ? <span>用时 {duration(Number(marker.data.durationMs))}</span> : <span>{resultText || '执行过程'}</span>}{resultText && marker?.data?.durationMs != null ? <span>· {resultText}</span> : null}</>;
+  if (!turn.user && turn.items.length === 1 && turn.items[0].kind === 'modelSwitch') return <MessageView message={turn.items[0]} openFile={openFile} />;
   function renderItems(items: Message[], live = false) {
     const blocks: (Message | Message[])[] = [];
     for (const item of items) {
@@ -231,10 +232,15 @@ function TurnView({ turn, lifecycle, pendingLabel, agentName, autoExpand, proces
       })}</div>{files.length > 3 ? <button className="changes-toggle" aria-expanded={allChanges} onClick={()=>setAllChanges(value=>!value)}>{allChanges ? '收起文件' : `再显示 ${files.length - 3} 个文件`}<ChevronDown size={14} className={allChanges ? 'expanded' : ''}/></button> : null}</section> : null}
     </section> : null}
   </div>;
-}
+}, (previous, next) => previous.turn === next.turn && previous.lifecycle.sessionStatus === next.lifecycle.sessionStatus && previous.lifecycle.activeTurnId === next.lifecycle.activeTurnId && previous.lifecycle.latest === next.lifecycle.latest && previous.pendingLabel === next.pendingLabel && previous.agentName === next.agentName && previous.autoExpand === next.autoExpand && previous.processDisplay === next.processDisplay && previous.showDiff === next.showDiff && previous.openFile === next.openFile && previous.onPlanAction === next.onPlanAction);
 
 export const Conversation = memo(function Conversation({ messages, agentName, autoExpand, processDisplay = 'collapsible', showDiff, openFile, openPath, projectId, sessionId, sessionStatus, activeTurnId, openSubagent, onPlanAction, pendingLabel = sessionStatus === 'starting' ? '正在启动 Agent…' : sessionStatus === 'waiting' ? '等待你的确认…' : '正在思考…' }: { messages: Message[]; agentName: string; autoExpand: boolean; processDisplay?: ProcessDisplay; showDiff:(name:string,text:string)=>void; openFile:(path:string,line?:number)=>void; openPath?: OpenPath; projectId?: string; sessionId?: string; sessionStatus?: string; activeTurnId?: string | null; openSubagent?:(key:string)=>void; onPlanAction?:(message:Message,decision:PlanDecision,feedback:string)=>Promise<void>; pendingLabel?: string }) {
-  const turns = conversationTurns(messages);
+  const previousTurns = useRef<ConversationTurn[]>([]);
+  const turns = useMemo(() => {
+    const shared = shareConversationTurns(previousTurns.current, conversationTurns(messages));
+    previousTurns.current = shared;
+    return shared;
+  }, [messages]);
   const mediaContext = useMemo(() => ({ projectId, sessionId, openFile }), [projectId, sessionId, openFile]);
   const subagents = useMemo(() => ({ agents:collectSubagents(messages), open:openSubagent }), [messages, openSubagent]);
   return <SubagentContext.Provider value={subagents}><MediaContext.Provider value={mediaContext}><ResourceMenu openFile={openFile} openPath={openPath}><ConversationIndex turns={turns}/>{turns.map((turn, index) => <TurnView key={turn.id} turn={turn} lifecycle={{ sessionStatus, activeTurnId, latest: index === turns.length - 1 }} pendingLabel={pendingLabel} agentName={agentName} autoExpand={autoExpand} processDisplay={processDisplay} showDiff={showDiff} openFile={openFile} onPlanAction={onPlanAction} />)}{!turns.length && isActive(sessionStatus) ? <TurnProgress label={pendingLabel} /> : null}</ResourceMenu></MediaContext.Provider></SubagentContext.Provider>;

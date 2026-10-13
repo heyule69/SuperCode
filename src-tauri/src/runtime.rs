@@ -9,7 +9,7 @@ use std::{
 };
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncWriteExt, BufReader},
     process::{Child, ChildStdin},
     sync::{oneshot, Mutex, Notify},
     time::{timeout, Duration},
@@ -31,6 +31,9 @@ struct TurnLifecycle {
 }
 
 impl TurnLifecycle {
+    async fn active(&self) -> bool {
+        self.turns.lock().await.values().any(|(_,phase)| *phase != TurnPhase::Finished)
+    }
     async fn expect(&self, thread: &str, turn: &str) {
         let mut turns = self.turns.lock().await;
         // A notification can precede its RPC response. Never regress that state.
@@ -118,9 +121,11 @@ pub struct Client {
     next: AtomicU64,
     pub alive: Arc<AtomicBool>,
     pub last_used: Arc<AtomicU64>,
+    active_connection_tasks: Arc<AtomicU64>,
     pub pid: u32,
     routing: u64,
     tool_configuration: u64,
+    context_configuration: crate::codex_context::Configuration,
     project: Option<std::path::PathBuf>,
     pub loaded_threads: Mutex<Vec<String>>,
     pub turn_settings: Mutex<Option<(String, String, String)>>,
@@ -187,6 +192,12 @@ impl Runtime {
     ) -> Result<Arc<Client>, String> {
         self.get_for_connection(app, session_id, None).await
     }
+    pub async fn get_for_session_context(
+        &self, app: &AppHandle, session_id: &str,
+        context: crate::codex_context::Configuration,
+    ) -> Result<Arc<Client>, String> {
+        self.for_session(session_id).get_context(app, Some(session_id), None, Some(context)).await
+    }
     pub async fn get_for_connection(
         &self,
         app: &AppHandle,
@@ -194,12 +205,13 @@ impl Runtime {
         connection_id: Option<&str>,
     ) -> Result<Arc<Client>, String> {
         if let Some(id) = session_id {
-            return self.for_session(id).get_context(app, session_id, connection_id).await;
+            return self.for_session(id).get_context(app, session_id, connection_id, None).await;
         }
-        self.get_context(app, None, connection_id).await
+        self.get_context(app, None, connection_id, None).await
     }
     async fn get_context(
         &self, app: &AppHandle, session_id: Option<&str>, connection_id: Option<&str>,
+        context_configuration: Option<crate::codex_context::Configuration>,
     ) -> Result<Arc<Client>, String> {
         let _startup = self.startup.lock().await;
         crate::desktop_lifecycle::ensure_running(app)?;
@@ -229,21 +241,22 @@ impl Runtime {
                     (routing, tool_configuration),
                     project.as_deref(),
                 )
+                && context_configuration_matches(&c.context_configuration,context_configuration.as_ref())
         }) {
             return Ok(client.clone());
         }
         let selected_is_active = session_id.is_some_and(|id| {
             app.state::<AppState>().store.session(id).is_ok_and(|s| matches!(s.status.as_str(), "running" | "waiting"))
         });
-        if selected_is_active
-            && slot
-                .as_ref()
-                .is_some_and(|c| c.alive.load(Ordering::Relaxed))
-        {
-            return Err("运行期间无法更换 Codex 连接，请等待当前任务完成".into());
+        if let Some(client)=slot.as_ref().filter(|client|client.alive.load(Ordering::Relaxed)) {
+            ensure_replacement_idle(selected_is_active,client.has_active_connection_tasks(),
+                client.turns.active().await,!client.requests.lock().await.is_empty())?;
         }
-        slot.take();
         let generation = self.epoch.fetch_add(1, Ordering::Relaxed) + 1;
+        if let Some(previous)=slot.take() {
+            previous.alive.store(false,Ordering::Relaxed);
+            let _=previous._child.lock().await.start_kill();
+        }
         let client = Arc::new(
             Client::start(
                 app.clone(),
@@ -253,6 +266,7 @@ impl Runtime {
                 tool_configuration,
                 project.as_deref(),
                 session_id.map(str::to_owned),
+                context_configuration.unwrap_or_default(),
             )
             .await?,
         );
@@ -284,7 +298,7 @@ impl Runtime {
     }
     async fn release_idle_local(&self) {
         let mut slot = self.client.lock().await;
-        if slot.as_ref().is_some_and(|c| (storage::now() as u64).saturating_sub(c.last_used.load(Ordering::Relaxed)) >= 300) {
+        if slot.as_ref().is_some_and(|c| !c.has_active_connection_tasks() && (storage::now() as u64).saturating_sub(c.last_used.load(Ordering::Relaxed)) >= 300) {
             self.epoch.fetch_add(1, Ordering::Relaxed);
             slot.take();
         }
@@ -292,6 +306,9 @@ impl Runtime {
 }
 
 impl Client {
+    fn has_active_connection_tasks(&self) -> bool {
+        self.alive.load(Ordering::Relaxed) && self.active_connection_tasks.load(Ordering::Acquire) > 0
+    }
     async fn start(
         app: AppHandle,
         epoch: Arc<AtomicU64>,
@@ -300,12 +317,15 @@ impl Client {
         tool_configuration: u64,
         project: Option<&std::path::Path>,
         session_id: Option<String>,
+        context_configuration: crate::codex_context::Configuration,
     ) -> Result<Self, String> {
         crate::runtime_diagnostics::register_secrets(&app, &route.config);
         if let Some(profile)=&route.profile { crate::runtime_diagnostics::register_secrets(&app, &profile.config); }
         let executable = crate::agents::resolve(&app, "codex")?.program;
+        let global_config = process::read_codex_config()?;
+        let project_config = process::read_codex_project_config(project)?;
         let mut overrides =
-            process::codex_config_overrides(app.state::<AppState>().store.load_mcp()?)?;
+            process::codex_config_overrides_for(&global_config, app.state::<AppState>().store.load_mcp()?)?;
         overrides.extend(crate::client_features::codex_mcp_overrides(&app)?);
         overrides.extend(crate::extensions::codex_overrides(&app, project)?);
         if route.config["official"] == true {
@@ -315,6 +335,9 @@ impl Client {
         if let Some(profile) = profile {
             overrides.extend(crate::ccswitch::codex_overrides(&profile.config)?);
         }
+        context_configuration.apply(&mut overrides,&app.state::<AppState>().data_dir)?;
+        let mcp = process::codex_mcp_configuration(&global_config, &project_config, &overrides)?;
+        crate::runtime_diagnostics::register_mcp_secrets(&app, &mcp);
         let mut args = vec!["app-server", "--listen", "stdio://"];
         for override_value in &overrides {
             args.extend(["-c", override_value.as_str()]);
@@ -366,6 +389,9 @@ impl Client {
         let reader_turns = turns.clone();
         let request_namespace = format!("codex:{}:", uuid::Uuid::new_v4());
         let reader_namespace = request_namespace.clone();
+        let active_connection_tasks = Arc::new(AtomicU64::new(0));
+        let reader_active_connection_tasks = active_connection_tasks.clone();
+        let connection_id = route.id.clone();
         let log_session = session_id.clone();
         tauri::async_runtime::spawn(async move {
             let mut reader = BufReader::new(output);
@@ -403,6 +429,17 @@ impl Client {
                         }
                     }
                 } else {
+                    let mut connection_usage_changed = false;
+                    match reader_app.state::<AppState>().store.observe_connection_usage(
+                        &reader_namespace, session_id.as_deref(), &connection_id, &message,
+                    ) {
+                        Ok(Some((changed, active))) => {
+                            reader_active_connection_tasks.store(active as u64, Ordering::Release);
+                            connection_usage_changed = changed;
+                        }
+                        Ok(None) => {}
+                        Err(error) => crate::runtime_diagnostics::message(&reader_app, session_id.as_deref(), "storage", "error", "connection_usage_error", &error),
+                    }
                     reader_turns.observe(&message).await;
                     if let Some(id) = &session_id { message["params"]["appSessionId"] = id.clone().into(); }
                     namespace_request(&mut message, &reader_namespace);
@@ -419,9 +456,14 @@ impl Client {
                             .remove(&message["params"]["requestId"].to_string());
                     }
                     publish_event(&reader_app, message);
+                    if connection_usage_changed { let _ = reader_app.emit("workspace-updated", ()); }
                 }
             }
             reader_alive.store(false, Ordering::Relaxed);
+            reader_active_connection_tasks.store(0, Ordering::Release);
+            if reader_app.state::<AppState>().store.clear_connection_usage(&reader_namespace).unwrap_or(false) {
+                let _ = reader_app.emit("workspace-updated", ());
+            }
             let exit_code = reader_child.lock().await.try_wait().ok().flatten().and_then(|s|s.code());
             crate::runtime_diagnostics::record(&reader_app, session_id.as_deref(), "agent_process_output_closed", json!({"source":"codex","pid":pid,"exitCode":exit_code}));
             let _ = reader_child.lock().await.kill().await;
@@ -466,6 +508,7 @@ impl Client {
             next: AtomicU64::new(1),
             alive,
             last_used,
+            active_connection_tasks,
             loaded_threads: Mutex::new(Vec::new()),
             turn_settings: Mutex::new(None),
             planning_supported: Mutex::new(None),
@@ -473,6 +516,7 @@ impl Client {
             pid,
             routing: route.fingerprint(),
             tool_configuration,
+            context_configuration,
             project: project.map(std::path::Path::to_owned),
         })
     }
@@ -563,6 +607,20 @@ fn context_matches(
 ) -> bool {
     active_route == route && project.is_none_or(|path| active_project == Some(path))
 }
+fn context_configuration_matches(
+    active: &crate::codex_context::Configuration,
+    requested: Option<&crate::codex_context::Configuration>,
+) -> bool {
+    // Model inventory, allowances, approvals and explicit compaction must reuse
+    // the live client; only a send path supplies a new selected-model policy.
+    requested.is_none_or(|requested| active == requested)
+}
+fn ensure_replacement_idle(session_active:bool,child_tasks:bool,turn_active:bool,pending_requests:bool) -> Result<(),String> {
+    if session_active || child_tasks || turn_active || pending_requests {
+        return Err("Codex 仍有任务或子任务运行，无法更换连接或上下文配置，请等待任务完成".into());
+    }
+    Ok(())
+}
 fn namespace_request(message: &mut Value, namespace: &str) {
     if let Some(id) = message.get("id").cloned() { message["id"] = format!("{namespace}{id}").into(); }
     if message["method"] == "serverRequest/resolved" {
@@ -572,31 +630,9 @@ fn namespace_request(message: &mut Value, namespace: &str) {
     }
 }
 
-pub(crate) async fn read_frame<R: tokio::io::AsyncBufRead + Unpin>(
-    reader: &mut R,
-) -> Result<Option<Vec<u8>>, String> {
-    let mut frame = Vec::new();
-    loop {
-        let buffer = reader.fill_buf().await.map_err(|e| e.to_string())?;
-        if buffer.is_empty() {
-            return if frame.is_empty() {
-                Ok(None)
-            } else {
-                Err("Codex 返回了不完整的 JSONL 数据".into())
-            };
-        }
-        let end = buffer.iter().position(|b| *b == b'\n');
-        let length = end.map_or(buffer.len(), |i| i + 1);
-        if frame.len() + length > 4 * 1024 * 1024 {
-            return Err("Codex 单条事件超过 4 MB，连接已关闭以保护内存".into());
-        }
-        frame.extend_from_slice(&buffer[..length]);
-        reader.consume(length);
-        if end.is_some() {
-            return Ok(Some(frame));
-        }
-    }
-}
+#[path = "agent_transport.rs"]
+mod transport;
+pub(crate) use transport::read_frame;
 
 pub(crate) fn publish_event(app: &AppHandle, mut message: Value) {
     if message["params"]["appSessionId"].is_null() {
@@ -844,6 +880,42 @@ mod tests {
         // Inventory queries can reuse a matching live client without switching it.
         assert!(context_matches((1, 3), Some(a), (1, 3), None));
     }
+    fn api_context(model:&str) -> crate::codex_context::Configuration {
+        let config=json!({"apiKey":"fixture","modelMetadata":{
+            "large":{"contextWindow":1000000},"small":{"contextWindow":64000},
+            "another-large":{"contextWindow":1000000}
+        }});
+        let route=crate::session_config::Route { id:"api".into(),config:config.clone(),profile:Some(crate::ccswitch::Profile {
+            id:"api".into(),agent:"codex".into(),name:"API".into(),config,
+        })};
+        crate::codex_context::Configuration::for_route(&route,Some(model))
+    }
+    #[test]
+    fn large_small_unknown_model_changes_refresh_only_explicit_context_requests() {
+        let mut active=api_context("large");
+        for model in ["small","unknown","large","another-large"] {
+            let requested=api_context(model);
+            // A summary, allowance query or approval uses the live context unchanged.
+            assert!(context_configuration_matches(&active,None));
+            assert!(!context_configuration_matches(&active,Some(&requested)));
+            ensure_replacement_idle(false,false,false,false).unwrap();
+            active=requested;
+            assert!(context_configuration_matches(&active,Some(&active)));
+        }
+    }
+    #[tokio::test]
+    async fn context_refresh_never_restarts_a_parent_turn_child_task_or_pending_approval() {
+        for state in [(true,false,false,false),(false,true,false,false),(false,false,true,false),(false,false,false,true)] {
+            assert!(ensure_replacement_idle(state.0,state.1,state.2,state.3).is_err());
+        }
+        let turns=TurnLifecycle::default();
+        turns.expect("native","pending").await;
+        assert!(ensure_replacement_idle(false,false,turns.active().await,false).is_err());
+        turns.observe(&json!({"method":"turn/completed","params":{"threadId":"native","turn":{"id":"pending"}}})).await;
+        // A completed root can still own a running child; its lease blocks replacement.
+        assert!(ensure_replacement_idle(false,true,turns.active().await,false).is_err());
+        ensure_replacement_idle(false,false,turns.active().await,false).unwrap();
+    }
     #[test]
     fn request_ids_are_isolated_and_resolved_with_the_same_namespace() {
         for raw in [json!(1), json!("one:two")] {
@@ -857,20 +929,5 @@ mod tests {
             namespace_request(&mut resolved, "codex:a:");
             assert_eq!(resolved["params"]["requestId"], a["id"]);
         }
-    }
-    #[tokio::test]
-    async fn jsonl_only_splits_at_lf_and_rejects_partial_frames() {
-        let bytes = "{\"text\":\"你好\u{2028}🧋\"}\n{\"id\":2}\n".as_bytes();
-        let mut reader = BufReader::with_capacity(4, bytes);
-        let first = read_frame(&mut reader).await.unwrap().unwrap();
-        assert!(serde_json::from_slice::<Value>(&first).is_ok());
-        assert_eq!(
-            serde_json::from_slice::<Value>(&read_frame(&mut reader).await.unwrap().unwrap())
-                .unwrap()["id"],
-            2
-        );
-        assert!(read_frame(&mut reader).await.unwrap().is_none());
-        let mut partial = BufReader::new("{\"id\":3}".as_bytes());
-        assert!(read_frame(&mut partial).await.is_err());
     }
 }

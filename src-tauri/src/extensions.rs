@@ -654,6 +654,11 @@ pub async fn set_extension_enabled(
     id: String,
     enabled: bool,
 ) -> Result<(), String> {
+    let agents = app.state::<crate::agents::Agents>();
+    let _configuration = agents
+        .operation
+        .try_write()
+        .map_err(|_| "Agent 正在启动或配置，请稍后更改扩展")?;
     if app.state::<AppState>().store.running()? > 0 {
         return Err("任务结束后才能更改插件和 MCP".into());
     }
@@ -687,6 +692,11 @@ pub async fn set_extension_enabled(
 }
 #[tauri::command]
 pub async fn import_extension(app: AppHandle, path: String, agent: String) -> Result<(), String> {
+    let agents = app.state::<crate::agents::Agents>();
+    let _configuration = agents
+        .operation
+        .try_write()
+        .map_err(|_| "Agent 正在启动或配置，请稍后导入扩展")?;
     if app.state::<AppState>().store.running()? > 0 {
         return Err("任务结束后才能导入插件".into());
     }
@@ -763,6 +773,13 @@ pub fn codex_overrides(app: &AppHandle, project: Option<&Path>) -> Result<Vec<St
     let mut roots = Roots::for_app(app, None)?;
     roots.project = project.map(Path::to_owned);
     let catalog = discover(&roots, &read_choices(app)?, false);
+    for mcp in catalog
+        .mcp
+        .iter()
+        .filter(|mcp| mcp.agent == "codex" && mcp.enabled)
+    {
+        crate::runtime_diagnostics::register_mcp_secrets(app, &mcp.config);
+    }
     codex_overrides_for(&catalog)
 }
 fn codex_overrides_for(catalog: &Catalog) -> Result<Vec<String>, String> {

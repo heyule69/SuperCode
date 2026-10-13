@@ -50,7 +50,7 @@ async fn claude_summary(
     } else {
         None
     };
-    let mut args = vec![
+    let args = vec![
         "--print",
         "--output-format",
         "json",
@@ -62,13 +62,10 @@ async fn claude_summary(
         "--setting-sources",
         "",
         "--settings",
-        "{\"disableAllHooks\":true}",
+        "{\"disableAllHooks\":true,\"autoCompactEnabled\":true}",
         "--append-system-prompt",
         INSTRUCTIONS,
     ];
-    if let Some(model) = &model {
-        args.extend(["--model", model]);
-    }
     let mut command = launch.command(&args);
     if route.id != crate::session_config::LOCAL {
         for key in [
@@ -76,9 +73,11 @@ async fn claude_summary(
             "ANTHROPIC_AUTH_TOKEN",
             "ANTHROPIC_BASE_URL",
             "ANTHROPIC_MODEL",
+            "ANTHROPIC_DEFAULT_FABLE_MODEL",
             "ANTHROPIC_DEFAULT_OPUS_MODEL",
             "ANTHROPIC_DEFAULT_SONNET_MODEL",
             "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+            "ANTHROPIC_SMALL_FAST_MODEL",
             "CLAUDE_CODE_SUBAGENT_MODEL",
         ] {
             command.env_remove(key);
@@ -90,6 +89,10 @@ async fn claude_summary(
                 command.env(k, v);
             }
         }
+    }
+    let context = crate::model_context::configure_claude(&mut command, &config, model.as_deref());
+    if let Some(model) = context.launch_model {
+        command.args(["--model", model.as_str()]);
     }
     command.env("CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST", "1");
     let project = app.state::<AppState>().store.session_workspace(&session)?;

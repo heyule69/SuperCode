@@ -176,7 +176,7 @@ pub fn model_source(config: &Value, agent: &str, connection_name: Option<&str>) 
         "planName":if coding {Some("编程计划")} else if id == "custom" && base.is_some() {Some("API")} else {plan_name},"connectionName":connection_name,"modelFamily":family})
 }
 
-fn configured_base_url(config: &Value) -> Option<String> {
+pub(crate) fn configured_base_url(config: &Value) -> Option<String> {
     config["baseUrl"]
         .as_str()
         .or(config["env"]["ANTHROPIC_BASE_URL"].as_str())
@@ -218,7 +218,9 @@ pub fn real_claude_model(config: &Value, requested: Option<&str>) -> Option<Stri
         .or(config["model"].as_str())
         .or(env["ANTHROPIC_MODEL"].as_str());
     if let Some(value) = value {
-        let suffix = if value.eq_ignore_ascii_case("opus") {
+        let suffix = if value.eq_ignore_ascii_case("fable") {
+            Some("FABLE")
+        } else if value.eq_ignore_ascii_case("opus") {
             Some("OPUS")
         } else if value.eq_ignore_ascii_case("sonnet") {
             Some("SONNET")
@@ -241,6 +243,7 @@ pub fn real_claude_model(config: &Value, requested: Option<&str>) -> Option<Stri
         "ANTHROPIC_DEFAULT_SONNET_MODEL",
         "ANTHROPIC_DEFAULT_OPUS_MODEL",
         "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+        "ANTHROPIC_DEFAULT_FABLE_MODEL",
     ]
     .iter()
     .find_map(|key| {
@@ -268,6 +271,7 @@ pub fn model_ids(config: &Value) -> Vec<String> {
     }
     for key in [
         "ANTHROPIC_MODEL",
+        "ANTHROPIC_DEFAULT_FABLE_MODEL",
         "ANTHROPIC_DEFAULT_OPUS_MODEL",
         "ANTHROPIC_DEFAULT_SONNET_MODEL",
         "ANTHROPIC_DEFAULT_HAIKU_MODEL",
@@ -561,7 +565,8 @@ pub async fn save_provider_profile(
     }
     let profile = make_profile(settings, previous.as_ref())?;
     let state = app.state::<AppState>();
-    state.runtime.release(&app).await?;
+    // Existing chats keep their connection; each runtime rechecks its route
+    // before the next turn. Unrelated changes need no process shutdown.
     let was_active = state
         .store
         .active_profile(&profile.agent)?
@@ -580,7 +585,6 @@ pub async fn save_provider_profile(
 #[tauri::command]
 pub async fn delete_provider_profile(id: String, app: AppHandle) -> Result<(), String> {
     let state = app.state::<AppState>();
-    state.runtime.release(&app).await?;
     find(&app, &id)?;
     state.store.delete_profile(&id)
 }
@@ -758,8 +762,6 @@ async fn test_claude_plan(app: &AppHandle, profile: &Profile, launch: &crate::ag
         "--print",
         "--output-format",
         "json",
-        "--model",
-        &model,
         "--tools",
         "",
         "--max-turns",
@@ -768,7 +770,7 @@ async fn test_claude_plan(app: &AppHandle, profile: &Profile, launch: &crate::ag
         "--setting-sources",
         "",
         "--settings",
-        "{\"disableAllHooks\":true}",
+        "{\"disableAllHooks\":true,\"autoCompactEnabled\":true}",
         "Reply only OK.",
     ]);
     for key in [
@@ -776,9 +778,11 @@ async fn test_claude_plan(app: &AppHandle, profile: &Profile, launch: &crate::ag
         "ANTHROPIC_AUTH_TOKEN",
         "ANTHROPIC_BASE_URL",
         "ANTHROPIC_MODEL",
+        "ANTHROPIC_DEFAULT_FABLE_MODEL",
         "ANTHROPIC_DEFAULT_OPUS_MODEL",
         "ANTHROPIC_DEFAULT_SONNET_MODEL",
         "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+        "ANTHROPIC_SMALL_FAST_MODEL",
     ] {
         cmd.env_remove(key);
     }
@@ -789,6 +793,8 @@ async fn test_claude_plan(app: &AppHandle, profile: &Profile, launch: &crate::ag
             }
         }
     }
+    let context=crate::model_context::configure_claude(&mut cmd,&profile.config,Some(&model));
+    if let Some(launch_model)=context.launch_model { cmd.args(["--model",&launch_model]); }
     let mut child = cmd
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
@@ -1006,6 +1012,10 @@ mod tests {
             real_claude_model(&c, Some("kimi-k2.5")).as_deref(),
             Some("kimi-k2.5")
         );
+        let fable = json!({"env":{"ANTHROPIC_DEFAULT_FABLE_MODEL":"glm-5.3"}});
+        assert_eq!(real_claude_model(&fable, Some("fable")).as_deref(),Some("glm-5.3"));
+        assert_eq!(real_claude_model(&fable, None).as_deref(),Some("glm-5.3"));
+        assert_eq!(catalog_models(&fable)["data"][0]["contextWindow"],1000000);
     }
     #[test]
     fn manual_profile_roundtrip_preserves_model_and_secret_without_exposing_it() {

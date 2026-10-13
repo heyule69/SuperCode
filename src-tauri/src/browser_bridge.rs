@@ -60,6 +60,51 @@ pub fn validate(name: &str, args: &Value) -> Result<(), String> {
 pub fn text_result(value: Value, failed: bool) -> Value {
     json!({"content":[{"type":"text","text":value.to_string()}],"isError":failed})
 }
+pub(crate) fn takeover_result(action_may_have_run: bool) -> Value {
+    text_result(json!({"status":"stopped","code":"user_takeover","actionMayHaveRun":action_may_have_run,
+        "message":"Browser automation was cancelled. The browser tool connection and the agent task remain available.",
+        "nextStep":"Stop browser automation. Do not retry, reclaim control, or use another browser to bypass the user's takeover without renewed user authorization. Continue other work that does not control the browser."}),false)
+}
+async fn call_tool(
+    client: &reqwest::Client,
+    address: std::net::SocketAddr,
+    token: &str,
+    request: Value,
+) -> Value {
+    let result = async {
+        let name = request["name"].as_str().unwrap_or("");
+        validate(name, &request["arguments"])?;
+        let response = client
+            .post(format!("http://{address}/call"))
+            .bearer_auth(token)
+            .json(&request)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        if !response.status().is_success() {
+            return Err("Browser connection rejected; return to the chat and check the browser panel".into());
+        }
+        let bytes = response.bytes().await.map_err(|e| e.to_string())?;
+        if bytes.len() > 8 * 1024 * 1024 {
+            return Err("Browser response too large".into());
+        }
+        serde_json::from_slice::<Value>(&bytes).map_err(|e| e.to_string())
+    }
+    .await;
+    match result {
+        Ok(value) => value,
+        Err(error) => {
+            let _ = client
+                .post(format!("http://{address}/cancel"))
+                .bearer_auth(token)
+                .json(&json!({"agent":request["agent"],"id":request["id"]}))
+                .timeout(Duration::from_secs(2))
+                .send()
+                .await;
+            text_result(json!({"error":error,"nextStep":"Stop browser automation for this request and do not retry an uncertain action. Check the browser panel with the user before further browser control. Other work may continue."}),true)
+        }
+    }
+}
 fn send(out: &Arc<Mutex<std::io::Stdout>>, value: Value) {
     if let Ok(mut out) = out.lock() {
         let _ = serde_json::to_writer(&mut *out, &value);
@@ -112,15 +157,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
                     let key=id.to_string();let request_id=format!("{instance}:{key}");
                     calls.insert(key,tokio::spawn(async move {
                         let name=value["params"]["name"].as_str().unwrap_or("");let arguments=value["params"].get("arguments").cloned().unwrap_or(json!({}));
-                        let result=async {
-                            validate(name,&arguments)?;
-                            let response=client.post(format!("http://{address}/call")).bearer_auth(&token).json(&json!({"agent":agent,"session":session,"id":request_id,"name":name,"arguments":arguments})).send().await.map_err(|e|e.to_string())?;
-                            if !response.status().is_success(){return Err("Browser connection rejected; return to the chat and check the browser panel".into());}
-                            let bytes=response.bytes().await.map_err(|e|e.to_string())?;
-                            if bytes.len()>8*1024*1024{return Err("Browser response too large".into());}
-                            serde_json::from_slice::<Value>(&bytes).map_err(|e|e.to_string())
-                        }.await;
-                        let result=match result{Ok(value)=>value,Err(error)=>{let _=client.post(format!("http://{address}/cancel")).bearer_auth(&token).json(&json!({"agent":agent,"id":request_id})).timeout(Duration::from_secs(2)).send().await;text_result(json!({"error":error,"nextStep":"Do not retry an uncertain action. Return control to the user."}),true)}};
+                        let result=call_tool(&client,address,&token,json!({"agent":agent,"session":session,"id":request_id,"name":name,"arguments":arguments})).await;
                         send(&out,json!({"jsonrpc":"2.0","id":id,"result":result}));
                     }));
                 },
@@ -149,5 +186,61 @@ mod tests {
         .is_err());
         assert!(validate("browser_scroll", &json!({"snapshotId":"s","deltaY":1601})).is_err());
         assert!(validate("browser_click", &json!({"ref":"e1"})).is_err());
+    }
+    fn detail(result: &Value) -> Value {
+        serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap()
+    }
+    #[test]
+    fn user_takeover_stops_browser_control_without_ending_other_work() {
+        let result = takeover_result(true);
+        assert_eq!(result["isError"], false);
+        let detail = detail(&result);
+        assert_eq!(detail["code"], "user_takeover");
+        assert_eq!(detail["actionMayHaveRun"], true);
+        let instruction = detail["nextStep"].as_str().unwrap();
+        assert!(instruction.contains("renewed user authorization"));
+        assert!(instruction.contains("Continue other work"));
+        assert!(instruction.contains("Do not retry"));
+    }
+    #[tokio::test]
+    async fn http_and_decode_failures_are_tool_errors_and_the_next_request_still_returns() {
+        for first_status in [axum::http::StatusCode::UNAUTHORIZED, axum::http::StatusCode::OK] {
+            let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let seen = attempts.clone();
+            let router = axum::Router::new()
+                .route("/call", axum::routing::post(move || {
+                    let first = seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0;
+                    async move {
+                        if first { (first_status, "invalid JSON".to_owned()) }
+                        else { (axum::http::StatusCode::OK, text_result(json!({"ok":true}), false).to_string()) }
+                    }
+                }))
+                .route("/cancel", axum::routing::post(|| async { axum::http::StatusCode::NO_CONTENT }));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap(); });
+            let client = reqwest::Client::builder().no_proxy().timeout(Duration::from_secs(2)).build().unwrap();
+            let request = json!({"agent":"codex","session":"fixture","id":"one","name":"browser_snapshot","arguments":{}});
+            let failed = call_tool(&client, address, "fixture", request.clone()).await;
+            assert_eq!(failed["isError"], true);
+            assert!(detail(&failed)["error"].is_string());
+            assert!(detail(&failed)["nextStep"].as_str().unwrap().contains("Other work may continue"));
+            let next = call_tool(&client, address, "fixture", request).await;
+            assert_eq!(next["isError"], false);
+            assert_eq!(detail(&next)["ok"], true);
+            server.abort();
+        }
+    }
+    #[tokio::test]
+    async fn disconnected_browser_host_and_invalid_tools_return_errors_without_panicking() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let client = reqwest::Client::builder().no_proxy().timeout(Duration::from_secs(1)).build().unwrap();
+        for name in ["browser_snapshot", "unknown_browser_tool"] {
+            let result = call_tool(&client, address, "fixture", json!({"agent":"claude","id":"fixture","name":name,"arguments":{}})).await;
+            assert_eq!(result["isError"], true);
+            assert!(detail(&result)["error"].is_string());
+        }
     }
 }

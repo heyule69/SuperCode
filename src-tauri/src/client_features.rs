@@ -27,9 +27,9 @@ pub fn permission(mode: &str) -> Result<(&'static str, &'static str, Value), Str
 }
 
 pub fn has_plan_preset(result: &Value) -> bool {
-    result["data"].as_array().is_some_and(|presets| {
-        presets.iter().any(|preset| preset["mode"] == "plan")
-    })
+    result["data"]
+        .as_array()
+        .is_some_and(|presets| presets.iter().any(|preset| preset["mode"] == "plan"))
 }
 
 /// Select the native collaboration mode on every configured turn so leaving
@@ -363,6 +363,11 @@ pub fn list_tool_servers(app: AppHandle) -> Result<Value, String> {
 }
 #[tauri::command]
 pub async fn save_tool_servers(mut servers: Vec<ToolServer>, app: AppHandle) -> Result<(), String> {
+    let agents = app.state::<crate::agents::Agents>();
+    let _configuration = agents
+        .operation
+        .try_write()
+        .map_err(|_| "Agent 正在启动或配置，请稍后更改工具")?;
     if app.state::<AppState>().store.running()? > 0 {
         return Err("任务结束后才能更改工具连接".into());
     }
@@ -511,15 +516,22 @@ fn canonical_target(path: &Path) -> Option<PathBuf> {
     crate::file_changes::canonical_target(path)
 }
 pub fn capture_change(app: &AppHandle, session: &crate::storage::Session, params: &mut Value) {
-    let Ok(workspace) = app.state::<AppState>().store.session_workspace(session) else { return; };
+    let Ok(workspace) = app.state::<AppState>().store.session_workspace(session) else {
+        return;
+    };
     let state = app.state::<AppState>();
-    let Ok(mut snapshots) = state.change_snapshots.lock() else { return; };
+    let Ok(mut snapshots) = state.change_snapshots.lock() else {
+        return;
+    };
     let changes = snapshots.observe(&session.id, Path::new(&workspace.path), &mut params["item"]);
     let turn = params["turnId"].as_str().unwrap_or("unknown");
     for change in changes {
         let _ = state.store.save_message(
-            &format!("change-{turn}:{}",change.path), &session.id, "activity",
-            &crate::protocol::bounded(&change.diff,128*1024), "turnDiff",
+            &format!("change-{turn}:{}", change.path),
+            &session.id,
+            "activity",
+            &crate::protocol::bounded(&change.diff, 128 * 1024),
+            "turnDiff",
             &json!({"turnId":turn,"status":"completed","path":change.path}),
         );
     }
@@ -720,23 +732,31 @@ mod tests {
     #[test]
     fn codex_planning_uses_native_instructions_and_explicitly_exits_on_the_next_normal_turn() {
         let plan = codex_collaboration_mode("read", Some("provider-model"), Some("high"))
-            .unwrap().unwrap();
+            .unwrap()
+            .unwrap();
         assert_eq!(plan["mode"], "plan");
         assert_eq!(plan["settings"]["model"], "provider-model");
         assert_eq!(plan["settings"]["reasoning_effort"], "high");
         assert!(plan["settings"]["developer_instructions"].is_null());
         for permission in ["ask", "auto", "strict", "full"] {
             let next = codex_collaboration_mode(permission, Some("another-model"), None)
-                .unwrap().unwrap();
+                .unwrap()
+                .unwrap();
             assert_eq!(next["mode"], "default");
             assert_eq!(next["settings"]["model"], "another-model");
             assert!(next["settings"]["reasoning_effort"].is_null());
         }
         assert!(codex_collaboration_mode("read", None, None).is_err());
         assert!(codex_collaboration_mode("read", Some(" "), None).is_err());
-        assert!(codex_collaboration_mode("ask", None, None).unwrap().is_none());
-        assert!(has_plan_preset(&json!({"data":[{"mode":"default"},{"mode":"plan"}]})));
-        assert!(!has_plan_preset(&json!({"data":[{"name":"plan","mode":"default"}]})));
+        assert!(codex_collaboration_mode("ask", None, None)
+            .unwrap()
+            .is_none());
+        assert!(has_plan_preset(
+            &json!({"data":[{"mode":"default"},{"mode":"plan"}]})
+        ));
+        assert!(!has_plan_preset(
+            &json!({"data":[{"name":"plan","mode":"default"}]})
+        ));
         assert!(!has_plan_preset(&json!({"data":null})));
     }
     #[test]

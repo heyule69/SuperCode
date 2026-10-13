@@ -50,3 +50,9 @@ it('keeps the old usable version after a rejected update',async()=>{
   await render();await act(async()=>button(row('Codex'),'更新').click());
   expect(row('Codex').textContent).toContain('可使用');expect(row('Codex').textContent).toContain('0.160.1');expect(button(row('Codex'),'更新').disabled).toBe(false);
 });
+it('offers the recorded rollback while keeping compatibility evidence explicit',async()=>{
+  mocks.call.mockImplementation(async(command:string)=>command==='check_agent_updates'?releases:command==='list_agent_recovery'?[{id:'codex',version:'0.160.1',status:'unverified',referenceVersion:'0.154.0',canRollback:true,previousVersion:'0.154.0'}]:agents);
+  await render();expect(row('Codex').textContent).toContain('当前版本尚无完整兼容验证');
+  await act(async()=>button(row('Codex'),'回滚上个版本').click());expect(mocks.call).toHaveBeenCalledWith('rollback_agent',{id:'codex'});
+  await render(true);expect(button(row('Codex'),'回滚上个版本').disabled).toBe(true);
+});

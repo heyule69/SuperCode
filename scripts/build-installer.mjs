@@ -4,6 +4,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync, statSync } from 'no
 import { join, resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { verifyRelease } from './release-contract.mjs';
+import { captureSource, assertUnchanged, verifyAppBuild } from './build-provenance.mjs';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const generated = join(root, 'installer', 'generated');
@@ -26,12 +27,18 @@ const nsis = process.env.SUPERCODE_NSIS || join(process.env.LOCALAPPDATA, 'tauri
 if (!existsSync(nsis)) throw new Error('NSIS 未找到。先运行 npm run desktop:build，或用 SUPERCODE_NSIS 指定 makensis.exe。');
 if (process.platform !== 'win32') throw new Error('请在 Windows 上生成此安装器。');
 mkdirSync(generated, { recursive: true }); mkdirSync(output, { recursive: true });
+const source = captureSource(root);
+const app = join(root, 'src-tauri', 'target', 'release', 'supercode.exe');
+const appStamp = join(root, 'src-tauri', 'target', 'release', 'supercode-build.json');
 if (!reuseApp && !prepareOnly) {
   // Calling Node directly avoids a shell and allows spaces in the repository path.
   run(process.execPath, [join(root, 'node_modules', '@tauri-apps', 'cli', 'tauri.js'), 'build', '--no-bundle']);
+  assertUnchanged(source, captureSource(root));
+  writeFileSync(appStamp, `${JSON.stringify({ source, appSha256: hash(readFileSync(app)) }, null, 2)}\n`, 'utf8');
 }
-const app = join(root, 'src-tauri', 'target', 'release', 'supercode.exe');
 if (!existsSync(app)) throw new Error('请先编译 SuperCode 的 release 主程序。');
+if (!existsSync(appStamp)) throw new Error('主程序没有构建来源记录，请运行 installer:build 重新编译。');
+verifyAppBuild(JSON.parse(readText(appStamp)), source, readFileSync(app));
 const version = JSON.parse(readText(join(root, 'package.json'))).version;
 const ico = join(root, 'src-tauri', 'icons', 'icon.ico');
 const iconName = `supercode-icon-${hash(readFileSync(ico)).slice(0, 12)}.ico`;
@@ -54,12 +61,14 @@ if (!prepareOnly) {
   run('cargo', ['build', '--release', '--locked', '--manifest-path', join(root, 'installer', 'Cargo.toml'), '--target-dir', join(root, 'src-tauri', 'target')]);
   const setup = join(output, `SuperCode_${version}_x64-setup.exe`);
   run(nsis, ['/INPUTCHARSET', 'UTF8', `/DOUTPUT=${setup}`, `/DICON_SOURCE=${ico}`, `/DGUI_SOURCE=${join(root, 'src-tauri', 'target', 'release', 'supercode-installer.exe')}`, `/DVERSION=${version}`, join(root, 'installer', 'bootstrapper.nsi')]);
-  const metadata = { version, setup: setup.slice(root.length + 1), bytes: statSync(setup).size, sha256: hash(readFileSync(setup)), appSha256: entries[0].sha256, iconName, builtAt: new Date().toISOString() };
+  assertUnchanged(source, captureSource(root));
+  const metadata = { version, source, setup: setup.slice(root.length + 1), bytes: statSync(setup).size, sha256: hash(readFileSync(setup)), appSha256: entries[0].sha256, iconName, builtAt: new Date().toISOString() };
   writeFileSync(join(output, 'installer-build.json'), `${JSON.stringify(metadata, null, 2)}\n`, 'utf8');
   writeFileSync(`${setup}.sha256`, `${metadata.sha256}  SuperCode_${version}_x64-setup.exe\n`, 'utf8');
   const signingKey = process.env.TAURI_SIGNING_PRIVATE_KEY_PATH || join(process.env.USERPROFILE, '.supercode-signing', 'update.key');
   if (existsSync(signingKey)) {
     run(process.execPath, [join(root, 'node_modules', '@tauri-apps', 'cli', 'tauri.js'), 'signer', 'sign', '-f', signingKey, '-p', process.env.TAURI_SIGNING_PRIVATE_KEY_PASSWORD || '', '--app-version', version, setup]);
+    run(process.execPath, [join(root, 'node_modules', '@tauri-apps', 'cli', 'tauri.js'), 'signer', 'sign', '-f', signingKey, '-p', process.env.TAURI_SIGNING_PRIVATE_KEY_PASSWORD || '', '--app-version', version, join(output, 'installer-build.json')]);
     const notesPath = join(root, '.github', 'release-notes', `${version}.md`);
     const latest = { version, notes: existsSync(notesPath) ? readText(notesPath).trim() : `SuperCode ${version}`, pub_date: new Date().toISOString(), platforms: {
       'windows-x86_64': { url: `https://github.com/heyule69/SuperCode/releases/download/v${version}/SuperCode_${version}_x64-setup.exe`, signature: readText(`${setup}.sig`).trim(), sha256: metadata.sha256, size: metadata.bytes },

@@ -257,6 +257,12 @@ pub(crate) fn sanitize_provider(agent: &str, id: &str, raw: Value) -> Result<Val
     if agent == "claude" {
         let mut safe = json!({"env":claude_env(&raw),"model":raw["model"],"source":"ccswitch"});
         safe["model"] = json!(crate::providers::real_claude_model(&safe, None));
+        // MAX_CONTEXT declares this selected model's window. It is not a safe
+        // global override for differently sized child models on this connection.
+        // AUTO_COMPACT_WINDOW is only a trigger window, never model capacity.
+        if let (Some(model),Some(window))=(safe["model"].as_str().map(str::to_owned),crate::model_context::positive(&raw["env"]["CLAUDE_CODE_MAX_CONTEXT_TOKENS"])) {
+            safe["modelMetadata"]=json!({model:{"contextWindow":window}});
+        }
         return Ok(safe);
     }
     if matches!(agent, "opencode" | "pi") {
@@ -607,9 +613,6 @@ pub fn import_ccswitch(
     ids: Vec<String>,
     app: AppHandle,
 ) -> Result<usize, String> {
-    if app.state::<AppState>().store.running()? != 0 {
-        return Err("请先完成或停止当前任务后导入配置".into());
-    }
     if ids.is_empty() {
         return Err("请选择要导入的配置".into());
     }
@@ -624,7 +627,6 @@ pub async fn select_agent_profile(
     app: AppHandle,
 ) -> Result<(), String> {
     let state = app.state::<AppState>();
-    state.runtime.release(&app).await?;
     state.store.select_profile(&agent, id.as_deref())?;
     let _ = app.emit("workspace-updated", ());
     Ok(())
@@ -670,6 +672,21 @@ pub fn codex_overrides(config: &Value) -> Result<Vec<String>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn imported_claude_max_context_is_metadata_for_selected_model_not_a_global_child_override() {
+        let config=sanitize("claude",json!({"env":{"ANTHROPIC_MODEL":"sonnet","ANTHROPIC_DEFAULT_SONNET_MODEL":"private-provider-model","ANTHROPIC_DEFAULT_HAIKU_MODEL":"glm-5-turbo","CLAUDE_CODE_MAX_CONTEXT_TOKENS":"1000000","CLAUDE_CODE_AUTO_COMPACT_WINDOW":"500000"}})).unwrap();
+        assert_eq!(config["model"],"private-provider-model");
+        assert_eq!(config["modelMetadata"]["private-provider-model"]["contextWindow"],1000000);
+        assert!(config["modelMetadata"]["glm-5-turbo"].is_null());
+        assert!(config["env"]["CLAUDE_CODE_MAX_CONTEXT_TOKENS"].is_null());
+        assert!(config["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"].is_null());
+        let trigger_only=sanitize("claude",json!({"model":"private","env":{"CLAUDE_CODE_AUTO_COMPACT_WINDOW":"1000000"}})).unwrap();
+        assert!(trigger_only["modelMetadata"].is_null());
+        for invalid in [json!(0),json!(-1),json!(100000001),json!(true),json!("broken")] {
+            let invalid=sanitize("claude",json!({"model":"private","env":{"CLAUDE_CODE_MAX_CONTEXT_TOKENS":invalid}})).unwrap();
+            assert!(invalid["modelMetadata"].is_null());
+        }
+    }
     #[test]
     fn existing_http_gateway_routes_survive_import_without_relaxing_address_structure() {
         for config in [

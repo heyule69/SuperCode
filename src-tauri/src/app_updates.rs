@@ -14,12 +14,14 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tauri::{AppHandle, Emitter, Manager};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 
 const ENDPOINT: &str = "https://github.com/heyule69/SuperCode/releases/latest/download/latest.json";
 const RELEASES: &str = "https://github.com/heyule69/SuperCode/releases";
 const MAX_PACKAGE: u64 = 256 * 1024 * 1024;
+const STARTUP_CHECK_DELAY: Duration = Duration::from_secs(10);
 const CHECK_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
+const BUSY_CHECK_RETRY: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -73,6 +75,7 @@ struct Cache {
 pub struct AppUpdates {
     cache: Mutex<Cache>,
     operation: Mutex<()>,
+    preference_changed: Notify,
 }
 
 fn now() -> u64 {
@@ -83,6 +86,36 @@ fn now() -> u64 {
 }
 fn supported() -> bool {
     cfg!(all(windows, target_arch = "x86_64"))
+}
+fn remaining_check_delay(status: &Status, timestamp: u64) -> Duration {
+    status.checked_at.map_or(Duration::ZERO, |checked_at| {
+        Duration::from_secs(
+            CHECK_INTERVAL
+                .as_secs()
+                .saturating_sub(timestamp.saturating_sub(checked_at)),
+        )
+    })
+}
+fn automatic_check_delay(status: &Status, timestamp: u64) -> Option<Duration> {
+    if !status.automatic
+        || matches!(
+            status.phase.as_str(),
+            "ready" | "installing" | "unsupported"
+        )
+    {
+        return None;
+    }
+    if matches!(status.phase.as_str(), "checking" | "downloading") {
+        return Some(BUSY_CHECK_RETRY);
+    }
+    Some(remaining_check_delay(status, timestamp))
+}
+fn check_allowed(status: &Status, timestamp: u64, force: bool, automatic: bool) -> bool {
+    !matches!(
+        status.phase.as_str(),
+        "downloading" | "ready" | "installing"
+    ) && (!automatic || status.automatic)
+        && (force || remaining_check_delay(status, timestamp).is_zero())
 }
 fn decode_text(value: &str) -> Result<String, String> {
     String::from_utf8(
@@ -201,20 +234,17 @@ pub async fn app_update_status(app: AppHandle) -> Status {
 
 #[tauri::command]
 pub async fn check_app_update(app: AppHandle, force: Option<bool>) -> Result<Status, String> {
+    check_update(app, force.unwrap_or(false), false).await
+}
+
+async fn check_update(app: AppHandle, force: bool, automatic: bool) -> Result<Status, String> {
     let state = app.state::<AppUpdates>();
     let Ok(_operation) = state.operation.try_lock() else {
         return Ok(state.cache.lock().await.status.clone());
     };
     {
         let mut cache = state.cache.lock().await;
-        if cache.status.phase == "ready"
-            || cache.status.phase == "installing"
-            || (!force.unwrap_or(false)
-                && cache
-                    .status
-                    .checked_at
-                    .is_some_and(|t| now().saturating_sub(t) < CHECK_INTERVAL.as_secs()))
-        {
+        if !check_allowed(&cache.status, now(), force, automatic) {
             return Ok(cache.status.clone());
         }
         if !supported() {
@@ -460,35 +490,42 @@ pub async fn set_automatic_app_updates(app: AppHandle, enabled: bool) -> Result<
     fs::rename(temp, path).map_err(|e| e.to_string())?;
     cache.status.automatic = enabled;
     drop(cache);
+    state.preference_changed.notify_one();
     Ok(emit(&app).await)
 }
 pub async fn watch(app: AppHandle) {
+    let state = app.state::<AppUpdates>();
     let preference = app.state::<AppState>().data_dir.join("app-updates.json");
-    if let Ok(text) = fs::read_to_string(preference) {
-        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
-            if let Some(enabled) = value["automatic"].as_bool() {
-                app.state::<AppUpdates>()
-                    .cache
-                    .lock()
-                    .await
-                    .status
-                    .automatic = enabled;
+    {
+        let mut cache = state.cache.lock().await;
+        if let Ok(text) = fs::read_to_string(preference) {
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
+                if let Some(enabled) = value["automatic"].as_bool() {
+                    cache.status.automatic = enabled;
+                }
             }
         }
     }
-    tokio::time::sleep(Duration::from_secs(15)).await;
+    tokio::time::sleep(STARTUP_CHECK_DELAY).await;
     loop {
-        if app
-            .state::<AppUpdates>()
-            .cache
-            .lock()
-            .await
-            .status
-            .automatic
-        {
-            let _ = check_app_update(app.clone(), Some(false)).await;
+        let delay = automatic_check_delay(&state.cache.lock().await.status, now());
+        let delay = match delay {
+            Some(delay) if delay.is_zero() => {
+                let _ = check_update(app.clone(), false, true).await;
+                // An operation may have claimed the lock before this check. Retry soon,
+                // then recalculate from checked_at so a manual check cannot skip a cycle.
+                Some(BUSY_CHECK_RETRY)
+            }
+            delay => delay,
+        };
+        if let Some(delay) = delay {
+            tokio::select! {
+                _ = tokio::time::sleep(delay) => {},
+                _ = state.preference_changed.notified() => {},
+            }
+        } else {
+            state.preference_changed.notified().await;
         }
-        tokio::time::sleep(CHECK_INTERVAL).await;
     }
 }
 
@@ -537,6 +574,66 @@ pub async fn smoke(app: AppHandle) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn automatic_checks_start_after_ten_seconds_and_repeat_when_due() {
+        assert_eq!(STARTUP_CHECK_DELAY, Duration::from_secs(10));
+        let mut status = Status::default();
+        assert_eq!(automatic_check_delay(&status, 100), Some(Duration::ZERO));
+        status.checked_at = Some(100);
+        assert_eq!(automatic_check_delay(&status, 100), Some(CHECK_INTERVAL));
+        assert_eq!(
+            automatic_check_delay(&status, 100 + CHECK_INTERVAL.as_secs() - 1),
+            Some(Duration::from_secs(1))
+        );
+        assert_eq!(
+            automatic_check_delay(&status, 100 + CHECK_INTERVAL.as_secs()),
+            Some(Duration::ZERO)
+        );
+    }
+    #[test]
+    fn manual_checks_reset_the_remaining_automatic_delay_even_after_errors() {
+        let status = Status {
+            phase: "error".into(),
+            checked_at: Some(3600),
+            ..Status::default()
+        };
+        assert_eq!(
+            automatic_check_delay(&status, 7200),
+            Some(CHECK_INTERVAL - Duration::from_secs(3600))
+        );
+        assert!(!check_allowed(&status, 7200, false, false));
+        assert!(check_allowed(&status, 7200, true, false));
+        assert_eq!(automatic_check_delay(&status, 3500), Some(CHECK_INTERVAL));
+    }
+    #[test]
+    fn automatic_setting_is_rechecked_before_starting_and_can_resume_when_due() {
+        let mut status = Status {
+            automatic: false,
+            ..Status::default()
+        };
+        assert_eq!(automatic_check_delay(&status, 100), None);
+        assert!(!check_allowed(&status, 100, false, true));
+        assert!(check_allowed(&status, 100, true, false));
+        status.automatic = true;
+        assert_eq!(automatic_check_delay(&status, 100), Some(Duration::ZERO));
+        assert!(check_allowed(&status, 100, false, true));
+    }
+    #[test]
+    fn busy_updates_retry_soon_and_downloaded_packages_are_preserved() {
+        let mut status = Status::default();
+        for phase in ["checking", "downloading"] {
+            status.phase = phase.into();
+            assert_eq!(automatic_check_delay(&status, 100), Some(BUSY_CHECK_RETRY));
+        }
+        assert!(!check_allowed(&status, 100, true, false));
+        for phase in ["ready", "installing"] {
+            status.phase = phase.into();
+            assert_eq!(automatic_check_delay(&status, 100), None);
+            assert!(!check_allowed(&status, 100, true, false));
+        }
+        status.phase = "unsupported".into();
+        assert_eq!(automatic_check_delay(&status, 100), None);
+    }
     fn fixture() -> (Manifest, Vec<u8>) {
         let bytes = include_bytes!("../testdata/update-fixture.txt").to_vec();
         let version = "0.2.0";

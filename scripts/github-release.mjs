@@ -1,12 +1,14 @@
 import { readFileSync, appendFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { verifyRelease } from './release-contract.mjs';
+import { verifySourceBinding, sourceTree } from './build-provenance.mjs';
 const root = process.cwd(), directory = resolve(process.argv[2]);
 const tag = process.env.GITHUB_REF_NAME, sourceCommit = process.env.RELEASE_SOURCE_COMMIT;
 if (!/^v\d+\.\d+\.\d+$/.test(tag ?? '') || !/^[a-f0-9]{40}$/.test(sourceCommit ?? '')) throw new Error('Invalid release tag or source commit');
 const version = tag.slice(1);
 const source = JSON.parse(readFileSync(join(directory, 'source.json'), 'utf8'));
 const release = verifyRelease(directory, root, version);
+verifySourceBinding(release.metadata, sourceCommit, sourceTree(root));
 if (source.version !== version || source.sourceCommit !== sourceCommit || source.sha256 !== release.digest) throw new Error('Assets do not belong to this source tag');
 const repository = 'heyule69/SuperCode';
 if (process.env.GITHUB_REPOSITORY !== repository) throw new Error('Release destination mismatch');
@@ -29,7 +31,7 @@ for (const name of release.assets) {
   const old = published.assets.find(asset => asset.name === name);
   if (old) await request(`${api}/releases/assets/${old.id}`, { method: 'DELETE' });
   await request(`${published.upload_url.split('{')[0]}?name=${encodeURIComponent(name)}`, {
-    method: 'POST', headers: { 'Content-Type': name.endsWith('.exe') ? 'application/octet-stream' : name.endsWith('.json') ? 'application/json' : 'text/plain; charset=utf-8' }, body: readFileSync(join(directory, name)),
+    method: 'POST', headers: { 'Content-Type': name.endsWith('.exe') ? 'application/octet-stream' : name.endsWith('.json') ? 'application/json' : 'text/plain; charset=utf-8' }, body: release.readAsset(name),
   });
 }
 const checked = await request(`${api}/releases/${published.id}`);

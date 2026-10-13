@@ -3,7 +3,7 @@ import { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import ProviderSettings from './ProviderSettings';
-import type { AgentProfile } from './types';
+import type { AgentProfile, ProviderSettings as Config } from './types';
 const mocks=vi.hoisted(()=>({call:vi.fn()}));
 vi.mock('./api',()=>({desktop:true,call:mocks.call}));
 let root:Root,node:HTMLDivElement;
@@ -21,7 +21,7 @@ beforeEach(()=>{
   mocks.call.mockReset();mocks.call.mockImplementation(async(command:string)=>command==='list_provider_accounts'?accounts:command==='list_official_accounts'?[{id:'@official',agent:'claude',name:'本机账号',loggedIn:false,current:false}]:undefined);
 });
 afterEach(async()=>{await act(async()=>root.unmount());node.remove();});
-async function render(){await act(async()=>root.render(<ProviderSettings profiles={profiles} officialAgents={['codex','claude']} order={order} busy={false} updated={async()=>{}}/>));}
+async function render(runningConnections: Record<string, string[]> = {}, updated = async () => {}){await act(async()=>root.render(<ProviderSettings profiles={profiles} officialAgents={['codex','claude']} order={order} runningConnections={runningConnections} updated={updated}/>));}
 it('counts only configured suppliers and confirmed official logins, with no CLI placeholder',async()=>{
   await render();expect(tab('claude').textContent).toContain('2');expect(tab('codex').textContent).toContain('1');expect(tab('opencode').textContent).toContain('0');expect(tab('pi').textContent).toContain('0');
   expect(node.textContent).not.toContain('本机 CLI 配置');expect(node.textContent).not.toContain('Claude 官方账号');
@@ -123,6 +123,47 @@ it('keeps OpenCode and Pi API connections with their own engine rather than usin
 });
 it('does not authorize managed accounts from a different logged-in native account',async()=>{
   const managed:AgentProfile={id:'account:one',accountId:'one',agent:'codex',name:'工作账号',officialAccount:true,model:'test-model',current:false,hasCredential:false};
-  await act(async()=>root.render(<ProviderSettings profiles={[...profiles,managed]} officialAgents={['codex']} order={order} busy={false} updated={async()=>{}}/>));
+  await act(async()=>root.render(<ProviderSettings profiles={[...profiles,managed]} officialAgents={['codex']} order={order} runningConnections={{}} updated={async()=>{}}/>));
   expect(tab('codex').textContent).toContain('1');await act(async()=>tab('codex').click());expect(node.querySelector('.saved-provider-list')?.textContent).not.toContain('工作账号');
+});
+const config = (id: string): Config => ({ id, agent:'claude',name:id === 'kimi' ? 'Kimi' : 'GLM',providerId:'custom',plan:'anthropic',protocol:'anthropic',baseUrl:'https://example.com',model:'test-model',models:['test-model'],hasCredential:true });
+const savedCard = (id: string) => node.querySelector<HTMLButtonElement>(`[data-connection-id="${id}"] .saved-provider`)!;
+it('allows adding a new supplier and editing another connection during a task', async () => {
+  const original = mocks.call.getMockImplementation()!;
+  const updated = vi.fn(async () => {});
+  mocks.call.mockImplementation(async (command: string, args: any) => command === 'get_provider_profile' ? config(args.id) : command === 'save_provider_profile' ? {id:args.settings.id ?? 'new',agent:'claude',hasCredential:true,current:args.activate} : original(command,args));
+  await render({claude:['kimi']}, updated);
+  expect(savedCard('kimi').textContent).toContain('任务使用中');
+  expect(button('添加').disabled).toBe(false); expect(button('CC Switch 导入').disabled).toBe(false);
+  await act(async () => button('添加').click()); await act(async () => providerCard('Kimi / Moonshot').click());
+  expect(node.querySelector<HTMLInputElement>('#provider-name')?.disabled).toBe(false);
+  await act(async () => button('保存').click());
+  expect(mocks.call).toHaveBeenCalledWith('save_provider_profile', { settings: expect.objectContaining({id:null,agent:'claude'}),activate:false });
+  await act(async () => button('所有连接').click()); await act(async () => savedCard('glm').click());
+  expect(node.querySelector<HTMLInputElement>('#provider-key')?.disabled).toBe(false);
+  await act(async () => button('保存为默认').click());
+  expect(mocks.call).toHaveBeenCalledWith('save_provider_profile', { settings: expect.objectContaining({id:'glm'}),activate:true });
+  expect(updated).toHaveBeenCalledWith('claude');
+});
+it('opens the used supplier read-only, and reacts when its task starts or finishes', async () => {
+  const original = mocks.call.getMockImplementation()!;
+  mocks.call.mockImplementation(async (command: string, args: any) => command === 'get_provider_profile' ? config(args.id) : original(command,args));
+  await render(); await act(async () => savedCard('kimi').click());
+  expect(button('保存').disabled).toBe(false);
+  await render({claude:['kimi']});
+  expect(node.querySelector('[role="status"]')?.textContent).toContain('任务完成或停止后可编辑');
+  for (const id of ['provider-name','provider-url','provider-key','provider-default-model']) expect(node.querySelector<HTMLInputElement>(`#${id}`)?.disabled).toBe(true);
+  for (const label of ['保存','保存为默认','删除','测试','获取模型']) expect(button(label).disabled).toBe(true);
+  await act(async () => button('保存').click());
+  expect(mocks.call).not.toHaveBeenCalledWith('save_provider_profile', expect.anything());
+  await render({codex:['kimi']}); expect(button('保存').disabled).toBe(false);
+  await render({claude:['kimi']}); expect(button('保存').disabled).toBe(true);
+  await render(); expect(button('保存').disabled).toBe(false);
+});
+it('permits default reordering without modifying a connection used by a task', async () => {
+  await render({claude:['kimi']});
+  expect(node.querySelector<HTMLButtonElement>('[aria-label="下移 Kimi"]')?.disabled).toBe(false);
+  await act(async () => node.querySelector<HTMLButtonElement>('[aria-label="下移 Kimi"]')!.click());
+  expect(mocks.call).toHaveBeenCalledWith('reorder_provider_connections', {agent:'claude',ids:['glm','kimi','@local','@official']});
+  expect(mocks.call).not.toHaveBeenCalledWith('save_provider_profile', expect.anything());
 });

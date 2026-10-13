@@ -11,6 +11,9 @@ mod platform {
         UI::WindowsAndMessaging::*,
     };
     static APP: OnceLock<AppHandle> = OnceLock::new();
+    fn user_input(extra_info: usize) -> bool {
+        extra_info != crate::computer_gate::INPUT_TAG
+    }
     unsafe fn own_foreground() -> bool {
         let mut process = 0;
         GetWindowThreadProcessId(GetForegroundWindow(), &mut process);
@@ -18,10 +21,10 @@ mod platform {
     }
     unsafe extern "system" fn keyboard(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
         if code >= 0 && matches!(wparam as u32, WM_KEYDOWN | WM_SYSKEYDOWN) {
-            keyboard_input(
-                (*(lparam as *const KBDLLHOOKSTRUCT)).vkCode,
-                own_foreground(),
-            );
+            let input = &*(lparam as *const KBDLLHOOKSTRUCT);
+            if user_input(input.dwExtraInfo) {
+                keyboard_input(input.vkCode, own_foreground());
+            }
         }
         CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam)
     }
@@ -36,7 +39,6 @@ mod platform {
                     browser::stop_with_reason(
                         app,
                         &tab.session,
-                        true,
                         if key == 27 {
                             "escape_key"
                         } else {
@@ -62,6 +64,10 @@ mod platform {
                 WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN | WM_MOUSEWHEEL
             )
         {
+            let input = &*(lparam as *const MSLLHOOKSTRUCT);
+            if !user_input(input.dwExtraInfo) {
+                return CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam);
+            }
             if let Some(app) = APP.get() {
                 if let Some(tab) = browser::active_tab(app) {
                     if !tab.visible.load(Ordering::Acquire) {
@@ -73,7 +79,7 @@ mod platform {
                         let scale = f64::from_bits(tab.scale.load(Ordering::Acquire));
                         let mut origin = POINT { x: 0, y: 0 };
                         ClientToScreen(tab.hwnd as _, &mut origin);
-                        let point = (*(lparam as *const MSLLHOOKSTRUCT)).pt;
+                        let point = input.pt;
                         let (x, y, width, height) = *tab.rect.lock().unwrap();
                         if point.x as f64 >= origin.x as f64 + x * scale
                             && point.y as f64 >= origin.y as f64 + y * scale
@@ -83,7 +89,6 @@ mod platform {
                             browser::stop_with_reason(
                                 app,
                                 &tab.session,
-                                true,
                                 "browser_mouse_input",
                             );
                         }
@@ -187,6 +192,7 @@ mod platform {
                     args.VirtualKey(&mut key)?;
                     args.KeyEventKind(&mut kind)?;
                     if key == 27
+                        && user_input(GetMessageExtraInfo() as usize)
                         && matches!(
                             kind,
                             COREWEBVIEW2_KEY_EVENT_KIND_KEY_DOWN
@@ -196,7 +202,7 @@ mod platform {
                             .is_some_and(|active| Arc::ptr_eq(&active, &escape_tab))
                     {
                         args.SetHandled(true)?;
-                        browser::stop_with_reason(&escape_app, &escape_tab.session, true, "browser_escape_key");
+                        browser::stop_with_reason(&escape_app, &escape_tab.session, "browser_escape_key");
                     }
                 }
                 Ok(())
@@ -246,6 +252,26 @@ mod platform {
     mod tests {
         use super::*;
         use webview2_com::Microsoft::Web::WebView2::Win32::*;
+        #[test]
+        fn managed_computer_escape_does_not_take_over_browser_control() {
+            let mut escape = KBDLLHOOKSTRUCT {
+                vkCode: 27, scanCode: 0, flags: LLKHF_INJECTED, time: 0,
+                dwExtraInfo: crate::computer_gate::INPUT_TAG,
+            };
+            assert!(!user_input(escape.dwExtraInfo));
+            escape.dwExtraInfo = 0;
+            // Accessibility and other injected user Esc still revokes control.
+            assert!(user_input(escape.dwExtraInfo));
+            escape.flags = 0;
+            assert!(user_input(escape.dwExtraInfo));
+            escape.dwExtraInfo = 0x55534552;
+            assert!(user_input(escape.dwExtraInfo));
+            let click = MSLLHOOKSTRUCT {
+                pt: POINT { x: 0, y: 0 }, mouseData: 0, flags: LLMHF_INJECTED,
+                time: 0, dwExtraInfo: crate::computer_gate::INPUT_TAG,
+            };
+            assert!(!user_input(click.dwExtraInfo));
+        }
         #[test]
         fn gpu_and_utility_recovery_are_not_agent_interrupts() {
             assert_eq!(

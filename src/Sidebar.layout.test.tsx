@@ -19,6 +19,30 @@ beforeEach(() => {
 afterEach(async () => { await act(async () => root.unmount()); host.remove(); });
 function menuButton(label: string) { return [...document.querySelectorAll<HTMLButtonElement>('[role="menuitem"]')].find(button => button.textContent === label)!; }
 
+it('protects only chats with live child tasks and their project actions', async () => {
+  props.activeSessionIds = ['项目会话'];
+  await act(async () => root.render(<Sidebar {...props}/>));
+  expect(host.querySelector<HTMLButtonElement>('[aria-label="归档 项目会话"]')!.disabled).toBe(true);
+  expect(host.querySelector<HTMLButtonElement>('[aria-label="归档 独立任务"]')!.disabled).toBe(false);
+  await act(async () => host.querySelector<HTMLButtonElement>('[aria-label="项目 A 的项目菜单"]')!.click());
+  expect(menuButton('归档聊天').disabled).toBe(true); expect(menuButton('移除项目').disabled).toBe(true);
+  await act(async () => document.dispatchEvent(new KeyboardEvent('keydown', {key:'Escape',bubbles:true})));
+  await act(async () => [...host.querySelectorAll<HTMLButtonElement>('.session-row')].find(button=>button.title==='项目会话')!.dispatchEvent(new MouseEvent('contextmenu',{bubbles:true,cancelable:true})));
+  expect(menuButton('永久删除').disabled).toBe(true); expect(menuButton('项目').disabled).toBe(true);
+});
+
+it('closes an old delete confirmation when a child task becomes active', async () => {
+  await act(async () => root.render(<Sidebar {...props}/>));
+  await act(async () => [...host.querySelectorAll<HTMLButtonElement>('.session-row')].find(button=>button.title==='项目会话')!.dispatchEvent(new MouseEvent('contextmenu',{bubbles:true,cancelable:true})));
+  await act(async () => menuButton('永久删除').click());
+  expect(document.querySelector('[aria-label="永久删除聊天"]')).not.toBeNull();
+  props = { ...props, activeSessionIds:['项目会话'] };
+  await act(async () => root.render(<Sidebar {...props}/>));
+  expect(document.querySelector('[aria-label="永久删除聊天"]')).toBeNull();
+  expect(host.textContent).toContain('仍有任务运行');
+  expect(call).not.toHaveBeenCalledWith('delete_sidebar_session',expect.anything());
+});
+
 it('dismisses project launch menus before IPC finishes, keeps the sidebar interactive, and skips refreshing unchanged data', async () => {
   platform.desktop = true;
   await act(async () => root.render(<Sidebar {...props}/>));

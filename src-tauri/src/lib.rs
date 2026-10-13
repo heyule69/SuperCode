@@ -8,9 +8,11 @@ mod accounts;
 mod agent_commands;
 mod agent_smoke;
 mod agent_versions;
+mod agent_recovery;
 mod agents;
 mod app_updates;
 mod automation;
+mod backup;
 mod bridge;
 mod browser;
 mod browser_bridge;
@@ -27,6 +29,7 @@ mod computer_gate;
 mod computer_native;
 mod computer_smoke;
 mod connection_order;
+mod connection_usage;
 mod credentials;
 mod desktop_control;
 mod desktop_control_smoke;
@@ -43,8 +46,10 @@ mod installation_exit_protocol;
 mod links;
 mod log_files;
 mod log_redaction;
+mod maintenance;
 mod media;
 mod model_context;
+mod codex_context;
 mod native_agents;
 mod notifications;
 mod official_accounts;
@@ -198,8 +203,9 @@ pub fn run() {
             "supercode-media",
             |context, request, responder| {
                 let app = context.app_handle().clone();
+                let webview = context.webview_label().to_owned();
                 tauri::async_runtime::spawn_blocking(move || {
-                    responder.respond(media::response(&app.state::<media::Media>(), request));
+                    responder.respond(media::response(&app.state::<media::Media>(), &webview, request));
                 });
             },
         )
@@ -336,8 +342,16 @@ pub fn run() {
             agents::install_agent,
             agents::update_agent,
             agent_versions::check_agent_updates,
+            agent_recovery::list_agent_recovery,
+            agent_recovery::rollback_agent,
             agents::cancel_agent_install,
             agents::configure_agent,
+            backup::export_data_backup,
+            backup::prepare_data_restore,
+            backup::restored_frontend,
+            backup::acknowledge_frontend_restore,
+            maintenance::storage_summary,
+            maintenance::clean_retired_storage,
             automation::list_automation,
             automation::install_automation,
             automation::test_automation,

@@ -1,7 +1,7 @@
 {
   "name": "supercode",
   "private": true,
-  "version": "0.2.2",
+  "version": "0.2.3",
   "type": "module",
   "scripts": {
     "dev": "vite --host 127.0.0.1",
@@ -13,11 +13,13 @@
     "installer:test": "cargo test --manifest-path installer/Cargo.toml --target-dir src-tauri/target",
     "installer:test:ui": "node scripts/test-installer-ui.mjs",
     "installer:test:update-ui": "node scripts/test-installer-update-ui.mjs",
-    "release:test": "node --test scripts/test-release-contract.mjs",
+    "release:test": "node --test scripts/test-release-contract.mjs scripts/test-build-provenance.mjs",
     "release:publish": "node scripts/publish-release.mjs",
     "check": "tsc -b",
     "check:encoding": "node scripts/verify-utf8.mjs",
+    "check:catalogs": "node scripts/check-catalogs.mjs",
     "test": "vitest run",
+    "benchmark": "node scripts/run-benchmark.mjs",
     "test:rust": "cargo test --manifest-path src-tauri/Cargo.toml",
     "test:integration": "cargo run --manifest-path src-tauri/Cargo.toml -- --smoke-test"
   },
@@ -41,6 +43,6 @@
     "material-icon-theme": "5.39.0",
     "typescript": "~5.7.2",
     "vite": "^6.0.5",
-    "vitest": "^3.0.0"
+    "vitest": "4.1.11"
   }
 }

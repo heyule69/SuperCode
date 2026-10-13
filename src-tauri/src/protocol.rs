@@ -75,8 +75,10 @@ pub fn item_message(item: &Value) -> Option<(String, String, String, Value)> {
         object.remove("summary");
         object.remove("content");
     }
-    if kind=="fileChange" {
-        if let Some(output)=item["aggregatedOutput"].as_str(){data["operationOutput"]=json!(output);}
+    if kind == "fileChange" {
+        if let Some(output) = item["aggregatedOutput"].as_str() {
+            data["operationOutput"] = json!(output);
+        }
     }
     // Media references are small durable metadata. Reserve room before bounding
     // verbose tool arguments/results, so history does not lose its screenshots.
@@ -87,15 +89,21 @@ pub fn item_message(item: &Value) -> Option<(String, String, String, Value)> {
     let media_limited = media
         .as_ref()
         .map(|value| bounded_value(value, &mut media_budget, 0));
-    let summary=data.as_object_mut().and_then(|object|object.remove("changeSummary"));
-    let mut summary_budget=16*1024;
-    let summary_limited=summary.as_ref().map(|value|bounded_value(value,&mut summary_budget,0));
-    let mut budget = TEXT_LIMIT - (16 * 1024 - media_budget) - (16*1024-summary_budget);
+    let summary = data
+        .as_object_mut()
+        .and_then(|object| object.remove("changeSummary"));
+    let mut summary_budget = 16 * 1024;
+    let summary_limited = summary
+        .as_ref()
+        .map(|value| bounded_value(value, &mut summary_budget, 0));
+    let mut budget = TEXT_LIMIT - (16 * 1024 - media_budget) - (16 * 1024 - summary_budget);
     let mut data_limited = bounded_value(&data, &mut budget, 0);
     if let Some(media) = media_limited {
         data_limited["media"] = media;
     }
-    if let Some(summary)=summary_limited {data_limited["changeSummary"]=summary;}
+    if let Some(summary) = summary_limited {
+        data_limited["changeSummary"] = summary;
+    }
     for key in [
         "id",
         "type",
@@ -194,6 +202,24 @@ pub fn reasoning_text(item: &Value) -> String {
 pub struct ActivityBuffer {
     native: String,
     items: Vec<Value>,
+    item_bytes: Vec<usize>,
+    cached_bytes: usize,
+}
+
+fn serialized_size(value: &Value) -> usize {
+    struct Counter(usize);
+    impl std::io::Write for Counter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 += bytes.len();
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut counter = Counter(0);
+    serde_json::to_writer(&mut counter, value).expect("JSON value serialization");
+    counter.0
 }
 
 fn append(item: &mut Value, key: &str, delta: &str) {
@@ -232,10 +258,14 @@ impl ActivityBuffer {
         if self.native != native {
             self.native = native.into();
             self.items.clear();
+            self.item_bytes.clear();
+            self.cached_bytes = 0;
         }
         let method = event["method"].as_str()?;
         if method == "turn/started" {
             self.items.clear();
+            self.item_bytes.clear();
+            self.cached_bytes = 0;
             let item = json!({"id":format!("run-{}",p["turn"]["id"].as_str().unwrap_or("")),"type":"runMarker","status":"inProgress","startedAt":millis(),"turnId":p["turn"]["id"]});
             self.replace(item.clone());
             return Some(item);
@@ -287,12 +317,15 @@ impl ActivityBuffer {
             }
             self.replace(item.clone());
             if method == "item/completed" {
-                self.items.retain(|i| i["id"] != item["id"]);
+                if let Some(index) = self.items.iter().position(|i| i["id"] == item["id"]) {
+                    self.remove(index);
+                }
             }
             return Some(item);
         }
         let id = p["itemId"].as_str()?;
-        let item = self.items.iter_mut().find(|i| i["id"] == id)?;
+        let index = self.items.iter().position(|i| i["id"] == id)?;
+        let item = &mut self.items[index];
         let delta = p["delta"].as_str().unwrap_or("");
         match method {
             "item/agentMessage/delta" | "item/plan/delta" => append(item, "text", delta),
@@ -322,28 +355,46 @@ impl ActivityBuffer {
             }
             _ => return None,
         }
+        self.cached_bytes -= self.item_bytes[index];
+        self.item_bytes[index] = serialized_size(&self.items[index]);
+        self.cached_bytes += self.item_bytes[index];
         self.trim();
         None
     }
     fn replace(&mut self, item: Value) {
-        if let Some(i) = self.items.iter_mut().find(|i| i["id"] == item["id"]) {
-            *i = item;
+        let size = serialized_size(&item);
+        if let Some(index) = self.items.iter().position(|i| i["id"] == item["id"]) {
+            self.cached_bytes -= self.item_bytes[index];
+            self.items[index] = item;
+            self.item_bytes[index] = size;
         } else {
             self.items.push(item);
+            self.item_bytes.push(size);
         }
+        self.cached_bytes += size;
         self.trim();
+    }
+    fn remove(&mut self, index: usize) {
+        self.items.remove(index);
+        self.cached_bytes -= self.item_bytes.remove(index);
     }
     fn trim(&mut self) {
         while self.items.len() > 200
-            || serde_json::to_vec(&self.items).map_or(0, |v| v.len()) > 2 * 1024 * 1024
+            || self.cached_bytes + 2 + self.items.len().saturating_sub(1) > 2 * 1024 * 1024
         {
             // The start marker is needed to persist completion and elapsed
             // time even when streamed tool details exhaust the cache budget.
-            let index = self.items.iter().position(|item| item["type"] != "runMarker").unwrap_or(0);
-            self.items.remove(index);
+            let index = self
+                .items
+                .iter()
+                .position(|item| item["type"] != "runMarker")
+                .unwrap_or(0);
+            self.remove(index);
         }
     }
     pub fn finish(&mut self, status: &str) -> Vec<Value> {
+        self.item_bytes.clear();
+        self.cached_bytes = 0;
         self.items
             .drain(..)
             .map(|mut i| {
@@ -379,30 +430,39 @@ fn millis() -> u64 {
 mod tests {
     #[test]
     fn file_operation_output_and_exact_counts_survive_verbose_metadata_bounds() {
-        let item=serde_json::json!({"id":"edit","type":"fileChange","changes":[{"path":"a.ts","diff":"@@ -1 +1 @@\n-old\n+new\n"}],"aggregatedOutput":"PATCH_OUTPUT","durationMs":1300,"exitCode":0,"cwd":"D:/中文","arguments":{"a":"x".repeat(128*1024)},"changeSummary":[{"path":"a.ts","added":4000,"removed":1}]});
-        let (_,_,_,data)=super::item_message(&item).unwrap();
-        assert_eq!(data["operationOutput"],"PATCH_OUTPUT");
-        assert_eq!(data["changeSummary"][0]["added"],4000);
-        assert_eq!(data["durationMs"],1300);
-        assert_eq!(data["exitCode"],0);
-        assert_eq!(data["cwd"],"D:/中文");
+        let item = serde_json::json!({"id":"edit","type":"fileChange","changes":[{"path":"a.ts","diff":"@@ -1 +1 @@\n-old\n+new\n"}],"aggregatedOutput":"PATCH_OUTPUT","durationMs":1300,"exitCode":0,"cwd":"D:/中文","arguments":{"a":"x".repeat(128*1024)},"changeSummary":[{"path":"a.ts","added":4000,"removed":1}]});
+        let (_, _, _, data) = super::item_message(&item).unwrap();
+        assert_eq!(data["operationOutput"], "PATCH_OUTPUT");
+        assert_eq!(data["changeSummary"][0]["added"], 4000);
+        assert_eq!(data["durationMs"], 1300);
+        assert_eq!(data["exitCode"], 0);
+        assert_eq!(data["cwd"], "D:/中文");
     }
     use super::*;
     #[test]
     fn interleaved_session_output_and_completion_keep_separate_buffers() {
-        let sessions = crate::session_runtimes::Sessions::<std::sync::Mutex<ActivityBuffer>>::default();
-        let a = sessions.get("a"); let b = sessions.get("b");
+        let sessions =
+            crate::session_runtimes::Sessions::<std::sync::Mutex<ActivityBuffer>>::default();
+        let a = sessions.get("a");
+        let b = sessions.get("b");
         for (buffer, native) in [(&a, "native-a"), (&b, "native-b")] {
             buffer.lock().unwrap().update(&json!({"method":"item/started","params":{"threadId":native,"item":{"id":"same-id","type":"agentMessage","text":"","status":"inProgress"}}}));
         }
-        for (buffer, native, delta) in [(&a, "native-a", "A1"), (&b, "native-b", "B1"), (&a, "native-a", "A2")] {
+        for (buffer, native, delta) in [
+            (&a, "native-a", "A1"),
+            (&b, "native-b", "B1"),
+            (&a, "native-a", "A2"),
+        ] {
             buffer.lock().unwrap().update(&json!({"method":"item/agentMessage/delta","params":{"threadId":native,"itemId":"same-id","delta":delta}}));
         }
         assert_eq!(a.lock().unwrap().snapshot("native-a")[0]["text"], "A1A2");
         a.lock().unwrap().finish("completed");
         b.lock().unwrap().update(&json!({"method":"item/agentMessage/delta","params":{"threadId":"native-b","itemId":"same-id","delta":"B2"}}));
         assert_eq!(b.lock().unwrap().snapshot("native-b")[0]["text"], "B1B2");
-        assert_eq!(b.lock().unwrap().snapshot("native-b")[0]["status"], "inProgress");
+        assert_eq!(
+            b.lock().unwrap().snapshot("native-b")[0]["status"],
+            "inProgress"
+        );
     }
     use serde_json::json;
     #[test]
@@ -438,17 +498,32 @@ mod tests {
     fn activity_cache_pressure_keeps_the_turn_marker_for_completion() {
         for large in [false, true] {
             let mut buffer = ActivityBuffer::default();
-            buffer.update(&json!({"method":"turn/started","params":{"threadId":"n","turn":{"id":"t"}}}));
-            let text = if large { "x".repeat(TEXT_LIMIT) } else { String::new() };
+            buffer.update(
+                &json!({"method":"turn/started","params":{"threadId":"n","turn":{"id":"t"}}}),
+            );
+            let text = if large {
+                "x".repeat(TEXT_LIMIT)
+            } else {
+                String::new()
+            };
             for index in 0..205 {
                 buffer.update(&json!({"method":"item/started","params":{"threadId":"n","turnId":"t","item":{"id":format!("tool-{index}"),"type":"claudeToolCall","tool":"Read","arguments":{"content":text},"status":"inProgress"}}}));
             }
             let cached = buffer.snapshot("n");
             assert!(cached.len() <= 200);
             assert!(serde_json::to_vec(&cached).unwrap().len() <= 2 * 1024 * 1024);
-            assert_eq!(cached.iter().filter(|item| item["type"] == "runMarker").count(), 1);
+            assert_eq!(
+                cached
+                    .iter()
+                    .filter(|item| item["type"] == "runMarker")
+                    .count(),
+                1
+            );
             let finished = buffer.finish("completed");
-            let marker = finished.iter().find(|item| item["type"] == "runMarker").unwrap();
+            let marker = finished
+                .iter()
+                .find(|item| item["type"] == "runMarker")
+                .unwrap();
             assert_eq!(marker["status"], "completed");
             assert_eq!(marker["turnId"], "t");
             assert!(marker["durationMs"].is_u64());
@@ -506,5 +581,33 @@ mod tests {
         assert_eq!(text, "中文结果");
         assert!(data.get("output").is_none());
         assert_eq!(data["tool"], "Read");
+    }
+    #[test]
+    fn incremental_cache_budget_matches_json_after_deltas_replacement_eviction_and_reset() {
+        let mut buffer = ActivityBuffer::default();
+        for n in 0..220 {
+            let id = format!("item-{n}");
+            buffer.update(&json!({"method":"item/started","params":{"threadId":"n","item":{"id":id,"type":"agentMessage","text":"中\\\"\n".repeat(2000)}}}));
+            buffer.update(&json!({"method":"item/agentMessage/delta","params":{"threadId":"n","itemId":id,"delta":"🧋\\\""}}));
+            assert_eq!(
+                buffer.cached_bytes,
+                buffer.items.iter().map(serialized_size).sum::<usize>()
+            );
+            assert_eq!(buffer.item_bytes.len(), buffer.items.len());
+            assert_eq!(
+                buffer.cached_bytes + 2 + buffer.items.len().saturating_sub(1),
+                serde_json::to_vec(&buffer.items).unwrap().len()
+            );
+            assert!(
+                buffer.cached_bytes + 2 + buffer.items.len().saturating_sub(1) <= 2 * 1024 * 1024
+            );
+        }
+        buffer.finish("completed");
+        assert_eq!(buffer.cached_bytes, 0);
+        assert!(buffer.item_bytes.is_empty());
+        buffer.update(
+            &json!({"method":"turn/started","params":{"threadId":"another","turn":{"id":"new"}}}),
+        );
+        assert_eq!(buffer.item_bytes.len(), 1);
     }
 }

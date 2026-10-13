@@ -1,5 +1,5 @@
 {
-  "verifiedAt": "2026-10-12",
+  "verifiedAt": "2026-10-13",
   "sources": {
     "openai": "https://developers.openai.com/api/docs/models/gpt-6.1-sol",
     "glm": "https://docs.z.ai/guides/llm/glm-5.3",
@@ -8,8 +8,35 @@
     "kimi": "https://www.kimi.com/code/docs/en/kimi-code/models",
     "claude": "https://platform.claude.com/docs/en/models/overview",
     "minimax": "https://platform.minimax.io/docs/api-reference/text-anthropic-api",
-    "qwen": "https://help.aliyun.com/zh/model-studio/qwen3-6-plus"
+    "qwen": "https://help.aliyun.com/zh/model-studio/qwen3-6-plus",
+    "qwenMax": "https://help.aliyun.com/en/model-studio/qwen3-8-max",
+    "qwenFlash": "https://help.aliyun.com/zh/model-studio/qwen3-8-flash",
+    "deepseek": "https://api-docs.deepseek.com/api/list-models/",
+    "grok": "https://docs.x.ai/developers/grok-4-7",
+    "gptOss20b": "https://console.groq.com/docs/model/openai/gpt-oss-20b",
+    "gptOss120b": "https://console.groq.com/docs/model/openai/gpt-oss-120b",
+    "gemini": "https://ai.google.dev/gemini-api/docs/models/gemini-3.8-flash",
+    "kimiK27": "https://huggingface.co/moonshotai/Kimi-K2.7-Code/raw/main/config.json",
+    "kimiK3": "https://huggingface.co/moonshotai/Kimi-K3/raw/main/config.json",
+    "hy3": "https://cloud.tencent.com/document/product/1823/130935",
+    "deepseekV4Flash": "https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash/raw/main/config.json",
+    "bailianHosted": "https://help.aliyun.com/zh/model-studio/text-generation-model"
   },
+  "endpointLimits": [
+    {
+      "hosts": ["dashscope.aliyuncs.com", "dashscope-intl.aliyuncs.com", "dashscope-us.aliyuncs.com"],
+      "source": "bailianHosted",
+      "models": {
+        "minimax-m3": 192000,
+        "minimax-m2.7": 192000,
+        "minimax-m2.5": 192000,
+        "glm-5.1": 198000,
+        "glm-5": 198000,
+        "deepseek-v4-pro": 1000000,
+        "kimi-k2.7-code": 256000
+      }
+    }
+  ],
   "models": {
     "gpt-6.1-sol": { "contextWindow": 1050000, "source": "openai" },
     "gpt-6-sol": { "contextWindow": 1050000, "source": "openai" },
@@ -36,6 +63,18 @@
     "minimax-m2.1": { "contextWindow": 204800, "source": "minimax" },
     "minimax-m2.1-highspeed": { "contextWindow": 204800, "source": "minimax" },
     "minimax-m2": { "contextWindow": 204800, "source": "minimax" },
-    "qwen3.6-plus": { "contextWindow": 1000000, "source": "qwen" }
+    "qwen3.6-plus": { "contextWindow": 1000000, "source": "qwen" },
+    "qwen3.8-max": { "contextWindow": 1000000, "source": "qwenMax" },
+    "qwen3.8-flash": { "contextWindow": 1000000, "source": "qwenFlash" },
+    "deepseek-v4-pro": { "contextWindow": 1048576, "source": "deepseek" },
+    "deepseek-flash": { "contextWindow": 1048576, "source": "deepseek" },
+    "grok-4.7": { "contextWindow": 500000, "source": "grok" },
+    "gpt-oss-20b": { "contextWindow": 131072, "source": "gptOss20b" },
+    "gpt-oss-120b": { "contextWindow": 131072, "source": "gptOss120b" },
+    "gemini-3.8-flash": { "contextWindow": 1048576, "source": "gemini" },
+    "kimi-k2.7-code": { "contextWindow": 262144, "source": "kimiK27" },
+    "kimi-k3": { "contextWindow": 1048576, "source": "kimiK3" },
+    "hy3": { "contextWindow": 262144, "source": "hy3" },
+    "deepseek-v4-flash": { "contextWindow": 1048576, "source": "deepseekV4Flash" }
   }
 }

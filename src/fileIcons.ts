@@ -1,11 +1,27 @@
-import catalog from 'virtual:material-file-icons';
-
 export interface IconAssociations {
   file?: string; folder?: string; folderExpanded?: string;
   fileNames?: Record<string, string>; fileExtensions?: Record<string, string>;
   folderNames?: Record<string, string>; folderNamesExpanded?: Record<string, string>;
 }
 export interface FileIconCatalog extends IconAssociations { light: IconAssociations; definitions: Record<string, string> }
+const fallback: FileIconCatalog = { file: 'file', folder: 'folder', folderExpanded: 'folder-open', light: {}, definitions: { file: 'file.svg', folder: 'folder.svg', 'folder-open': 'folder-open.svg' } };
+let catalog = fallback;
+let pending: Promise<FileIconCatalog> | undefined;
+const listeners = new Set<() => void>();
+export function loadFileIconCatalog() {
+  pending ??= import('virtual:material-file-icons').then(module => {
+    catalog = module.default;
+    for (const listener of listeners) listener();
+    return catalog;
+  }).catch(error => { pending = undefined; throw error; });
+  return pending;
+}
+export const fileIconCatalog = () => catalog;
+export function subscribeFileIconCatalog(listener: () => void) {
+  listeners.add(listener);
+  void loadFileIconCatalog().catch(() => {});
+  return () => { listeners.delete(listener); };
+}
 function own(map: Record<string, string> | undefined, key: string) {
   return map && Object.hasOwn(map, key) ? map[key] : undefined;
 }

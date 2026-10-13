@@ -132,7 +132,7 @@ mod native {
             let handles = [self.1.raw() as HANDLE, self.0];
             if WaitForMultipleObjects(2, handles.as_ptr(), 0, 200) != WAIT_OBJECT_0 + 1 {
                 return Err(
-                    "Keyboard input stopped; do not retry without a new user request".into(),
+                    "Keyboard input stopped; continue conversation or permitted non-control work. Do not retry input without renewed user authorization".into(),
                 );
             }
             Ok(())
@@ -184,13 +184,14 @@ mod native {
         1
     }
     unsafe fn foreground(window: HWND) -> Result<(), String> {
-        if IsIconic(window) != 0 || IsWindowVisible(window) == 0 || GetForegroundWindow() != window
-        {
-            return Err(
-                "Target is no longer the foreground window. Stop and wait for the user; do not refocus automatically".into(),
-            );
-        }
-        Ok(())
+        crate::computer_gate::verify_foreground(
+            IsIconic(window) == 0 && IsWindowVisible(window) != 0 && GetForegroundWindow() == window,
+            || {
+                let name = std::env::var(crate::computer_gate::ENVIRONMENT)
+                    .map_err(|_| "电脑操作停止机制未连接".to_owned())?;
+                crate::computer_gate::Gate::revoke(&name)
+            },
+        )
     }
     unsafe fn geometry(window: HWND) -> Result<Value, String> {
         let mut r: RECT = std::mem::zeroed();
@@ -450,7 +451,7 @@ mod native {
             .read_line(&mut reply)
             .map_err(|e| e.to_string())?;
         if reply != "ok\n" {
-            return Err("AI pointer cue was revoked; stop and wait for the user".into());
+            return Err("AI pointer cue was revoked; cancel desktop input and continue conversation or permitted non-control work. Do not retry control without renewed user authorization".into());
         }
         Ok(())
     }
@@ -714,7 +715,7 @@ mod native {
                         };
                         if GetAncestor(target, GA_ROOT) != window {
                             return Err(
-                                "Focused control changed; stop and wait for the user".into()
+                                "Focused control changed; cancel desktop input and continue conversation or permitted non-control work. Do not retry control without renewed user authorization".into()
                             );
                         }
                         let scan = MapVirtualKeyW(VK_ESCAPE as u32, MAPVK_VK_TO_VSC) as isize;

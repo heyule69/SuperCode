@@ -8,13 +8,21 @@ import type { Agent } from './types';
 import './agentSettings.css';
 
 type Status = Agent & { phase?:string; message?:string; version?:string; source?:string; received?:number; total?:number };
+type Recovery = { id:string; version:string|null; status:'covered'|'unverified'|'unsupported'; referenceVersion?:string|null; canRollback:boolean; previousVersion?:string|null };
 const working = (s:Status) => ['downloading','installing','testing'].includes(s.phase??'');
 export default function AgentSettings({agents,busy,loadMcp,setLoadMcp,saveMcp}:{agents:Agent[];busy:boolean;loadMcp:boolean;setLoadMcp:(value:boolean)=>void;saveMcp:()=>Promise<void>}) {
   const [items,setItems]=useState<Status[]>(agents);
   const [releases,setReleases]=useState<Record<string,AgentRelease>>({});
+  const [recovery,setRecovery]=useState<Record<string,Recovery>>({});
   const [loading,setLoading]=useState(desktop),[checking,setChecking]=useState(desktop);
   const [acting,setActing]=useState(false),[advanced,setAdvanced]=useState(false),[error,setError]=useState('');
   const mounted=useRef(false),revision=useRef(0);
+  const recoveryRevision=useRef(0);
+  async function refreshRecovery() {
+    const rev=++recoveryRevision.current;
+    const rows=await call<Recovery[]>('list_agent_recovery');
+    if(mounted.current&&recoveryRevision.current===rev&&Array.isArray(rows))setRecovery(Object.fromEntries(rows.filter(row=>['covered','unverified','unsupported'].includes(row.status)).map(row=>[row.id,row])));
+  }
   async function checkVersions(force=false) {
     const rev=++revision.current;
     setChecking(true);
@@ -31,6 +39,7 @@ export default function AgentSettings({agents,busy,loadMcp,setLoadMcp,saveMcp}:{
     let disposed=false;let stop:(()=>void)|undefined;
     // Network checks do not delay local detection or overwrite installation events.
     void checkVersions();
+    void refreshRecovery().catch(()=>{});
     void(async()=>{
       try {
         const off=await listen<Status>('agent-install-progress',e=>{if(!disposed)setItems(rows=>rows.map(s=>s.id===e.payload.id?{...s,...e.payload}:s));});
@@ -39,13 +48,13 @@ export default function AgentSettings({agents,busy,loadMcp,setLoadMcp,saveMcp}:{
       }catch(e){if(!disposed)setError(String(e));}
       finally{if(!disposed)setLoading(false);}
     })();
-    return()=>{disposed=true;mounted.current=false;revision.current++;stop?.();};
+    return()=>{disposed=true;mounted.current=false;revision.current++;recoveryRevision.current++;stop?.();};
   },[]);
   async function action(command:string,args:Record<string,unknown>={}) {
     setActing(true);setError('');
     try{const result=await call<Status[]>(command,args);if(mounted.current&&Array.isArray(result))setItems(result);}
     catch(e){if(mounted.current){setError(String(e));if(command==='install_agent'||command==='update_agent'){const rows=await call<Status[]>('list_agents').catch(()=>null);if(mounted.current&&rows)setItems(rows);}}}
-    finally{if(mounted.current)setActing(false);}
+    finally{if(mounted.current){setActing(false);void refreshRecovery().catch(()=>{});}}
   }
   async function browse(id:string) {
     const {open}=await import('@tauri-apps/plugin-dialog');
@@ -58,14 +67,16 @@ export default function AgentSettings({agents,busy,loadMcp,setLoadMcp,saveMcp}:{
     <p className="agent-settings-intro">自动使用本机已安装的 Agent 和已有配置。可一键安装或更新，完成后自动测试连接。</p>
     {error?<p className="cc-error" role="alert">{error}</p>:null}
     <div className="agent-install-list" aria-busy={loading}>{items.map(s=>{
-      const release=releases[s.id],state=releaseState(s.version,release?.latestVersion),available=!!release?.latestVersion&&!release.error;
+      const release=releases[s.id],state=releaseState(s.version,release?.latestVersion),available=!!release?.latestVersion&&!release.error,restore=recovery[s.id];
       const healthy=s.installed&&s.phase!=='failed';
       return <section className="agent-install-row" key={s.id} aria-label={s.name}>
         <div className="agent-install-main"><span className="agent-install-logo"><AgentIcon agent={s.id}/></span><div className="agent-install-info"><h3>{s.name}</h3><p>{loading?'正在检测…':!desktop?'桌面端可检测和安装':working(s)?s.message:s.version?`${s.version} · ${s.source==='managed'?'SuperCode 安装':s.source==='configured'?'手动指定':'本机安装'}`:s.installed?'已检测到本机安装':'尚未安装'}</p>
           {desktop?<div className="agent-release-info">{checking?<span>正在检查最新版本…</span>:release?.latestVersion?<><span>{release.error?'上次检测':'最新版本'} <strong>{release.latestVersion}</strong></span>{!release.error&&healthy?<span className={state==='update'?'agent-update-badge':'agent-version-label'}>{state==='update'?'可更新':state==='current'?'已是最新':state==='newer'?'本机版本更新':''}</span>:null}</>:null}{!checking&&release?.error?<span className="agent-release-error" title={release.error}>暂时无法检查更新<button disabled={locked} onClick={()=>void checkVersions(true)}>重试</button></span>:null}</div>:null}
+          {restore&&healthy?<p className="agent-install-message">{restore.status==='unsupported'?'当前版本不受支持':restore.status==='covered'?'当前版本有受控协议测试与资料覆盖':'当前版本尚无完整兼容验证'}{restore.referenceVersion?` · 参考版本 ${restore.referenceVersion}`:''}</p>:null}
         </div><div className="agent-install-actions">{working(s)?<button className="quiet-button" onClick={()=>void call('cancel_agent_install',{id:s.id}).catch(e=>setError(String(e)))}><X size={14}/>取消</button>:<>
           {healthy?<span className="agent-install-ready"><Check size={14}/>可使用</span>:null}
           {healthy?<button className="quiet-button" disabled={locked||!desktop} onClick={()=>void action('test_agent',{id:s.id})}>测试连接</button>:null}
+          {restore?.canRollback?<button className="quiet-button" disabled={locked||!desktop} title={restore.previousVersion?`恢复 ${restore.previousVersion}`:'恢复上一个安装版本'} onClick={()=>void action('rollback_agent',{id:s.id})}>回滚上个版本</button>:null}
           {!healthy?<button className="primary-button" disabled={locked||!desktop||checking||!available} onClick={()=>void action('install_agent',{id:s.id,repair:s.phase==='failed',version:release?.latestVersion})}><Download size={14}/>{s.installed?'修复安装':'安装'}</button>:available&&state==='update'?<button className="primary-button" disabled={locked||checking} onClick={()=>void action('update_agent',{id:s.id,version:release.latestVersion})}><Download size={14}/>更新</button>:available&&state==='unknown'?<button className="quiet-button" disabled={locked||checking} onClick={()=>void action('update_agent',{id:s.id,version:release.latestVersion})}>安装最新版</button>:null}
         </>}</div></div>
         {working(s)?<progress aria-label={`${s.name} 安装进度`} max={s.total||undefined} value={s.total&&s.received!=null?s.received:undefined}/>:s.message?<p className={`agent-install-message ${s.phase==='failed'?'failed':''}`} role="status">{s.message}</p>:null}

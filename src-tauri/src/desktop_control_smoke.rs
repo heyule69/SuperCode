@@ -767,7 +767,7 @@ async fn verify(app: &AppHandle) -> Result<Value, String> {
         #[cfg(windows)]
         native_fixture.user_input(agent == "claude", true)?;
         #[cfg(not(windows))]
-        desktop_control::stop(app);
+        desktop_control::takeover_reason(app, true, "fixture_escape");
         let status = tokio::time::timeout(Duration::from_secs(3), fixture.child.wait())
             .await
             .map_err(|_| "停止后电脑 MCP 桥接仍未退出")?

@@ -21,8 +21,10 @@ export function modelContextWindow(model: string, metadata?: Model, officialCode
   const base = variant ? id.slice(0, -variant[0].length) : id;
   const spec = (limits.models as Record<string, { contextWindow: number; longContextWindow?: number }>)[base];
   if (!spec) return undefined;
-  return variant?.[1] === '1m' ? spec.longContextWindow ?? Math.max(1_000_000, spec.contextWindow)
-    : variant?.[1] === '256k' ? 262_144 : spec.contextWindow;
+  // A CLI annotation selects a verified variant; it cannot add capacity to a
+  // model or endpoint that only supports a smaller window.
+  return variant?.[1] === '1m' ? spec.longContextWindow ?? spec.contextWindow
+    : variant?.[1] === '256k' ? Math.min(262_144, spec.contextWindow) : spec.contextWindow;
 }
 
 // Match Codex's compact tooltip while retaining exact counts for accessibility.

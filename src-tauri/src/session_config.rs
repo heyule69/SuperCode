@@ -53,11 +53,20 @@ pub fn routing_identity(profile: &Profile) -> Value {
         .or_else(|| config["env"]["ANTHROPIC_BASE_URL"].as_str())
         .or(endpoint)
         .unwrap_or("");
-    let protocol = config["protocol"].as_str().unwrap_or(if profile.agent == "claude" { "anthropic" } else { "responses" });
+    let protocol = config["protocol"]
+        .as_str()
+        .unwrap_or(if profile.agent == "claude" {
+            "anthropic"
+        } else {
+            "responses"
+        });
     let mut model_routes = serde_json::Map::new();
     if let Some(models) = config["piProvider"]["models"].as_array() {
         for model in models {
-            let model_base = model["baseUrl"].as_str().unwrap_or(base).trim_end_matches('/');
+            let model_base = model["baseUrl"]
+                .as_str()
+                .unwrap_or(base)
+                .trim_end_matches('/');
             let model_protocol = match model["api"].as_str() {
                 Some("anthropic-messages") => "anthropic",
                 Some("openai-responses") => "responses",
@@ -66,7 +75,10 @@ pub fn routing_identity(profile: &Profile) -> Value {
             };
             if model_base != base.trim_end_matches('/') || model_protocol != protocol {
                 if let Some(id) = model["id"].as_str() {
-                    model_routes.insert(id.into(), json!({"base":model_base,"protocol":model_protocol}));
+                    model_routes.insert(
+                        id.into(),
+                        json!({"base":model_base,"protocol":model_protocol}),
+                    );
                 }
             }
         }
@@ -93,7 +105,13 @@ impl Route {
                     && source["providerId"] == "openai"
                     && crate::providers::key(&self.config).is_none())
         {
-            source["connectionName"] = self.profile.as_ref().filter(|p| p.account_id().is_some()).map(|p| p.name.as_str()).unwrap_or("ChatGPT 官方账号").into();
+            source["connectionName"] = self
+                .profile
+                .as_ref()
+                .filter(|p| p.account_id().is_some())
+                .map(|p| p.name.as_str())
+                .unwrap_or("ChatGPT 官方账号")
+                .into();
         }
         source
     }
@@ -330,13 +348,41 @@ impl Store {
     pub fn commit_model_switch(
         &self,
         session: &Session,
-        connection: &str,
+        expected: &Route,
         model: &str,
         summary: Option<(&str, i64)>,
         marker: &Value,
     ) -> Result<Session, String> {
         let mut conn = self.0.lock().map_err(|e| e.to_string())?;
         let tx = conn.transaction().map_err(|e| e.to_string())?;
+        let connection = expected.id.as_str();
+        if crate::connection_usage::session_tasks(&tx, &session.id)? {
+            return Err("后台子任务已开始，切换已取消，请等待任务完成".into());
+        }
+        // Handoff can await a summary while the target connection is still
+        // unused. Cancel if it changed instead of silently binding to settings
+        // different from those the user selected or recreating a removed route.
+        if let Some(profile) = &expected.profile {
+            let current: Option<(String, String, String)> = tx
+                .query_row(
+                    "SELECT agent,name,config FROM agent_profiles WHERE id=?1",
+                    [connection],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()
+                .map_err(|e| e.to_string())?;
+            let unchanged = current
+                .map(|(agent, name, raw)| -> Result<bool, String> {
+                    let config: Value = serde_json::from_str(&crate::credentials::open(&raw)?)
+                        .map_err(|_| "本地配置 JSON 无效")?;
+                    Ok(agent == profile.agent && name == profile.name && config == profile.config)
+                })
+                .transpose()?
+                .unwrap_or(false);
+            if !unchanged {
+                return Err("目标连接已修改或移除，切换已取消，请重新选择模型".into());
+            }
+        }
         let native = if marker["contextMode"] == "native"
             && session.connection_id.as_deref() == Some(connection)
         {
@@ -424,14 +470,14 @@ async fn change_session_model(
         return Ok(session);
     }
     let previous = state.store.route(&session.agent, Some(&session_id))?;
-    state.store.claim(&session_id)?;
+    state.store.claim_configuration_change(&session_id)?;
     let _ = app.emit("workspace-updated", ());
     let result = async {
         let input = state.store.handoff_input(&session_id)?;
         let mode = context_mode(force_compact, previous.id == next.id, session.native_id.is_some(), input.as_ref().map(|(s,_)|s.as_str()));
         let summary = if mode == "summary" { if let Some((input, seq)) = &input { Some((crate::handoff::summarize(&app,&session,&previous,input).await?,*seq)) } else { None } } else { None };
         let marker = json!({"from":previous.source(&session.agent),"to":next.source(&session.agent),"fromModel":session.model,"toModel":model,"status":"completed","compactOnly":force_compact,"contextMode":mode,"hasHistory":input.is_some()});
-        state.store.commit_model_switch(&session,connection,model,summary.as_ref().map(|(s,seq)|(s.as_str(),*seq)),&marker)
+        state.store.commit_model_switch(&session,&next,model,summary.as_ref().map(|(s,seq)|(s.as_str(),*seq)),&marker)
     }.await;
     if result.is_err() {
         // No binding/native id/history has been changed. A failed handoff is retryable.
@@ -462,12 +508,36 @@ mod tests {
         profiles(&store);
         store.select_profile("claude", Some("kimi")).unwrap();
         let project = store.add_project(Path::new("D:/model-route-test")).unwrap();
-        let session = store.create_configured_session(&project.id, None, "claude", Some("glm")).unwrap();
-        assert_eq!(store.route_with_connection("claude", None, None).unwrap().id, "kimi");
-        assert_eq!(store.route_with_connection("claude", None, Some("glm")).unwrap().id, "glm");
-        assert_eq!(store.route_with_connection("claude", Some(&session.id), Some("kimi")).unwrap().id, "glm");
-        assert!(store.route_with_connection("claude", None, Some("deleted")).is_err());
-        let official = store.route_with_connection("codex", None, Some(OFFICIAL)).unwrap();
+        let session = store
+            .create_configured_session(&project.id, None, "claude", Some("glm"))
+            .unwrap();
+        assert_eq!(
+            store
+                .route_with_connection("claude", None, None)
+                .unwrap()
+                .id,
+            "kimi"
+        );
+        assert_eq!(
+            store
+                .route_with_connection("claude", None, Some("glm"))
+                .unwrap()
+                .id,
+            "glm"
+        );
+        assert_eq!(
+            store
+                .route_with_connection("claude", Some(&session.id), Some("kimi"))
+                .unwrap()
+                .id,
+            "glm"
+        );
+        assert!(store
+            .route_with_connection("claude", None, Some("deleted"))
+            .is_err());
+        let official = store
+            .route_with_connection("codex", None, Some(OFFICIAL))
+            .unwrap();
         assert_eq!(official.id, OFFICIAL);
         assert_eq!(official.config["official"], true);
         assert_eq!(store.default_connection("claude").unwrap(), "kimi");
@@ -526,7 +596,7 @@ mod tests {
         let native = store
             .commit_model_switch(
                 &before,
-                "kimi",
+                &store.route_for("claude", "kimi").unwrap(),
                 "other-model",
                 None,
                 &json!({"contextMode":"native","hasHistory":true}),
@@ -538,7 +608,7 @@ mod tests {
         let portable = store
             .commit_model_switch(
                 &native,
-                "glm",
+                &store.route_for("claude", "glm").unwrap(),
                 "glm-test",
                 None,
                 &json!({"contextMode":"history","hasHistory":true}),
@@ -679,7 +749,7 @@ mod tests {
         let switched = store
             .commit_model_switch(
                 &before,
-                "glm",
+                &store.route_for("claude", "glm").unwrap(),
                 "glm-test",
                 Some(("summary with original goal", through)),
                 &json!({"toModel":"glm-test"}),
@@ -720,7 +790,7 @@ mod tests {
         assert!(store
             .commit_model_switch(
                 &a,
-                "glm",
+                &store.route_for("claude", "glm").unwrap(),
                 "glm-test",
                 Some(("invalid summary", 0)),
                 &Value::Null
@@ -732,6 +802,58 @@ mod tests {
         );
         assert_eq!(store.route("claude", Some(&a.id)).unwrap().id, "kimi");
         assert!(store.compressed_context(&a.id).unwrap().is_none());
+    }
+    #[test]
+    fn target_edits_or_removal_during_handoff_cancel_without_changing_chat_or_history() {
+        for remove in [false, true] {
+            let store = store();
+            profiles(&store);
+            let project = store
+                .add_project(Path::new("D:/switch-target-guard"))
+                .unwrap();
+            let session = store
+                .create_configured_session(&project.id, Some("k3".into()), "claude", Some("kimi"))
+                .unwrap();
+            store.bind_native(&session.id, "original-native").unwrap();
+            store
+                .save_message(
+                    "user",
+                    &session.id,
+                    "user",
+                    "keep my history",
+                    "userMessage",
+                    &Value::Null,
+                )
+                .unwrap();
+            let before = store.session(&session.id).unwrap();
+            let target = store.route_for("claude", "glm").unwrap();
+            store.claim(&session.id).unwrap();
+            if remove {
+                store.delete_profile("glm").unwrap();
+            } else {
+                let mut edited = target.profile.clone().unwrap();
+                edited.config["apiKey"] = "updated-key".into();
+                store.import_profiles(&[edited]).unwrap();
+            }
+            let error = store
+                .commit_model_switch(
+                    &before,
+                    &target,
+                    "glm-test",
+                    Some(("must not be committed", 1)),
+                    &json!({"contextMode":"summary","hasHistory":true}),
+                )
+                .err()
+                .unwrap();
+            assert!(error.contains("目标连接已修改或移除"));
+            let retained = store.session(&session.id).unwrap();
+            assert_eq!(retained.connection_id, before.connection_id);
+            assert_eq!(retained.model, before.model);
+            assert_eq!(retained.native_id, before.native_id);
+            assert_eq!(retained.status, "starting");
+            assert!(store.compressed_context(&session.id).unwrap().is_none());
+            assert_eq!(store.messages(&session.id, None).unwrap().len(), 1);
+        }
     }
     #[test]
     fn legacy_connections_are_inferred_once_and_survive_reopen() {

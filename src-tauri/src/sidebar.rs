@@ -52,17 +52,22 @@ fn require_item(conn: &Connection, kind: &str, id: &str) -> Result<(), String> {
 }
 fn require_idle(conn: &Connection, kind: &str, id: &str) -> Result<(), String> {
     require_item(conn, kind, id)?;
-    let sql = if kind == "project" {
-        "SELECT count(*) FROM sessions WHERE project_id=?1 AND status IN ('starting','running','waiting')"
-    } else {
-        "SELECT count(*) FROM sessions WHERE id=?1 AND status IN ('starting','running','waiting')"
+    if kind == "session" {
+        return crate::connection_usage::ensure_session_idle(conn, id);
+    }
+    let sessions = {
+        let mut query = conn
+            .prepare("SELECT id FROM sessions WHERE project_id=?1")
+            .map_err(|e| e.to_string())?;
+        let rows = query
+            .query_map([id], |row| row.get::<_, String>(0))
+            .map_err(|e| e.to_string())?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|e| e.to_string())?;
+        rows
     };
-    if conn
-        .query_row::<i64, _, _>(sql, [id], |r| r.get(0))
-        .map_err(|e| e.to_string())?
-        > 0
-    {
-        return Err("请先停止或完成运行中的任务".into());
+    for session in sessions {
+        crate::connection_usage::ensure_session_idle(conn, &session)?;
     }
     Ok(())
 }
@@ -319,6 +324,7 @@ impl Store {
         let tx = conn.transaction().map_err(|e| e.to_string())?;
         require_idle(&tx, "session", id)?;
         for sql in [
+            "DELETE FROM followups WHERE session_id=?1",
             "DELETE FROM messages WHERE session_id=?1",
             "DELETE FROM usage_records WHERE session_id=?1",
             "DELETE FROM sidebar_items WHERE kind='session' AND id=?1",
@@ -888,12 +894,35 @@ mod tests {
         store
             .record_usage(&s, "t", json!({"turn":{"totalTokens":10}}))
             .unwrap();
+        let other = store.create_session(&p.id, None).unwrap();
+        {
+            let conn = store.0.lock().unwrap();
+            conn.execute("INSERT INTO followups(id,session_id,payload,status) VALUES('own',?1,'{}','paused'),('other',?2,'{}','queued')", params![s.id, other.id]).unwrap();
+            conn.execute(
+                "INSERT INTO followup_edits VALUES('own','token','paused')",
+                [],
+            )
+            .unwrap();
+        }
         store.delete_session(&s.id).unwrap();
         assert!(store.session(&s.id).is_err());
         assert!(store.messages(&s.id, None).unwrap().is_empty());
         assert!(store.sidebar().unwrap().sessions.is_empty());
         assert!(store.usage_records(Some(&s.id)).unwrap().is_empty());
         assert_eq!(store.projects().unwrap().len(), 1);
+        let conn = store.0.lock().unwrap();
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM followups", [], |row| row
+                .get::<_, usize>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM followup_edits", [], |row| row
+                .get::<_, usize>(0))
+                .unwrap(),
+            0
+        );
     }
     #[test]
     fn context_is_bounded_and_does_not_include_tool_output() {

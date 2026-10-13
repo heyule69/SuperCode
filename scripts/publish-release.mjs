@@ -1,11 +1,12 @@
 // Publish tested local assets through GitHub Actions using the existing Git SSH login.
-// Only the installer, update manifest and source.json enter a temporary, parentless Git branch.
+// Only verified installer/update assets, signed build metadata/signature and source.json enter the parentless staging branch.
 import { spawnSync } from 'node:child_process';
 import { mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { resolve, join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
 import { verifyRelease } from './release-contract.mjs';
+import { verifySourceBinding } from './build-provenance.mjs';
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 function git(args, options={}) {
   const result = spawnSync('git', args, { cwd: root, encoding: 'utf8', windowsHide: true, shell: false, ...options });
@@ -18,6 +19,7 @@ const tag = `v${version}`, ref = `refs/heads/release-assets/${tag}`;
 const sourceCommit = git(['rev-parse', 'HEAD']);
 const directory = join(root, 'release');
 const release = verifyRelease(directory, root, version);
+verifySourceBinding(release.metadata, sourceCommit, git(['rev-parse', 'HEAD^{tree}']));
 const existing = git(['ls-remote', '--tags', 'origin', `refs/tags/${tag}`]);
 if (existing) throw new Error(`${tag} already exists; do not replace a published release`);
 const temporary = join(root, '.supercode', `release-index-${randomUUID()}`);
@@ -26,9 +28,11 @@ const env = { ...process.env, GIT_INDEX_FILE: temporary };
 try {
   git(['read-tree', '--empty'], { env });
   const source = join(directory, 'source.json');
-  writeFileSync(source, `${JSON.stringify({ version, sourceCommit, sha256: release.digest }, null, 2)}\n`, 'utf8');
+  const sourceBytes = Buffer.from(`${JSON.stringify({ version, sourceCommit, sha256: release.digest }, null, 2)}\n`, 'utf8');
+  writeFileSync(source, sourceBytes);
   for (const name of [...release.assets, 'source.json']) {
-    const blob = git(['hash-object', '-w', join(directory, name)]);
+    const bytes = name === 'source.json' ? sourceBytes : release.readAsset(name);
+    const blob = git(['hash-object', '-w', '--stdin'], { input: bytes });
     git(['update-index', '--add', '--cacheinfo', `100644,${blob},${name}`], { env });
   }
   const tree = git(['write-tree'], { env });

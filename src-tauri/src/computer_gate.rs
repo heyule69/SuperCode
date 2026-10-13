@@ -1,6 +1,18 @@
 //! A kernel event closes input immediately, independently of the WebView/UI thread.
 pub const INPUT_TAG: usize = 0x53434f44;
 pub const ENVIRONMENT: &str = "SUPERCODE_COMPUTER_STOP_EVENT";
+pub(crate) const FOREGROUND_CHANGED: &str = "Target is no longer the foreground window.";
+
+pub(crate) fn verify_foreground(
+    matches: bool,
+    revoke: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    if matches { return Ok(()); }
+    // Focus loss closes the same authoritative input gate as user takeover;
+    // a model-facing instruction alone cannot prevent a subsequent refocus.
+    let failure = revoke().err().map(|error| format!(" ({error})")).unwrap_or_default();
+    Err(format!("{FOREGROUND_CHANGED} Desktop control revoked{failure}. Continue conversation or permitted non-control work; do not refocus without renewed user authorization"))
+}
 pub fn event_name(token: &str) -> String {
     format!("Local\\SuperCodeComputer-{token}")
 }
@@ -31,6 +43,13 @@ mod native {
             } else {
                 Ok(Self(handle))
             }
+        }
+        pub fn revoke(name: &str) -> Result<(), String> {
+            let handle=unsafe { OpenEventW(EVENT_MODIFY_STATE,0,wide(name).as_ptr()) };
+            if handle.is_null() { return Err("电脑操作停止机制已关闭".into()); }
+            let stopped=unsafe { SetEvent(handle) } != 0;
+            unsafe { CloseHandle(handle); }
+            if stopped { Ok(()) } else { Err("无法停止电脑输入".into()) }
         }
         pub fn stop(&self) {
             unsafe {
@@ -86,7 +105,7 @@ pub fn input_allowed() -> Result<Gate, String> {
     let gate = Gate::open(&name)?;
     if gate.stopped() {
         return Err(
-            "用户已接管电脑，操作已停止。等待用户发起新的任务，不要重试或重新抢占焦点".into(),
+            "用户已接管电脑，电脑输入已停止。继续对话或其他已授权工作；再次操作电脑前需用户重新授权，不要重试或重新抢占焦点".into(),
         );
     }
     Ok(gate)
@@ -104,6 +123,9 @@ mod tests {
         #[cfg(windows)]
         {
             assert!(!Gate::open(&name).unwrap().stopped());
+            Gate::revoke(&name).unwrap();
+            assert!(gate.stopped());
+            gate.arm().unwrap();
         }
         gate.stop();
         assert!(gate.stopped());
@@ -122,5 +144,23 @@ mod tests {
         assert!(old.stopped());
         assert!(!new.stopped());
         new.stop();
+    }
+    #[test]
+    fn foreground_loss_revokes_input_without_operating_the_desktop() {
+        let name = event_name(&uuid::Uuid::new_v4().to_string());
+        let gate = Gate::create(&name).unwrap();
+        gate.arm().unwrap();
+        verify_foreground(true, || panic!("safe foreground must retain its grant")).unwrap();
+        assert!(!gate.stopped());
+        let error = verify_foreground(false, || {
+            #[cfg(windows)]
+            { Gate::revoke(&name) }
+            #[cfg(not(windows))]
+            { gate.stop(); Ok(()) }
+        }).unwrap_err();
+        assert!(error.starts_with(FOREGROUND_CHANGED));
+        assert!(gate.stopped());
+        #[cfg(windows)]
+        assert!(Gate::open(&name).unwrap().stopped());
     }
 }

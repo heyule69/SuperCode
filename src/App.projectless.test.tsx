@@ -9,19 +9,22 @@ import { PROVIDER_REQUIRED } from './chatConnection';
 import { mergeEvent } from './events';
 import type { Followup } from './Followups';
 import { PlatformUsageIndicator } from './PlatformUsageView';
+import { AppUpdateNotice } from './AppUpdate';
+import { readWorkspaceDraft } from './workspaceDrafts';
 
 vi.mock('./api', () => ({ desktop:true, call:vi.fn(), subscribe:vi.fn(async()=>()=>{}) }));
 vi.mock('@tauri-apps/api/event', () => ({ listen:vi.fn(async()=>()=>{}) }));
 vi.mock('./windowTheme', () => ({ watchWindowTheme:()=>()=>{} }));
 vi.mock('./DesktopTitleBar', () => ({ DesktopTitleBar:()=>null }));
 vi.mock('./PlatformUsageView', () => ({ PlatformUsageIndicator:vi.fn(()=> <span data-testid="platform-allowance">供应商额度</span>) }));
-vi.mock('./AppUpdate', () => ({ default:()=>null, AppUpdateNotice:()=>null }));
+vi.mock('./AppUpdate', () => ({ default:()=>null, AppUpdateNotice:vi.fn(()=>null) }));
 let root: Root, container: HTMLDivElement, data: Bootstrap, messages: Message[], providerMissing: boolean;
 let pendingRequests: RpcEvent[];
 let notify: (event: RpcEvent) => void;
 beforeEach(() => {
   (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
   localStorage.clear(); vi.mocked(call).mockClear(); messages = []; pendingRequests = []; providerMissing = false;
+  vi.mocked(AppUpdateNotice).mockReset();
   vi.mocked(subscribe).mockImplementation(async handler => { notify = handler; return () => {}; });
   data = { projects:[{id:'existing',name:'已有项目',path:'D:/existing'}],sessions:[],agents:[],profiles:[{id:'api:claude',agent:'claude',name:'Test API',model:'test-model',hasCredential:true,current:true}],officialAgents:[],connectionOrder:{},sidebar:{ projects:{}, sessions:{}, sections:[] },codexPath:null,loadMcp:false } as Bootstrap;
   vi.mocked(call).mockImplementation(async (command, args={}) => {
@@ -55,7 +58,7 @@ beforeEach(() => {
   });
   container = document.createElement('div'); document.body.append(container); root = createRoot(container);
 });
-afterEach(async () => { await act(async()=>root.unmount()); container.remove(); vi.restoreAllMocks(); });
+afterEach(async () => { await act(async()=>root.unmount()); container.remove(); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
 async function render() { await act(async()=>{root.render(<App/>); await new Promise(resolve=>setTimeout(resolve,30));}); }
 async function type(text: string) {
   const textarea = container.querySelector<HTMLTextAreaElement>('.composer textarea')!;
@@ -64,6 +67,170 @@ async function type(text: string) {
 async function send() {
   await act(async()=>{container.querySelector<HTMLFormElement>('.composer')!.dispatchEvent(new Event('submit',{bubbles:true,cancelable:true}));await new Promise(resolve=>setTimeout(resolve,30));});
 }
+
+it('does not resurrect a resolved approval when initial recovery returns late', async () => {
+  const original = vi.mocked(call).getMockImplementation()!;
+  let finish!: (requests: RpcEvent[]) => void;
+  vi.mocked(call).mockImplementation((command, args) => command === 'pending_requests' ? new Promise(resolve => { finish = resolve; }) : original(command, args));
+  await render();
+  const request: RpcEvent = { id: 'resolved-during-load', method: 'claude/tool/requestApproval', params: { toolName: 'Shell', input: { command: 'example' } } };
+  await act(async () => { notify(request); notify({ method: 'serverRequest/resolved', params: { requestId: request.id } }); finish([request]); await vi.dynamicImportSettled(); });
+  expect(container.querySelector('.request-card')).toBeNull();
+});
+
+it.each(['pi','opencode'])('rebinds %s provisional native startup and keeps its boot approval visible by exact owner', async agent => {
+  localStorage.setItem('supercode.session','native-chat');
+  data.sessions = [{id:'native-chat',projectId:'existing',title:'原生启动',agent,connectionId:`api:${agent}`,model:'test-model',status:'starting',nativeId:'boot-native',turnId:null,updatedAt:1}];
+  data.profiles.push({id:`api:${agent}`,agent,name:'Native API',model:'test-model',hasCredential:true,current:true});
+  pendingRequests = [{id:'boot-approval',method:'claude/tool/requestApproval',params:{appSessionId:'native-chat',threadId:'different-boot-alias',toolName:'BOOT_APPROVAL',input:{}}}];
+  await render(); await act(async () => {await vi.dynamicImportSettled();});
+  expect(container.querySelector('.request-card')?.textContent).toContain('BOOT_APPROVAL');
+  data.sessions[0] = {...data.sessions[0],nativeId:'actual-native',status:'running',turnId:'native-turn'};
+  await act(async () => {
+    notify({method:'thread/started',params:{appSessionId:'native-chat',thread:{id:'actual-native'}}});
+    notify({method:'turn/started',params:{appSessionId:'native-chat',threadId:'actual-native',turn:{id:'native-turn'}}});
+    notify({method:'item/agentMessage/delta',params:{appSessionId:'native-chat',threadId:'actual-native',turnId:'native-turn',itemId:'native-answer',delta:'正式线程实时输出'}});
+    notify({id:'unrelated',method:'claude/tool/requestApproval',params:{appSessionId:'other-chat',threadId:'actual-native',toolName:'OTHER_OWNER',input:{}}});
+    await new Promise(resolve=>setTimeout(resolve,80)); await vi.dynamicImportSettled();
+  });
+  expect(container.textContent).toContain('正式线程实时输出');
+  expect(container.querySelector('.request-card')?.textContent).toContain('BOOT_APPROVAL');
+  expect(container.textContent).not.toContain('OTHER_OWNER');
+});
+
+it('keeps a new approval when reconnect recovery returns an older empty snapshot', async () => {
+  await render();
+  const original = vi.mocked(call).getMockImplementation()!;
+  let finish!: (requests: RpcEvent[]) => void;
+  vi.mocked(call).mockImplementation((command, args) => command === 'pending_requests' ? new Promise(resolve => { finish = resolve; }) : original(command, args));
+  const stopped = vi.mocked(subscribe).mock.calls.at(-1)![2];
+  await act(async () => { stopped(); notify({ id: 'new-during-reconnect', method: 'claude/tool/requestApproval', params: { toolName: 'NEW_APPROVAL', input: {} } }); finish([]); await vi.dynamicImportSettled(); });
+  await act(async () => { await vi.dynamicImportSettled(); });
+  expect(container.querySelector('.request-card')?.textContent).toContain('NEW_APPROVAL');
+});
+
+it('blocks Enter and submit while a model handoff is pending, then sends the selected model', async () => {
+  localStorage.setItem('supercode.session', 'model-chat');
+  data.sessions = [{ id:'model-chat',projectId:'existing',title:'模型聊天',agent:'claude',connectionId:'api:claude',model:'test-model',status:'idle',nativeId:'native',turnId:null,updatedAt:1 }];
+  data.profiles[0].models = ['test-model', 'next-model'];
+  const original = vi.mocked(call).getMockImplementation()!; let finish!: (session: Session) => void;
+  vi.mocked(call).mockImplementation((command, args) => command === 'switch_session_model' ? new Promise(resolve => { finish = resolve; }) : command === 'list_models' ? Promise.resolve({data:[{id:'test-model',model:'test-model',displayName:'test-model',isDefault:true},{id:'next-model',model:'next-model',displayName:'next-model',isDefault:false}],source:{providerId:'custom',providerName:'Test API',mark:'T',available:true}}) : original(command, args));
+  await render(); await type('切换后发送这条消息');
+  await act(async () => container.querySelector<HTMLButtonElement>('.model-chip')!.click());
+  await act(async () => [...container.querySelectorAll<HTMLButtonElement>('.model-option')].find(button => button.textContent?.includes('next-model'))!.click());
+  expect(container.querySelector<HTMLButtonElement>('.send-button')!.disabled).toBe(true);
+  await act(async () => {
+    container.querySelector('textarea')!.dispatchEvent(new KeyboardEvent('keydown', { key:'Enter', bubbles:true, cancelable:true }));
+    container.querySelector('form.composer')!.dispatchEvent(new Event('submit', { bubbles:true, cancelable:true }));
+  });
+  expect(call).not.toHaveBeenCalledWith('send_chat_message', expect.anything());
+  expect(call).not.toHaveBeenCalledWith('enqueue_followup', expect.anything());
+  data.sessions[0] = { ...data.sessions[0], model:'next-model' };
+  await act(async () => { finish(data.sessions[0]); await vi.dynamicImportSettled(); });
+  await send();
+  expect(call).toHaveBeenCalledWith('send_chat_message', expect.objectContaining({ model:'next-model' }));
+});
+
+it('restores a selected chat draft outside the twenty-row memory cache', async () => {
+  localStorage.setItem('supercode.session', 'older-chat');
+  data.sessions = [{ id:'older-chat',projectId:'existing',title:'旧聊天',agent:'claude',connectionId:'api:claude',model:'test-model',status:'idle',nativeId:null,turnId:null,updatedAt:1 }];
+  localStorage.setItem('supercode.draft.v2:older-chat', JSON.stringify({version:2,updatedAt:1,draft:{text:'仍保留的旧草稿',attachments:[]}}));
+  for (let index=0;index<25;index++) localStorage.setItem(`supercode.draft.v2:newer-${index}`, JSON.stringify({version:2,updatedAt:index+2,draft:{text:'其他草稿',attachments:[]}}));
+  await render();
+  expect(container.querySelector<HTMLTextAreaElement>('.composer textarea')!.value).toBe('仍保留的旧草稿');
+});
+
+it('shows a draft persistence warning on quota failure, retains the draft and clears it after retry', async () => {
+  await render();
+  const original = localStorage;
+  vi.stubGlobal('localStorage', { get length(){return original.length;},key:(index:number)=>original.key(index),getItem:(key:string)=>original.getItem(key),removeItem:(key:string)=>original.removeItem(key),clear:()=>original.clear(),setItem:(key:string,value:string)=>{if(key.startsWith('supercode.draft.v2:'))throw new Error('quota');original.setItem(key,value);} } satisfies Storage);
+  await type('磁盘未保存时仍要保留的草稿');
+  await act(async () => { await new Promise(resolve=>setTimeout(resolve,280)); });
+  expect(container.querySelector('.draft-persistence-error')?.textContent).toContain('草稿暂未保存到磁盘');
+  expect(container.querySelector<HTMLTextAreaElement>('.composer textarea')!.value).toBe('磁盘未保存时仍要保留的草稿');
+  vi.unstubAllGlobals();
+  await act(async () => container.querySelector<HTMLButtonElement>('.draft-persistence-error button')!.click());
+  expect(container.querySelector('.draft-persistence-error')).toBeNull();
+  expect(readWorkspaceDraft(':claude')?.text).toBe('磁盘未保存时仍要保留的草稿');
+});
+
+it('flushes the current draft before unload without overwriting a draft saved by another window', async () => {
+  await render(); await type('刚输入的新草稿');
+  localStorage.setItem('supercode.draft.v2:other-chat', JSON.stringify({ version:2,updatedAt:Date.now(),draft:{text:'另一窗口的草稿',attachments:[]} }));
+  window.dispatchEvent(new Event('beforeunload'));
+  expect(readWorkspaceDraft(':claude')?.text).toBe('刚输入的新草稿');
+  expect(readWorkspaceDraft('other-chat')?.text).toBe('另一窗口的草稿');
+});
+
+it('isolates selected-content details, traps focus, blocks shortcuts and closes with Escape', async () => {
+  localStorage.setItem('supercode.session', 'selection-chat');
+  data.sessions = [{ id:'selection-chat',projectId:'existing',title:'选中文字',agent:'claude',connectionId:'api:claude',model:'test-model',status:'idle',nativeId:'native',turnId:null,updatedAt:1 }];
+  messages = [{ id:'user',seq:1,sessionId:'selection-chat',role:'user',kind:'userMessage',text:'需要进一步查看的文字',data:null }];
+  await render();
+  const range = document.createRange(); range.selectNodeContents(container.querySelector('.message-text')!);
+  Object.defineProperty(range, 'getBoundingClientRect', { value:() => new DOMRect(100,100,100,20) });
+  window.getSelection()!.addRange(range);
+  await act(async () => container.querySelector('.chat-scroll')!.dispatchEvent(new MouseEvent('mouseup', { bubbles:true })));
+  await act(async () => [...container.querySelectorAll<HTMLButtonElement>('.selection-actions button')].find(button => button.textContent === '更多详情')!.click());
+  const dialog = container.querySelector<HTMLElement>('[aria-label="选中内容"]')!;
+  expect(dialog.contains(document.activeElement)).toBe(true);
+  expect(container.querySelector<HTMLElement>('main.workspace')?.inert).toBe(true);
+  await act(async () => window.dispatchEvent(new KeyboardEvent('keydown', { key:'n',ctrlKey:true,bubbles:true,cancelable:true })));
+  expect(container.querySelector('[aria-label="选中内容"]')).toBe(dialog);
+  await act(async () => document.dispatchEvent(new KeyboardEvent('keydown', { key:'Escape',bubbles:true,cancelable:true })));
+  expect(container.querySelector('[aria-label="选中内容"]')).toBeNull();
+  expect(container.querySelector<HTMLElement>('main.workspace')?.inert).toBe(false);
+});
+
+it('blocks workspace and sidebar shortcuts while the update dialog is open', async () => {
+  localStorage.setItem('supercode.session', 'update-chat');
+  data.sessions = [{ id:'update-chat',projectId:'existing',title:'更新时的聊天',agent:'claude',connectionId:'api:claude',model:'test-model',status:'idle',nativeId:null,turnId:null,updatedAt:1 }];
+  await render();
+  const changed = vi.mocked(AppUpdateNotice).mock.calls.at(-1)![0].dialogChanged!;
+  await act(async () => changed(true));
+  expect(container.querySelector<HTMLElement>('.desktop-shell')?.inert).toBe(true);
+  await act(async () => {
+    for (const options of [{key:'r',altKey:true},{key:'p',altKey:true},{key:'u',shiftKey:true},{key:'a',shiftKey:true},{key:'k'}]) {
+      window.dispatchEvent(new KeyboardEvent('keydown', { ...options, ctrlKey:true, bubbles:true, cancelable:true }));
+    }
+  });
+  expect(call).not.toHaveBeenCalledWith('archive_session', expect.anything());
+  expect(call).not.toHaveBeenCalledWith('update_sidebar_item', expect.anything());
+  expect(container.querySelector('[role="dialog"]')).toBeNull();
+  await act(async () => changed(false));
+  expect(container.querySelector<HTMLElement>('.desktop-shell')?.inert).toBe(false);
+  await act(async () => window.dispatchEvent(new KeyboardEvent('keydown', {key:'a',ctrlKey:true,shiftKey:true,bubbles:true,cancelable:true})));
+  expect(call).toHaveBeenCalledWith('archive_session', { sessionId:'update-chat' });
+});
+
+it.each(['waiting','live-child'])('only locks the supplier used by a background %s and unlocks it when that task finishes', async activity => {
+  localStorage.setItem('supercode.session', 'idle-chat');
+  data.profiles.push({id:'running-profile',agent:'claude',name:'运行中的连接',model:'test-model',hasCredential:true,current:false});
+  data.sessions = [
+    { id:'idle-chat',projectId:'existing',title:'当前聊天',agent:'claude',connectionId:'api:claude',model:'test-model',status:'idle',nativeId:null,turnId:null,updatedAt:1 },
+    { id:'background',projectId:'existing',title:'后台任务',agent:'claude',connectionId:'running-profile',model:'test-model',status:activity === 'waiting' ? 'waiting' : 'idle',nativeId:'background-native',turnId:activity === 'waiting' ? 'background-turn' : null,updatedAt:1 },
+  ];
+  data.runningConnections = activity === 'live-child' ? {claude:['running-profile']} : {};
+  const original = vi.mocked(call).getMockImplementation()!;
+  vi.mocked(call).mockImplementation(async (command, args={}) => command === 'get_provider_profile' ? {id:args.id,agent:'claude',name:'运行中的连接',providerId:'custom',plan:'anthropic',protocol:'anthropic',baseUrl:'https://example.com',model:'test-model',models:['test-model'],hasCredential:true} : original(command,args));
+  await render();
+  await act(async () => window.dispatchEvent(new KeyboardEvent('keydown', {key:',',ctrlKey:true,bubbles:true,cancelable:true})));
+  await act(async () => { await vi.dynamicImportSettled(); });
+  const suppliers = [...container.querySelectorAll<HTMLButtonElement>('.settings-nav button')].find(button => button.textContent === '模型供应商')!;
+  await act(async () => suppliers.click()); await act(async () => { await vi.dynamicImportSettled(); });
+  expect(container.querySelector<HTMLButtonElement>('.settings-page-heading .primary-button')?.disabled).toBe(false);
+  const used = container.querySelector<HTMLButtonElement>('[data-connection-id="running-profile"] .saved-provider')!;
+  expect(used.textContent).toContain('任务使用中');
+  expect(container.querySelector('[data-connection-id="api:claude"]')?.textContent).not.toContain('任务使用中');
+  await act(async () => used.click());
+  expect(container.querySelector<HTMLInputElement>('#provider-key')?.disabled).toBe(true);
+  data.sessions[1].status = 'idle'; data.sessions[1].turnId = null;
+  data.runningConnections = {};
+  await act(async () => [...container.querySelectorAll<HTMLButtonElement>('button')].find(button => button.textContent === '刷新连接')!.click());
+  expect(container.querySelector<HTMLInputElement>('#provider-key')?.disabled).toBe(false);
+  expect(data.sessions[0].connectionId).toBe('api:claude');
+  expect(call).not.toHaveBeenCalledWith('switch_session_model', expect.anything());
+});
 
 it.each([['execute','ask'],['execute','full'],['execute','auto'],['revise','full']] as const)('submits a reviewed native plan as %s preserving %s permission and the composer draft',async (decision,remembered)=>{
   localStorage.setItem('supercode.session','planned');
@@ -522,6 +689,22 @@ it('does not let a delayed usage load overwrite newer live context on a slow dev
   await act(async () => notify({ method: 'thread/tokenUsage/updated', params: { threadId: 'native-context', tokenUsage: { total: {}, last: {}, contextTokens: 23456 } } }));
   await act(async () => { resolve({ records: [{ data: { total: {}, last: {}, contextTokens: 12345 } }] }); await pending; });
   expect(container.querySelector('.usage-trigger')?.textContent).toBe('上下文 23.5K');
+});
+it('waits for hosted-route capacity and never substitutes the publisher window while its catalog is pending', async () => {
+  localStorage.setItem('supercode.session','hosted-context');
+  data.profiles[0].model = 'MiniMax-M3';
+  data.sessions = [{id:'hosted-context',projectId:'existing',title:'托管模型',agent:'claude',connectionId:'api:claude',model:'MiniMax-M3',nativeId:'native-context',status:'running',turnId:'turn-context',updatedAt:1}];
+  let resolve!: (value: unknown) => void;
+  const pending = new Promise(done => { resolve = done; });
+  const fallback = vi.mocked(call).getMockImplementation()!;
+  vi.mocked(call).mockImplementation(async (command,args) => command==='list_models' ? pending : command==='get_usage' ? {records:[{data:{total:{},last:{},contextTokens:96000,cumulative:false}}]} : fallback(command,args));
+  await render();
+  expect(container.querySelector('.usage-trigger')?.textContent).toBe('上下文 96.0K');
+  expect(container.querySelector('.usage-trigger')?.getAttribute('aria-label')).not.toContain('1,000,000');
+  await act(async () => { resolve({data:[{id:'MiniMax-M3',model:'MiniMax-M3',displayName:'MiniMax-M3',isDefault:true,contextWindow:192000}]}); await pending; });
+  expect(container.querySelector('.usage-trigger')?.textContent).toBe('上下文 50%');
+  await act(async () => notify({method:'thread/tokenUsage/updated',params:{threadId:'native-context',turnId:'turn-context',tokenUsage:{total:{},last:{},contextTokens:96000,modelContextWindow:160000,cumulative:false}}}));
+  expect(container.querySelector('.usage-trigger')?.textContent).toBe('上下文 60%');
 });
 it('loads official models locally on startup, reuses the result, and explicitly refreshes without a CLI', async () => {
   localStorage.setItem('supercode.session','official-chat');

@@ -22,6 +22,7 @@ struct Endpoint {
 struct Connection {
     agent: String,
     session: Option<String>,
+    gate_token: Option<String>,
     revoked: bool,
     calls: HashSet<String>,
 }
@@ -32,6 +33,16 @@ struct Grant {
     token: String,
     gate: Arc<crate::computer_gate::Gate>,
     allowed: bool,
+    reconnect_required: bool,
+}
+impl Grant {
+    fn transport_closed(&mut self, token: Option<&str>) {
+        // A retired worker cannot revoke the next user-authorized grant.
+        if token.is_some_and(|token| token != self.token) { return; }
+        self.allowed = false;
+        self.reconnect_required = true;
+        self.gate.stop();
+    }
 }
 #[derive(Default)]
 struct Activity {
@@ -289,11 +300,13 @@ async fn connection(app: AppHandle, socket: tokio::net::TcpStream) {
     {
         let mut activity = state.activity.lock().unwrap();
         let session = hello["session"].as_str().map(str::to_owned).or_else(|| activity.session.clone());
+        let gate_token = session.as_ref().and_then(|id| state.grants.lock().unwrap().get(id).map(|grant| grant.token.clone()));
         activity.connections.insert(
             key.clone(),
             Connection {
                 agent: agent.into(),
                 session,
+                gate_token,
                 ..Default::default()
             },
         );
@@ -346,18 +359,22 @@ async fn connection(app: AppHandle, socket: tokio::net::TcpStream) {
             if app
                 .run_on_main_thread(move || {
                     let current_gate = connection_gate(&app_ui, &key_ui);
-                    let result =
-                        current_gate == expected_gate && set_call(&app_ui, &key_ui, &id, active);
+                    let result = if current_gate == expected_gate {
+                        set_call(&app_ui, &key_ui, &id, active)
+                    } else { Err("stale_grant") };
                     let _ = tx.send(result);
                 })
                 .is_err()
             {
                 break;
             }
-            let ok = tokio::time::timeout(Duration::from_secs(5), rx)
-                .await
-                .is_ok_and(|r| r == Ok(true));
-            let answer = serde_json::json!({"ok":ok,"gate":if ok { current } else { None }})
+            let decision = match tokio::time::timeout(Duration::from_secs(5), rx).await {
+                Ok(Ok(result)) => result,
+                Ok(Err(_)) => Err("cue_unavailable"),
+                Err(_) => Err("cue_timeout"),
+            };
+            let ok = decision.is_ok();
+            let answer = serde_json::json!({"ok":ok,"gate":if ok { current } else { None },"reason":decision.err()})
                 .to_string()
                 + "\n";
             if write.write_all(answer.as_bytes()).await.is_err() {
@@ -365,17 +382,21 @@ async fn connection(app: AppHandle, socket: tokio::net::TcpStream) {
             }
         }
     }
+    // Retire control immediately on cue EOF. A stalled UI must not leave the
+    // unavailable bridge reusable by the next accepted user message.
+    state.cancellations.lock().unwrap().remove(&key);
+    {
+        let mut activity = state.activity.lock().unwrap();
+        if let Some(row) = activity.connections.get(&key) {
+            if let Some(session) = row.session.as_deref() {
+                if let Some(grant) = state.grants.lock().unwrap().get_mut(session) {
+                    grant.transport_closed(row.gate_token.as_deref());
+                }
+            }
+        }
+        activity.disconnect(&key);
+    }
     let _ = app.clone().run_on_main_thread(move || {
-        app.state::<DesktopControl>()
-            .cancellations
-            .lock()
-            .unwrap()
-            .remove(&key);
-        app.state::<DesktopControl>()
-            .activity
-            .lock()
-            .unwrap()
-            .disconnect(&key);
         let _ = refresh(&app);
         if app
             .state::<DesktopControl>()
@@ -390,25 +411,27 @@ async fn connection(app: AppHandle, socket: tokio::net::TcpStream) {
     });
 }
 
-fn set_call(app: &AppHandle, connection: &str, id: &str, active: bool) -> bool {
+fn set_call(app: &AppHandle, connection: &str, id: &str, active: bool) -> Result<(), &'static str> {
     let state = app.state::<DesktopControl>();
     let ok = {
         let mut activity = state.activity.lock().unwrap();
         if active {
-            let Some(row) = activity.connections.get(connection) else { return false; };
-            let Some(session) = row.session.clone() else { return false; };
+            let Some(row) = activity.connections.get(connection) else { return Err("connection_closed"); };
+            if row.revoked { return Err("control_revoked"); }
+            let Some(session) = row.session.clone() else { return Err("missing_session"); };
             let grant = state.grants.lock().unwrap().get(&session).cloned();
-            let Some(grant) = grant.filter(|g| g.allowed && g.agent == row.agent && !row.revoked) else { return false; };
+            let Some(grant) = grant.filter(|g| g.allowed && g.agent == row.agent) else { return Err("control_not_authorized"); };
             if activity.session.as_deref() != Some(&session) {
                 // Chat processes remain concurrent. Physical mouse/keyboard ownership
                 // changes only after its current owner's observation/action loop ends.
-                if !activity.can_prepare_session(&session) { return false; }
+                if !activity.can_prepare_session(&session) { return Err("desktop_busy"); }
                 activity.prepare_session(&grant.agent, &session);
                 activity.turn = grant.turn.clone();
             }
             if let Some(old) = state.gate.lock().unwrap().replace(grant.gate.clone()) {
                 if !Arc::ptr_eq(&old, &grant.gate) { old.stop(); }
             }
+            if let Some(row) = activity.connections.get_mut(connection) { row.gate_token = Some(grant.token.clone()); }
             if let Some(endpoint) = state.endpoint.lock().unwrap().as_mut() { endpoint.lease = grant.token; }
             activity.start(connection, id)
         } else {
@@ -417,7 +440,7 @@ fn set_call(app: &AppHandle, connection: &str, id: &str, active: bool) -> bool {
         }
     };
     if !ok {
-        return false;
+        return Err("control_revoked");
     }
     if active {
         yield_desktop(app);
@@ -425,10 +448,10 @@ fn set_call(app: &AppHandle, connection: &str, id: &str, active: bool) -> bool {
     if let Err(error) = refresh(app) {
         diagnostic(app, "cue_failed", Some(&error));
         crate::runtime_diagnostics::message(app,None,"desktop_control","warn","desktop_control_blocked",&error.to_string());
-        stop(app);
-        return false;
+        takeover_reason(app, true, "cue_initialization_failed");
+        return Err("cue_unavailable");
     }
-    true
+    Ok(())
 }
 fn connection_gate(app: &AppHandle, connection: &str) -> Option<String> {
     let state = app.state::<DesktopControl>();
@@ -585,8 +608,9 @@ pub(crate) fn authorize_session(
         &crate::computer_gate::event_name(&token),
     )?);
     let mut activity = state.activity.lock().unwrap();
-    let reconnect = activity.connections.values().any(|c| c.session.as_deref() == Some(session) && c.revoked);
-    let grant = Grant { agent: agent.into(), turn: None, token: token.clone(), gate: gate.clone(), allowed: true };
+    let reconnect = activity.connections.values().any(|c| c.session.as_deref() == Some(session) && c.revoked)
+        || state.grants.lock().unwrap().get(session).is_some_and(|grant| grant.reconnect_required);
+    let grant = Grant { agent: agent.into(), turn: None, token: token.clone(), gate: gate.clone(), allowed: true, reconnect_required: false };
     if let Some(old) = state.grants.lock().unwrap().insert(session.into(), grant) { old.gate.stop(); }
     if activity.can_prepare_session(session) {
         if let Some(old) = state.gate.lock().unwrap().replace(gate) { old.stop(); }
@@ -671,20 +695,22 @@ pub fn observe(app: &AppHandle, event: &Value) {
     });
 }
 
-pub fn stop(app: &AppHandle) {
-    takeover_reason(app, true, "chat_stop");
+pub fn stop_session(app: &AppHandle, session: &str) {
+    revoke_control(app, true, "chat_stop", Some(session));
 }
 
 /// Manual input takes priority. Mouse/ordinary keys keep the user's foreground;
 /// Esc and the chat's Stop button may bring the chat back.
 pub(crate) fn takeover_reason(app: &AppHandle, bring_back: bool, reason: &str) {
+    revoke_control(app, bring_back, reason, None);
+}
+fn revoke_control(app: &AppHandle, bring_back: bool, reason: &str, expected_session: Option<&str>) {
     let state = app.state::<DesktopControl>();
-    state.manual_takeover.store(!bring_back, Ordering::Release);
-    if let Some(gate) = state.gate.lock().unwrap().as_ref() {
-        gate.stop();
-    }
-    let agents = {
+    let (agents, owner) = {
         let mut activity = state.activity.lock().unwrap();
+        if expected_session.is_some_and(|session| activity.session.as_deref() != Some(session)) { return; }
+        state.manual_takeover.store(!bring_back, Ordering::Release);
+        if let Some(gate) = state.gate.lock().unwrap().as_ref() { gate.stop(); }
         if let Some(owner) = &activity.session {
             if let Some(grant) = state.grants.lock().unwrap().get_mut(owner) { grant.allowed = false; }
         }
@@ -692,14 +718,13 @@ pub(crate) fn takeover_reason(app: &AppHandle, bring_back: bool, reason: &str) {
         for agent in &agents {
             activity.revoke(agent);
         }
-        agents
+        (agents, activity.session.clone())
     };
     if agents.is_empty() {
         return;
     }
     // Native workers observe the gate and return a takeover result. Legacy servers
     // still need their process tree killed because they have no cancellation contract.
-    let owner = state.activity.lock().unwrap().session.clone();
     for (key, (agent, builtin, cancel)) in state.cancellations.lock().unwrap().iter() {
         let owned = state.activity.lock().unwrap().connections.get(key).is_some_and(|c| c.session == owner);
         if owned && agents.contains(agent) && !builtin {
@@ -707,19 +732,9 @@ pub(crate) fn takeover_reason(app: &AppHandle, bring_back: bool, reason: &str) {
         }
     }
     diagnostic(app, "control_stopped", Some(reason));
-    let sessions = app.state::<AppState>().store.sessions().unwrap_or_default();
-    for session in sessions.into_iter().filter(|s| {
-        agents.contains(&s.agent)
-            && owner.as_ref().is_none_or(|id| id == &s.id)
-            && matches!(s.status.as_str(), "starting" | "running" | "waiting")
-    }) {
-        let app = app.clone();
-        tauri::async_runtime::spawn(async move {
-            if let Err(error) = crate::commands::interrupt_turn(session.id, app).await {
-                eprintln!("停止电脑操作失败：{error}");
-            }
-        });
-    }
+    // Revoke desktop input only. The cancelled tool returns to the agent, which
+    // can explain the result and continue other work. The chat Stop command
+    // handles whole-turn interruption separately.
     let app_ui = app.clone();
     let _ = app.run_on_main_thread(move || {
         let _ = refresh(&app_ui);
@@ -764,6 +779,33 @@ pub(crate) fn active(app: &AppHandle) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn cue_disconnect_keeps_a_reconnect_marker_after_its_connection_is_removed() {
+        let token = uuid::Uuid::new_v4().to_string();
+        let gate = Arc::new(crate::computer_gate::Gate::create(&crate::computer_gate::event_name(&token)).unwrap());
+        gate.arm().unwrap();
+        let mut grant = Grant {agent:"claude".into(),turn:Some("turn".into()),token:token.clone(),gate:gate.clone(),allowed:true,reconnect_required:false};
+        grant.transport_closed(Some(&token));
+        assert!(gate.stopped());
+        assert!(!grant.allowed);
+        assert!(grant.reconnect_required);
+        assert_eq!(grant.turn.as_deref(), Some("turn"));
+        // Recovery depends on the grant, even after the old MCP connection is gone.
+        let connections = HashMap::<String, Connection>::new();
+        assert!(connections.is_empty() && grant.reconnect_required);
+    }
+    #[test]
+    fn old_cue_disconnect_cannot_revoke_a_new_user_authorized_gate() {
+        let token = uuid::Uuid::new_v4().to_string();
+        let gate = Arc::new(crate::computer_gate::Gate::create(&crate::computer_gate::event_name(&token)).unwrap());
+        gate.arm().unwrap();
+        let mut grant = Grant {agent:"codex".into(),turn:Some("new-turn".into()),token,gate:gate.clone(),allowed:true,reconnect_required:false};
+        grant.transport_closed(Some("previous-token"));
+        assert!(!gate.stopped());
+        assert!(grant.allowed);
+        assert!(!grant.reconnect_required);
+        assert_eq!(grant.turn.as_deref(), Some("new-turn"));
+    }
     #[test]
     fn another_chat_with_the_same_agent_does_not_steal_desktop_ownership() {
         let mut state = Activity::default();

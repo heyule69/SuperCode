@@ -36,6 +36,10 @@ pub struct Bootstrap {
     official_agents: Vec<String>,
     #[serde(rename = "connectionOrder")]
     connection_order: std::collections::BTreeMap<String, Vec<String>>,
+    #[serde(rename = "runningConnections")]
+    running_connections: std::collections::BTreeMap<String, Vec<String>>,
+    #[serde(rename = "activeSessionIds")]
+    active_session_ids: Vec<String>,
     sidebar: crate::sidebar::SidebarState,
 }
 
@@ -80,6 +84,8 @@ pub fn bootstrap(state: State<'_, AppState>, app: AppHandle) -> Result<Bootstrap
         codex_path,
         load_mcp: state.store.load_mcp()?,
         connection_order,
+        running_connections: state.store.running_connections()?,
+        active_session_ids: state.store.active_session_ids()?,
         official_agents,
         profiles,
     })
@@ -110,6 +116,11 @@ pub async fn configure_codex(
         })
         .transpose()?;
     let state = app.state::<AppState>();
+    let agents = app.state::<crate::agents::Agents>();
+    let _operation = agents
+        .operation
+        .try_write()
+        .map_err(|_| "Agent 正在启动或配置，请稍后更改")?;
     state.runtime.release(&app).await?;
     state.store.configure_codex(path.as_deref(), load_mcp)
 }
@@ -172,11 +183,18 @@ pub fn list_messages(
     state: State<'_, AppState>,
 ) -> Result<Vec<Message>, String> {
     let session_activity = state.activity.existing(&session_id);
-    let activity = session_activity.as_ref().map(|slot| slot.lock().map_err(|e| e.to_string())).transpose()?;
+    let activity = session_activity
+        .as_ref()
+        .map(|slot| slot.lock().map_err(|e| e.to_string()))
+        .transpose()?;
     let mut messages = state.store.messages(&session_id, before)?;
     if before.is_none() {
         if let Some(native) = state.store.session(&session_id)?.native_id {
-            for item in activity.as_ref().map(|buffer| buffer.snapshot(&native)).unwrap_or_default() {
+            for item in activity
+                .as_ref()
+                .map(|buffer| buffer.snapshot(&native))
+                .unwrap_or_default()
+            {
                 if let Some(message) = messages.iter_mut().find(|m| item["id"] == m.id) {
                     if let Some((role, text, kind, data)) = protocol::item_message(&item) {
                         message.role = role;
@@ -458,7 +476,6 @@ async fn send_inner(
         .await;
     }
     let route = state.store.route("codex", Some(session_id))?;
-    let client = state.runtime.get_for_session(app, Some(session_id)).await?;
     let profile_model = route.config["model"].as_str().map(str::to_owned);
     let model = match model.or(session.model.clone()).or(profile_model) {
         Some(model) => Some(model),
@@ -481,6 +498,11 @@ async fn send_inner(
                 .map(str::to_owned)
         }
     };
+    let context = crate::codex_context::Configuration::for_route(&route, model.as_deref());
+    let client = state
+        .runtime
+        .get_for_session_context(app, session_id, context)
+        .await?;
     let mode = if read_only { "read" } else { permission };
     let (sandbox, approval, mut policy) = crate::client_features::permission(mode)?;
     let reviewer = crate::client_features::approvals_reviewer(mode);
@@ -488,8 +510,12 @@ async fn send_inner(
     // with the process. Older installations retain ordinary turn behavior.
     let mut planning_supported = client.planning_supported.lock().await;
     if mode == "read" && planning_supported.is_none() {
-        let presets = client.request("collaborationMode/list", json!({})).await
-            .map_err(|error| format!("无法启用 Codex 原生计划模式，请更新 Codex 后重试：{error}"))?;
+        let presets = client
+            .request("collaborationMode/list", json!({}))
+            .await
+            .map_err(|error| {
+                format!("无法启用 Codex 原生计划模式，请更新 Codex 后重试：{error}")
+            })?;
         *planning_supported = Some(crate::client_features::has_plan_preset(&presets));
     }
     if mode == "read" && *planning_supported != Some(true) {
@@ -503,12 +529,15 @@ async fn send_inner(
     } else {
         already_loaded
     };
-    let result = if already_loaded {
-        json!({"thread":{"id":session.native_id}})
-    } else if let Some(native) = &session.native_id {
-        client.request("thread/resume",json!({"threadId":native,"cwd":project.path,"approvalPolicy":approval,"approvalsReviewer":reviewer,"sandbox":sandbox,"model":model,"modelProvider":route.provider()})).await?
+    let request = codex_thread_request(
+        session.native_id.as_deref(),
+        already_loaded,
+        json!({"cwd":project.path,"approvalPolicy":approval,"approvalsReviewer":reviewer,"sandbox":sandbox,"model":model,"modelProvider":route.provider(),"developerInstructions":crate::client_features::instructions(app),"serviceName":"supercode"}),
+    );
+    let result = if let Some((method, parameters)) = request {
+        client.request(method, parameters).await?
     } else {
-        client.request("thread/start",json!({"cwd":project.path,"approvalPolicy":approval,"approvalsReviewer":reviewer,"sandbox":sandbox,"model":model,"modelProvider":route.provider(),"developerInstructions":crate::client_features::instructions(app),"serviceName":"supercode"})).await?
+        json!({"thread":{"id":session.native_id}})
     };
     let native = result["thread"]["id"]
         .as_str()
@@ -555,11 +584,19 @@ async fn send_inner(
     };
     let collaboration = if use_collaboration {
         crate::client_features::codex_collaboration_mode(
-            mode, model.as_deref().or_else(|| result["thread"]["model"].as_str()), effort.as_deref(),
+            mode,
+            model
+                .as_deref()
+                .or_else(|| result["thread"]["model"].as_str()),
+            effort.as_deref(),
         )?
-    } else { None };
+    } else {
+        None
+    };
     let mut turn = json!({"threadId":native,"input":inputs,"cwd":project.path,"model":model,"effort":effort,"summary":"auto","approvalPolicy":approval,"approvalsReviewer":reviewer,"sandboxPolicy":policy});
-    if let Some(collaboration) = collaboration { turn["collaborationMode"] = collaboration; }
+    if let Some(collaboration) = collaboration {
+        turn["collaborationMode"] = collaboration;
+    }
     let reply = client.request("turn/start", turn).await?;
     let turn_id = reply["turn"]["id"].as_str().ok_or("Codex 未返回任务 ID")?;
     client.expect_turn(native, turn_id).await;
@@ -572,19 +609,49 @@ async fn send_inner(
     state.store.session(session_id)
 }
 
+pub(crate) fn codex_thread_request(
+    native: Option<&str>,
+    loaded: bool,
+    mut parameters: Value,
+) -> Option<(&'static str, Value)> {
+    if let Some(native) = native {
+        if loaded {
+            return None;
+        }
+        parameters["threadId"] = json!(native);
+        if let Some(object) = parameters.as_object_mut() {
+            object.remove("developerInstructions");
+            object.remove("serviceName");
+        }
+        Some(("thread/resume", parameters))
+    } else {
+        Some(("thread/start", parameters))
+    }
+}
+
 #[tauri::command]
 pub async fn interrupt_turn(session_id: String, app: AppHandle) -> Result<(), String> {
-    crate::browser::stop(&app, &session_id, false);
+    crate::browser::stop(&app, &session_id);
+    crate::desktop_control::stop_session(&app, &session_id);
     let state = app.state::<AppState>();
     let session = state.store.session(&session_id)?;
-    crate::runtime_diagnostics::record(&app, Some(&session_id), "interrupt_requested", json!({"turnId":session.turn_id}));
+    crate::runtime_diagnostics::record(
+        &app,
+        Some(&session_id),
+        "interrupt_requested",
+        json!({"turnId":session.turn_id}),
+    );
     if matches!(session.agent.as_str(), "opencode" | "pi") {
         return state.native.interrupt(&session_id).await;
     }
     if session.agent == "claude" {
         return state.claude.interrupt(&app, &session_id).await;
     }
-    let client = state.runtime.session_client(&session_id).await.ok_or("当前没有运行中的 agent")?;
+    let client = state
+        .runtime
+        .session_client(&session_id)
+        .await
+        .ok_or("当前没有运行中的 agent")?;
     let native = session.native_id.ok_or("会话尚未启动，请稍后再试")?;
     let turn = session.turn_id.ok_or("任务正在启动，请稍后再试")?;
     client.interrupt_turn(&native, &turn).await?;
@@ -1040,10 +1107,19 @@ pub async fn runtime_info(app: AppHandle) -> Result<Value, String> {
     let state = app.state::<AppState>();
     let requests = pending_requests(app.clone()).await?;
     let mut agent_pids = state.native.warm_pids().await;
-    agent_pids.extend(state.runtime.clients().await.into_iter().filter(|c| c.alive.load(Ordering::Relaxed)).map(|c| c.pid));
+    agent_pids.extend(
+        state
+            .runtime
+            .clients()
+            .await
+            .into_iter()
+            .filter(|c| c.alive.load(Ordering::Relaxed))
+            .map(|c| c.pid),
+    );
     agent_pids.extend(state.claude.clients().await.into_iter().map(|c| c.pid));
     agent_pids.extend(state.native.clients().await.into_iter().map(|c| c.pid()));
-    agent_pids.sort_unstable(); agent_pids.dedup();
+    agent_pids.sort_unstable();
+    agent_pids.dedup();
     let pid = std::process::id();
     let agent_pid = agent_pids.first().copied();
     let running = !agent_pids.is_empty();

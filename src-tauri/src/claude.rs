@@ -501,8 +501,9 @@ pub async fn send(
     // Validate IDs before passing flags. Prompts and permission replies always travel via stdin.
     uuid::Uuid::parse_str(&native).map_err(|_| "Claude 原生会话 ID 无效")?;
     let permission_args = permission_args(read_only, permission)?;
-    let (native_mcp, plugin_settings, plugin_args) =
+    let (native_mcp, mut plugin_settings, plugin_args) =
         crate::extensions::claude_config(app, Path::new(cwd))?;
+    plugin_settings["autoCompactEnabled"] = json!(true);
     let mut args = vec![
         "--print".to_owned(),
         "--input-format".into(),
@@ -544,9 +545,6 @@ pub async fn send(
             "session-id"
         }
     ));
-    if let Some(model) = &model {
-        args.push(format!("--model={model}"));
-    }
     let mut command = process::command(
         &executable,
         &args.iter().map(String::as_str).collect::<Vec<_>>(),
@@ -560,9 +558,11 @@ pub async fn send(
             "ANTHROPIC_BASE_URL",
             "ANTHROPIC_MODEL",
             "ANTHROPIC_REASONING_MODEL",
+            "ANTHROPIC_DEFAULT_FABLE_MODEL",
             "ANTHROPIC_DEFAULT_OPUS_MODEL",
             "ANTHROPIC_DEFAULT_SONNET_MODEL",
             "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+            "ANTHROPIC_SMALL_FAST_MODEL",
             "CLAUDE_CODE_SUBAGENT_MODEL",
             "CLAUDE_CODE_OAUTH_TOKEN",
             "CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR",
@@ -580,6 +580,8 @@ pub async fn send(
             }
         }
     }
+    let claude_context=crate::model_context::configure_claude(&mut command,&config,model.as_deref());
+    if let Some(launch_model)=&claude_context.launch_model { command.arg(format!("--model={launch_model}")); }
     crate::official_accounts::configure(&mut command, app, "claude", &config)?;
     command.env("SUPERCODE_SESSION_ID", &session.id);
     command.env("CLAUDE_CODE_SDK_READS_SESSION_STATE", "1");
@@ -680,7 +682,12 @@ pub async fn send(
     drop(slot);
     let reader_app = app.clone();
     tauri::async_runtime::spawn(async move {
-        let mut stream = Stream::default();
+        let mut stream = Stream {
+            model:model.clone().unwrap_or_default(),
+            declared_context:claude_context.launch_model.clone().zip(claude_context.context_window),
+            model_context_window:claude_context.context_window,
+            ..Stream::default()
+        };
         let mut completion = RunCompletion::default();
         let mut failure = Some("Claude 连接在任务完成前关闭".to_owned());
         loop {
@@ -754,26 +761,7 @@ pub async fn send(
                     event("agent/commands", &turn.native, &turn.id(), data),
                 );
             } else if message["type"] == "system" && message["subtype"] == "compact_boundary" {
-                stream.reset_context();
-                publish(
-                    &reader_app,
-                    event(
-                        "thread/tokenUsage/updated",
-                        &turn.native,
-                        &turn.id(),
-                        json!({"tokenUsage":stream.context_usage()}),
-                    ),
-                );
-                let item = json!({"type":"contextCompaction","id":format!("compact-{}",turn.id()),"status":"completed","text":"Claude 已完成原生上下文压缩。","metadata":message["compact_metadata"]});
-                publish(
-                    &reader_app,
-                    event(
-                        "item/completed",
-                        &turn.native,
-                        &turn.id(),
-                        json!({"item":item}),
-                    ),
-                );
+                for notification in stream.compact_boundary(&message,&turn.native,&turn.id()) { publish(&reader_app,notification); }
             } else if message["type"] == "control_request" {
                 let id = format!("claude:{}:{}", turn.session, message["request_id"].as_str().unwrap_or(""));
                 let request = &message["request"];
@@ -882,6 +870,7 @@ pub async fn send(
                 stream = Stream {
                     model: stream.model.clone(),
                     model_context_window: stream.model_context_window,
+                    declared_context: stream.declared_context.clone(),
                     last_context: stream.context_usage(),
                     ..Stream::default()
                 };
@@ -1001,6 +990,7 @@ struct Stream {
     last_context: Value,
     model: String,
     model_context_window: Option<u64>,
+    declared_context: Option<(String,u64)>,
     message_id: String,
     text: String,
     tools: HashMap<String, Value>,
@@ -1025,11 +1015,16 @@ impl Stream {
         self.clear_request_usage();
     }
     fn observe_model(&mut self, model: &str) {
-        if self.model != model {
-            self.model_context_window = None;
+        if !same_context_model(&self.model,model) {
+            self.model_context_window = self.declared_context.as_ref().filter(|(id,_)|same_context_model(id,model)).map(|(_,window)|*window);
             self.last_context = Value::Null;
         }
         self.model = model.into();
+    }
+    fn compact_boundary(&mut self,message:&Value,native:&str,turn:&str) -> Vec<Value> {
+        self.reset_context();
+        let item=json!({"type":"contextCompaction","id":format!("compact-{turn}"),"status":"completed","text":"Claude 已完成原生上下文压缩。","metadata":message["compact_metadata"]});
+        vec![event("thread/tokenUsage/updated",native,turn,json!({"tokenUsage":self.context_usage()})),event("item/completed",native,turn,json!({"item":item}))]
     }
     fn observe_usage(&mut self, usage: &Value) -> bool {
         let input = crate::usage_tokens::count(&usage["input_tokens"]);
@@ -1078,7 +1073,8 @@ impl Stream {
     }
     fn context_window(&self, result: &Value) -> Option<u64> {
         let models = result["modelUsage"].as_object()?;
-        let usage = models.get(&self.model).or_else(|| {
+        let configured=self.declared_context.as_ref().filter(|(id,_)|same_context_model(id,&self.model)).and_then(|(id,_)|models.get(id));
+        let usage = configured.or_else(||models.get(&self.model)).or_else(|| {
             (models.len() == 1)
                 .then(|| models.values().next())
                 .flatten()
@@ -1359,6 +1355,14 @@ impl Stream {
     }
 }
 
+fn same_context_model(left: &str, right: &str) -> bool {
+    let base=|model:&str| {
+        let lower=model.to_ascii_lowercase();
+        lower.strip_suffix("[1m]").or_else(||lower.strip_suffix("[256k]")).unwrap_or(&lower).to_owned()
+    };
+    base(left)==base(right)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1614,6 +1618,31 @@ mod tests {
         assert!(stream.context_usage()["contextTokens"].is_null());
         stream.observe_usage(&json!({"input_tokens":0}));
         assert!(stream.context_usage()["contextTokens"].is_null());
+    }
+    #[test]
+    fn native_auto_compaction_resets_usage_and_continues_the_same_turn() {
+        let mut stream=Stream {model:"glm-5.3".into(),model_context_window:Some(1_000_000),declared_context:Some(("glm-5.3".into(),1_000_000)),..Stream::default()};
+        let assistant=|id:&str,input:u64|json!({"type":"assistant","message":{"id":id,"model":"glm-5.3","usage":{"input_tokens":input,"output_tokens":1},"content":[]}});
+        stream.translate(&assistant("before",899999),"native","same-turn");
+        let compact=stream.compact_boundary(&json!({"compact_metadata":{"trigger":"auto","pre_tokens":900000}}),"native","same-turn");
+        assert!(compact.iter().all(|event|event["params"]["turnId"]=="same-turn" && event["method"]!="turn/completed"));
+        assert!(compact[0]["params"]["tokenUsage"]["contextTokens"].is_null());
+        assert_eq!(compact[0]["params"]["tokenUsage"]["modelContextWindow"],1_000_000);
+        let after=stream.translate(&assistant("after",12000),"native","same-turn");
+        assert_eq!(after[0]["params"]["turnId"],"same-turn");
+        assert_eq!(after[0]["params"]["tokenUsage"]["contextTokens"],12001);
+        assert_eq!(after[0]["params"]["tokenUsage"]["modelContextWindow"],1_000_000);
+    }
+    #[test]
+    fn native_capacity_wins_over_declared_fallback_and_cli_variant_matches_true_api_model() {
+        let mut stream=Stream {model:"glm-5.3".into(),declared_context:Some(("glm-5.3[1m]".into(),1_000_000)),model_context_window:Some(1_000_000),..Stream::default()};
+        stream.observe_model("GLM-5.3");
+        assert_eq!(stream.context_usage()["modelContextWindow"],1_000_000);
+        let result=json!({"usage":{},"modelUsage":{"glm-5.3[1m]":{"contextWindow":900000},"glm-5.3":{"contextWindow":200000}}});
+        let usage=stream.result_usage(&result,&mut InputState::default());
+        assert_eq!(usage["modelContextWindow"],900000);
+        stream.observe_model("different-private-model");
+        assert!(stream.context_usage()["modelContextWindow"].is_null());
     }
     #[test]
     fn late_cache_counts_and_sdk_placeholders_do_not_zero_measured_context() {

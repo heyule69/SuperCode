@@ -63,6 +63,13 @@ pub fn register_secrets(app: &AppHandle, config: &Value) {
         }
     }
 }
+pub fn register_mcp_secrets(app: &AppHandle, config: &Value) {
+    if let Some(diagnostics) = app.try_state::<Diagnostics>() {
+        if let Ok(mut secrets) = diagnostics.secrets.write() {
+            log_redaction::collect_mcp(config, &mut secrets, |name| std::env::var(name).ok());
+        }
+    }
+}
 
 pub fn error_type(text: &str) -> &'static str {
     let lower = text.to_lowercase();

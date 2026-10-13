@@ -1,8 +1,9 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
-import { expect, it } from 'vitest';
+import { beforeAll, expect, it } from 'vitest';
 import catalog from 'virtual:material-file-icons';
-import { fileIcon } from './fileIcons';
+import { fileIcon, loadFileIconCatalog } from './fileIcons';
+beforeAll(() => loadFileIconCatalog());
 
 it('uses the upstream filename and compound-extension associations before generic file types', () => {
   expect(fileIcon('C:\\项目\\PACKAGE.JSON').id).toBe('nodejs');

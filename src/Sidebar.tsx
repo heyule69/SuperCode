@@ -1,4 +1,4 @@
-import { useEffect, useId, useLayoutEffect, useRef, useState, type Dispatch, type MouseEvent, type SetStateAction } from 'react';
+import { useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type Dispatch, type MouseEvent, type SetStateAction } from 'react';
 import { createPortal } from 'react-dom';
 import { Archive, Check, ChevronRight, Copy, Download, ExternalLink, Eye, EyeOff, Folder, FolderClosed, FolderOpen, FolderInput, GitFork, List, LoaderCircle, MoreHorizontal, PanelTop, Pencil, Pin, PinOff, Plus, Settings2, Share2, SquarePen, Terminal, Trash2, X, type LucideIcon } from 'lucide-react';
 import { call, desktop } from './api';
@@ -12,15 +12,17 @@ type SessionDialog = { [Kind in 'rename' | 'share' | 'delete']: { kind: Kind; se
 type ProjectDialog = { [Kind in 'edit' | 'remove' | 'archiveProject']: { kind: Kind; project: Project } }['edit' | 'remove' | 'archiveProject'];
 type Dialog = SessionDialog | ProjectDialog | { kind: 'section'; section?: SidebarSection; target?: Target } | { kind: 'archives' };
 interface MenuItem { id?: string; label: string; description?: string; icon?: LucideIcon; shortcut?: string; run?: () => void; items?: MenuItem[]; disabled?: boolean; checked?: boolean; danger?: boolean; divider?: boolean }
+const emptyActiveSessions: string[] = [];
 export interface SidebarProps {
   projects: Project[]; sessions: Session[]; state: SidebarState; projectId: string; sessionId: string; ready: boolean; blocked: boolean;
+  activeSessionIds?: string[];
   collapsed: Set<string>; setCollapsed: Dispatch<SetStateAction<Set<string>>>;
   selectProject: (project: Project) => void; selectSession: (session: Session) => void | Promise<void>;
   addProject: () => void; createSession: (project?: Project) => Promise<void>; updated: () => Promise<void>; dialogChanged: (open: boolean) => void;
 }
 
 export function Sidebar(props: SidebarProps) {
-  const { projects, sessions, state, projectId, sessionId, ready, blocked, collapsed, setCollapsed, selectProject, selectSession, addProject, createSession, updated, dialogChanged } = props;
+  const { activeSessionIds = emptyActiveSessions, projects, sessions, state, projectId, sessionId, ready, blocked, collapsed, setCollapsed, selectProject, selectSession, addProject, createSession, updated, dialogChanged } = props;
   const [menu, setMenu] = useState<{ target: Target; x: number; y: number; origin: HTMLElement } | null>(null);
   const [sub, setSub] = useState<{ parent: string; items: MenuItem[]; x: number; y: number; focus: boolean } | null>(null);
   const [dialog, setDialog] = useState<Dialog | null>(null);
@@ -67,6 +69,17 @@ export function Sidebar(props: SidebarProps) {
     closeMenu(); setTitle(next.kind === 'rename' ? next.session.title : next.kind === 'edit' ? next.project.name : next.kind === 'section' ? next.section?.name ?? '' : '');
     setPath(next.kind === 'edit' ? next.project.path : ''); setError(''); setFeedback(''); setDialog(next);
   }
+  const busySessions = useMemo(() => new Set([...activeSessionIds, ...sessions.filter(session => isActive(session.status)).map(session => session.id)]), [activeSessionIds, sessions]);
+  const sessionBusy = (session: Session) => busySessions.has(session.id);
+  const projectBusy = (id: string) => sessions.some(session => session.projectId === id && sessionBusy(session));
+  useEffect(() => {
+    if (sub && menu?.target.kind === 'session' && busySessions.has(menu.target.item.id) && ['项目', '分叉'].includes(sub.parent)) setSub(null);
+  }, [sub, menu, busySessions]);
+  useEffect(() => {
+    if (dialog && (dialog.kind === 'delete' && sessionBusy(dialog.session) || ['edit','remove','archiveProject'].includes(dialog.kind) && 'project' in dialog && projectBusy(dialog.project.id))) {
+      setDialog(null); setError('此聊天或项目仍有任务运行，请等待任务结束后再操作。');
+    }
+  }, [dialog, sessions, activeSessionIds]);
   function closeDialog() { if (actionLock.current) return; setDialog(null); setError(''); setFeedback(''); }
   useEffect(() => { dialogChanged(!!dialog); return () => dialogChanged(false); }, [dialog, dialogChanged]);
   useEffect(() => {
@@ -116,7 +129,7 @@ export function Sidebar(props: SidebarProps) {
       if (event.altKey && key === 'r') { event.preventDefault(); openDialog({ kind: 'rename', session }); }
       else if (event.altKey && key === 'p') { event.preventDefault(); void update('session', session.id, 'pin', !current.current.state.sessions[session.id]?.pinned); }
       else if (event.shiftKey && key === 'u') { event.preventDefault(); void update('session', session.id, 'unread', !current.current.state.sessions[session.id]?.unread); }
-      else if (event.shiftKey && key === 'a' && !isActive(session.status)) { event.preventDefault(); void command('archive_session', { sessionId: session.id }); }
+      else if (event.shiftKey && key === 'a' && !isActive(session.status) && !current.current.activeSessionIds?.includes(session.id)) { event.preventDefault(); void command('archive_session', { sessionId: session.id }); }
     }
     window.addEventListener('keydown', shortcuts); return () => window.removeEventListener('keydown', shortcuts);
   }, [dialog, menu]);
@@ -159,7 +172,7 @@ export function Sidebar(props: SidebarProps) {
     const { item } = target;
     const meta = state[target.kind === 'project' ? 'projects' : 'sessions'][item.id];
     if (target.kind === 'project') {
-      const busy = sessions.some(s => s.projectId === item.id && isActive(s.status));
+      const busy = projectBusy(item.id);
       return [
         { label: meta?.pinned ? '取消置顶' : '置顶', icon: meta?.pinned ? PinOff : Pin, run: () => void update('project', item.id, 'pin', !meta?.pinned) },
         { label: '编辑项目', icon: Settings2, disabled: busy, run: () => openDialog({ kind: 'edit', project: target.item }) },
@@ -171,7 +184,7 @@ export function Sidebar(props: SidebarProps) {
         { label: '移除项目', icon: X, divider: true, disabled: busy, run: () => openDialog({ kind: 'remove', project: target.item }) },
       ];
     }
-    const session = target.item; const busy = isActive(session.status);
+    const session = target.item; const busy = sessionBusy(session);
     return [
       { label: '重命名', icon: Pencil, shortcut: 'Alt+Ctrl+R', run: () => openDialog({ kind: 'rename', session }) },
       { label: meta?.pinned ? '取消置顶' : '置顶', icon: meta?.pinned ? PinOff : Pin, shortcut: 'Alt+Ctrl+P', run: () => void update('session', session.id, 'pin', !meta?.pinned) },
@@ -214,6 +227,7 @@ export function Sidebar(props: SidebarProps) {
   async function saveDialog() {
     if (!dialog) return;
     const value = dialog;
+    if (value.kind === 'delete' && sessionBusy(value.session) || ['edit','remove','archiveProject'].includes(value.kind) && 'project' in value && projectBusy(value.project.id)) { setError('此聊天或项目仍有任务运行，请等待任务结束后再操作。'); return; }
     await run(async () => {
       if (value.kind === 'rename') await call('rename_session', { sessionId: value.session.id, title: title.trim() });
       else if (value.kind === 'edit') await call('edit_sidebar_project', { projectId: value.project.id, name: title.trim(), path: path.trim() });
@@ -236,7 +250,7 @@ export function Sidebar(props: SidebarProps) {
   }
   function chatRow(session: Session, standalone = false) {
     const meta = state.sessions[session.id];
-    const active = isActive(session.status);
+    const active = sessionBusy(session);
     return <div className={`sidebar-chat-row ${session.id === sessionId ? 'selected' : ''} ${meta?.unread && !active ? 'unread' : ''}`} key={session.id} onContextMenu={e => show(e, { kind: 'session', item: session })}>
       <button className={`session-row ${session.id === sessionId ? 'selected' : ''}`} aria-current={session.id === sessionId ? 'page' : undefined} aria-haspopup="menu" onClick={() => void selectSession(session)} onKeyDown={event => { if (event.key === 'ContextMenu' || event.shiftKey && event.key === 'F10') show(event, { kind: 'session', item: session }); }} title={session.title}>
         <span className="session-title">{session.title}{standalone && session.projectId ? <small>{projects.find(p => p.id === session.projectId)?.name}</small> : null}</span>

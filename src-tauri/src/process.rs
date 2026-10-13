@@ -59,7 +59,11 @@ pub fn command(program: &Path, args: &[&str]) -> Command {
 }
 
 pub fn codex_config_overrides(load_mcp: bool) -> Result<Vec<String>, String> {
-    config_overrides(&read_codex_config()?, load_mcp)
+    codex_config_overrides_for(&read_codex_config()?, load_mcp)
+}
+
+pub(crate) fn codex_config_overrides_for(text: &str, load_mcp: bool) -> Result<Vec<String>, String> {
+    config_overrides(text, load_mcp)
 }
 
 pub fn read_codex_config() -> Result<String, String> {
@@ -72,13 +76,63 @@ pub fn read_codex_config() -> Result<String, String> {
     let Some(home) = home else {
         return Ok(String::new());
     };
-    let bytes = match std::fs::read(home.join("config.toml")) {
+    read_codex_file(&home.join("config.toml"))
+}
+
+pub(crate) fn read_codex_project_config(project: Option<&Path>) -> Result<String, String> {
+    project.map(|project| read_codex_file(&project.join(".codex/config.toml"))).unwrap_or_else(|| Ok(String::new()))
+}
+
+fn read_codex_file(path: &Path) -> Result<String, String> {
+    match std::fs::metadata(path) {
+        Ok(metadata) if metadata.len() > 1024 * 1024 => return Err("Codex 配置超过 1 MB，未读取或修改".into()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(String::new()),
+        Err(error) => return Err(format!("无法读取 Codex 配置：{error}")),
+        _ => {}
+    }
+    let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(String::new()),
         Err(e) => return Err(format!("无法读取 Codex 配置：{e}")),
     };
     let text = std::str::from_utf8(&bytes).map_err(|_| "Codex 配置不是 UTF-8，未转换或修改编码")?;
     Ok(text.to_owned())
+}
+
+/// Project settings and CLI overrides can replace the global MCP transport.
+/// Keep this snapshot private and use it only to register diagnostic secrets.
+pub(crate) fn codex_mcp_configuration(global: &str, project: &str, overrides: &[String]) -> Result<serde_json::Value, String> {
+    fn merge(target: &mut toml::Table, source: toml::Table) {
+        for (key, value) in source {
+            if let (Some(toml::Value::Table(existing)), toml::Value::Table(next)) = (target.get_mut(&key), &value) {
+                merge(existing, next.clone());
+            } else {
+                target.insert(key, value);
+            }
+        }
+    }
+    let parse = |text: &str| toml::from_str::<toml::Table>(text).map_err(|_| "Codex 配置 TOML 格式无效，未修改原文件".to_owned());
+    let mut config = parse(global)?;
+    merge(&mut config, parse(project)?);
+    for value in overrides {
+        // Codex CLI paths allow bare plugin IDs such as name@market, which
+        // are not valid bare TOML keys. Quote only the path, never the value.
+        let parsed = parse(value).or_else(|_| {
+            let (key, value) = value.split_once('=').ok_or("Codex MCP 覆盖配置无效".to_owned())?;
+            let key = key.split('.').map(|part| {
+                let part = part.trim();
+                if part.starts_with('"') && part.ends_with('"') { part.to_owned() }
+                else { toml::Value::String(part.to_owned()).to_string() }
+            }).collect::<Vec<_>>().join(".");
+            parse(&format!("{key}={value}"))
+        })?;
+        merge(&mut config, parsed);
+    }
+    let mut mcp = toml::Table::new();
+    for key in ["mcp_servers", "plugins"] {
+        if let Some(value) = config.remove(key) { mcp.insert(key.to_owned(), value); }
+    }
+    serde_json::to_value(mcp).map_err(|_| "Codex MCP 配置无效".into())
 }
 
 fn config_overrides(text: &str, load_mcp: bool) -> Result<Vec<String>, String> {
@@ -107,6 +161,28 @@ fn config_overrides(text: &str, load_mcp: bool) -> Result<Vec<String>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn final_mcp_configuration_registers_global_project_managed_and_extension_secrets_before_stderr() {
+        let global = "[mcp_servers.native.http_headers]\nX-Custom-Credential='global-value-123'\n";
+        let project = "[mcp_servers.project.env]\nCUSTOM_ACCESS='project-value-456'\n";
+        let overrides = vec![
+            "mcp_servers.managed.args=['--token','managed-value-789']".into(),
+            "mcp_servers.extension.http_headers={X-Opaque='extension-value-321'}".into(),
+            "mcp_servers.extension.bearer_token_env_var='MCP_AUTH_ENV'".into(),
+            "mcp_servers.native.enabled=false".into(),
+            "plugins.installed@market.enabled=true".into(),
+            "plugins.installed@market.mcp_servers.native.http_headers={X-Opaque='plugin-value-987'}".into(),
+        ];
+        let config = codex_mcp_configuration(global, project, &overrides).unwrap();
+        let mut secrets = Vec::new();
+        crate::log_redaction::collect_mcp(&config, &mut secrets, |name| (name == "MCP_AUTH_ENV").then(|| "resolved-value-654".to_owned()));
+        // Deliberately no key names or Bearer prefix: pattern-only redaction
+        // cannot protect this actual transport error.
+        let output = crate::log_redaction::text("Rejected global-value-123 project-value-456 managed-value-789 extension-value-321 resolved-value-654 plugin-value-987", &secrets);
+        assert_eq!(output, "Rejected [REDACTED] [REDACTED] [REDACTED] [REDACTED] [REDACTED] [REDACTED]");
+        assert_eq!(config["mcp_servers"]["native"]["enabled"], false);
+        assert!(codex_mcp_configuration("invalid toml", "", &[]).is_err());
+    }
     #[test]
     fn external_commands_do_not_inherit_the_hosting_task_transport_or_permission_profile() {
         let mut command = Command::new("agent");

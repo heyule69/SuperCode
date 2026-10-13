@@ -403,6 +403,11 @@ async fn operate(
                 .any(|s| s.id == kind.id() && s.enabled);
         }
         task.check()?;
+        let agents = app.state::<crate::agents::Agents>();
+        let _configuration = agents
+            .operation
+            .try_write()
+            .map_err(|_| "Agent 正在启动或配置，请稍后启用工具")?;
         ensure_idle(&app)?;
         let mut ready = installed(&app)?;
         ready.retain(|i| i.kind != kind);

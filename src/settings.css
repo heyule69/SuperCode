@@ -125,6 +125,7 @@
 .provider-scroll { min-height: 0; overflow: auto; flex: 1; }
 .saved-provider-list { display: flex; flex-direction: column; }
 .provider-order-hint { margin: 0 0 18px; font-size: 11px; line-height: 1.6; color: var(--muted); }
+.provider-runtime-hint { margin: 0 0 18px; padding: 10px 12px; background: var(--surface2); border: 1px solid var(--line); border-radius: 8px; font-size: 12px; line-height: 1.7; color: var(--muted); }
 .provider-sort-row { display: flex; align-items: center; position: relative; border-bottom: 1px solid var(--line); border-radius: 6px; min-width: 0; }
 .provider-sort-row:hover { background: var(--hover); }
 .provider-sort-row.is-dragging { opacity: .4; }

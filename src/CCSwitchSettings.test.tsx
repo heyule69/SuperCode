@@ -18,7 +18,7 @@ beforeEach(() => {
   mocks.call.mockImplementation(async (command: string) => command === 'scan_ccswitch' ? scan : 1);
 });
 afterEach(async () => { await act(async () => root.unmount()); node.remove(); });
-async function render(agent = 'claude') { await act(async () => root.render(<CCSwitchSettings agent={agent} busy={false} updated={updated} back={() => {}} />)); }
+async function render(agent = 'claude', runningConnections: Record<string, string[]> = {}, busy = false) { await act(async () => root.render(<CCSwitchSettings agent={agent} busy={busy} runningConnections={runningConnections} updated={updated} back={() => {}} />)); }
 
 it('automatically scans on entry, shows the detected path, and keeps valid rows when other rows fail', async () => {
   await render();
@@ -117,4 +117,80 @@ it('distinguishes a database read failure from an empty scan and prevents stale 
   expect(node.querySelectorAll('.cc-source-row')).toHaveLength(0);
   expect(button('导入全部').disabled).toBe(true);
   expect(node.querySelector('.cc-scan-warnings')).toBeNull();
+});
+
+it('scans and selects unrelated connections while only the active connection is excluded from imports', async () => {
+  mocks.call.mockImplementation(async (command: string) => command === 'scan_ccswitch' ? mixed : 1);
+  await render('claude', { claude: ['claude:valid'], codex: ['claude:other'] });
+  const active = node.querySelector<HTMLInputElement>('[aria-label="导入 有效连接 · claude"]')!;
+  const other = node.querySelector<HTMLInputElement>('[aria-label="导入 另一 Claude 连接 · claude"]')!;
+  expect(active.disabled).toBe(true); expect(active.checked).toBe(false);
+  expect(other.disabled).toBe(false);
+  expect(active.closest('.cc-source-row')?.textContent).toContain('任务使用中');
+  expect(node.querySelector<HTMLInputElement>('#cc-path')!.disabled).toBe(false);
+  expect(button('读取').disabled).toBe(false); expect(button('自动识别').disabled).toBe(false);
+  expect(node.querySelector('.cc-list-toolbar')?.textContent).toContain('已选 0 / 2');
+  await act(async () => button('全选').click());
+  expect(active.checked).toBe(false); expect(other.checked).toBe(true);
+  await act(async () => button('导入所选 (1)').click());
+  expect(mocks.call).toHaveBeenLastCalledWith('import_ccswitch', { path: database, agent: 'claude', ids: ['claude:other'] });
+  await act(async () => button('导入全部').click());
+  expect(mocks.call).toHaveBeenLastCalledWith('import_ccswitch', { path: database, agent: 'claude', ids: ['claude:other'] });
+});
+
+it('removes newly active rows from effective selection without rescanning and filters Import All', async () => {
+  mocks.call.mockImplementation(async (command: string) => command === 'scan_ccswitch' ? mixed : 1);
+  await render();
+  await act(async () => button('全选').click());
+  await render('claude', { claude: ['claude:other'] });
+  expect(mocks.call.mock.calls.filter(([command]) => command === 'scan_ccswitch')).toHaveLength(1);
+  expect(node.querySelector<HTMLInputElement>('[aria-label="导入 另一 Claude 连接 · claude"]')!.checked).toBe(false);
+  expect(node.querySelector('.cc-list-toolbar')?.textContent).toContain('已选 1 / 2');
+  await act(async () => button('导入全部').click());
+  expect(mocks.call).toHaveBeenLastCalledWith('import_ccswitch', { path: database, agent: 'claude', ids: ['claude:valid'] });
+  await render('claude', { claude: ['claude:valid', 'claude:other'] });
+  expect(button('导入全部').disabled).toBe(true);
+  expect(button('导入所选 (0)').disabled).toBe(true);
+  expect(button('全选').disabled).toBe(true);
+  expect(button('读取').disabled).toBe(false);
+});
+
+it('uses the latest running connection when an initial scan completes after it changes', async () => {
+  let finish!: (value: typeof mixed) => void;
+  const pending = new Promise<typeof mixed>(resolve => { finish = resolve; });
+  mocks.call.mockImplementation(async (command: string) => command === 'scan_ccswitch' ? pending : 1);
+  await render();
+  await render('claude', { claude: ['claude:valid'] });
+  await act(async () => { finish(mixed); await pending; });
+  expect(node.querySelector<HTMLInputElement>('[aria-label="导入 有效连接 · claude"]')!.checked).toBe(false);
+  expect(button('导入所选 (0)').disabled).toBe(true);
+  await render();
+  expect(node.querySelector<HTMLInputElement>('[aria-label="导入 有效连接 · claude"]')!.checked).toBe(false);
+});
+
+it('keeps local provider operations blocking imports and path changes', async () => {
+  await render('claude', {}, true);
+  expect(node.querySelector<HTMLInputElement>('#cc-path')!.disabled).toBe(true);
+  expect(button('读取').disabled).toBe(true);
+  expect(button('导入全部').disabled).toBe(true);
+});
+
+it('allows searching during runs and excludes active matches from Select Current', async () => {
+  mocks.call.mockImplementation(async (command: string) => command === 'scan_ccswitch' ? mixed : 1);
+  await render('claude', { claude: ['claude:valid'] });
+  await act(async () => {
+    const input = node.querySelector<HTMLInputElement>('[aria-label="搜索导入配置"]')!;
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')!.set!.call(input, '有效连接');
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+  });
+  expect(node.querySelectorAll('.cc-source-row')).toHaveLength(1);
+  expect(button('全选当前').disabled).toBe(true);
+  expect(button('导入所选 (0)').disabled).toBe(true);
+});
+
+it('does not lock imported connection IDs when the native official connection is running', async () => {
+  await render('claude', { claude: ['@official'] });
+  const input = node.querySelector<HTMLInputElement>('input[type="checkbox"]')!;
+  expect(input.disabled).toBe(false); expect(input.checked).toBe(true);
+  expect(button('导入所选 (1)').disabled).toBe(false);
 });

@@ -18,188 +18,11 @@ use tokio::{
     process::{Child, ChildStdin},
     sync::{mpsc, oneshot, Mutex, Notify},
 };
-type Reply = oneshot::Sender<Result<Value, String>>;
-struct Client {
-    diagnostics: Option<(AppHandle, String, Option<String>)>,
-    cwd: String,
-    pid: u32,
-    input: Mutex<ChildStdin>,
-    child: Mutex<Child>,
-    _job: process::JobGuard,
-    pending: Mutex<HashMap<String, Reply>>,
-    sequence: AtomicU64,
-    pi: bool,
-    alive: AtomicBool,
-    concurrent_prompt: AtomicBool,
-}
-impl Client {
-    async fn start(
-        launch: &Launch,
-        args: &[String],
-        cwd: &Path,
-        env: &[(String, String)],
-        pi: bool,
-        diagnostics: Option<(AppHandle, String, Option<String>)>,
-    ) -> Result<(Arc<Self>, mpsc::Receiver<Value>), String> {
-        let mut command = launch.command(&[]);
-        if let Some((app,_,_))=&diagnostics {
-            let values=env.iter().map(|(key,value)|(key.clone(),Value::String(value.clone()))).collect::<serde_json::Map<_,_>>();
-            crate::runtime_diagnostics::register_secrets(app,&Value::Object(values));
-        }
-        command
-            .args(args)
-            .current_dir(cwd)
-            .envs(env.iter().cloned())
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
-        let mut child = command
-            .spawn()
-            .map_err(|e| format!("无法启动 Agent：{e}"))?;
-        let job = process::JobGuard::attach(&child)?;
-        let input = child.stdin.take().ok_or("Agent 无输入管道")?;
-        let output = child.stdout.take().ok_or("Agent 无输出管道")?;
-        let stderr = child.stderr.take().ok_or("Agent 无错误管道")?;
-        let client = Arc::new(Self {
-            diagnostics: diagnostics.clone(),
-            cwd: cwd.to_string_lossy().into_owned(),
-            pid: child.id().unwrap_or(0),
-            input: Mutex::new(input),
-            child: Mutex::new(child),
-            _job: job,
-            pending: Mutex::new(HashMap::new()),
-            sequence: AtomicU64::new(1),
-            alive: AtomicBool::new(true),
-            pi,
-            concurrent_prompt: AtomicBool::new(false),
-        });
-        let reader = client.clone();
-        let (tx, rx) = mpsc::channel(16);
-        if let Some((app, source, session))=&diagnostics {
-            crate::runtime_diagnostics::record(app,session.as_deref(),"agent_process_started",json!({"source":source,"pid":client.pid}));
-        }
-        // Drain diagnostics without retaining unbounded output in memory.
-        tokio::spawn(async move {
-            let (app,source,session)=diagnostics.map(|(app,source,session)|(Some(app),source,session))
-                .unwrap_or((None,if pi {"pi"} else {"opencode"}.into(),None));
-            crate::runtime_diagnostics::stderr(app,session,&source,stderr).await;
-        });
-        tokio::spawn(async move {
-            let mut lines = BufReader::new(output);
-            loop {
-                let value = match runtime::read_frame(&mut lines).await {
-                    Ok(Some(line)) => match serde_json::from_slice::<Value>(&line) {
-                        Ok(v) => v,
-                        Err(error) => { reader.log("protocol_parse_error", &error.to_string()); continue; },
-                    },
-                    Ok(None) => break,
-                    Err(error) => {reader.log("protocol_read_error", &error); break;},
-                };
-                if is_response(&value, pi) {
-                    let key = value["id"]
-                        .as_str()
-                        .map(str::to_owned)
-                        .unwrap_or_else(|| value["id"].to_string());
-                    if let Some(reply) = reader.pending.lock().await.remove(&key) {
-                        let result=response(&value,pi);
-                        if let Err(error)=&result {reader.log("agent_request_error",error);}
-                        let _ = reply.send(result);
-                    }
-                    continue;
-                }
-                if tx.send(value).await.is_err() {
-                    break;
-                }
-            }
-            let intentional = !reader.alive.swap(false, Ordering::AcqRel);
-            let exit_code = reader.child.lock().await.try_wait().ok().flatten().and_then(|s|s.code());
-            if let Some((app,source,session))=&reader.diagnostics {
-                crate::runtime_diagnostics::record(app,session.as_deref(),"agent_process_output_closed",json!({"source":source,"pid":reader.pid,"exitCode":exit_code,"intentional":intentional}));
-            }
-            for (_, reply) in reader.pending.lock().await.drain() {
-                let _ = reply.send(Err("Agent 连接已关闭".into()));
-            }
-            let _ = tx.send(json!({"type":"supercode_disconnected"})).await;
-        });
-        Ok((client, rx))
-    }
-    fn log(&self,event:&str,text:&str) {
-        if let Some((app,source,session))=&self.diagnostics {
-            crate::runtime_diagnostics::message(app,session.as_deref(),source,"error",event,text);
-        }
-    }
-    async fn write(&self, value: Value) -> Result<(), String> {
-        let mut bytes = serde_json::to_vec(&value).map_err(|e| e.to_string())?;
-        bytes.push(b'\n');
-        self.input
-            .lock()
-            .await
-            .write_all(&bytes)
-            .await
-            .map_err(|e| e.to_string())
-    }
-    async fn request(&self, method: &str, params: Value, seconds: u64) -> Result<Value, String> {
-        let (id, rx) = self.begin_request(method, params).await?;
-        let result = tokio::time::timeout(Duration::from_secs(seconds), rx).await;
-        self.pending.lock().await.remove(&id);
-        result
-            .map_err(|_| format!("Agent 请求 {method} 超时"))?
-            .map_err(|_| "Agent 已退出".to_owned())?
-    }
-    async fn begin_request(
-        &self,
-        method: &str,
-        mut params: Value,
-    ) -> Result<(String, oneshot::Receiver<Result<Value, String>>), String> {
-        let id = self.sequence.fetch_add(1, Ordering::Relaxed).to_string();
-        let (tx, rx) = oneshot::channel();
-        self.pending.lock().await.insert(id.clone(), tx);
-        let value = if self.pi {
-            params["type"] = method.into();
-            params["id"] = id.clone().into();
-            params
-        } else {
-            json!({"jsonrpc":"2.0","id":id,"method":method,"params":params})
-        };
-        if let Err(e) = self.write(value).await {
-            self.pending.lock().await.remove(&id);
-            return Err(e);
-        }
-        Ok((id, rx))
-    }
-    async fn close(&self) {
-        self.alive.store(false, Ordering::Release);
-        let _ = self.child.lock().await.kill().await;
-    }
-}
-fn is_response(v: &Value, pi: bool) -> bool {
-    if pi {
-        v["type"] == "response"
-    } else {
-        v.get("id").is_some() && v.get("method").is_none()
-    }
-}
-fn response(v: &Value, pi: bool) -> Result<Value, String> {
-    if pi {
-        if v["success"] == false {
-            Err(protocol::bounded(
-                v["error"].as_str().unwrap_or("Pi 请求失败"),
-                4096,
-            ))
-        } else {
-            Ok(v["data"].clone())
-        }
-    } else if v.get("error").is_some() {
-        Err(protocol::bounded(
-            v["error"]["message"]
-                .as_str()
-                .unwrap_or("OpenCode 请求失败"),
-            4096,
-        ))
-    } else {
-        Ok(v["result"].clone())
-    }
-}
+mod mapper;
+mod requests;
+use mapper::*;
+use requests::*;
+
 fn init() -> Value {
     json!({"protocolVersion":1,"clientInfo":{"name":"SuperCode","version":env!("CARGO_PKG_VERSION")},"clientCapabilities":{"fs":{"readTextFile":false,"writeTextFile":false},"terminal":false}})
 }
@@ -286,7 +109,7 @@ struct Warm {
 }
 pub struct Turn {
     client: Arc<Client>,
-    pub requests: Mutex<HashMap<String, Value>>,
+    pub requests: Arc<Mutex<HashMap<String, Value>>>,
     session: String,
     native: String,
     turn: String,
@@ -312,6 +135,26 @@ impl Turn {
     pub fn pid(&self) -> u32 {
         self.client.pid
     }
+    fn after_setup(&self, native: String) -> Self {
+        Self {
+            client: self.client.clone(),
+            requests: self.requests.clone(),
+            session: self.session.clone(),
+            native,
+            turn: self.turn.clone(),
+            agent: self.agent.clone(),
+            stopped: AtomicBool::new(false),
+            accepting: AtomicBool::new(true),
+            inputs_pending: AtomicU64::new(0),
+            input_done: Notify::new(),
+            settled: AtomicBool::new(false),
+            prompt_accepted: AtomicBool::new(false),
+            prompt_ready: Notify::new(),
+            started: AtomicBool::new(false),
+            stop_done: AtomicBool::new(true),
+            signature: self.signature.clone(),
+        }
+    }
 }
 fn publish(app: &AppHandle, value: Value) {
     runtime::publish_event(app, value);
@@ -319,18 +162,25 @@ fn publish(app: &AppHandle, value: Value) {
 fn event(t: &Turn, method: &str, mut p: Value) -> Value {
     p["threadId"] = t.native.clone().into();
     p["turnId"] = t.turn.clone().into();
+    p["appSessionId"] = t.session.clone().into();
     json!({"method":method,"params":p})
 }
 impl Runtime {
-    pub fn for_session(&self, id: &str) -> Arc<Runtime> { self.sessions.get(id) }
+    pub fn for_session(&self, id: &str) -> Arc<Runtime> {
+        self.sessions.get(id)
+    }
     pub async fn clients(&self) -> Vec<Arc<Turn>> {
         let mut clients = self.client.lock().await.iter().cloned().collect::<Vec<_>>();
-        for (_, runtime) in self.sessions.entries() { clients.extend(runtime.client.lock().await.iter().cloned()); }
+        for (_, runtime) in self.sessions.entries() {
+            clients.extend(runtime.client.lock().await.iter().cloned());
+        }
         clients
     }
     pub async fn warm_pids(&self) -> Vec<u32> {
         let mut pids = self.warm_pid().await.into_iter().collect::<Vec<_>>();
-        for (_, runtime) in self.sessions.entries() { pids.extend(runtime.warm_pid().await); }
+        for (_, runtime) in self.sessions.entries() {
+            pids.extend(runtime.warm_pid().await);
+        }
         pids
     }
     pub async fn steering_mode(&self, session: &str) -> &'static str {
@@ -349,7 +199,9 @@ impl Runtime {
     pub async fn release_idle(&self) {
         for (id, runtime) in self.sessions.entries() {
             runtime.release_idle_local().await;
-            if runtime.client.lock().await.is_none() && runtime.warm.lock().await.is_none() { self.sessions.remove_idle(&id, &runtime); }
+            if runtime.client.lock().await.is_none() && runtime.warm.lock().await.is_none() {
+                self.sessions.remove_idle(&id, &runtime);
+            }
         }
         self.release_idle_local().await;
     }
@@ -431,7 +283,9 @@ impl Runtime {
         Ok(())
     }
     pub async fn shutdown(&self) {
-        for (_, runtime) in self.sessions.entries() { runtime.shutdown_local().await; }
+        for (_, runtime) in self.sessions.entries() {
+            runtime.shutdown_local().await;
+        }
         self.shutdown_local().await;
     }
     async fn shutdown_local(&self) {
@@ -519,7 +373,12 @@ impl Runtime {
     pub async fn respond(&self, app: &AppHandle, id: Value, result: Value) -> Result<(), String> {
         let id = id.as_str().ok_or("请求 ID 无效")?;
         let mut selected = None;
-        for turn in self.clients().await { if turn.requests.lock().await.contains_key(id) { selected = Some(turn); break; } }
+        for turn in self.clients().await {
+            if turn.requests.lock().await.contains_key(id) {
+                selected = Some(turn);
+                break;
+            }
+        }
         let t = selected.ok_or("该请求已结束")?;
         let request = t
             .requests
@@ -531,9 +390,26 @@ impl Runtime {
         let wire = permission_reply(&request, &result, &t.agent)?;
         t.client.write(wire).await?;
         t.requests.lock().await.remove(id);
+        let current = if let Some(runtime) = self.sessions.existing(&t.session) {
+            runtime
+                .client
+                .lock()
+                .await
+                .as_ref()
+                .filter(|active| {
+                    active.turn == t.turn && Arc::ptr_eq(&active.requests, &t.requests)
+                })
+                .cloned()
+        } else {
+            None
+        };
         publish(
             app,
-            event(&t, "serverRequest/resolved", json!({"requestId":id})),
+            event(
+                current.as_deref().unwrap_or(&t),
+                "serverRequest/resolved",
+                json!({"requestId":id}),
+            ),
         );
         Ok(())
     }
@@ -679,7 +555,7 @@ fn mcp_entry(s: &client_features::ToolServer, name: &str, acp: bool) -> Value {
 }
 fn opencode_config(config: &Value, permission: &str) -> Value {
     let rule = if permission == "full" { "allow" } else { "ask" };
-    let mut value = json!({"autoupdate":false,"permission":{"*":rule}});
+    let mut value = json!({"autoupdate":false,"compaction":{"auto":true},"permission":{"*":rule}});
     if permission == "read" {
         value["permission"] =
             json!({"*":"deny","read":"allow","glob":"allow","grep":"allow","list":"allow"});
@@ -704,7 +580,9 @@ fn opencode_config(config: &Value, permission: &str) -> Value {
                     .unwrap_or_else(|| json!({"name":m}));
                 if !definition["limit"]["context"].is_number() {
                     if let Some(capacity) = crate::model_context::for_model(config, &m) {
-                        if !definition["limit"].is_object() { definition["limit"] = json!({}); }
+                        if !definition["limit"].is_object() {
+                            definition["limit"] = json!({});
+                        }
                         definition["limit"]["context"] = json!(capacity);
                     }
                 }
@@ -727,6 +605,18 @@ fn opencode_config(config: &Value, permission: &str) -> Value {
         value["provider"] = json!({"supercode":{"npm":npm,"name":native["name"].as_str().unwrap_or("SuperCode"),"options":options,"models":models}});
     }
     value
+}
+fn opencode_environment(config: &Value, permission: &str) -> [(String, String); 3] {
+    [
+        (
+            "OPENCODE_CONFIG_CONTENT".into(),
+            opencode_config(config, permission).to_string(),
+        ),
+        ("OPENCODE_DISABLE_AUTOUPDATE".into(), "true".into()),
+        // A parent terminal may disable compaction. Managed chats keep native
+        // automatic compaction enabled without changing global/project files.
+        ("OPENCODE_DISABLE_AUTOCOMPACT".into(), "false".into()),
+    ]
 }
 // AI SDK appends /messages; the other Anthropic SDKs append /v1/messages.
 fn sdk_base(config: &Value) -> String {
@@ -894,15 +784,13 @@ async fn start_configured(
     launch: &Launch,
 ) -> Result<(Arc<Client>, mpsc::Receiver<Value>, Value), String> {
     let mut env = vec![];
-    if let Some(session) = session { env.push(("SUPERCODE_SESSION_ID".into(), session.id.clone())); }
+    if let Some(session) = session {
+        env.push(("SUPERCODE_SESSION_ID".into(), session.id.clone()));
+    }
     let mut args = vec![];
     if agent == "opencode" {
         args.push("acp".into());
-        env.push((
-            "OPENCODE_CONFIG_CONTENT".into(),
-            opencode_config(&config, permission).to_string(),
-        ));
-        env.push(("OPENCODE_DISABLE_AUTOUPDATE".into(), "true".into()));
+        env.extend(opencode_environment(&config, permission));
     } else if agent == "pi" {
         let dir = app.state::<AppState>().data_dir.join("agents/pi-runtime");
         tokio::fs::create_dir_all(&dir)
@@ -949,8 +837,14 @@ async fn start_configured(
     } else if agent == "codex" {
         args.extend(["app-server".into(), "--listen".into(), "stdio://".into()]);
         let mut overrides = crate::ccswitch::codex_overrides(&config)?;
-        overrides.extend(["mcp_servers={}".into(), "features.shell_tool=false".into(), "web_search=\"disabled\"".into()]);
-        for value in overrides { args.extend(["-c".into(), value]); }
+        overrides.extend([
+            "mcp_servers={}".into(),
+            "features.shell_tool=false".into(),
+            "web_search=\"disabled\"".into(),
+        ]);
+        for value in overrides {
+            args.extend(["-c".into(), value]);
+        }
         if let Some(key) = crate::providers::key(&config) {
             env.push(("SUPERCODE_PROVIDER_API_KEY".into(), key.to_owned()));
         }
@@ -958,8 +852,15 @@ async fn start_configured(
         return Err("连接测试不支持此引擎".into());
     }
     crate::runtime_diagnostics::register_secrets(app, &config);
-    let (client, events) = Client::start(launch, &args, cwd, &env, agent == "pi",
-        Some((app.clone(),agent.to_owned(),session.map(|s|s.id.clone())))).await?;
+    let (client, events) = Client::start(
+        launch,
+        &args,
+        cwd,
+        &env,
+        agent == "pi",
+        Some((app.clone(), agent.to_owned(), session.map(|s| s.id.clone()))),
+    )
+    .await?;
     Ok((client, events, config))
 }
 // Test an explicitly selected profile in a separate, tool-free process. Never
@@ -969,130 +870,272 @@ pub async fn test_provider_connection(
     profile: &crate::ccswitch::Profile,
     launch: &Launch,
 ) -> Result<Value, String> {
-    let model = crate::providers::real_claude_model(&profile.config, None).ok_or("请填写模型 ID")?;
-    let cwd = app.state::<AppState>().data_dir.join("agents/connection-tests");
-    tokio::fs::create_dir_all(&cwd).await.map_err(|_| "无法创建连接测试目录")?;
-    let (client, mut events, config) = start_configured(app, &profile.agent, &cwd, None, "summary", profile.config.clone(), launch).await?;
-    let result = tokio::time::timeout(Duration::from_secs(90), probe_completion(&client, &mut events, &profile.agent, &config, &model, &cwd)).await;
+    let model =
+        crate::providers::real_claude_model(&profile.config, None).ok_or("请填写模型 ID")?;
+    let cwd = app
+        .state::<AppState>()
+        .data_dir
+        .join("agents/connection-tests");
+    tokio::fs::create_dir_all(&cwd)
+        .await
+        .map_err(|_| "无法创建连接测试目录")?;
+    let (client, mut events, config) = start_configured(
+        app,
+        &profile.agent,
+        &cwd,
+        None,
+        "summary",
+        profile.config.clone(),
+        launch,
+    )
+    .await?;
+    let result = tokio::time::timeout(
+        Duration::from_secs(90),
+        probe_completion(&client, &mut events, &profile.agent, &config, &model, &cwd),
+    )
+    .await;
     client.close().await;
-    let text = result.map_err(|_| format!("{} 套餐连接测试超时", crate::agents::name(&profile.agent)))??;
-    if text.trim().is_empty() { return Err("模型没有返回测试回复，请检查模型权限和套餐状态".into()); }
-    Ok(json!({"ok":true,"model":model,"protocol":config["protocol"],"verifiedBy":crate::agents::name(&profile.agent)}))
+    let text = result
+        .map_err(|_| format!("{} 套餐连接测试超时", crate::agents::name(&profile.agent)))??;
+    if text.trim().is_empty() {
+        return Err("模型没有返回测试回复，请检查模型权限和套餐状态".into());
+    }
+    Ok(
+        json!({"ok":true,"model":model,"protocol":config["protocol"],"verifiedBy":crate::agents::name(&profile.agent)}),
+    )
 }
-async fn probe_request(client: &Client, events: &mut mpsc::Receiver<Value>, method: &str, params: Value) -> Result<Value, String> {
+async fn probe_request(
+    client: &Client,
+    events: &mut mpsc::Receiver<Value>,
+    method: &str,
+    params: Value,
+) -> Result<Value, String> {
     let request = client.request(method, params, 60);
     tokio::pin!(request);
-    loop { tokio::select! {
-        result = &mut request => return result,
-        event = events.recv() => probe_notification(&event.ok_or("连接测试进程已退出")?)?,
-    } }
+    loop {
+        tokio::select! {
+            result = &mut request => return result,
+            event = events.recv() => probe_notification(&event.ok_or("连接测试进程已退出")?)?,
+        }
+    }
 }
 fn probe_notification(event: &Value) -> Result<(), String> {
-    if event["type"] == "supercode_disconnected" { return Err("连接测试进程已退出，请检查引擎安装和运行日志".into()); }
-    if event["type"] == "extension_error" { return Err(protocol::bounded(event["error"].as_str().unwrap_or("Pi 扩展加载失败"), 4096)); }
-    if event.get("id").is_some() && (event.get("method").is_some() || event["type"] == "extension_ui_request") {
+    if event["type"] == "supercode_disconnected" {
+        return Err("连接测试进程已退出，请检查引擎安装和运行日志".into());
+    }
+    if event["type"] == "extension_error" {
+        return Err(protocol::bounded(
+            event["error"].as_str().unwrap_or("Pi 扩展加载失败"),
+            4096,
+        ));
+    }
+    if event.get("id").is_some()
+        && (event.get("method").is_some() || event["type"] == "extension_ui_request")
+    {
         return Err("连接测试收到审批请求，测试已停止；请在对话中处理该请求".into());
     }
     Ok(())
 }
-async fn probe_completion(client: &Client, events: &mut mpsc::Receiver<Value>, agent: &str, config: &Value, model: &str, cwd: &Path) -> Result<String, String> {
+async fn probe_completion(
+    client: &Client,
+    events: &mut mpsc::Receiver<Value>,
+    agent: &str,
+    config: &Value,
+    model: &str,
+    cwd: &Path,
+) -> Result<String, String> {
     let wire = wire_model(config, model);
     let native = if agent == "pi" {
         probe_request(client, events, "get_state", json!({})).await?;
-        probe_request(client, events, "set_model", json!({"provider":"supercode","modelId":wire})).await?;
+        probe_request(
+            client,
+            events,
+            "set_model",
+            json!({"provider":"supercode","modelId":wire}),
+        )
+        .await?;
         String::new()
     } else if agent == "opencode" {
         probe_request(client, events, "initialize", init()).await?;
-        let session = probe_request(client, events, "session/new", json!({"cwd":cwd,"mcpServers":[]})).await?;
-        let id = session["sessionId"].as_str().ok_or("OpenCode 未返回测试会话 ID")?.to_owned();
-        probe_request(client, events, "session/set_model", json!({"sessionId":id,"modelId":format!("supercode/{wire}")})).await?;
+        let session = probe_request(
+            client,
+            events,
+            "session/new",
+            json!({"cwd":cwd,"mcpServers":[]}),
+        )
+        .await?;
+        let id = session["sessionId"]
+            .as_str()
+            .ok_or("OpenCode 未返回测试会话 ID")?
+            .to_owned();
+        probe_request(
+            client,
+            events,
+            "session/set_model",
+            json!({"sessionId":id,"modelId":format!("supercode/{wire}")}),
+        )
+        .await?;
         id
     } else {
         probe_request(client, events, "initialize", json!({"clientInfo":{"name":"supercode","version":env!("CARGO_PKG_VERSION")},"capabilities":{"experimentalApi":true}})).await?;
-        client.write(json!({"method":"initialized","params":{}})).await?;
-        let table = toml::from_str::<toml::Table>(config["config"].as_str().unwrap_or("")).map_err(|_| "Codex 连接配置无效")?;
+        client
+            .write(json!({"method":"initialized","params":{}}))
+            .await?;
+        let table = toml::from_str::<toml::Table>(config["config"].as_str().unwrap_or(""))
+            .map_err(|_| "Codex 连接配置无效")?;
         let provider = table.get("model_provider").and_then(toml::Value::as_str);
         let thread = probe_request(client, events, "thread/start", json!({"cwd":cwd,"model":model,"modelProvider":provider,"sandbox":"read-only","approvalPolicy":"untrusted","ephemeral":true,"developerInstructions":"Reply only OK. Do not use tools.","config":{"features.shell_tool":false,"web_search":"disabled"}})).await?;
-        thread["thread"]["id"].as_str().ok_or("Codex 未返回测试会话 ID")?.to_owned()
+        thread["thread"]["id"]
+            .as_str()
+            .ok_or("Codex 未返回测试会话 ID")?
+            .to_owned()
     };
     let prompt = "Reply only OK. Do not use tools.";
     let (method, params) = match agent {
         "pi" => ("prompt", json!({"message":prompt,"images":[]})),
-        "opencode" => ("session/prompt", json!({"sessionId":native,"prompt":[{"type":"text","text":prompt}]})),
-        _ => ("turn/start", json!({"threadId":native,"model":model,"input":[{"type":"text","text":prompt}]})),
+        "opencode" => (
+            "session/prompt",
+            json!({"sessionId":native,"prompt":[{"type":"text","text":prompt}]}),
+        ),
+        _ => (
+            "turn/start",
+            json!({"threadId":native,"model":model,"input":[{"type":"text","text":prompt}]}),
+        ),
     };
     let request = client.request(method, params, 90);
     tokio::pin!(request);
     let mut acknowledged = false;
     let mut text = String::new();
     let mut failure = None;
-    loop { tokio::select! {
-        result = &mut request, if !acknowledged => {
-            let result = result?;
-            if agent == "opencode" {
-                if result["stopReason"] == "cancelled" { return Err("OpenCode 取消了连接测试".into()); }
-                break;
-            }
-            acknowledged = true;
-        },
-        event = events.recv() => {
-            let event = event.ok_or("连接测试进程已退出")?;
-            probe_notification(&event)?;
-            if probe_output(&event, agent, &native, &mut text, &mut failure)? { break; }
-        },
-    } }
+    loop {
+        tokio::select! {
+            result = &mut request, if !acknowledged => {
+                let result = result?;
+                if agent == "opencode" {
+                    if result["stopReason"] == "cancelled" { return Err("OpenCode 取消了连接测试".into()); }
+                    break;
+                }
+                acknowledged = true;
+            },
+            event = events.recv() => {
+                let event = event.ok_or("连接测试进程已退出")?;
+                probe_notification(&event)?;
+                if probe_output(&event, agent, &native, &mut text, &mut failure)? { break; }
+            },
+        }
+    }
     while let Ok(event) = events.try_recv() {
         probe_notification(&event)?;
         probe_output(&event, agent, &native, &mut text, &mut failure)?;
     }
-    if let Some(error) = failure { return Err(error); }
+    if let Some(error) = failure {
+        return Err(error);
+    }
     Ok(text)
 }
-fn probe_output(event: &Value, agent: &str, native: &str, text: &mut String, failure: &mut Option<String>) -> Result<bool, String> {
+fn probe_output(
+    event: &Value,
+    agent: &str,
+    native: &str,
+    text: &mut String,
+    failure: &mut Option<String>,
+) -> Result<bool, String> {
     if agent == "pi" {
-        if event["type"] == "tool_execution_start" { return Err("连接测试尝试调用工具，已停止测试".into()); }
-        if event["type"] == "message_update" && event["assistantMessageEvent"]["type"] == "text_delta" {
-            append_probe_text(text, event["assistantMessageEvent"]["delta"].as_str().unwrap_or(""));
+        if event["type"] == "tool_execution_start" {
+            return Err("连接测试尝试调用工具，已停止测试".into());
+        }
+        if event["type"] == "message_update"
+            && event["assistantMessageEvent"]["type"] == "text_delta"
+        {
+            append_probe_text(
+                text,
+                event["assistantMessageEvent"]["delta"]
+                    .as_str()
+                    .unwrap_or(""),
+            );
         }
         if event["type"] == "message_end" && event["message"]["role"] == "assistant" {
             let message = &event["message"];
             if matches!(message["stopReason"].as_str(), Some("error" | "aborted")) {
-                *failure = Some(protocol::bounded(message["errorMessage"].as_str().unwrap_or("Pi 模型请求失败"), 4096));
+                *failure = Some(protocol::bounded(
+                    message["errorMessage"]
+                        .as_str()
+                        .unwrap_or("Pi 模型请求失败"),
+                    4096,
+                ));
             }
-            if text.is_empty() { if let Some(parts) = message["content"].as_array() { for part in parts { if part["type"] == "text" { append_probe_text(text, part["text"].as_str().unwrap_or("")); } } } }
+            if text.is_empty() {
+                if let Some(parts) = message["content"].as_array() {
+                    for part in parts {
+                        if part["type"] == "text" {
+                            append_probe_text(text, part["text"].as_str().unwrap_or(""));
+                        }
+                    }
+                }
+            }
         }
         return Ok(event["type"] == "agent_settled");
     }
     if agent == "opencode" {
-        if event["params"]["sessionId"] != native { return Ok(false); }
+        if event["params"]["sessionId"] != native {
+            return Ok(false);
+        }
         let update = &event["params"]["update"];
-        if matches!(update["sessionUpdate"].as_str(), Some("tool_call" | "tool_call_update")) { return Err("连接测试尝试调用工具，已停止测试".into()); }
-        if update["sessionUpdate"] == "agent_message_chunk" && update["content"]["type"] == "text" { append_probe_text(text, update["content"]["text"].as_str().unwrap_or("")); }
+        if matches!(
+            update["sessionUpdate"].as_str(),
+            Some("tool_call" | "tool_call_update")
+        ) {
+            return Err("连接测试尝试调用工具，已停止测试".into());
+        }
+        if update["sessionUpdate"] == "agent_message_chunk" && update["content"]["type"] == "text" {
+            append_probe_text(text, update["content"]["text"].as_str().unwrap_or(""));
+        }
         return Ok(false);
     }
-    if event["params"]["threadId"] != native { return Ok(false); }
-    if event["method"] == "error" {
-        return Err(protocol::bounded(event["params"]["error"]["message"].as_str().unwrap_or("Codex 模型请求失败"), 4096));
+    if event["params"]["threadId"] != native {
+        return Ok(false);
     }
-    if matches!(event["method"].as_str(), Some("item/started" | "item/completed")) {
+    if event["method"] == "error" {
+        return Err(protocol::bounded(
+            event["params"]["error"]["message"]
+                .as_str()
+                .unwrap_or("Codex 模型请求失败"),
+            4096,
+        ));
+    }
+    if matches!(
+        event["method"].as_str(),
+        Some("item/started" | "item/completed")
+    ) {
         let item = &event["params"]["item"];
         match item["type"].as_str() {
-            Some("agentMessage") if event["method"] == "item/completed" => append_probe_text(text, item["text"].as_str().unwrap_or("")),
-            Some("userMessage" | "agentMessage" | "reasoning" | "contextCompaction") => {},
+            Some("agentMessage") if event["method"] == "item/completed" => {
+                append_probe_text(text, item["text"].as_str().unwrap_or(""))
+            }
+            Some("userMessage" | "agentMessage" | "reasoning" | "contextCompaction") => {}
             Some(_) => return Err("连接测试尝试调用工具，已停止测试".into()),
-            _ => {},
+            _ => {}
         }
     }
     if event["method"] == "turn/completed" {
         let turn = &event["params"]["turn"];
-        if turn["status"] != "completed" { *failure = Some(protocol::bounded(turn["error"]["message"].as_str().unwrap_or("Codex 模型请求失败"), 4096)); }
+        if turn["status"] != "completed" {
+            *failure = Some(protocol::bounded(
+                turn["error"]["message"]
+                    .as_str()
+                    .unwrap_or("Codex 模型请求失败"),
+                4096,
+            ));
+        }
         return Ok(true);
     }
     Ok(false)
 }
 fn append_probe_text(text: &mut String, value: &str) {
     let mut end = value.len().min(8192usize.saturating_sub(text.len()));
-    while !value.is_char_boundary(end) { end -= 1; }
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
     text.push_str(&value[..end]);
 }
 fn warm_identity_matches(session: &Session, cached_session: &str, cached_native: &str) -> bool {
@@ -1130,7 +1173,10 @@ pub async fn send(
     .to_string();
     let cached = session_runtime.warm.lock().await.take();
     let cached = if let Some(c) = cached {
-        if warm_identity_matches(s, &c.session, &c.native) && c.signature == signature && c.client.alive.load(Ordering::Acquire) {
+        if warm_identity_matches(s, &c.session, &c.native)
+            && c.signature == signature
+            && c.client.alive.load(Ordering::Acquire)
+        {
             Some(c)
         } else {
             c.client.close().await;
@@ -1147,7 +1193,7 @@ pub async fn send(
     };
     let boot = Arc::new(Turn {
         client: client.clone(),
-        requests: Mutex::new(HashMap::new()),
+        requests: Arc::new(Mutex::new(HashMap::new())),
         session: s.id.clone(),
         native: s.native_id.clone().unwrap_or_else(|| s.id.clone()),
         turn: uuid::Uuid::new_v4().to_string(),
@@ -1334,24 +1380,7 @@ pub async fn send(
             .store
             .rename(&s.id, &text.chars().take(24).collect::<String>())?;
     }
-    let turn = Arc::new(Turn {
-        client: client.clone(),
-        requests: Mutex::new(HashMap::new()),
-        session: s.id.clone(),
-        native,
-        turn: boot.turn.clone(),
-        agent: s.agent.clone(),
-        stopped: AtomicBool::new(false),
-        accepting: AtomicBool::new(true),
-        inputs_pending: AtomicU64::new(0),
-        input_done: Notify::new(),
-        settled: AtomicBool::new(false),
-        prompt_accepted: AtomicBool::new(false),
-        prompt_ready: Notify::new(),
-        started: AtomicBool::new(false),
-        stop_done: AtomicBool::new(true),
-        signature: signature.clone(),
-    });
+    let turn = Arc::new(boot.after_setup(native));
     let instructions = client_features::instructions(app);
     let prompt = prompt_content(&s.agent, &content, &instructions);
     let params = if turn.agent == "pi" {
@@ -1396,6 +1425,13 @@ pub async fn send(
             return Err(e);
         }
     };
+    let mut pending_requests = turn.requests.lock().await;
+    let rebound = rebind_public_requests(
+        &mut pending_requests,
+        &boot.native,
+        &turn.native,
+        &turn.session,
+    );
     *slot = Some(turn.clone());
     drop(slot);
     publish(
@@ -1406,13 +1442,32 @@ pub async fn send(
             json!({"turn":{"id":turn.turn,"status":"running"}}),
         ),
     );
+    // Re-emit the same IDs after the start notification so restored cards stay
+    // visible and unresolved startup requests keep the chat in waiting state.
+    for request in rebound {
+        publish(app, request);
+    }
+    drop(pending_requests);
     let model_context_window = if turn.agent == "pi" {
-        selected.as_deref().and_then(|model| crate::model_context::for_model(&config, model))
-            .or_else(|| defaults["model"]["id"].as_str()
-                .filter(|id| selected.as_deref().is_none_or(|model| model.rsplit('/').next() == Some(*id)))
-                .and_then(|_| crate::model_context::positive(&defaults["model"]["contextWindow"])))
+        selected
+            .as_deref()
+            .and_then(|model| crate::model_context::for_model(&config, model))
+            .or_else(|| {
+                defaults["model"]["id"]
+                    .as_str()
+                    .filter(|id| {
+                        selected
+                            .as_deref()
+                            .is_none_or(|model| model.rsplit('/').next() == Some(*id))
+                    })
+                    .and_then(|_| {
+                        crate::model_context::positive(&defaults["model"]["contextWindow"])
+                    })
+            })
             .or_else(|| config["baseUrl"].is_string().then_some(128000))
-    } else { None };
+    } else {
+        None
+    };
     let app = app.clone();
     tokio::spawn(async move {
         let mut mapped = Mapper {
@@ -1426,8 +1481,11 @@ pub async fn send(
         let mut failure = None;
         let prompt_timeout = tokio::time::sleep(Duration::from_secs(3600));
         tokio::pin!(prompt_timeout);
+        let mut checkpoint = tokio::time::interval(Duration::from_secs(1));
+        checkpoint.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
+                _=checkpoint.tick()=>{for e in mapped.checkpoint(&turn){publish(&app,e);}},
                 value=rx.recv()=>{let Some(value)=value else{failure=Some("Agent 输出连接已关闭".into());break;};
                     if value["type"]=="supercode_disconnected"{failure=Some("Agent 意外退出".into());break;}
                     if value["type"]=="agent_start" || (value["method"]=="session/update" && value["params"]["sessionId"]==turn.native && matches!(value["params"]["update"]["sessionUpdate"].as_str(),Some("agent_message_chunk"|"agent_thought_chunk"|"tool_call"))) {turn.started.store(true,Ordering::Release);}
@@ -1457,6 +1515,7 @@ pub async fn send(
                     tokio::pin!(state_request);
                     let native_state = loop {
                         tokio::select! {
+                            _=checkpoint.tick()=>{for e in mapped.checkpoint(&turn){publish(&app,e);}},
                             result=&mut state_request=>break result,
                             value=rx.recv()=>{let Some(value)=value else{break Err("Pi 连接已关闭".into());};
                                 if value["type"]=="supercode_disconnected"{break Err("Pi 连接已关闭".into());}
@@ -1581,7 +1640,7 @@ pub async fn summary(app: &AppHandle, session: &Session, input: &str) -> Result<
             if session.agent=="pi" { let(p,id)=model.split_once('/').ok_or("Pi 模型缺少供应商")?;summary_request(&client,&mut rx,"set_model",json!({"provider":p,"modelId":id})).await?; }
             else { summary_request(&client,&mut rx,"session/set_model",json!({"sessionId":native,"modelId":model})).await?; }
         }
-        let t=Turn { client:client.clone(),requests:Mutex::new(HashMap::new()),session:session.id.clone(),native,turn:format!("handoff-{}",uuid::Uuid::new_v4()),agent:session.agent.clone(),stopped:AtomicBool::new(false),accepting:AtomicBool::new(false),inputs_pending:AtomicU64::new(0),input_done:Notify::new(),settled:AtomicBool::new(false),prompt_accepted:AtomicBool::new(false),prompt_ready:Notify::new(),started:AtomicBool::new(false),stop_done:AtomicBool::new(true),signature:String::new() };
+        let t=Turn { client:client.clone(),requests:Arc::new(Mutex::new(HashMap::new())),session:session.id.clone(),native,turn:format!("handoff-{}",uuid::Uuid::new_v4()),agent:session.agent.clone(),stopped:AtomicBool::new(false),accepting:AtomicBool::new(false),inputs_pending:AtomicU64::new(0),input_done:Notify::new(),settled:AtomicBool::new(false),prompt_accepted:AtomicBool::new(false),prompt_ready:Notify::new(),started:AtomicBool::new(false),stop_done:AtomicBool::new(true),signature:String::new() };
         let mut mapper=Mapper{priced:!config["baseUrl"].is_string(),..Mapper::default()};
         let mut texts=std::collections::BTreeMap::new();
         let prompt=prompt_content(&session.agent,&[json!({"type":"text","text":input})],"");
@@ -1675,468 +1734,75 @@ fn prompt_content(agent: &str, content: &[Value], instructions: &str) -> Value {
         json!(blocks)
     }
 }
-#[derive(Default)]
-struct Mapper {
-    items: HashMap<String, Value>,
-    message: u64,
-    failed: bool,
-    failure: Option<String>,
-    usage: Value,
-    priced: bool,
-    model_context_window: Option<u64>,
-    acp_phase: String,
-    acp_segment: u64,
-    media_segment: u64,
-}
-impl Mapper {
-    fn map(&mut self, t: &Turn, v: &Value) -> Vec<Value> {
-        let mut out = vec![];
-        let mut item = None;
-        let mut delta = None;
-        if t.agent == "pi" {
-            match v["type"].as_str().unwrap_or("") {
-                "message_start" if v["message"]["role"] == "assistant" => self.message += 1,
-                "message_update" => {
-                    let e = &v["assistantMessageEvent"];
-                    let usage = v
-                        .get("usage")
-                        .filter(|u| u.is_object())
-                        .or_else(|| v["message"].get("usage").filter(|u| u.is_object()))
-                        .or_else(|| e["partial"].get("usage").filter(|u| u.is_object()));
-                    if let Some(usage) = usage {
-                        if self.observe_pi_usage(usage) {
-                            out.push(event(
-                                t,
-                                "thread/tokenUsage/updated",
-                                json!({"tokenUsage":self.usage}),
-                            ));
-                        }
-                    }
-                    let index = e["contentIndex"].as_u64().unwrap_or(0);
-                    let id = format!("{}-msg-{}-{index}", t.turn, self.message);
-                    match e["type"].as_str().unwrap_or("") {
-                        "text_start" | "text_delta" | "thinking_start" | "thinking_delta" => {
-                            let thought = e["type"].as_str().unwrap().starts_with("thinking");
-                            let row=self.items.entry(id.clone()).or_insert_with(||if thought{json!({"id":id,"type":"reasoning","summary":[""],"status":"inProgress"})}else{json!({"id":id,"type":"agentMessage","messageId":format!("{}-msg-{}", t.turn, self.message),"text":"","status":"inProgress"})});
-                            let old = if thought {
-                                row["summary"][0].as_str().unwrap_or("")
-                            } else {
-                                row["text"].as_str().unwrap_or("")
-                            };
-                            let text = protocol::bounded(
-                                &format!("{old}{}", e["delta"].as_str().unwrap_or("")),
-                                protocol::TEXT_LIMIT,
-                            );
-                            if thought {
-                                row["summary"][0] = text.into();
-                            } else {
-                                row["text"] = text.into();
-                            }
-                            item = Some(row.clone());
-                        }
-                        _ => {}
-                    }
-                }
-                "message_end" if v["message"]["role"] == "assistant" => {
-                    let m = &v["message"];
-                    self.failed |= m["stopReason"] == "error";
-                    if let Some(blocks) = m["content"].as_array() {
-                        for (i, b) in blocks.iter().enumerate() {
-                            let id = format!("{}-msg-{}-{i}", t.turn, self.message);
-                            let row = match b["type"].as_str() {
-                                Some("text") => {
-                                    json!({"id":id,"type":"agentMessage","messageId":format!("{}-msg-{}", t.turn, self.message),"text":b["text"],"status":"completed"})
-                                }
-                                Some("thinking") => {
-                                    json!({"id":id,"type":"reasoning","summary":[b["thinking"]],"status":"completed"})
-                                }
-                                Some("image" | "audio" | "video") => {
-                                    json!({"id":id,"type":"agentMessage","messageId":format!("{}-msg-{}", t.turn, self.message),"text":"","contentItems":[b],"status":"completed"})
-                                }
-                                _ => continue,
-                            };
-                            self.items.remove(&id);
-                            out.push(event(t, "item/completed", json!({"item":row})));
-                        }
-                    }
-                    if let Some(error) = m["errorMessage"].as_str() {
-                        self.failure = Some(protocol::bounded(error, 4096));
-                        out.push(event(t, "error", json!({"error":{"message":error}})));
-                    }
-                    if m["usage"].is_object() {
-                        out.push(event(
-                            t,
-                            "thread/tokenUsage/updated",
-                            json!({"tokenUsage":self.add_usage(&m["usage"])}),
-                        ));
-                    }
-                }
-                "tool_execution_start" | "tool_execution_update" | "tool_execution_end" => {
-                    let id = format!(
-                        "{}-tool-{}",
-                        t.turn,
-                        v["toolCallId"].as_str().unwrap_or("unknown")
-                    );
-                    let end = v["type"] == "tool_execution_end";
-                    let row=self.items.entry(id.clone()).or_insert(json!({"id":id,"type":"claudeToolCall","tool":pi_tool(v["toolName"].as_str().unwrap_or("Tool")),"arguments":tool_args(&v["args"]),"cwd":t.client.cwd,"status":"inProgress"}));
-                    if !end && v["partialResult"]["content"].is_array() {
-                        row["output"]=blocks_text(&v["partialResult"]["content"]).into();
-                        row["contentItems"]=v["partialResult"]["content"].clone();
-                    }
-                    if end {
-                        apply_pi_result(row,&v["result"],v["isError"]==true);
-                        row["status"] = if v["isError"] == true {
-                            "failed"
-                        } else {
-                            "completed"
-                        }
-                        .into();
-                    }
-                    item = Some(row.clone());
-                }
-                "compaction_start" => {
-                    item = Some(
-                        json!({"id":format!("{}-compact",t.turn),"type":"contextCompaction","status":"inProgress"}),
-                    )
-                }
-                "compaction_end" => {
-                    if v["aborted"] != true && v["errorMessage"].is_null() {
-                        if !self.usage.is_object() {
-                            self.usage = json!({"total":{},"last":{}});
-                        }
-                        self.usage["contextTokens"] = Value::Null;
-                        self.usage["last"] = json!({});
-                        out.push(event(
-                            t,
-                            "thread/tokenUsage/updated",
-                            json!({"tokenUsage":self.usage}),
-                        ));
-                    }
-                    item = Some(
-                        json!({"id":format!("{}-compact",t.turn),"type":"contextCompaction","status":"completed"}),
-                    )
-                }
-                _ => {}
-            }
-        } else if v["method"] == "session/update" && v["params"]["sessionId"] == t.native {
-            let u = &v["params"]["update"];
-            match u["sessionUpdate"].as_str().unwrap_or("") {
-                "agent_message_chunk" | "agent_thought_chunk" => {
-                    let thought = u["sessionUpdate"] == "agent_thought_chunk";
-                    if !thought
-                        && matches!(
-                            u["content"]["type"].as_str(),
-                            Some("image" | "audio" | "video" | "resource" | "resource_link")
-                        )
-                    {
-                        self.media_segment += 1;
-                        out.push(event(t, "item/completed", json!({"item":{"id":format!("{}-media-{}",t.turn,self.media_segment),"type":"agentMessage","text":"","contentItems":[u["content"]],"status":"completed"}})));
-                        return out;
-                    }
-                    let phase = if thought { "thought" } else { "msg" };
-                    if u["messageId"].as_str().is_none() && self.acp_phase != phase {
-                        let old = self
-                            .items
-                            .iter()
-                            .filter(|(_, row)| {
-                                matches!(row["type"].as_str(), Some("agentMessage" | "reasoning"))
-                            })
-                            .map(|(id, _)| id.clone())
-                            .collect::<Vec<_>>();
-                        for id in old {
-                            if let Some(mut row) = self.items.remove(&id) {
-                                row["status"] = "completed".into();
-                                out.push(event(t, "item/completed", json!({"item":row})));
-                            }
-                        }
-                        self.acp_segment += 1;
-                        self.acp_phase = phase.into();
-                    }
-                    let id = format!(
-                        "{}-{}-{}",
-                        t.turn,
-                        if thought { "thought" } else { "msg" },
-                        u["messageId"]
-                            .as_str()
-                            .map(str::to_owned)
-                            .unwrap_or_else(|| self.acp_segment.to_string())
-                    );
-                    let row = self.items.entry(id.clone()).or_insert_with(|| {
-                        if thought {
-                            json!({"id":id,"type":"reasoning","summary":[""],"status":"inProgress"})
-                        } else {
-                            json!({"id":id,"type":"agentMessage","text":"","status":"inProgress"})
-                        }
-                    });
-                    let d = u["content"]["text"].as_str().unwrap_or("");
-                    let old = if thought {
-                        row["summary"][0].as_str().unwrap_or("")
-                    } else {
-                        row["text"].as_str().unwrap_or("")
-                    };
-                    let text = protocol::bounded(&format!("{old}{d}"), protocol::TEXT_LIMIT);
-                    if thought {
-                        row["summary"][0] = text.into();
-                    } else {
-                        row["text"] = text.into();
-                    }
-                    delta = Some(event(
-                        t,
-                        if thought {
-                            "item/reasoning/summaryTextDelta"
-                        } else {
-                            "item/agentMessage/delta"
-                        },
-                        json!({"itemId":id,"delta":d,"summaryIndex":0}),
-                    ));
-                    item = Some(row.clone());
-                }
-                "tool_call" | "tool_call_update" => {
-                    self.acp_phase = "tool".into();
-                    let old = self
-                        .items
-                        .iter()
-                        .filter(|(_, row)| {
-                            matches!(row["type"].as_str(), Some("agentMessage" | "reasoning"))
-                        })
-                        .map(|(id, _)| id.clone())
-                        .collect::<Vec<_>>();
-                    for id in old {
-                        if let Some(mut row) = self.items.remove(&id) {
-                            row["status"] = "completed".into();
-                            out.push(event(t, "item/completed", json!({"item":row})));
-                        }
-                    }
-                    let id = format!(
-                        "{}-tool-{}",
-                        t.turn,
-                        u["toolCallId"].as_str().unwrap_or("unknown")
-                    );
-                    let row=self.items.entry(id.clone()).or_insert(json!({"id":id,"type":"claudeToolCall","tool":acp_tool(u),"arguments":tool_args(&u["rawInput"]),"status":"inProgress"}));
-                    update_acp_tool(row, u);
-                    if let Some(c) = u.get("rawInput") {
-                        row["arguments"] = tool_args(c);
-                    }
-                    if let Some(c) = u.get("content") {
-                        row["output"] = blocks_text(c).into();
-                        row["contentItems"] = c.clone();
-                    }
-                    if let Some(status) = acp_tool_status(u) {
-                        row["status"] = status.into();
-                    }
-                    item = Some(row.clone());
-                }
-                "plan" => {
-                    item = Some(
-                        json!({"id":format!("{}-plan",t.turn),"type":"executionPlan","text":u["entries"].to_string(),"status":"inProgress"}),
-                    )
-                }
-                "usage_update" => {
-                    let usage = self.observe_acp_usage(u);
-                    out.push(event(t,"thread/tokenUsage/updated",json!({"tokenUsage":usage})));
-                }
-                _ => {}
-            }
-        }
-        if let Some(mut row) = item {
-            row["turnId"] = t.turn.clone().into();
-            let method = if matches!(row["status"].as_str(), Some("completed" | "failed" | "interrupted")) {
-                self.items.remove(row["id"].as_str().unwrap_or(""));
-                "item/completed"
-            } else {
-                "item/started"
-            };
-            out.push(event(t, method, json!({"item":row})));
-        }
-        if let Some(delta) = delta {
-            /* complete snapshots above are authoritative; avoid appending duplicate text */
-            let _ = delta;
-        }
-        out
-    }
-    fn finish(&mut self, interrupted: bool) -> Vec<Value> {
-        self.items
-            .drain()
-            .map(|(_, mut v)| {
-                v["status"] = if interrupted {
-                    "interrupted"
-                } else {
-                    "completed"
-                }
-                .into();
-                v
-            })
-            .collect()
-    }
-    fn add_usage(&mut self, native: &Value) -> Value {
-        let last = crate::usage_tokens::pi_usage(native);
-        if !self.usage.is_object() {
-            self.usage = json!({"total":{},"last":{},"contextTokens":null,"cumulative":false});
-        }
-        if crate::usage_tokens::pi_context(&last).is_none() {
-            return self.usage.clone();
-        }
-        self.observe_pi_usage(native);
-        for key in [
-            "inputTokens",
-            "outputTokens",
-            "cachedInputTokens",
-            "cacheWriteInputTokens",
-            "totalTokens",
-        ] {
-            self.usage["total"][key] = json!(self.usage["total"][key]
-                .as_u64()
-                .unwrap_or(0)
-                .saturating_add(last[key].as_u64().unwrap_or(0)));
-        }
-        if self.priced {
-            if let Some(cost) = native["cost"]["total"]
-                .as_f64()
-                .filter(|n| n.is_finite() && *n >= 0.0)
-            {
-                self.usage["costUsd"] = json!(self.usage["costUsd"].as_f64().unwrap_or(0.0) + cost);
-            }
-        }
-        self.usage.clone()
-    }
-    fn observe_acp_usage(&mut self, native: &Value) -> Value {
-        let used = crate::usage_tokens::count(&native["used"]);
-        self.model_context_window = crate::model_context::positive(&native["size"])
-            .or(self.model_context_window);
-        json!({"total":{},"last":{},"contextTokens":used,"modelContextWindow":self.model_context_window,"cumulative":false})
-    }
-    fn observe_pi_usage(&mut self, native: &Value) -> bool {
-        let last = crate::usage_tokens::pi_usage(native);
-        let context = crate::usage_tokens::pi_context(&last);
-        let Some(context) = context else {
-            return false;
-        };
-        if !self.usage.is_object() {
-            self.usage = json!({"total":{},"cumulative":false});
-        }
-        let changed = self.usage["last"] != last || self.usage["contextTokens"] != json!(context);
-        self.usage["last"] = last;
-        self.usage["contextTokens"] = json!(context);
-        if let Some(capacity) = self.model_context_window {
-            self.usage["modelContextWindow"] = json!(capacity);
-        }
-        changed
-    }
-}
-fn apply_pi_result(row: &mut Value, result: &Value, is_error: bool) {
-    row["output"]=blocks_text(&result["content"]).into();
-    row["contentItems"]=result["content"].clone();
-    let structured=&result["structuredContent"];
-    if let Some(code)=structured["exit_code"].as_i64() { row["exitCode"]=code.into(); }
-    if let Some(seconds)=structured["wall_time_seconds"].as_f64().filter(|seconds|seconds.is_finite() && *seconds>=0.0) {
-        row["durationMs"]=json!((seconds*1000.0).round() as u64);
-    }
-    if !is_error {
-        if let (Some(path),Some(patch))=(row["arguments"]["file_path"].as_str(),result["details"]["patch"].as_str()) {
-            if let Some(change)=crate::file_changes::patch_change(path,patch) {
-                row["changes"]=json!([change]); crate::file_changes::summarize(row);
-            }
-        }
-    }
-    if result["details"]["supercodeFileChange"].is_object() {
-        row["fileSnapshot"]=result["details"]["supercodeFileChange"].clone();
-    }
-}
-fn acp_tool(v: &Value) -> &str {
-    if v["rawInput"]["subagent_type"].is_string() && v["rawInput"]["prompt"].is_string() {
-        return "Task";
-    }
-    match v["kind"].as_str() {
-        Some("read") => "Read",
-        Some("edit") => "Edit",
-        Some("execute") => "Bash",
-        Some("search") => "Grep",
-        _ => v["title"].as_str().unwrap_or("Tool"),
-    }
-}
-fn update_acp_tool(row: &mut Value, update: &Value) {
-    // OpenCode replaces a Task's title with its description after approval.
-    // Keep the native tool identity so progress and completion still reach its row.
-    if matches!(row["tool"].as_str(), Some("Task" | "task")) {
-        return;
-    }
-    if update["kind"].is_string() || update["rawInput"]["subagent_type"].is_string() {
-        row["tool"] = acp_tool(update).into();
-    }
-}
-fn acp_tool_status(update: &Value) -> Option<&str> {
-    match update["status"].as_str() {
-        Some("failed") if blocks_text(&update["content"]).trim() == "Task cancelled" => Some("interrupted"),
-        Some(status @ ("completed" | "failed")) => Some(status),
-        _ => None,
-    }
-}
-fn blocks_text(v: &Value) -> String {
-    let text = v
-        .as_array()
-        .map(|a| {
-            a.iter()
-                .filter_map(|b| b["text"].as_str().or_else(|| b["content"]["text"].as_str()))
-                .collect::<Vec<_>>()
-                .join("\n")
-        })
-        .unwrap_or_default();
-    protocol::bounded(&text, protocol::TEXT_LIMIT)
-}
-fn pi_tool(name: &str) -> &str {
-    match name {
-        "read" => "Read",
-        "bash" => "Bash",
-        "write" => "Write",
-        "edit" => "Edit",
-        "grep" => "Grep",
-        "find" | "ls" => "Glob",
-        _ => name,
-    }
-}
-fn tool_args(v: &Value) -> Value {
-    let mut args = v.clone();
-    if let Some(path) = v["file_path"]
-        .as_str()
-        .or(v["filePath"].as_str())
-        .or(v["path"].as_str())
-    {
-        args["file_path"] = path.into();
-    }
-    args
-}
 #[cfg(test)]
 mod tests {
     use super::*;
     #[test]
     fn cleared_or_replaced_native_checkpoint_does_not_resume_old_context() {
-        let mut session=Session {id:"chat".into(),project_id:String::new(),workspace_path:None,title:"Test".into(),agent:"pi".into(),model:Some("glm-5.3".into()),connection_id:Some("glm".into()),native_id:Some("native-before".into()),status:"idle".into(),updated_at:0,turn_id:None};
-        assert!(warm_identity_matches(&session,"chat","native-before"));
-        assert!(!warm_identity_matches(&session,"other-chat","native-before"));
-        session.native_id=None;
-        assert!(!warm_identity_matches(&session,"chat","native-before"));
-        session.native_id=Some("native-after".into());
-        assert!(!warm_identity_matches(&session,"chat","native-before"));
-        assert!(warm_identity_matches(&session,"chat","native-after"));
+        let mut session = Session {
+            id: "chat".into(),
+            project_id: String::new(),
+            workspace_path: None,
+            title: "Test".into(),
+            agent: "pi".into(),
+            model: Some("glm-5.3".into()),
+            connection_id: Some("glm".into()),
+            native_id: Some("native-before".into()),
+            status: "idle".into(),
+            updated_at: 0,
+            turn_id: None,
+        };
+        assert!(warm_identity_matches(&session, "chat", "native-before"));
+        assert!(!warm_identity_matches(
+            &session,
+            "other-chat",
+            "native-before"
+        ));
+        session.native_id = None;
+        assert!(!warm_identity_matches(&session, "chat", "native-before"));
+        session.native_id = Some("native-after".into());
+        assert!(!warm_identity_matches(&session, "chat", "native-before"));
+        assert!(warm_identity_matches(&session, "chat", "native-after"));
     }
     #[test]
     fn acp_task_identity_survives_native_title_updates_and_completion() {
         let start = json!({"kind":"other","title":"task","rawInput":{"subagent_type":"explore","prompt":"Read fixture files","description":"kimi-opencode-a"}});
         let mut row = json!({"tool":acp_tool(&start),"arguments":start["rawInput"]});
         assert_eq!(row["tool"], "Task");
-        update_acp_tool(&mut row, &json!({"kind":"other","title":"kimi-opencode-a","status":"in_progress"}));
-        update_acp_tool(&mut row, &json!({"kind":"other","title":"kimi-opencode-a","status":"completed"}));
+        update_acp_tool(
+            &mut row,
+            &json!({"kind":"other","title":"kimi-opencode-a","status":"in_progress"}),
+        );
+        update_acp_tool(
+            &mut row,
+            &json!({"kind":"other","title":"kimi-opencode-a","status":"completed"}),
+        );
         assert_eq!(row["tool"], "Task");
         assert_eq!(row["arguments"]["prompt"], "Read fixture files");
         let mut generic = json!({"tool":"Tool"});
-        update_acp_tool(&mut generic, &json!({"kind":"read","title":"Read README.md"}));
+        update_acp_tool(
+            &mut generic,
+            &json!({"kind":"read","title":"Read README.md"}),
+        );
         assert_eq!(generic["tool"], "Read");
-        assert_eq!(acp_tool_status(&json!({"status":"failed","content":[{"type":"content","content":{"type":"text","text":"Task cancelled"}}]})), Some("interrupted"));
-        assert_eq!(acp_tool_status(&json!({"status":"failed","content":[{"type":"content","content":{"type":"text","text":"File does not exist"}}]})), Some("failed"));
+        assert_eq!(
+            acp_tool_status(
+                &json!({"status":"failed","content":[{"type":"content","content":{"type":"text","text":"Task cancelled"}}]})
+            ),
+            Some("interrupted")
+        );
+        assert_eq!(
+            acp_tool_status(
+                &json!({"status":"failed","content":[{"type":"content","content":{"type":"text","text":"File does not exist"}}]})
+            ),
+            Some("failed")
+        );
     }
     #[tokio::test]
     async fn provider_probes_use_the_configured_model_and_wait_for_actual_completion() {
-        let Some(program) = process::find_program("node") else { return; };
+        let Some(program) = process::find_program("node") else {
+            return;
+        };
         // Controlled protocol peers exercise adapters without real provider calls.
         let script = r#"const rl=require('readline').createInterface({input:process.stdin});
 const out=v=>process.stdout.write(JSON.stringify(v)+'\n');
@@ -2154,33 +1820,271 @@ if(m==='session/prompt'){out({method:'session/update',params:{sessionId:'test',u
 if(m==='turn/start'){reply({turn:{id:'turn'}});out({method:'item/completed',params:{threadId:'test',item:{type:'userMessage'}}});out({method:'item/completed',params:{threadId:'test',item:{type:'agentMessage',text:'OK'}}});return out({method:'turn/completed',params:{threadId:'test',turn:{id:'turn',status:'completed'}}});}
 process.exit(6);
 });"#;
-        let launch = Launch { program, prefix:vec!["-e".into(),script.into()], source:"protocol-test".into() };
+        let launch = Launch {
+            program,
+            prefix: vec!["-e".into(), script.into()],
+            source: "protocol-test".into(),
+        };
         for agent in ["pi", "opencode", "codex"] {
-            let (client, mut events) = Client::start(&launch, &[], Path::new("."), &[], agent == "pi", None).await.unwrap();
+            let (client, mut events) =
+                Client::start(&launch, &[], Path::new("."), &[], agent == "pi", None)
+                    .await
+                    .unwrap();
             let config = json!({"baseUrl":"https://example.invalid/anthropic","protocol":"anthropic","model":"glm-5.3","config":"model_provider='selected'"});
-            let result = tokio::time::timeout(Duration::from_secs(5), probe_completion(&client, &mut events, agent, &config, "glm-5.3", Path::new("."))).await;
+            let result = tokio::time::timeout(
+                Duration::from_secs(5),
+                probe_completion(
+                    &client,
+                    &mut events,
+                    agent,
+                    &config,
+                    "glm-5.3",
+                    Path::new("."),
+                ),
+            )
+            .await;
             client.close().await;
             assert_eq!(result.unwrap().unwrap(), "OK", "{agent}");
         }
     }
+    #[tokio::test]
+    async fn pi_automatic_compaction_keeps_the_native_thread_and_continues_the_turn() {
+        let Some(program) = process::find_program("node") else {
+            return;
+        };
+        // A controlled RPC peer streams overflow recovery and its continued
+        // answer. No provider or installed agent is started by this test.
+        let script = r#"const rl=require('readline').createInterface({input:process.stdin});
+const out=v=>process.stdout.write(JSON.stringify(v)+'\n');
+rl.on('line',line=>{const v=JSON.parse(line);
+if(v.type!=='prompt')process.exit(2);
+out({type:'response',id:v.id,command:'prompt',success:true,data:{disposition:'started'}});
+out({type:'agent_start'});
+out({type:'compaction_start',reason:'overflow'});
+out({type:'compaction_end',reason:'overflow',aborted:true,willRetry:false});
+out({type:'compaction_start',reason:'overflow'});
+out({type:'compaction_end',reason:'overflow',aborted:false,errorMessage:'Provider summary failed',willRetry:false});
+out({type:'compaction_start',reason:'overflow'});
+out({type:'compaction_end',reason:'overflow',aborted:false,willRetry:true,result:{tokensBefore:900000}});
+out({type:'message_start',message:{role:'assistant'}});
+out({type:'message_end',message:{role:'assistant',content:[{type:'text',text:'压缩后继续完成任务'}],stopReason:'stop',usage:{input:1200,output:40,totalTokens:1240}}});
+out({type:'agent_end'});out({type:'agent_settled'});
+});"#;
+        let launch = Launch {
+            program,
+            prefix: vec!["-e".into(), script.into()],
+            source: "protocol-test".into(),
+        };
+        let (client, mut events) = Client::start(&launch, &[], Path::new("."), &[], true, None)
+            .await
+            .unwrap();
+        let turn = Turn {
+            client: client.clone(),
+            requests: Arc::new(Mutex::new(HashMap::new())),
+            session: "chat".into(),
+            native: "native-existing".into(),
+            turn: "same-turn".into(),
+            agent: "pi".into(),
+            stopped: AtomicBool::new(false),
+            accepting: AtomicBool::new(true),
+            inputs_pending: AtomicU64::new(0),
+            input_done: Notify::new(),
+            settled: AtomicBool::new(false),
+            prompt_accepted: AtomicBool::new(false),
+            prompt_ready: Notify::new(),
+            started: AtomicBool::new(false),
+            stop_done: AtomicBool::new(true),
+            signature: String::new(),
+        };
+        let boot = turn.after_setup("temporary-chat-id".into());
+        let request = user_request(&boot, json!({"type":"extension_ui_request","method":"confirm","id":"startup","title":"Startup approval"})).unwrap();
+        let request_id = request["id"].as_str().unwrap().to_owned();
+        turn.requests
+            .lock()
+            .await
+            .insert(request_id.clone(), request);
+        let active = boot.after_setup("native-existing".into());
+        assert!(Arc::ptr_eq(&turn.requests, &active.requests));
+        let rebound = rebind_public_requests(
+            &mut *active.requests.lock().await,
+            &boot.native,
+            &active.native,
+            &active.session,
+        );
+        assert_eq!(rebound.len(), 1);
+        assert_eq!(rebound[0]["params"]["threadId"], "native-existing");
+        let request = active
+            .requests
+            .lock()
+            .await
+            .get(&request_id)
+            .cloned()
+            .unwrap();
+        assert_eq!(
+            permission_reply(&request, &json!({"decision":"accept"}), "pi").unwrap(),
+            json!({"type":"extension_ui_response","id":"startup","confirmed":true})
+        );
+        active.requests.lock().await.remove(&request_id);
+        assert!(turn.requests.lock().await.is_empty());
+        for agent in ["pi", "opencode"] {
+            let mut t = active.after_setup("native-existing".into());
+            t.agent = agent.into();
+            let mut mapper = Mapper::default();
+            let mut buffer = protocol::ActivityBuffer::default();
+            let mut writes = 0;
+            for index in 0..50 {
+                let value = if agent == "pi" {
+                    json!({"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"中🧋","contentIndex":0}})
+                } else {
+                    json!({"method":"session/update","params":{"sessionId":"native-existing","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"中🧋"}}}})
+                };
+                for event in mapper.map(&t, &value) {
+                    writes += usize::from(buffer.update(&event).is_some());
+                }
+                if index == 19 || index == 39 {
+                    for event in mapper.checkpoint(&t) {
+                        writes += usize::from(buffer.update(&event).is_some());
+                    }
+                    assert!(
+                        mapper.checkpoint(&t).is_empty(),
+                        "unchanged text cannot write another checkpoint"
+                    );
+                }
+                assert_eq!(
+                    writes,
+                    1 + usize::from(index >= 19) + usize::from(index >= 39),
+                    "chunk {index} must only write at checkpoints"
+                );
+            }
+            for item in mapper.finish(false) {
+                let completed = buffer
+                    .update(&event(&t, "item/completed", json!({"item":item})))
+                    .unwrap();
+                assert_eq!(completed["text"], "中🧋".repeat(50));
+                writes += 1;
+            }
+            assert_eq!(writes, 4);
+            let mut failure_mapper = Mapper::default();
+            let value = if agent == "pi" {
+                json!({"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"partial","contentIndex":0}})
+            } else {
+                json!({"method":"session/update","params":{"sessionId":"native-existing","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"partial"}}}})
+            };
+            failure_mapper.map(&t, &value);
+            let final_rows = failure_mapper.finish(true);
+            assert_eq!(final_rows[0]["text"], "partial");
+            assert_eq!(final_rows[0]["status"], "interrupted");
+        }
+        let mut mapper = Mapper {
+            model_context_window: Some(1_000_000),
+            ..Mapper::default()
+        };
+        mapper.observe_pi_usage(&json!({"input":900000,"output":20}));
+        let accepted = client
+            .request("prompt", json!({"message":"继续当前任务"}), 5)
+            .await
+            .unwrap();
+        assert_eq!(accepted["disposition"], "started");
+        let mapped = tokio::time::timeout(Duration::from_secs(5), async {
+            let mut mapped = Vec::new();
+            loop {
+                let event = events
+                    .recv()
+                    .await
+                    .expect("RPC peer closed before settling");
+                mapped.extend(mapper.map(&turn, &event));
+                if event["type"] == "agent_settled" {
+                    break;
+                }
+            }
+            mapped
+        })
+        .await;
+        client.close().await;
+        let mapped = mapped.unwrap();
+        let compact_start = mapped
+            .iter()
+            .position(|event| {
+                event["params"]["item"]["type"] == "contextCompaction"
+                    && event["method"] == "item/started"
+            })
+            .unwrap();
+        let compact_end = mapped
+            .iter()
+            .position(|event| {
+                event["params"]["item"]["type"] == "contextCompaction"
+                    && event["params"]["item"]["status"] == "completed"
+            })
+            .unwrap();
+        let answer = mapped
+            .iter()
+            .position(|event| event["params"]["item"]["text"] == "压缩后继续完成任务")
+            .unwrap();
+        assert!(compact_start < compact_end && compact_end < answer);
+        assert!(mapped
+            .iter()
+            .all(|event| event["params"]["threadId"] == "native-existing"
+                && event["params"]["turnId"] == "same-turn"));
+        assert!(!mapped.iter().any(|event| matches!(
+            event["method"].as_str(),
+            Some("thread/started" | "turn/completed")
+        )));
+        let compactions = mapped
+            .iter()
+            .filter(|event| event["params"]["item"]["type"] == "contextCompaction")
+            .map(|event| event["params"]["item"]["status"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            compactions,
+            vec![
+                "inProgress",
+                "interrupted",
+                "inProgress",
+                "failed",
+                "inProgress",
+                "completed"
+            ]
+        );
+        let failed = mapped
+            .iter()
+            .find(|event| event["params"]["item"]["status"] == "failed")
+            .unwrap();
+        assert_eq!(failed["params"]["item"]["error"], "Provider summary failed");
+        assert_eq!(mapper.usage["contextTokens"], 1240);
+        assert_eq!(mapper.usage["modelContextWindow"], 1_000_000);
+    }
     #[test]
     fn provider_probes_preserve_failures_reject_tools_and_bound_unicode_output() {
-        let mut text = String::new(); let mut failure = None;
+        let mut text = String::new();
+        let mut failure = None;
         probe_output(&json!({"type":"message_end","message":{"role":"assistant","stopReason":"error","errorMessage":"401 invalid key"}}), "pi", "", &mut text, &mut failure).unwrap();
         assert_eq!(failure.as_deref(), Some("401 invalid key"));
-        assert!(probe_output(&json!({"type":"tool_execution_start"}), "pi", "", &mut text, &mut failure).is_err());
-        assert!(probe_notification(&json!({"type":"extension_ui_request","id":1,"method":"confirm"})).is_err());
+        assert!(probe_output(
+            &json!({"type":"tool_execution_start"}),
+            "pi",
+            "",
+            &mut text,
+            &mut failure
+        )
+        .is_err());
+        assert!(probe_notification(
+            &json!({"type":"extension_ui_request","id":1,"method":"confirm"})
+        )
+        .is_err());
         assert!(probe_output(&json!({"method":"item/started","params":{"threadId":"test","item":{"type":"commandExecution"}}}), "codex", "test", &mut text, &mut failure).is_err());
         failure = None;
         assert!(probe_output(&json!({"method":"turn/completed","params":{"threadId":"test","turn":{"status":"failed","error":{"message":"model unavailable"}}}}), "codex", "test", &mut text, &mut failure).unwrap());
         assert_eq!(failure.as_deref(), Some("model unavailable"));
         let long = "中文".repeat(4000);
         probe_output(&json!({"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":long},{"type":"text","text":long}]}}), "pi", "", &mut text, &mut failure).unwrap();
-        assert!(text.len() <= 8192); assert!(text.ends_with('中') || text.ends_with('文'));
+        assert!(text.len() <= 8192);
+        assert!(text.ends_with('中') || text.ends_with('文'));
     }
     #[tokio::test]
     async fn independent_protocol_processes_do_not_block_or_cancel_each_other() {
-        let Some(program) = process::find_program("node") else { return; };
+        let Some(program) = process::find_program("node") else {
+            return;
+        };
         // Controlled protocol peers, not real Agent runs or provider requests.
         let script = r#"const rl=require('readline').createInterface({input:process.stdin});
 const write=v=>process.stdout.write(JSON.stringify(v)+'\n');
@@ -2190,22 +2094,53 @@ if(method==='hold')return;
 if(method==='exit')process.exit(0);
 write(v.type?{type:'response',command:method,id:v.id,success:true,data:{session:process.env.SUPERCODE_SESSION_ID}}:{jsonrpc:'2.0',id:v.id,result:{session:process.env.SUPERCODE_SESSION_ID}});
 });"#;
-        let launch = Launch { program, prefix:vec!["-e".into(),script.into()], source:"protocol-test".into() };
+        let launch = Launch {
+            program,
+            prefix: vec!["-e".into(), script.into()],
+            source: "protocol-test".into(),
+        };
         for pi in [false, true] {
-            let (a, mut events_a) = Client::start(&launch,&[],Path::new("."),&[("SUPERCODE_SESSION_ID".into(),"a".into())],pi,None).await.unwrap();
-            let (b, mut events_b) = Client::start(&launch,&[],Path::new("."),&[("SUPERCODE_SESSION_ID".into(),"b".into())],pi,None).await.unwrap();
-            assert_ne!(a.pid,b.pid);
-            let (_, held) = a.begin_request("hold",json!({})).await.unwrap();
-            let reply = b.request("ping",json!({}),5).await.unwrap();
-            assert_eq!(reply["session"],"b");
-            a.request("approval",json!({}),5).await.unwrap();
-            b.request("approval",json!({}),5).await.unwrap();
-            let raw_a = tokio::time::timeout(Duration::from_secs(5),events_a.recv()).await.unwrap().unwrap();
-            let raw_b = tokio::time::timeout(Duration::from_secs(5),events_b.recv()).await.unwrap().unwrap();
-            assert_eq!(raw_a["id"],raw_b["id"]);
+            let (a, mut events_a) = Client::start(
+                &launch,
+                &[],
+                Path::new("."),
+                &[("SUPERCODE_SESSION_ID".into(), "a".into())],
+                pi,
+                None,
+            )
+            .await
+            .unwrap();
+            let (b, mut events_b) = Client::start(
+                &launch,
+                &[],
+                Path::new("."),
+                &[("SUPERCODE_SESSION_ID".into(), "b".into())],
+                pi,
+                None,
+            )
+            .await
+            .unwrap();
+            assert_ne!(a.pid, b.pid);
+            let (_, held) = a.begin_request("hold", json!({})).await.unwrap();
+            let reply = b.request("ping", json!({}), 5).await.unwrap();
+            assert_eq!(reply["session"], "b");
+            a.request("approval", json!({}), 5).await.unwrap();
+            b.request("approval", json!({}), 5).await.unwrap();
+            let raw_a = tokio::time::timeout(Duration::from_secs(5), events_a.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let raw_b = tokio::time::timeout(Duration::from_secs(5), events_b.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(raw_a["id"], raw_b["id"]);
             a.close().await;
             assert!(held.await.unwrap().is_err());
-            assert_eq!(b.request("ping",json!({}),5).await.unwrap()["session"],"b");
+            assert_eq!(
+                b.request("ping", json!({}), 5).await.unwrap()["session"],
+                "b"
+            );
             b.close().await;
         }
     }
@@ -2336,7 +2271,10 @@ write(v.type?{type:'response',command:method,id:v.id,success:true,data:{session:
     }
     #[test]
     fn streaming_usage_updates_context_without_accumulating_billing_or_erasing_it_with_zero() {
-        let mut mapper = Mapper { model_context_window: Some(1_000_000), ..Mapper::default() };
+        let mut mapper = Mapper {
+            model_context_window: Some(1_000_000),
+            ..Mapper::default()
+        };
         assert!(!mapper.observe_pi_usage(&json!({"input":0,"output":0,"totalTokens":0})));
         assert!(mapper
             .observe_pi_usage(&json!({"input":100,"cacheRead":50,"output":5,"totalTokens":0})));
@@ -2366,19 +2304,39 @@ write(v.type?{type:'response',command:method,id:v.id,success:true,data:{session:
         let compacted = mapper.observe_acp_usage(&json!({"used":10000,"size":0}));
         assert_eq!(compacted["contextTokens"], 10000);
         assert_eq!(compacted["modelContextWindow"], 262144);
-        assert_eq!(mapper.observe_acp_usage(&json!({"size":1048576}))["modelContextWindow"],1048576);
+        assert_eq!(
+            mapper.observe_acp_usage(&json!({"size":1048576}))["modelContextWindow"],
+            1048576
+        );
     }
     #[test]
     fn generated_provider_limits_are_model_specific_and_native_limits_win() {
-        let config=json!({"baseUrl":"https://api.example","protocol":"anthropic","model":"glm-5.3","models":["glm-5.3","kimi-for-coding","kimi-for-coding-highspeed","MiniMax-M2.7"]});
-        let provider=pi_provider_config(&config).unwrap();
-        for (id, capacity) in [("glm-5.3",1000000),("kimi-for-coding",1048576),("kimi-for-coding-highspeed",262144),("MiniMax-M2.7",204800)] {
-            let row=provider["models"].as_array().unwrap().iter().find(|row|row["id"]==id).unwrap();
-            assert_eq!(row["contextWindow"],capacity);
-            assert_eq!(opencode_config(&config,"read")["provider"]["supercode"]["models"][id]["limit"]["context"],capacity);
+        let config = json!({"baseUrl":"https://api.example","protocol":"anthropic","model":"glm-5.3","models":["glm-5.3","kimi-for-coding","kimi-for-coding-highspeed","MiniMax-M2.7"]});
+        let provider = pi_provider_config(&config).unwrap();
+        for (id, capacity) in [
+            ("glm-5.3", 1000000),
+            ("kimi-for-coding", 1048576),
+            ("kimi-for-coding-highspeed", 262144),
+            ("MiniMax-M2.7", 204800),
+        ] {
+            let row = provider["models"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|row| row["id"] == id)
+                .unwrap();
+            assert_eq!(row["contextWindow"], capacity);
+            assert_eq!(
+                opencode_config(&config, "read")["provider"]["supercode"]["models"][id]["limit"]
+                    ["context"],
+                capacity
+            );
         }
-        let declared=json!({"baseUrl":"https://api.example","protocol":"anthropic","model":"glm-5.3","piProvider":{"models":[{"id":"glm-5.3","contextWindow":32768}]}});
-        assert_eq!(pi_provider_config(&declared).unwrap()["models"][0]["contextWindow"],32768);
+        let declared = json!({"baseUrl":"https://api.example","protocol":"anthropic","model":"glm-5.3","piProvider":{"models":[{"id":"glm-5.3","contextWindow":32768}]}});
+        assert_eq!(
+            pi_provider_config(&declared).unwrap()["models"][0]["contextWindow"],
+            32768
+        );
     }
     #[test]
     fn native_tool_paths_and_interrupted_items_survive_normalization() {
@@ -2450,24 +2408,72 @@ write(v.type?{type:'response',command:method,id:v.id,success:true,data:{session:
     fn opencode_execution_permissions_do_not_keep_the_readonly_policy() {
         for mode in ["ask", "strict", "full"] {
             let config = opencode_config(&json!({}), mode);
-            assert_eq!(config["permission"]["*"], if mode == "full" { "allow" } else { "ask" });
+            assert_eq!(
+                config["permission"]["*"],
+                if mode == "full" { "allow" } else { "ask" }
+            );
             assert!(config["permission"].get("read").is_none());
         }
-        assert_eq!(opencode_config(&json!({}), "read")["permission"]["*"], "deny");
+        assert_eq!(
+            opencode_config(&json!({}), "read")["permission"]["*"],
+            "deny"
+        );
+    }
+    #[test]
+    fn managed_opencode_compaction_overrides_disabled_parent_environment() {
+        for mode in ["ask", "strict", "full", "read", "summary"] {
+            let mut command = std::process::Command::new("controlled-protocol-peer");
+            command.env("OPENCODE_DISABLE_AUTOCOMPACT", "true");
+            command.envs(opencode_environment(&json!({}), mode));
+            let env = command
+                .get_envs()
+                .collect::<std::collections::HashMap<_, _>>();
+            assert_eq!(
+                env.get(std::ffi::OsStr::new("OPENCODE_DISABLE_AUTOCOMPACT")),
+                Some(&Some(std::ffi::OsStr::new("false")))
+            );
+            let config: Value = serde_json::from_str(
+                env[std::ffi::OsStr::new("OPENCODE_CONFIG_CONTENT")]
+                    .unwrap()
+                    .to_str()
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(config["compaction"]["auto"], true);
+            assert!(config["compaction"].get("prune").is_none());
+            assert_eq!(
+                config["permission"]["*"],
+                if mode == "full" {
+                    "allow"
+                } else if matches!(mode, "read" | "summary") {
+                    "deny"
+                } else {
+                    "ask"
+                }
+            );
+        }
     }
     #[test]
     fn pi_operation_results_keep_native_counts_output_and_command_metadata() {
-        let mut edit=json!({"arguments":{"file_path":"a.ts"}});
-        apply_pi_result(&mut edit,&json!({"content":[{"type":"text","text":"Edited a.ts"}],"details":{"patch":"@@ -1 +1 @@\n-old\n+new\n","supercodeFileChange":{"path":"a.ts","before":"old\n","after":"new\n"}}}),false);
-        assert_eq!(edit["changeSummary"][0]["added"],1);
-        assert_eq!(edit["changeSummary"][0]["removed"],1);
-        assert_eq!(edit["fileSnapshot"]["before"],"old\n");
-        assert_eq!(edit["output"],"Edited a.ts");
-        let mut command=json!({"arguments":{"command":"node check.js"}});
-        apply_pi_result(&mut command,&json!({"content":[{"type":"text","text":"native output"}],"structuredContent":{"exit_code":1,"wall_time_seconds":1.3}}),true);
-        assert_eq!(command["exitCode"],1);
-        assert_eq!(command["durationMs"],1300);
-        assert_eq!(command["output"],"native output");
+        let mut edit = json!({"arguments":{"file_path":"a.ts"}});
+        apply_pi_result(
+            &mut edit,
+            &json!({"content":[{"type":"text","text":"Edited a.ts"}],"details":{"patch":"@@ -1 +1 @@\n-old\n+new\n","supercodeFileChange":{"path":"a.ts","before":"old\n","after":"new\n"}}}),
+            false,
+        );
+        assert_eq!(edit["changeSummary"][0]["added"], 1);
+        assert_eq!(edit["changeSummary"][0]["removed"], 1);
+        assert_eq!(edit["fileSnapshot"]["before"], "old\n");
+        assert_eq!(edit["output"], "Edited a.ts");
+        let mut command = json!({"arguments":{"command":"node check.js"}});
+        apply_pi_result(
+            &mut command,
+            &json!({"content":[{"type":"text","text":"native output"}],"structuredContent":{"exit_code":1,"wall_time_seconds":1.3}}),
+            true,
+        );
+        assert_eq!(command["exitCode"], 1);
+        assert_eq!(command["durationMs"], 1300);
+        assert_eq!(command["output"], "native output");
         assert!(command["changes"].is_null());
     }
     #[test]

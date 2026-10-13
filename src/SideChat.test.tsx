@@ -40,19 +40,41 @@ async function render(draft:SideDraft, options:Partial<ComponentProps<typeof Sid
   await act(async()=>root.render(<SideChat draft={draft} projectId="" agent="pi" connectionId={draft.connectionId??'@local'} defaults={defaults} close={()=>{}} opened={()=>{}} openFile={()=>{}} showDiff={()=>{}} providerRequired={providerRequired} {...options}/>));
 }
 async function send() {await act(async()=>{container.querySelector('form')!.dispatchEvent(new Event('submit',{bubbles:true,cancelable:true}));});}
+it('blocks Enter while a side model switch is pending and uses the new model afterwards', async () => {
+  missing = false;
+  const base = vi.mocked(call).getMockImplementation()!; let finish!: (session: Session) => void;
+  vi.mocked(call).mockImplementation((command, args={}) => command === 'switch_session_model' ? new Promise(resolve => { finish = resolve; }) : base(command,args));
+  const profiles = [{ id:'api:pi',agent:'pi',name:'Pi API',model:'test-model',models:['test-model','next-model'],hasCredential:true,current:true }];
+  await render({key:'draft',text:'建立侧边聊天',connectionId:'api:pi'}, { profiles, catalog:{ origin:'saved',data:[{id:'test-model',model:'test-model',displayName:'test-model',isDefault:true},{id:'next-model',model:'next-model',displayName:'next-model',isDefault:false}],source:{providerId:'custom',providerName:'Pi API',mark:'P',available:true} } });
+  await send();
+  const input = container.querySelector<HTMLTextAreaElement>('[aria-label="侧边聊天消息"]')!;
+  await act(async () => { Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype,'value')!.set!.call(input,'切换后再发送'); input.dispatchEvent(new Event('input',{bubbles:true})); });
+  await act(async () => container.querySelector<HTMLButtonElement>('.model-chip')!.click());
+  await act(async () => [...container.querySelectorAll<HTMLButtonElement>('.model-option')].find(button => button.textContent?.includes('next-model'))!.click());
+  vi.mocked(call).mockClear();
+  await act(async () => input.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',bubbles:true,cancelable:true})));
+  await send();
+  expect(call).not.toHaveBeenCalledWith('enqueue_followup',expect.anything());
+  sessions[0] = { ...sessions[0], model:'next-model' };
+  await act(async () => finish(sessions[0]));
+  await send();
+  expect(call).toHaveBeenCalledWith('enqueue_followup',expect.objectContaining({payload:expect.objectContaining({text:'切换后再发送',model:'next-model'})}));
+});
 it.each([['execute','ask'],['execute','full'],['execute','auto'],['revise','full']] as const)('reviews a native side-chat plan as %s preserving %s permission and its unsent draft',async (decision,remembered)=>{
   missing=false;
+  const pendingConnectionChanged=vi.fn();
   localStorage.setItem('supercode.execution-permissions.v1',JSON.stringify({codex:remembered}));
   const base=vi.mocked(call).getMockImplementation()!;
   vi.mocked(call).mockImplementation(async(command,args={})=>command==='list_messages'?[{id:'p',seq:1,sessionId:'side',role:'assistant',kind:'plan',text:'# 侧边计划\n\n包含边界验收。',data:{status:'completed'}},{id:'r',seq:2,sessionId:'side',role:'activity',kind:'runMarker',text:'',data:{status:'completed'}}]:base(command,args));
   await act(async()=>{await import('./ProposedPlan');});
-  await render({key:'draft',text:'先规划'},{agent:'codex'});await send();
+  await render({key:'draft',text:'先规划'},{agent:'codex',pendingConnectionChanged});await send();
   const input=container.querySelector<HTMLTextAreaElement>('[aria-label="侧边聊天消息"]')!;
   await act(async()=>{Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype,'value')!.set!.call(input,'保留这份侧边草稿');input.dispatchEvent(new Event('input',{bubbles:true}));});
-  vi.mocked(call).mockClear();
+  vi.mocked(call).mockClear();pendingConnectionChanged.mockClear();
   await act(async()=>container.querySelector<HTMLButtonElement>(decision==='execute'?'.plan-request-execute':'.plan-request-revise')!.click());
   expect(call).toHaveBeenCalledWith('enqueue_followup',{sessionId:'side',payload:expect.objectContaining({permissionMode:decision==='execute'?remembered:'read',readOnly:decision==='revise',attachments:[]})});
   expect(input.value).toBe('保留这份侧边草稿');
+  expect(pendingConnectionChanged.mock.calls).toEqual([[{agent:'codex',id:'@local'}],[null]]);
 });
 it('restores full access when accepting a native Claude plan in the side chat',async()=>{
   missing=false;
@@ -258,4 +280,134 @@ it('keeps a newer side draft while an earlier message is being submitted', async
   await act(async()=>{release();await gate;});
   expect(call).toHaveBeenCalledWith('enqueue_followup',expect.objectContaining({payload:expect.objectContaining({text:'先发送这条'})}));
   expect(textarea.value).toBe('下一条还在编辑');
+});
+
+it('notifies the selected connection before validation and keeps it protected when the side chat is hidden', async () => {
+  missing=false;
+  const pendingConnectionChanged=vi.fn();
+  let validate!:()=>void,enqueue!:()=>void;
+  const validation=new Promise<void>(resolve=>{validate=resolve;});
+  const enqueuing=new Promise<void>(resolve=>{enqueue=resolve;});
+  const original=vi.mocked(call).getMockImplementation()!;
+  vi.mocked(call).mockImplementation(async(command,args={})=>{
+    if(['check_chat_connection','create_session','enqueue_followup'].includes(command))expect(pendingConnectionChanged).toHaveBeenLastCalledWith({agent:'pi',id:'selected:pi'});
+    if(command==='check_chat_connection')await validation;
+    if(command==='enqueue_followup')await enqueuing;
+    return original(command,args);
+  });
+  const draft={key:'draft',text:'侧边发送',connectionId:'selected:pi'};
+  await render(draft,{pendingConnectionChanged});await send();
+  expect(pendingConnectionChanged.mock.calls).toEqual([[{agent:'pi',id:'selected:pi'}]]);
+  await render(draft,{pendingConnectionChanged,connectionId:'unrelated:pi',hidden:true});
+  expect(container.querySelector('aside')!.hidden).toBe(true);
+  expect(pendingConnectionChanged).toHaveBeenCalledTimes(1);
+  await act(async()=>{validate();await validation;});
+  expect(call).toHaveBeenCalledWith('create_session',expect.objectContaining({connectionId:'selected:pi'}));
+  expect(pendingConnectionChanged).toHaveBeenCalledTimes(1);
+  await act(async()=>{enqueue();await enqueuing;});
+  expect(pendingConnectionChanged.mock.calls).toEqual([[{agent:'pi',id:'selected:pi'}],[null]]);
+});
+
+it('keeps an unbound side draft on its initial route when the main default changes', async () => {
+  missing=false;
+  const draft={key:'draft',text:'保留侧边选择'};
+  const pendingConnectionChanged=vi.fn();
+  await render(draft,{connectionId:'original:pi',pendingConnectionChanged});
+  await render(draft,{connectionId:'new-default:pi',pendingConnectionChanged});
+  await send();
+  expect(call).toHaveBeenCalledWith('check_chat_connection',{agent:'pi',connectionId:'original:pi',sessionId:null});
+  expect(call).toHaveBeenCalledWith('create_session',expect.objectContaining({connectionId:'original:pi'}));
+  expect(pendingConnectionChanged).toHaveBeenNthCalledWith(1,{agent:'pi',id:'original:pi'});
+});
+
+it.each(['check_chat_connection','create_session','enqueue_followup'])('clears the pending route when %s fails',async failedCommand=>{
+  missing=false;
+  const pendingConnectionChanged=vi.fn(),original=vi.mocked(call).getMockImplementation()!;
+  vi.mocked(call).mockImplementation(async(command,args={})=>{if(command===failedCommand)throw new Error('提交失败');return original(command,args);});
+  await render({key:'draft',text:'侧边发送',connectionId:'chosen:pi'},{pendingConnectionChanged});await send();
+  expect(pendingConnectionChanged.mock.calls).toEqual([[{agent:'pi',id:'chosen:pi'}],[null]]);
+  expect(container.querySelector('[role="alert"]')?.textContent).toContain('提交失败');
+});
+
+it('clears a missing-provider pending route while preserving the side draft',async()=>{
+  const pendingConnectionChanged=vi.fn();
+  await render({key:'draft',text:'连接尚未配置',connectionId:'missing:pi'},{pendingConnectionChanged});await send();
+  expect(pendingConnectionChanged.mock.calls).toEqual([[{agent:'pi',id:'missing:pi'}],[null]]);
+  expect(providerRequired).toHaveBeenCalledWith('pi',expect.objectContaining({text:'连接尚未配置',connectionId:'missing:pi'}));
+});
+
+it.each(['check_chat_connection','create_session'])('clears an unmounted %s operation without clearing a newly opened side chat or enqueueing the old draft',async waitingCommand=>{
+  missing=false;
+  const pendingConnectionChanged=vi.fn();
+  let oldRelease!:()=>void,newRelease!:()=>void;
+  const oldGate=new Promise<void>(resolve=>{oldRelease=resolve;});
+  const newGate=new Promise<void>(resolve=>{newRelease=resolve;});
+  const original=vi.mocked(call).getMockImplementation()!;
+  vi.mocked(call).mockImplementation(async(command,args={})=>{
+    if(command===waitingCommand&&args.connectionId==='old:pi')await oldGate;
+    if(command==='check_chat_connection'&&args.connectionId==='new:pi')await newGate;
+    return original(command,args);
+  });
+  await render({key:'old',text:'旧侧边草稿',connectionId:'old:pi'},{pendingConnectionChanged});await send();
+  await act(async()=>root.render(null));
+  expect(pendingConnectionChanged.mock.calls).toEqual([[{agent:'pi',id:'old:pi'}],[null]]);
+  await render({key:'new',text:'新侧边草稿',connectionId:'new:pi'},{pendingConnectionChanged});await send();
+  expect(pendingConnectionChanged).toHaveBeenLastCalledWith({agent:'pi',id:'new:pi'});
+  await act(async()=>{oldRelease();await oldGate;});
+  expect(pendingConnectionChanged).toHaveBeenCalledTimes(3);
+  expect(call).not.toHaveBeenCalledWith('enqueue_followup',expect.anything());
+  if(waitingCommand==='check_chat_connection')expect(call).not.toHaveBeenCalledWith('create_session',expect.objectContaining({connectionId:'old:pi'}));
+  await act(async()=>{newRelease();await newGate;});
+  expect(pendingConnectionChanged).toHaveBeenLastCalledWith(null);
+  expect(call).toHaveBeenCalledWith('enqueue_followup',expect.objectContaining({payload:expect.objectContaining({text:'新侧边草稿'})}));
+});
+
+it('does not clear a concurrent queue-resume pending operation when a send finishes',async()=>{
+  missing=false;
+  const pendingConnectionChanged=vi.fn(),original=vi.mocked(call).getMockImplementation()!;
+  let sending=false,sendRelease!:()=>void,resumeRelease!:()=>void;
+  const sendGate=new Promise<void>(resolve=>{sendRelease=resolve;});
+  const resumeGate=new Promise<void>(resolve=>{resumeRelease=resolve;});
+  vi.mocked(call).mockImplementation(async(command,args={})=>{
+    if(command==='list_followups')return [{id:'paused',sessionId:'side',status:'paused',error:null,payload:{...defaults,text:'暂缓的侧边补充'}}];
+    if(command==='check_chat_connection'&&sending)await sendGate;
+    if(command==='change_followup'&&args.action==='resume')await resumeGate;
+    return original(command,args);
+  });
+  await render({key:'draft',text:'开始侧边聊天',connectionId:'bound:pi'},{pendingConnectionChanged});await send();
+  pendingConnectionChanged.mockClear();sending=true;
+  const input=container.querySelector<HTMLTextAreaElement>('[aria-label="侧边聊天消息"]')!;
+  await act(async()=>{Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype,'value')!.set!.call(input,'新侧边任务');input.dispatchEvent(new Event('input',{bubbles:true}));});
+  await send();
+  await act(async()=>[...container.querySelectorAll<HTMLButtonElement>('button')].find(button=>button.textContent==='继续排队')!.click());
+  expect(pendingConnectionChanged.mock.calls).toEqual([[{agent:'pi',id:'bound:pi'}],[{agent:'pi',id:'bound:pi'}]]);
+  await act(async()=>{sendRelease();await sendGate;});
+  expect(pendingConnectionChanged.mock.calls.some(([connection])=>connection===null)).toBe(false);
+  await act(async()=>{resumeRelease();await resumeGate;});
+  expect(pendingConnectionChanged).toHaveBeenLastCalledWith(null);
+});
+
+it('protects a goal start before validating and clears it when the start completes',async()=>{
+  missing=false;
+  const pendingConnectionChanged=vi.fn(),original=vi.mocked(call).getMockImplementation()!;
+  let release!:()=>void;
+  const gate=new Promise<void>(resolve=>{release=resolve;});
+  vi.mocked(call).mockImplementation(async(command,args={})=>{
+    if(command==='list_local_skills')return {skills:[],warnings:[]};
+    if(command==='list_extensions')return {plugins:[],mcp:[],warnings:[]};
+    if(command==='check_chat_connection'){expect(pendingConnectionChanged).toHaveBeenLastCalledWith({agent:'codex',id:'goal:codex'});await gate;}
+    return original(command,args);
+  });
+  await render({key:'draft',text:'',connectionId:'goal:codex'},{agent:'codex',pendingConnectionChanged});
+  await act(async()=>container.querySelector<HTMLButtonElement>('[aria-label="添加附件"]')!.click());
+  await act(async()=>container.querySelector<HTMLButtonElement>('[data-goal-entry]')!.click());
+  await act(async()=>{
+    const input=container.querySelector<HTMLTextAreaElement>('.add-goal-panel textarea')!;
+    Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype,'value')!.set!.call(input,'完成侧边任务');input.dispatchEvent(new Event('input',{bubbles:true}));
+  });
+  await act(async()=>container.querySelector<HTMLButtonElement>('.add-goal-actions button')!.click());
+  expect(pendingConnectionChanged.mock.calls).toEqual([[{agent:'codex',id:'goal:codex'}]]);
+  await act(async()=>{release();await gate;});
+  expect(call).toHaveBeenCalledWith('execute_agent_command',{sessionId:'side',command:'goal-create',argument:'完成侧边任务',permissionMode:'read'});
+  expect(pendingConnectionChanged).toHaveBeenLastCalledWith(null);
 });

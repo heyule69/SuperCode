@@ -366,7 +366,6 @@ pub async fn remove_official_account(
     let state = app.state::<AppState>();
     let id = format!("account:{account_id}");
     state.store.profile(&agent, &id)?.ok_or("账号不存在")?;
-    state.runtime.release(&app).await?;
     state.store.delete_profile(&id)?; // Refuse removal while any chat still uses it.
     if dir.exists() {
         tokio::fs::remove_dir_all(dir)
@@ -483,6 +482,30 @@ mod tests {
             assert_eq!(store.default_connection(agent).unwrap(), b.id);
             drop(store);
             let _ = std::fs::remove_file(path);
+        }
+    }
+    #[test]
+    fn official_accounts_can_be_added_and_selected_while_the_active_account_is_locked() {
+        for agent in ["codex", "claude"] {
+            let store = crate::storage::Store::from_connection(rusqlite::Connection::open_in_memory().unwrap()).unwrap();
+            let active = profile(agent, &uuid::Uuid::new_v4().to_string(), "Active account");
+            store.import_profiles(&[active.clone()]).unwrap();
+            let project = store.add_project(Path::new("D:/account-edit-guard")).unwrap();
+            let chat = store.create_configured_session(&project.id, None, agent, Some(&active.id)).unwrap();
+            store.claim(&chat.id).unwrap();
+            let mut renamed = active.clone();
+            renamed.name = "Renamed account".into();
+            assert!(store.import_profiles(&[renamed.clone()]).is_err());
+            assert!(store.delete_profile(&active.id).is_err());
+            let additional = profile(agent, &uuid::Uuid::new_v4().to_string(), "New account");
+            store.import_profiles(&[additional.clone()]).unwrap();
+            store.select_profile(agent, Some(&additional.id)).unwrap();
+            store.use_official(agent).unwrap();
+            assert_eq!(store.session(&chat.id).unwrap().status, "starting");
+            assert_eq!(store.session(&chat.id).unwrap().connection_id.as_deref(), Some(active.id.as_str()));
+            store.set_status(&chat.id, "idle", None).unwrap();
+            store.import_profiles(&[renamed]).unwrap();
+            assert_eq!(store.profile(agent, &active.id).unwrap().unwrap().name, "Renamed account");
         }
     }
 }

@@ -28,6 +28,11 @@ fn sensitive(key: &str) -> bool {
         || key.ends_with("cookie")
         || key.ends_with("privatekey")
 }
+fn remember(secret: &str, secrets: &mut Vec<String>) {
+    if secret.len() >= 4 && secret.len() <= 4096 && secrets.len() < 512 && !secrets.iter().any(|known| known == secret) {
+        secrets.push(secret.to_owned());
+    }
+}
 pub fn collect(value: &Value, secrets: &mut Vec<String>, depth: usize) {
     if depth > 12 || secrets.len() >= 512 {
         return;
@@ -36,12 +41,7 @@ pub fn collect(value: &Value, secrets: &mut Vec<String>, depth: usize) {
         Value::Object(fields) => {
             for (key, value) in fields {
                 if sensitive(key) {
-                    if let Some(secret) = value.as_str().filter(|s| s.len() >= 4 && s.len() <= 4096)
-                    {
-                        if !secrets.iter().any(|s| s == secret) {
-                            secrets.push(secret.to_owned());
-                        }
-                    }
+                    if let Some(secret) = value.as_str() { remember(secret, secrets); }
                 } else if key == "config" {
                     if let Some(text) = value.as_str() {
                         if let Ok(table) = toml::from_str::<toml::Table>(text) {
@@ -71,6 +71,77 @@ pub fn collect(value: &Value, secrets: &mut Vec<String>, depth: usize) {
         }
         _ => {}
     }
+}
+/// MCP transports may use arbitrary environment/header names. Register values,
+/// including resolved environment references, without emitting the configuration.
+pub fn collect_mcp(config: &Value, secrets: &mut Vec<String>, environment: impl Fn(&str) -> Option<String>) {
+    fn credential(value: &str, secrets: &mut Vec<String>) {
+        remember(value, secrets);
+        if let Some((scheme, token)) = value.split_once(' ') {
+            if scheme.eq_ignore_ascii_case("bearer") || scheme.eq_ignore_ascii_case("basic") {
+                remember(token.trim(), secrets);
+            }
+        }
+    }
+    fn visit(value: &Value, secrets: &mut Vec<String>, environment: &impl Fn(&str) -> Option<String>, depth: usize) {
+        if depth > 12 || secrets.len() >= 512 { return; }
+        match value {
+            Value::Object(fields) => {
+                for (key, value) in fields {
+                    match key.as_str() {
+                        "env" | "http_headers" | "headers" => {
+                            if let Some(fields) = value.as_object() {
+                                for value in fields.values().filter_map(Value::as_str) { credential(value, secrets); }
+                            }
+                        }
+                        "env_http_headers" => {
+                            if let Some(fields) = value.as_object() {
+                                for name in fields.values().filter_map(Value::as_str) {
+                                    if let Some(value) = environment(name) { credential(&value, secrets); }
+                                }
+                            }
+                        }
+                        "bearer_token_env_var" => {
+                            if let Some(value) = value.as_str().and_then(environment) { credential(&value, secrets); }
+                        }
+                        "args" => {
+                            if let Some(args) = value.as_array() {
+                                for (index, arg) in args.iter().enumerate() {
+                                    let Some(arg) = arg.as_str() else { continue; };
+                                    if let Some((flag, value)) = arg.split_once('=') {
+                                        if sensitive(flag) { credential(value, secrets); }
+                                        visit(&Value::String(value.to_owned()), secrets, environment, depth + 1);
+                                    } else if sensitive(arg) && arg.starts_with('-') {
+                                        if let Some(value) = args.get(index + 1).and_then(Value::as_str) { credential(value, secrets); }
+                                    } else if matches!(arg, "--header" | "--headers" | "-H") {
+                                        if let Some((_, value)) = args.get(index + 1).and_then(Value::as_str).and_then(|value| value.split_once(':')) {
+                                            credential(value.trim(), secrets);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                    visit(value, secrets, environment, depth + 1);
+                }
+            }
+            Value::Array(values) => {
+                for value in values.iter().take(256) { visit(value, secrets, environment, depth + 1); }
+            }
+            Value::String(value) => {
+                if let Ok(url) = tauri::Url::parse(value) {
+                    if let Some(password) = url.password() { credential(password, secrets); }
+                    for (_, value) in url.query_pairs().filter(|(key, _)| sensitive(key)) { credential(&value, secrets); }
+                } else if let Ok(table) = toml::from_str::<toml::Table>(value) {
+                    if let Ok(value) = serde_json::to_value(table) { visit(&value, secrets, environment, depth + 1); }
+                }
+            }
+            _ => {}
+        }
+    }
+    collect(config, secrets, 0);
+    visit(config, secrets, &environment, 0);
 }
 pub fn environment() -> Vec<String> {
     let mut secrets = Vec::new();
@@ -221,6 +292,19 @@ pub fn text(text: &str, secrets: &[String]) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+    #[test]
+    fn mcp_custom_credentials_and_resolved_header_values_are_redacted_without_labels() {
+        let config = json!({"env":{"CUSTOM_ACCESS":"env-value-123"},
+            "http_headers":{"X-Custom":"header-value-456","Authorization":"Bearer opaque-value-789"},
+            "env_http_headers":{"X-Other":"HEADER_ENV"},"url":"https://example.com/mcp?api_key=query-value-654",
+            "args":["--header","Authorization: Bearer argument-value-111","--url=https://example.com/mcp?api_key=argument-value-222"]});
+        let mut secrets = Vec::new();
+        collect_mcp(&config, &mut secrets, |name| (name == "HEADER_ENV").then(|| "resolved-value-321".to_owned()));
+        let input = "Rejected env-value-123 header-value-456 opaque-value-789 resolved-value-321 query-value-654 argument-value-111 argument-value-222";
+        let output = text(input, &secrets);
+        assert_eq!(output, "Rejected [REDACTED] [REDACTED] [REDACTED] [REDACTED] [REDACTED] [REDACTED] [REDACTED]");
+        assert_eq!(value(json!({"message":input}), &secrets)["message"], output);
+    }
     #[test]
     fn masks_known_keys_auth_headers_json_and_url_credentials() {
         let mut secrets = Vec::new();

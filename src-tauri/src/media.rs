@@ -23,6 +23,7 @@ static PREVIEW_WORK: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(
 #[derive(Clone)]
 struct Entry {
     token: String,
+    principal: Principal,
     path: PathBuf,
     mime: String,
     image: bool,
@@ -30,6 +31,33 @@ struct Entry {
 #[derive(Default)]
 pub struct Media {
     files: Mutex<VecDeque<Entry>>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct Principal {
+    webview: String,
+    origin: String,
+}
+
+fn app_webview(label: &str) -> bool {
+    label == "main" || label.starts_with("chat-") && label.len() > 5
+}
+
+impl Principal {
+    fn new(label: &str, url: &tauri::Url) -> Result<Self, String> {
+        let origin = match (url.scheme(), url.host_str(), url.port()) {
+            ("tauri", Some("localhost"), None) => "tauri://localhost".to_owned(),
+            ("http" | "https", Some("tauri.localhost"), None) => url.origin().ascii_serialization(),
+            ("http", Some("127.0.0.1" | "localhost"), Some(1420)) if cfg!(debug_assertions) => {
+                url.origin().ascii_serialization()
+            }
+            _ => return Err("媒体只能由 SuperCode 窗口预览".into()),
+        };
+        if !app_webview(label) {
+            return Err("媒体只能由 SuperCode 窗口预览".into());
+        }
+        Ok(Self { webview: label.to_owned(), origin })
+    }
 }
 
 pub fn format(path: &str) -> Option<(&'static str, &'static str)> {
@@ -146,14 +174,20 @@ pub async fn reveal_media(
 }
 
 impl Media {
-    fn register(&self, path: PathBuf, mime: &str, image: bool) -> Result<String, String> {
-        let token = format!("{:x}", Sha256::digest(path.to_string_lossy().as_bytes()));
+    fn register(&self, principal: &Principal, path: PathBuf, mime: &str, image: bool) -> Result<String, String> {
         let mut files = self.files.lock().map_err(|_| "媒体加载失败")?;
-        if let Some(index) = files.iter().position(|file| file.token == token) {
-            files.remove(index);
+        // Repeated cards in this same window retain their URL; another window
+        // receives its own unpredictable grant for the same file.
+        if let Some(index) = files.iter().position(|file| file.path == path && &file.principal == principal) {
+            let entry = files.remove(index).unwrap();
+            let token = entry.token.clone();
+            files.push_back(entry);
+            return Ok(token);
         }
+        let token = uuid::Uuid::new_v4().to_string();
         files.push_back(Entry {
             token: token.clone(),
+            principal: principal.clone(),
             path,
             mime: mime.into(),
             image,
@@ -171,7 +205,9 @@ pub async fn prepare_media(
     project_id: Option<String>,
     session_id: Option<String>,
     app: AppHandle,
+    webview: tauri::Webview,
 ) -> Result<Value, String> {
+    let principal = Principal::new(webview.label(), &webview.url().map_err(|_| "媒体窗口不可用")?)?;
     let _permit = PREVIEW_WORK.acquire().await.map_err(|e| e.to_string())?;
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<crate::AppState>();
@@ -179,7 +215,7 @@ pub async fn prepare_media(
         let (kind, mime) = format(&path.to_string_lossy()).ok_or("不支持预览此文件类型")?;
         if kind == "image" && fs::metadata(&path).map_err(|e| e.to_string())?.len() > BLOB_LIMIT as u64 { return Err("图片超过 10 MB，请在系统中打开".into()); }
         let registry = app.state::<Media>();
-        let token = registry.register(path.clone(), mime, kind == "image")?;
+        let token = registry.register(&principal, path.clone(), mime, kind == "image")?;
         let mut preview = token.clone();
         // Raster previews decode off the UI thread and cache a 960px image.
         if matches!(mime, "image/png" | "image/jpeg" | "image/webp") {
@@ -189,7 +225,7 @@ pub async fn prepare_media(
             let key = format!("{:x}", Sha256::digest(&bytes));
             let thumb = root.join(format!("{key}.preview.png"));
             if !thumb.exists() { fs::write(&thumb, crate::image_attachments::thumbnail_size(&bytes, 960, 720)?).map_err(|e| e.to_string())?; }
-            preview = registry.register(thumb, "image/png", true)?;
+            preview = registry.register(&principal, thumb, "image/png", true)?;
         }
         Ok(json!({"token":token,"previewToken":preview,"kind":kind,"mimeType":mime,"path":path.to_string_lossy(),"name":path.file_name().unwrap_or_default().to_string_lossy()}))
     }).await.map_err(|e| e.to_string())?
@@ -228,8 +264,13 @@ fn byte_range(range: Option<&str>, length: u64) -> Result<(u64, u64, bool), ()> 
     Ok((start, (end - start + 1).min(CHUNK), true))
 }
 
-pub fn response(media: &Media, request: Request<Vec<u8>>) -> Response<Vec<u8>> {
+pub fn response(media: &Media, webview: &str, request: Request<Vec<u8>>) -> Response<Vec<u8>> {
     let result = || -> Result<Response<Vec<u8>>, String> {
+        // URI protocols are installed in every WebView, independently of IPC
+        // capabilities. The authenticated Tauri caller must own this grant.
+        if !app_webview(webview) {
+            return Err("媒体尚未授权".into());
+        }
         if !matches!(request.method().as_str(), "GET" | "HEAD") {
             return Err("不支持此媒体请求".into());
         }
@@ -239,16 +280,22 @@ pub fn response(media: &Media, request: Request<Vec<u8>>) -> Response<Vec<u8>> {
             .lock()
             .map_err(|_| "媒体加载失败")?
             .iter()
-            .find(|file| file.token == token)
+            .find(|file| file.token == token && file.principal.webview == webview)
             .cloned()
             .ok_or("媒体尚未授权")?;
+        if let Some(origin) = request.headers().get("Origin") {
+            if origin.to_str().ok() != Some(entry.principal.origin.as_str()) {
+                return Err("媒体尚未授权".into());
+            }
+        }
         let mut file = fs::File::open(&entry.path).map_err(|_| "媒体文件已移动或删除")?;
         let len = file.metadata().map_err(|e| e.to_string())?.len();
         let mut builder = Response::builder()
             .header("Content-Type", entry.mime)
             .header("Accept-Ranges", "bytes")
             .header("X-Content-Type-Options", "nosniff")
-            .header("Access-Control-Allow-Origin", "*")
+            .header("Access-Control-Allow-Origin", &entry.principal.origin)
+            .header("Vary", "Origin")
             .header("Cache-Control", "no-cache");
         if request.method() == "HEAD" {
             return builder
@@ -555,19 +602,21 @@ mod tests {
         let path = root.join("片段.mp4");
         fs::write(&path, (0..100u8).collect::<Vec<_>>()).unwrap();
         let registry = Media::default();
-        let token = registry.register(path.clone(), "video/mp4", false).unwrap();
+        let principal = Principal::new("main", &tauri::Url::parse("http://tauri.localhost/").unwrap()).unwrap();
+        let token = registry.register(&principal, path.clone(), "video/mp4", false).unwrap();
         let request = Request::builder()
             .uri(format!("http://supercode-media.localhost/{token}"))
             .header("Range", "bytes=10-19")
             .body(vec![])
             .unwrap();
-        let result = response(&registry, request);
+        let result = response(&registry, "main", request);
         assert_eq!(result.status(), 206);
         assert_eq!(result.headers()["Content-Range"], "bytes 10-19/100");
         assert_eq!(result.body(), &(10..20u8).collect::<Vec<_>>());
         assert_eq!(
             response(
                 &registry,
+                "main",
                 Request::builder()
                     .uri("http://supercode-media.localhost/C:/secret.txt")
                     .body(vec![])
@@ -579,6 +628,7 @@ mod tests {
         fs::File::create(&path).unwrap().set_len(8 * CHUNK).unwrap();
         let head = response(
             &registry,
+            "main",
             Request::builder()
                 .method("HEAD")
                 .uri(format!("http://supercode-media.localhost/{token}"))
@@ -589,6 +639,7 @@ mod tests {
         assert_eq!(head.headers()["Content-Length"], (8 * CHUNK).to_string());
         let range = response(
             &registry,
+            "main",
             Request::builder()
                 .uri(format!("http://supercode-media.localhost/{token}"))
                 .header("Range", "bytes=0-")
@@ -600,6 +651,7 @@ mod tests {
         assert_eq!(
             response(
                 &registry,
+                "main",
                 Request::builder()
                     .uri(format!("http://supercode-media.localhost/{token}"))
                     .body(vec![])
@@ -614,6 +666,43 @@ mod tests {
         let script = root.join("script.ps1");
         fs::write(&script, "Write-Host test").unwrap();
         assert!(local_path(script.to_str().unwrap(), None).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn media_grants_are_unpredictable_and_bound_to_the_requesting_window_and_origin() {
+        let root = std::env::temp_dir().join(format!("supercode-media-grants-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("private.png");
+        fs::write(&path, b"registered-media").unwrap();
+        let url = tauri::Url::parse("http://tauri.localhost/").unwrap();
+        let main = Principal::new("main", &url).unwrap();
+        let chat = Principal::new("chat-one", &url).unwrap();
+        let media = Media::default();
+        let token = media.register(&main, path.clone(), "image/png", true).unwrap();
+        let chat_token = media.register(&chat, path.clone(), "image/png", true).unwrap();
+        assert_ne!(token, chat_token);
+        assert_eq!(media.register(&main, path.clone(), "image/png", true).unwrap(), token);
+        let second = Media::default().register(&main, path.clone(), "image/png", true).unwrap();
+        assert_ne!(token, second);
+        assert_ne!(token, format!("{:x}", Sha256::digest(path.to_string_lossy().as_bytes())));
+        let request = |token: &str, origin: Option<&str>| {
+            let mut request = Request::builder().uri(format!("http://supercode-media.localhost/{token}"));
+            if let Some(origin) = origin { request = request.header("Origin", origin); }
+            request.body(vec![]).unwrap()
+        };
+        for label in ["browser-one", "chat-one", "tray-popup"] {
+            let denied = response(&media, label, request(&token, None));
+            assert_eq!(denied.status(), 404);
+            assert!(!denied.headers().contains_key("Access-Control-Allow-Origin"));
+            assert_ne!(denied.body(), b"registered-media");
+        }
+        assert_eq!(response(&media, "main", request(&token, Some("https://attacker.example"))).status(), 404);
+        let allowed = response(&media, "main", request(&token, Some("http://tauri.localhost")));
+        assert_eq!(allowed.body(), b"registered-media");
+        assert_eq!(allowed.headers()["Access-Control-Allow-Origin"], "http://tauri.localhost");
+        assert_eq!(response(&media, "chat-one", request(&chat_token, None)).status(), 200);
+        assert!(Principal::new("browser-one", &url).is_err());
+        assert!(Principal::new("main", &tauri::Url::parse("https://attacker.example/").unwrap()).is_err());
         fs::remove_dir_all(root).unwrap();
     }
 }

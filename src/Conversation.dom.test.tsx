@@ -6,6 +6,7 @@ import { Conversation } from './Conversation';
 import { mergeEvent, reconcileMessages } from './events';
 import type { Message } from './types';
 import type { TurnLifecycle } from './turnPresentation';
+import * as diffs from './diff';
 
 vi.mock('./api', () => ({ desktop: true, call: vi.fn(async () => ({ token: 'full', previewToken: 'small' })) }));
 vi.mock('@tauri-apps/api/core', () => ({ convertFileSrc: (token: string) => `http://supercode-media.localhost/${token}` }));
@@ -22,6 +23,15 @@ beforeEach(async () => {
   await act(async () => { await import('./Markdown'); });
 });
 afterEach(async () => { await act(async () => root.unmount()); node.remove(); vi.unstubAllGlobals(); });
+it('does not parse completed history diffs again when only the latest streamed answer changes', async () => {
+  const showDiff = vi.fn(), openFile = vi.fn(), parse = vi.spyOn(diffs,'diffFiles');
+  const messages = [message('old-user','user','旧任务'),message('old-answer','assistant','旧结果'),message('old-diff','activity','diff --git a/a b/a\n@@ -1 +1 @@\n-old\n+new\n','turnDiff'),run('completed','old-run'),message('new-user','user','新任务'),message('new-answer','assistant','正在输出','agentMessage',{turnId:'new-turn',status:'inProgress'}),message('new-run','activity','','runMarker',{turnId:'new-turn',status:'inProgress'})];
+  await act(async () => root.render(<Conversation messages={messages} agentName="Codex" autoExpand={false} sessionStatus="running" activeTurnId="new-turn" showDiff={showDiff} openFile={openFile}/>));
+  expect(parse).toHaveBeenCalled(); parse.mockClear();
+  const next = mergeEvent(messages,{method:'item/agentMessage/delta',params:{threadId:'native',turnId:'new-turn',itemId:'new-answer',delta:'新内容'}},'s');
+  await act(async () => root.render(<Conversation messages={next} agentName="Codex" autoExpand={false} sessionStatus="running" activeTurnId="new-turn" showDiff={showDiff} openFile={openFile}/>));
+  expect(parse).not.toHaveBeenCalled(); expect(node.textContent).toContain('旧结果'); expect(node.textContent).toContain('新内容'); parse.mockRestore();
+});
 it('opens file operations in the side review and keeps command output behind its own detail toggle',async()=>{
   const diff='--- a/src/中文.ts\n+++ b/src/中文.ts\n@@ -1,2 +1,3 @@\n stable\n-old-value\n+new-value\n+added-value\n';
   const edits=Array.from({length:5},(_,i)=>message(`edit-${i}`,'tool','TOOL_RESULT_'+i,'claudeToolCall',{tool:i?'Edit':'Write',status:'completed',arguments:{file_path:'src/中文.ts'},changes:[{path:'src/中文.ts',kind:{type:i?'update':'add'},diff,added:2,removed:1}]}));

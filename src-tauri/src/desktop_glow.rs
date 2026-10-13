@@ -102,7 +102,7 @@ mod native {
         },
         UI::{
             HiDpi::*,
-            Input::KeyboardAndMouse::{RegisterHotKey, UnregisterHotKey, MOD_NOREPEAT, VK_ESCAPE},
+            Input::KeyboardAndMouse::VK_ESCAPE,
             Input::*,
             WindowsAndMessaging::*,
         },
@@ -198,13 +198,14 @@ mod native {
                     2,
                     std::mem::size_of::<RAWINPUTDEVICE>() as u32,
                 ) != 0;
-                let hotkey_ready =
-                    RegisterHotKey(input_window, 1, MOD_NOREPEAT, VK_ESCAPE as u32) != 0;
+                // RegisterHotKey cannot distinguish a tagged agent Escape from
+                // user input. The tagged-aware hook and raw hardware input both
+                // cover real Esc without cancelling the agent's own keystrokes.
                 let key =
                     SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard), GetModuleHandleW(null()), 0);
                 let pointer =
                     SetWindowsHookExW(WH_MOUSE_LL, Some(mouse), GetModuleHandleW(null()), 0);
-                if key.is_null() || pointer.is_null() || !raw_ready || !hotkey_ready {
+                if key.is_null() || pointer.is_null() || !raw_ready {
                     if !key.is_null() {
                         UnhookWindowsHookEx(key);
                     }
@@ -256,7 +257,6 @@ mod native {
         }
     }
     unsafe fn cleanup_input(window: HWND, original: &[RAWINPUTDEVICE]) {
-        UnregisterHotKey(window, 1);
         let remove = [2, 6].map(|usage| RAWINPUTDEVICE {
             usUsagePage: 1,
             usUsage: usage,
@@ -449,10 +449,6 @@ mod native {
         l: LPARAM,
     ) -> LRESULT {
         match message {
-            WM_HOTKEY if w == 1 => {
-                yield_input(true, 1);
-                0
-            }
             WM_INPUT => {
                 raw_input(l);
                 DefWindowProcW(window, message, w, l)
