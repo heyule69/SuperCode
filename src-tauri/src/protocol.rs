@@ -266,7 +266,10 @@ impl ActivityBuffer {
             self.items.clear();
             self.item_bytes.clear();
             self.cached_bytes = 0;
-            let item = json!({"id":format!("run-{}",p["turn"]["id"].as_str().unwrap_or("")),"type":"runMarker","status":"inProgress","startedAt":millis(),"turnId":p["turn"]["id"]});
+            let mut item = json!({"id":format!("run-{}",p["turn"]["id"].as_str().unwrap_or("")),"type":"runMarker","status":"inProgress","startedAt":millis(),"turnId":p["turn"]["id"]});
+            if p["turn"]["phase"] == "awaitingResponse" {
+                item["phase"] = json!("awaitingResponse");
+            }
             self.replace(item.clone());
             return Some(item);
         }
@@ -493,6 +496,24 @@ mod tests {
         assert_eq!(data["phase"], "final_answer");
         assert_eq!(data["messageId"], "native-message");
         assert_eq!(data["status"], "completed");
+    }
+    #[test]
+    fn awaiting_response_phase_survives_history_and_does_not_reopen_completed_turns() {
+        let mut buffer = ActivityBuffer::default();
+        let started = buffer.update(&json!({"method":"turn/started","params":{
+            "threadId":"n","turn":{"id":"t","phase":"awaitingResponse"}
+        }})).unwrap();
+        let (_, _, kind, data) = item_message(&started).unwrap();
+        assert_eq!(kind, "runMarker");
+        assert_eq!(data["phase"], "awaitingResponse");
+        let finished = buffer.finish("interrupted");
+        let marker = finished.iter().find(|item| item["type"] == "runMarker").unwrap();
+        assert_eq!(marker["phase"], "awaitingResponse");
+        assert_eq!(marker["status"], "interrupted");
+        let next = buffer.update(&json!({"method":"turn/started","params":{
+            "threadId":"n","turn":{"id":"next"}
+        }})).unwrap();
+        assert!(next.get("phase").is_none());
     }
     #[test]
     fn activity_cache_pressure_keeps_the_turn_marker_for_completion() {

@@ -412,10 +412,7 @@ pub async fn read_json(response: reqwest::Response) -> Result<Value, String> {
     use futures_util::StreamExt;
     let status = response.status();
     if !status.is_success() {
-        return Err(format!(
-            "API 返回 HTTP {}，请检查地址、Key、模型和套餐权限",
-            status.as_u16()
-        ));
+        return Err(http_failure(status.as_u16()));
     }
     let mut stream = response.bytes_stream();
     let mut bytes = Vec::new();
@@ -427,6 +424,101 @@ pub async fn read_json(response: reqwest::Response) -> Result<Value, String> {
         bytes.extend_from_slice(&chunk);
     }
     serde_json::from_slice(&bytes).map_err(|_| "API 返回的内容不是受支持的 JSON".to_owned())
+}
+fn http_failure(status: u16) -> String {
+    let reason = match status {
+        401 => "认证失败，请检查 API Key",
+        403 => "访问被拒绝，请检查模型和接口权限",
+        404 => "请求接口或模型不存在，请检查地址和协议",
+        429 => "请求受到限流或额度限制",
+        500..=599 => "供应商服务或上游网关异常，不能据此判断 Key 或套餐无效",
+        300..=399 => "接口返回了重定向，请填写直接的 API 地址",
+        _ => "供应商拒绝了请求，请查看返回原因",
+    };
+    format!("API 返回 HTTP {status}：{reason}")
+}
+// Editor diagnostics may include the gateway's reason, but only with the
+// effective credential available for redaction. Runtime bridge responses keep
+// using read_json and never forward arbitrary gateway errors to the model.
+async fn provider_json(response: reqwest::Response, secret: Option<&str>) -> Result<Value, String> {
+    use futures_util::StreamExt;
+    if response.status().is_success() {
+        return read_json(response).await;
+    }
+    let mut message = http_failure(response.status().as_u16());
+    let secrets: Vec<String> = secret
+        .filter(|key| !key.is_empty())
+        .map(str::to_owned)
+        .into_iter()
+        .collect();
+    let mut endpoint = response.url().clone();
+    endpoint.set_query(None);
+    endpoint.set_fragment(None);
+    let endpoint = crate::log_redaction::text(endpoint.as_str(), &secrets);
+    let request_id = ["x-request-id", "request-id", "cf-ray"]
+        .iter()
+        .find_map(|name| {
+            response
+                .headers()
+                .get(*name)?
+                .to_str()
+                .ok()
+                .filter(|value| value.len() <= 128 && !value.chars().any(char::is_control))
+                .map(|value| crate::log_redaction::text(value, &secrets))
+        });
+    let mut stream = response.bytes_stream();
+    let mut bytes = Vec::new();
+    // Do not expose partial credentials if the response exceeds this bound.
+    // An oversized body is omitted in full rather than truncated before masking.
+    while let Some(chunk) = stream.next().await {
+        let Ok(chunk) = chunk else {
+            bytes.clear();
+            break;
+        };
+        if bytes.len() + chunk.len() > 32 * 1024 {
+            bytes.clear();
+            break;
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    if let Some(reason) = provider_error_reason(&bytes, &secrets) {
+        message.push_str(&format!("；供应商原因：{reason}"));
+    }
+    message.push_str(&format!("；请求地址：{endpoint}"));
+    if let Some(request_id) = request_id {
+        message.push_str(&format!("；请求 ID：{request_id}"));
+    }
+    Err(message)
+}
+fn provider_error_reason(bytes: &[u8], secrets: &[String]) -> Option<String> {
+    let text = std::str::from_utf8(bytes).ok()?.trim();
+    if text.is_empty() || text.starts_with('<') {
+        return None;
+    }
+    let reason = if let Ok(value) = serde_json::from_str::<Value>(text) {
+        let value = crate::log_redaction::value(value, secrets);
+        let extracted = [
+            &value["error"]["message"],
+            &value["error"],
+            &value["message"],
+            &value["detail"],
+            &value["msg"],
+        ]
+        .into_iter()
+        .filter_map(Value::as_str)
+        .find(|text| !text.trim().is_empty())?
+        .to_owned();
+        extracted
+    } else {
+        text.to_owned()
+    };
+    let reason = crate::log_redaction::text(&reason, secrets);
+    let reason: String = reason
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .take(512)
+        .collect();
+    (!reason.trim().is_empty()).then(|| reason.trim().to_owned())
 }
 pub fn settings(profile: &Profile) -> Settings {
     let c = &profile.config;
@@ -445,7 +537,7 @@ pub fn settings(profile: &Profile) -> Settings {
                 .as_str()
                 .map(str::to_owned)
         });
-    let mut result = Settings {
+    Settings {
         id: Some(profile.id.clone()),
         name: profile.name.clone(),
         agent: profile.agent.clone(),
@@ -470,11 +562,7 @@ pub fn settings(profile: &Profile) -> Settings {
         api_key: None,
         has_credential: key(c).is_some(),
         official: profile.is_official(),
-    };
-    if result.protocol == "gemini" && !result.base_url.is_empty() {
-        result.base_url = gemini_api_base(&result.base_url);
     }
-    result
 }
 fn find(app: &AppHandle, id: &str) -> Result<Profile, String> {
     app.state::<AppState>()
@@ -549,7 +637,10 @@ fn make_profile(mut s: Settings, previous: Option<&Profile>) -> Result<Profile, 
             config,
         });
     }
-    let base = api_base(&s.base_url, &s.protocol)?;
+    // Keep the user's/imported base visible and persistent. SDK/API version
+    // paths belong only to request construction, not to the saved connection.
+    let base = validate_url(&s.base_url)?;
+    let request_base = api_base(&base, &s.protocol)?;
     let mut config = json!({"providerId":s.provider_id,"plan":s.plan,"protocol":s.protocol,"baseUrl":base,"model":s.model,"models":models,"source":"manual"});
     // Editing a credential or model list must retain native model capabilities
     // and request headers imported from CC Switch on the same API route.
@@ -559,7 +650,7 @@ fn make_profile(mut s: Settings, previous: Option<&Profile>) -> Result<Profile, 
                 .as_str()
                 .and_then(|old| api_base(old, &s.protocol).ok())
                 .as_deref()
-                == Some(base.as_str())
+                == Some(request_base.as_str())
     }) {
         for field in ["opencodeProvider", "piProvider"] {
             if let Some(native) = previous.config.get(field) {
@@ -813,11 +904,12 @@ async fn fetch_models(s: &Settings, secret: Option<&str>) -> Result<(Vec<String>
                 request = request.query(&[("pageToken", token)]);
             }
         }
-        let value = read_json(
+        let value = provider_json(
             protocol_headers(request, &s.protocol, secret)
                 .send()
                 .await
                 .map_err(|_| "连接失败或超时，可手动填写模型 ID")?,
+            secret,
         )
         .await?;
         let rows = if s.protocol == "gemini" {
@@ -935,16 +1027,17 @@ pub async fn test_provider_connection(id: String, app: AppHandle) -> Result<Valu
         }
         return Ok(json!({"ok":true,"model":s.model,"verifiedBy":"officialAccountStatus"}));
     }
-    if subscription_plan(&s.plan) {
-        return test_coding_plan(&app, &p).await;
+    if native_connection_test(&s) {
+        return test_engine_connection(&app, &p).await;
     }
     let (url, body) = connection_probe(&s)?;
     let request = protocol_headers(client()?.post(url).json(&body), &s.protocol, key(&p.config));
-    let value = read_json(
+    let value = provider_json(
         request
             .send()
             .await
             .map_err(|_| "连接失败或超时，请检查网络与 API 地址")?,
+        key(&p.config),
     )
     .await?;
     if value.get("error").is_some() {
@@ -1018,7 +1111,7 @@ fn valid_probe_response(protocol: &str, value: &Value) -> bool {
         _ => false,
     }
 }
-async fn test_coding_plan(app: &AppHandle, profile: &Profile) -> Result<Value, String> {
+async fn test_engine_connection(app: &AppHandle, profile: &Profile) -> Result<Value, String> {
     // Resolve the selected engine first, so missing Pi/OpenCode is reported as
     // an installation problem rather than an unrelated Claude protocol error.
     let launch = plan_test_launch(profile, |agent| crate::agents::resolve(app, agent))?;
@@ -1040,7 +1133,7 @@ async fn test_coding_plan(app: &AppHandle, profile: &Profile) -> Result<Value, S
         let mut secrets = Vec::new();
         crate::log_redaction::collect(&profile.config, &mut secrets, 0);
         format!(
-            "{} 套餐连接测试失败：{}",
+            "{} 连接测试失败：{}",
             crate::agents::name(&profile.agent),
             crate::log_redaction::text(&error, &secrets)
         )
@@ -1056,6 +1149,11 @@ fn plan_test_launch(
 }
 fn subscription_plan(plan: &str) -> bool {
     matches!(plan.split('-').next(), Some("coding" | "token"))
+}
+fn native_connection_test(settings: &Settings) -> bool {
+    // Gemini CLI gateways may support only the CLI's streaming request shape
+    // and SDK headers. Test the same engine used by the chat, for every plan.
+    settings.agent == "gemini" || subscription_plan(&settings.plan)
 }
 fn validate_plan_test_engine(agent: &str, protocol: &str) -> Result<(), String> {
     match (agent, protocol) {
@@ -1291,9 +1389,151 @@ mod tests {
             draft.name = "fixture".into();
             draft.model = "chat-fixture".into();
             let profile = make_profile(draft, None).unwrap();
-            assert_eq!(profile.config["baseUrl"], format!("{base}{normalized}"));
-            assert_eq!(settings(&profile).base_url, format!("{base}{normalized}"));
+            let saved_base = format!("{base}{suffix}").trim_end_matches('/').to_owned();
+            assert_eq!(profile.config["baseUrl"], saved_base);
+            assert_eq!(settings(&profile).base_url, saved_base);
         }
+    }
+    #[test]
+    fn imported_gemini_base_survives_edit_and_save_without_adding_a_version() {
+        for base in [
+            "https://gateway.example",
+            "https://gateway.example/google",
+            "https://gateway.example/google/v1alpha",
+        ] {
+            let config = crate::ccswitch::sanitize_provider("gemini", "fixture", json!({
+                "env":{"GOOGLE_GEMINI_BASE_URL":base,"GEMINI_API_KEY":"fixture-secret","GEMINI_MODEL":"gemini-fixture"}
+            })).unwrap();
+            let previous = Profile {
+                id: "gemini:fixture".into(),
+                agent: "gemini".into(),
+                name: "导入连接".into(),
+                config,
+            };
+            let edit = settings(&previous);
+            assert_eq!(edit.base_url, base);
+            assert_eq!(edit.api_key, None);
+            let saved = make_profile(edit, Some(&previous)).unwrap();
+            assert_eq!(saved.config["baseUrl"], base);
+            assert_eq!(key(&saved.config), Some("fixture-secret"));
+            assert_eq!(settings(&saved).base_url, base);
+            let (endpoint, _) = connection_probe(&settings(&saved)).unwrap();
+            assert_eq!(
+                endpoint,
+                format!(
+                    "{}/models/gemini-fixture:generateContent",
+                    gemini_api_base(base)
+                )
+            );
+        }
+        // Changing only the displayed base notation must retain capacities and
+        // native SDK declarations attached to the same effective API route.
+        let previous = Profile {
+            id: "pi:fixture".into(),
+            agent: "pi".into(),
+            name: "导入连接".into(),
+            config: json!({"protocol":"gemini","baseUrl":"https://gateway.example/v1beta","model":"gemini-fixture","apiKey":"fixture-secret",
+                "modelMetadata":{"gemini-fixture":{"contextWindow":1048576}},"piProvider":{"name":"fixture"}}),
+        };
+        let mut edit = settings(&previous);
+        edit.base_url = "https://gateway.example".into();
+        let saved = make_profile(edit, Some(&previous)).unwrap();
+        assert_eq!(saved.config["baseUrl"], "https://gateway.example");
+        assert_eq!(
+            saved.config["modelMetadata"],
+            previous.config["modelMetadata"]
+        );
+        assert_eq!(saved.config["piProvider"], previous.config["piProvider"]);
+    }
+    async fn error_peer(status: u16, body: Vec<u8>) -> (String, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            loop {
+                let mut block = [0; 1024];
+                let count = stream.read(&mut block).await.unwrap();
+                assert!(count > 0 && request.len() < 16 * 1024);
+                request.extend_from_slice(&block[..count]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let header = format!("HTTP/1.1 {status} Fixture\r\nContent-Type: application/json\r\nx-request-id: fixture-request\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+            stream.write_all(header.as_bytes()).await.unwrap();
+            stream.write_all(&body).await.unwrap();
+        });
+        (format!("http://{address}"), task)
+    }
+    #[tokio::test]
+    async fn model_listing_keeps_gateway_503_reason_and_request_without_exposing_key() {
+        let (base, peer) = error_peer(
+            503,
+            serde_json::to_vec(
+                &json!({"error":{"message":"no available channel; supplied fixture-secret"}}),
+            )
+            .unwrap(),
+        )
+        .await;
+        let message = fetch_models(
+            &draft_settings("gemini", "gemini", &base),
+            Some("fixture-secret"),
+        )
+        .await
+        .unwrap_err();
+        assert!(message.contains("HTTP 503"));
+        assert!(message.contains("供应商服务或上游网关异常"));
+        assert!(message.contains("no available channel"));
+        assert!(message.contains("[REDACTED]"));
+        assert!(message.contains(&format!("{base}/v1beta/models")));
+        assert!(!message.contains("pageSize="));
+        assert!(message.contains("fixture-request"));
+        assert!(!message.contains("fixture-secret"));
+        peer.await.unwrap();
+    }
+    #[tokio::test]
+    async fn provider_errors_omit_oversized_bodies_instead_of_leaking_partial_credentials() {
+        let secret = "sensitive-value".repeat(400);
+        let body = format!("{}{}", "x".repeat(31 * 1024), secret).into_bytes();
+        let (base, peer) = error_peer(503, body).await;
+        let response = client()
+            .unwrap()
+            .get(format!("{base}/v1beta/models?pageToken=private-marker"))
+            .send()
+            .await
+            .unwrap();
+        let message = provider_json(response, Some(&secret)).await.unwrap_err();
+        assert!(message.contains("HTTP 503"));
+        assert!(!message.contains("供应商原因"));
+        assert!(!message.contains("sensitive-value"));
+        assert!(!message.contains("private-marker"));
+        peer.await.unwrap();
+    }
+    #[test]
+    fn provider_error_details_are_utf8_bounded_and_redacted_before_shortening() {
+        let secret = "long-secret".repeat(500);
+        let body = serde_json::to_vec(
+            &json!({"error":{"message":format!("{secret}：无可用上游 {}", "中".repeat(1000))}}),
+        )
+        .unwrap();
+        let reason = provider_error_reason(&body, &[secret]).unwrap();
+        assert!(reason.starts_with("[REDACTED]：无可用上游"));
+        assert!(reason.chars().count() <= 512);
+        assert!(!reason.contains("long-secret"));
+        assert!(provider_error_reason(b"<html>gateway error</html>", &[]).is_none());
+        assert!(provider_error_reason(&[0xff, 0xfe], &[]).is_none());
+        assert_eq!(
+            provider_error_reason(
+                br#"{"error":{"message":""},"message":"upstream unavailable"}"#,
+                &[]
+            )
+            .as_deref(),
+            Some("upstream unavailable")
+        );
+        assert!(http_failure(401).contains("认证失败"));
+        assert!(!http_failure(503).contains("请检查 API Key"));
     }
     #[test]
     fn connection_probe_keeps_each_protocol_url_body_and_response_shape_separate() {
@@ -1473,6 +1713,20 @@ mod tests {
             "anthropic",
         ] {
             assert!(!subscription_plan(plan));
+        }
+    }
+    #[test]
+    fn gemini_cli_tests_use_the_native_engine_even_for_standard_imports() {
+        for plan in ["standard", "standard-gemini", "coding", "token"] {
+            let mut settings = draft_settings("gemini", "gemini", "https://gateway.example");
+            settings.plan = plan.into();
+            assert!(native_connection_test(&settings));
+        }
+        for agent in ["opencode", "pi", "codex", "claude"] {
+            let mut settings = draft_settings(agent, "gemini", "https://gateway.example");
+            assert!(!native_connection_test(&settings));
+            settings.plan = "coding".into();
+            assert!(native_connection_test(&settings));
         }
     }
     #[test]

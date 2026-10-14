@@ -23,6 +23,15 @@ it('keeps paginated lifecycle context through native item updates and a later co
   expect(completed.filter(message => message.role === 'assistant')).toHaveLength(1);
 });
 
+it('retains the native awaiting-response phase through saved history and completion', () => {
+  const started = mergeEvent([], { method: 'turn/started', params: { turn: { id: 't', phase: 'awaitingResponse' } } }, 's')[0];
+  const saved = { ...started, seq: 2 };
+  const merged = reconcileMessages([started], [saved], new Set());
+  expect(conversationTurns(merged)[0].run?.data?.phase).toBe('awaitingResponse');
+  expect(mergeEvent(merged, { method: 'turn/completed', params: { turn: { id: 't', status: 'failed' } } }, 's')[0].data).toMatchObject({ phase: 'awaitingResponse', status: 'failed' });
+  expect(mergeEvent([], { method: 'turn/started', params: { turn: { id: 'other' } } }, 's')[0].data?.phase).toBeUndefined();
+});
+
 describe('message acknowledgements', () => {
   const user = (id: string, seq: number, clientMessageId?: string): Message => ({id,seq,sessionId:'s',role:'user',kind:'userMessage',text:'继续',data:clientMessageId ? {clientMessageId} : {}});
   it('retains an unacknowledged user before newly persisted work instead of matching an older identical text', () => {

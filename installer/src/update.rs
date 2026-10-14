@@ -73,7 +73,14 @@ mod tests {
                 serde_json::to_vec(&serde_json::json!({"path":alias,"version":"0.2.0"})).unwrap(),
             )
             .unwrap();
-            assert_eq!(read_request(&request, "0.2.0").unwrap().path, target);
+            let parsed = read_request(&request, "0.2.0").unwrap().path;
+            // CI's TEMP may use an 8.3 alias while canonicalize returns a long
+            // path. Check the directory identity and removal of the namespace.
+            assert_eq!(
+                fs::canonicalize(&parsed).unwrap(),
+                fs::canonicalize(&target).unwrap()
+            );
+            assert!(!parsed.to_string_lossy().starts_with(r"\\?\"));
         }
         assert!(read_request(&request, "0.3.0").is_err());
         fs::write(&request, b"{\"path\":\"../outside\",\"version\":\"0.2.0\"}").unwrap();

@@ -10,6 +10,12 @@ pub(super) fn mode(permission: &str) -> &'static str {
         _ => "default",
     }
 }
+pub(super) fn startup_model(mut config: Value, model: Option<&str>) -> Value {
+    if let Some(model) = model {
+        config["model"] = json!(model);
+    }
+    config
+}
 
 pub(super) fn api_endpoint(config: &Value) -> (String, String) {
     let base = crate::providers::gemini_api_base(
@@ -117,7 +123,7 @@ pub(super) async fn configure(
         .await
         .map_err(|e| e.to_string())?;
     let (base, version) = api_endpoint(config);
-    let args = vec![
+    let mut args = vec![
         "--acp".into(),
         "--approval-mode".into(),
         mode(permission).into(),
@@ -126,6 +132,13 @@ pub(super) async fn configure(
             .to_string_lossy()
             .into_owned(),
     ];
+    if let Some(model) = config["model"].as_str() {
+        if model.is_empty() || model.len() > 200 || model.chars().any(char::is_control) {
+            return Err("Gemini 模型 ID 无效".into());
+        }
+        // A single equals-form argument keeps even a leading '-' literal.
+        args.push(format!("--model={model}"));
+    }
     let env = vec![
         (
             "GEMINI_CLI_HOME".into(),
@@ -148,6 +161,10 @@ pub(super) async fn configure(
         (
             "GEMINI_API_KEY".into(),
             crate::providers::key(config).unwrap_or("").into(),
+        ),
+        (
+            "GEMINI_MODEL".into(),
+            config["model"].as_str().unwrap_or("").into(),
         ),
         ("GOOGLE_GEMINI_BASE_URL".into(), base),
         ("GOOGLE_GENAI_API_VERSION".into(), version),
@@ -212,5 +229,32 @@ mod tests {
         assert_ne!(first, home(root, Some("other"), false));
         assert_ne!(first, home(root, Some("../outside"), true));
         assert_eq!(first, home(root, Some("../outside"), false));
+    }
+    #[tokio::test]
+    async fn selected_model_is_available_before_initialize_and_cannot_inject_cli_flags() {
+        let root =
+            std::env::temp_dir().join(format!("supercode-gemini-model-{}", uuid::Uuid::new_v4()));
+        let config = startup_model(
+            json!({"model":"profile-default","apiKey":"fixture-key"}),
+            Some("--literal-custom-model"),
+        );
+        let (args, env) = configure(&root, &config, "summary").await.unwrap();
+        assert!(args.contains(&"--model=--literal-custom-model".into()));
+        assert!(!args.contains(&"--literal-custom-model".into()));
+        assert!(env.contains(&("GEMINI_MODEL".into(), "--literal-custom-model".into())));
+        assert_eq!(startup_model(config.clone(), None), config);
+        let settings = tokio::fs::read(root.join(".gemini/supercode-settings.json"))
+            .await
+            .unwrap();
+        assert!(!String::from_utf8(settings).unwrap().contains("fixture-key"));
+        let mut invalid = config;
+        invalid["model"] = json!("model\n--yolo");
+        assert!(configure(&root, &invalid, "summary").await.is_err());
+        let resolved = root.canonicalize().unwrap();
+        assert_eq!(
+            resolved.parent(),
+            Some(std::env::temp_dir().canonicalize().unwrap().as_path())
+        );
+        tokio::fs::remove_dir_all(resolved).await.unwrap();
     }
 }

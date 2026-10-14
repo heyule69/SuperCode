@@ -181,6 +181,8 @@ const TurnView = memo(function TurnView({ turn, lifecycle, pendingLabel, agentNa
   const resultIds = new Set(presentation.final.map(message=>message.id));
   const result = turn.items.filter(message=>resultIds.has(message.id)||agentRow(message));
   const marker = turn.run;
+  const responsePendingLabel = marker?.data?.phase === 'awaitingResponse' && lifecycle.sessionStatus === 'running'
+    ? '正在等待模型响应…' : pendingLabel;
   const processKey = marker?.id ?? turn.id;
   useEffect(() => { setExpandedProcess(null); }, [processKey, presentation.completed]);
   const completed = presentation.settled;
@@ -211,7 +213,7 @@ const TurnView = memo(function TurnView({ turn, lifecycle, pendingLabel, agentNa
     if (waiting) content.push(<TurnProgress key="turn-progress" label={pendingLabel} />);
     else if (live && !Array.isArray(blocks.at(-1))) {
       const activities = items.filter(item => !isSubagent(item));
-      content.push(<TurnProgress key="turn-progress" label={activities.length ? summarizeActivities(activities, true).label : pendingLabel} />);
+      content.push(<TurnProgress key="turn-progress" label={activities.length ? summarizeActivities(activities, true).label : responsePendingLabel} />);
     }
     return content;
   }

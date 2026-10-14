@@ -10,7 +10,7 @@ Windows CI 还运行 `npm audit`，并用固定版本 cargo-audit 检查主程�
 
 把 Codex、Claude Code、OpenCode、Pi 和 Gemini CLI 放进一个桌面工作台，管理项目、模型连接和工具，直接用对话完成开发任务。
 
-当前版本 **0.2.4**，主要支持 **Windows**。基于 Tauri 2、Rust、React + TypeScript 和 SQLite。
+当前版本 **0.2.5**，主要支持 **Windows**。基于 Tauri 2、Rust、React + TypeScript 和 SQLite。
 
 [下载 Windows 安装包](https://github.com/heyule69/SuperCode/releases/latest) · [版本记录](https://github.com/heyule69/SuperCode/releases)
 

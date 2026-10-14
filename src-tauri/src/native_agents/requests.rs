@@ -56,6 +56,7 @@ impl Client {
             // API keys, hooks or another CLI's settings from its parent process.
             for name in [
                 "GEMINI_API_KEY",
+                "GEMINI_MODEL",
                 "GOOGLE_API_KEY",
                 "GOOGLE_APPLICATION_CREDENTIALS",
                 "GOOGLE_GENAI_USE_VERTEXAI",
@@ -245,7 +246,11 @@ impl Client {
         let result = tokio::time::timeout(Duration::from_secs(seconds), rx).await;
         self.pending.lock().await.remove(&id);
         result
-            .map_err(|_| format!("Agent 请求 {method} 超时"))?
+            .map_err(|_| {
+                let message = format!("Agent 请求 {method} 超时（{seconds} 秒）");
+                self.log("agent_request_timeout", &message);
+                message
+            })?
             .map_err(|_| "Agent 已退出".to_owned())?
     }
     pub(super) async fn begin_request(
@@ -254,6 +259,28 @@ impl Client {
         mut params: Value,
     ) -> Result<(String, oneshot::Receiver<Result<Value, String>>), String> {
         let id = self.sequence.fetch_add(1, Ordering::Relaxed).to_string();
+        if let Some((app, source, session)) = &self.diagnostics {
+            if source == "gemini"
+                && matches!(
+                    method,
+                    "initialize"
+                        | "authenticate"
+                        | "session/new"
+                        | "session/load"
+                        | "session/set_model"
+                        | "session/set_mode"
+                )
+            {
+                // Record only stage identity; authentication payloads and MCP
+                // arguments can contain credentials and must never be logged.
+                crate::runtime_diagnostics::record(
+                    app,
+                    session.as_deref(),
+                    "agent_connection_phase",
+                    json!({"source":source,"pid":self.pid,"method":method}),
+                );
+            }
+        }
         let (tx, rx) = oneshot::channel();
         self.pending.lock().await.insert(id.clone(), tx);
         let value = if self.pi {

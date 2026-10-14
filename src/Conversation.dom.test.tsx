@@ -301,6 +301,20 @@ it('tracks actual write preparation, execution, completion and the next action i
   expect(node.querySelector('.activity-group-summary .pending-text')?.textContent).toBe('正在执行命令');
 });
 
+it('shows model response waiting after native startup and replaces it with real output or approval', async () => {
+  let rows = mergeEvent([items[0]], { method: 'turn/started', params: { turn: { id: 'gemini-turn', phase: 'awaitingResponse' } } }, 's');
+  await render(rows, false, { sessionStatus: 'running', activeTurnId: 'gemini-turn' });
+  expect(node.querySelector('.working-indicator .pending-text')?.textContent).toBe('正在等待模型响应…');
+  await render(rows, false, { sessionStatus: 'waiting', activeTurnId: 'gemini-turn' });
+  expect(node.querySelector('.working-indicator .pending-text')?.textContent).toBe('等待你的确认…');
+  rows = mergeEvent(rows, { method: 'item/agentMessage/delta', params: { turnId: 'gemini-turn', itemId: 'reply', delta: '实际输出' } }, 's');
+  await render(rows, false, { sessionStatus: 'running', activeTurnId: 'gemini-turn' });
+  expect(node.querySelector('.working-indicator .pending-text')?.textContent).toBe('正在回复');
+  rows = mergeEvent(rows, { method: 'turn/completed', params: { turn: { id: 'gemini-turn', status: 'interrupted' } } }, 's');
+  await render(rows, false, { sessionStatus: 'interrupted' });
+  expect(node.querySelector('.working-indicator')).toBeNull();
+});
+
 it('shows reply output separately from completed thought and tool history', async () => {
   const rows = [items[0], message('thought', 'activity', '已完成思考摘要', 'reasoning', { status: 'completed' }), items[2],
     message('reply', 'assistant', '文件已写好，正在说明结果。', 'agentMessage', { status: 'inProgress' })];

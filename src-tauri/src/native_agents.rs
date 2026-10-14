@@ -841,13 +841,20 @@ async fn start_for(
     cwd: &Path,
     session: Option<&Session>,
     permission: &str,
+    startup_model: Option<&str>,
 ) -> Result<(Arc<Client>, mpsc::Receiver<Value>, Value), String> {
     let launch = crate::agents::resolve(app, agent)?;
-    let config = app
+    let mut config = app
         .state::<AppState>()
         .store
         .route(agent, session.map(|s| s.id.as_str()))?
         .config;
+    if agent == "gemini" {
+        config = gemini::startup_model(
+            config,
+            startup_model.or_else(|| session.and_then(|s| s.model.as_deref())),
+        );
+    }
     start_configured(app, agent, cwd, session, permission, config, &launch).await
 }
 async fn start_configured(
@@ -981,7 +988,7 @@ pub async fn test_provider_connection(
     .await;
     client.close().await;
     let text = result
-        .map_err(|_| format!("{} 套餐连接测试超时", crate::agents::name(&profile.agent)))??;
+        .map_err(|_| format!("{} 连接测试超时", crate::agents::name(&profile.agent)))??;
     if text.trim().is_empty() {
         return Err("模型没有返回测试回复，请检查模型权限和套餐状态".into());
     }
@@ -1283,7 +1290,15 @@ pub async fn send(
     let (client, mut rx, config, resumed) = if let Some(c) = cached {
         (c.client, c.rx, c.config, Some((c.native, c.defaults)))
     } else {
-        let (c, r, config) = start_for(app, &s.agent, Path::new(cwd), Some(s), permission).await?;
+        let (c, r, config) = start_for(
+            app,
+            &s.agent,
+            Path::new(cwd),
+            Some(s),
+            permission,
+            model.as_deref(),
+        )
+        .await?;
         (c, r, config, None)
     };
     let boot = Arc::new(Turn {
@@ -1561,7 +1576,7 @@ pub async fn send(
         event(
             &turn,
             "turn/started",
-            json!({"turn":{"id":turn.turn,"status":"running"}}),
+            json!({"turn":{"id":turn.turn,"status":"running","phase":if turn.agent=="gemini"{Some("awaitingResponse")}else{None}}}),
         ),
     );
     // Re-emit the same IDs after the start notification so restored cards stay
@@ -1605,16 +1620,32 @@ pub async fn send(
         let mut protocol_finished = false;
         let mut drained = false;
         let mut failure = None;
+        let prompt_started = std::time::Instant::now();
+        let mut response_wait_logged = false;
         let prompt_timeout = tokio::time::sleep(Duration::from_secs(3600));
         tokio::pin!(prompt_timeout);
         let mut checkpoint = tokio::time::interval(Duration::from_secs(1));
         checkpoint.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
-                _=checkpoint.tick()=>{for e in mapped.checkpoint(&turn){publish(&app,e);}},
+                _=checkpoint.tick()=>{
+                    if turn.agent=="gemini" && !response_wait_logged && !completed
+                        && !turn.started.load(Ordering::Acquire) && !turn.stopped.load(Ordering::Acquire)
+                        && turn.requests.lock().await.is_empty() && prompt_started.elapsed().as_secs()>=15 {
+                        response_wait_logged=true;
+                        crate::runtime_diagnostics::record(&app,Some(&turn.session),"agent_response_pending",
+                            json!({"source":"gemini","pid":client.pid,"turnId":turn.turn,"elapsedSeconds":prompt_started.elapsed().as_secs()}));
+                    }
+                    for e in mapped.checkpoint(&turn){publish(&app,e);}
+                },
                 value=rx.recv()=>{let Some(value)=value else{failure=Some("Agent 输出连接已关闭".into());break;};
                     if value["type"]=="supercode_disconnected"{failure=Some("Agent 意外退出".into());break;}
-                    if value["type"]=="agent_start" || (value["method"]=="session/update" && value["params"]["sessionId"]==turn.native && matches!(value["params"]["update"]["sessionUpdate"].as_str(),Some("agent_message_chunk"|"agent_thought_chunk"|"tool_call"))) {turn.started.store(true,Ordering::Release);}
+                    if value["type"]=="agent_start" || (value["method"]=="session/update" && value["params"]["sessionId"]==turn.native && matches!(value["params"]["update"]["sessionUpdate"].as_str(),Some("agent_message_chunk"|"agent_thought_chunk"|"tool_call"))) {
+                        if !turn.started.swap(true,Ordering::AcqRel) && turn.agent=="gemini" {
+                            crate::runtime_diagnostics::record(&app,Some(&turn.session),"agent_first_response",
+                                json!({"source":"gemini","pid":client.pid,"turnId":turn.turn,"elapsedSeconds":prompt_started.elapsed().as_secs(),"updateKind":value["params"]["update"]["sessionUpdate"]}));
+                        }
+                    }
                     if let Some(request)=user_request(&turn,value.clone()){turn.requests.lock().await.insert(request["id"].as_str().unwrap().into(),request.clone());publish(&app,request);continue;}
                     if is_acp(&turn.agent)&&value.get("method").is_some()&&value.get("id").is_some(){let _=client.write(json!({"jsonrpc":"2.0","id":value["id"],"error":{"code":-32601,"message":"Client capability not supported"}})).await;continue;}
                     for e in mapped.map(&turn,&value){if e["method"]!="error" || !turn.stopped.load(Ordering::Relaxed){publish(&app,e);}}
@@ -1777,6 +1808,7 @@ pub async fn summary(
             Path::new(&cwd),
             Some(&fresh),
             "summary",
+            None,
         )
         .await?
     };
@@ -1906,6 +1938,61 @@ fn prompt_content(agent: &str, content: &[Value], instructions: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    #[ignore = "requires the downloaded official Gemini CLI bundle; uses only a local fake gateway"]
+    async fn official_gemini_cli_connects_through_production_transport_to_a_stream_only_gateway() {
+        use tokio::io::AsyncReadExt;
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_path_buf();
+        let script = root.join(".supercode/gemini-audit/package/bundle/gemini.js");
+        assert!(script.is_file(), "Download the official Gemini CLI bundle for this offline check");
+        let program = process::find_program("node").expect("Node is required for this offline check");
+        let stage = root.join(".supercode").join(format!("gemini-production-transport-{}", uuid::Uuid::new_v4()));
+        let cwd = stage.join("workspace");
+        tokio::fs::create_dir_all(cwd.join(".git")).await.unwrap();
+        let home = gemini::home(&stage, None, true);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let peer = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut bytes = Vec::new();
+            loop {
+                let mut block = [0; 8192];
+                let count = socket.read(&mut block).await.unwrap();
+                assert!(count > 0 && bytes.len() < 1024 * 1024);
+                bytes.extend_from_slice(&block[..count]);
+                if let Some(end) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+                    let header = std::str::from_utf8(&bytes[..end]).unwrap();
+                    let length = header.lines().find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length").then(|| value.trim().parse::<usize>().unwrap())
+                    });
+                    if length.is_some_and(|length| bytes.len() >= end + 4 + length) { break; }
+                }
+            }
+            let request = String::from_utf8(bytes).unwrap();
+            assert!(request.starts_with("POST /v1beta/models/gemini-fixture:streamGenerateContent?alt=sse HTTP/1.1"));
+            assert!(request.to_ascii_lowercase().contains("x-goog-api-key: controlled-fixture-key"));
+            let body = format!("data: {}\n\n", json!({"candidates":[{"content":{"role":"model","parts":[{"text":"OK"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":1,"candidatesTokenCount":1,"totalTokenCount":2},"modelVersion":"gemini-fixture"}));
+            let wire = format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+            socket.write_all(wire.as_bytes()).await.unwrap();
+        });
+        let config = json!({"protocol":"gemini","baseUrl":base,"model":"gemini-fixture","apiKey":"controlled-fixture-key"});
+        let (args, mut env) = gemini::configure(&home, &config, "summary").await.unwrap();
+        for name in ["USERPROFILE", "HOME", "APPDATA", "LOCALAPPDATA", "TEMP", "TMP"] {
+            let path = if matches!(name, "USERPROFILE" | "HOME") { home.clone() } else { stage.join(name) };
+            tokio::fs::create_dir_all(&path).await.unwrap();
+            env.push((name.into(), path.to_string_lossy().into_owned()));
+        }
+        let launch = Launch { program, prefix:vec![script.to_string_lossy().into_owned()], source:"official-gemini-offline-check".into() };
+        let (client, mut events) = Client::start(&launch, &args, &cwd, &env, false, None).await.unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(30), probe_completion(&client, &mut events, "gemini", &config, "gemini-fixture", &cwd)).await;
+        client.close().await;
+        let peer_result = tokio::time::timeout(Duration::from_secs(2), peer).await;
+        assert_eq!(result.unwrap().unwrap(), "OK");
+        peer_result.unwrap().unwrap();
+        tokio::fs::write(stage.join("report.json"), serde_json::to_vec_pretty(&json!({"officialCli":true,"realModel":false,"realUserCredentials":false,"productionTransport":true,"streamOnlyGateway":true,"reply":"OK"})).unwrap()).await.unwrap();
+        println!("Offline production-transport report: {}", stage.join("report.json").display());
+    }
     #[test]
     fn cleared_or_replaced_native_checkpoint_does_not_resume_old_context() {
         let mut session = Session {

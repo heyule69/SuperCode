@@ -103,7 +103,7 @@ export function mergeEvent(messages: Message[], event: RpcEvent, sessionId: stri
   const p = event.params;
   if (event.method === 'turn/diff/updated') return upsert(messages, { seq: 0, id: `diff-${p.turnId}`, sessionId, role: 'activity', text: bounded(String(p.diff ?? '')), kind: 'turnDiff', data: { turnId: p.turnId, status: 'completed' } });
   if (event.method === 'turn/started') {
-    return upsert(messages, { seq: 0, id: `run-${p.turn.id}`, sessionId, role: 'activity', text: '', kind: 'runMarker', data: { status: 'inProgress', turnId: p.turn.id, startedAt: Date.now() } });
+    return upsert(messages, { seq: 0, id: `run-${p.turn.id}`, sessionId, role: 'activity', text: '', kind: 'runMarker', data: { status: 'inProgress', turnId: p.turn.id, startedAt: Date.now(), ...(p.turn.phase === 'awaitingResponse' ? { phase: 'awaitingResponse' } : {}) } });
   }
   if (event.method === 'turn/completed') {
     const turnId = p.turn?.id;
