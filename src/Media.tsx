@@ -4,6 +4,7 @@ import { convertFileSrc } from '@tauri-apps/api/core';
 import { ExternalLink, Image, LoaderCircle, Maximize2, Music2, Play, X } from 'lucide-react';
 import { call, desktop } from './api';
 import { embeddedMedia, type MediaReference } from './mediaSources';
+import { firstVideoFrame } from './videoPreview';
 import './media.css';
 
 export const MediaContext = createContext<{ projectId?: string; sessionId?: string; openFile?: (path: string, line?: number) => void }>({});
@@ -19,6 +20,9 @@ export const MediaCard = memo(function MediaCard({ media }: { media: MediaRefere
   const [error, setError] = useState('');
   const [expanded, setExpanded] = useState(false);
   const [playing, setPlaying] = useState(false);
+  const [poster, setPoster] = useState('');
+  const [previewFailed, setPreviewFailed] = useState(false);
+  const [attempt, setAttempt] = useState(0);
   useEffect(() => {
     if (!target.current) return;
     if (typeof IntersectionObserver === 'undefined') { setVisible(true); return; }
@@ -36,7 +40,17 @@ export const MediaCard = memo(function MediaCard({ media }: { media: MediaRefere
       setSource(convertFileSrc(result.previewToken, 'supercode-media')); setFullSource(convertFileSrc(result.token, 'supercode-media'));
     }).catch(e => { if (!cancelled) setError(String(e)); });
     return () => { cancelled = true; };
-  }, [media.path, context.projectId, context.sessionId, visible]);
+  }, [media.path, context.projectId, context.sessionId, visible, attempt]);
+  useEffect(() => {
+    if (playing) return;
+    setPoster(''); setPreviewFailed(false);
+    if (media.kind !== 'video' || !fullSource) return;
+    const controller = new AbortController();
+    void firstVideoFrame(fullSource, controller.signal).then(frame => {
+      if (!controller.signal.aborted) setPoster(frame);
+    }).catch(() => { if (!controller.signal.aborted) setPreviewFailed(true); });
+    return () => controller.abort();
+  }, [media.kind, fullSource, playing, attempt]);
   const Icon = media.kind === 'image' ? Image : media.kind === 'video' ? Play : Music2;
   const label = media.kind === 'image' ? '图片' : media.kind === 'video' ? '视频' : '音频';
   function openInSystem() {
@@ -47,11 +61,11 @@ export const MediaCard = memo(function MediaCard({ media }: { media: MediaRefere
     // Only the player explicitly started by the user should remain audible.
     document.querySelectorAll<HTMLMediaElement>('.chat-media-player').forEach(player => { if (player !== event.currentTarget) player.pause(); });
   }
-  const content = error ? <span className="chat-media-error" role="status"><Icon size={22}/><span>{error}</span></span>
+  const content = error ? <span className="chat-media-error" role="status"><Icon size={22}/><span>{error}</span><button type="button" className="quiet-button" onClick={() => setAttempt(value => value + 1)}>重新加载{label}</button></span>
     : !source ? <span className="chat-media-placeholder"><Icon size={24}/><span>{visible ? <><LoaderCircle size={14} className="spin"/>正在加载{label}…</> : label}</span></span>
     : media.kind === 'image' ? <button ref={imageButton} type="button" className="chat-image-button" onClick={() => setExpanded(true)} aria-label={`放大图片 ${media.name}`}><img src={source} alt={media.name} loading="lazy" decoding="async" referrerPolicy="no-referrer" onError={() => setError('图片无法显示，文件可能已移动或格式不受支持')}/><span className="chat-image-zoom"><Maximize2 size={16}/></span></button>
-    : media.kind === 'video' && !playing ? <button type="button" className="chat-video-start" onClick={() => setPlaying(true)} aria-label={`加载视频 ${media.name}`}><Play size={28}/><span>打开视频播放器</span></button>
-    : media.kind === 'video' ? <video className="chat-media-player" src={fullSource} controls playsInline preload="metadata" onPlay={activatePlayer} onError={() => setError('当前播放器无法播放此视频，可在系统中打开')}/>
+    : media.kind === 'video' && !playing ? <button type="button" className={`chat-video-start${poster ? ' has-poster' : ''}`} onClick={() => setPlaying(true)} aria-label={`加载视频 ${media.name}`}>{poster ? <img className="chat-video-poster" src={poster} alt={`${media.name} 首帧`} decoding="async"/> : null}<span className="chat-video-overlay"><Play size={28}/>{poster ? null : <span>{previewFailed ? '首帧暂不可用，点击打开播放器' : <><LoaderCircle size={14} className="spin"/>正在加载视频首帧…</>}</span>}</span></button>
+    : media.kind === 'video' ? <video className="chat-media-player" src={fullSource} poster={poster || undefined} controls playsInline preload="metadata" onPlay={activatePlayer} onError={() => setError('当前播放器无法播放此视频，可在系统中打开')}/>
     : <audio className="chat-media-player" src={fullSource} controls preload="none" onPlay={activatePlayer} onError={() => setError('当前播放器无法播放此音频，可在系统中打开')}/>;
   return <span ref={target} className={`chat-media-card chat-media-${media.kind}`} data-media-source={media.path} tabIndex={-1}>
     {content}<span className="chat-media-caption"><Icon size={14}/><span title={media.name}>{media.name}</span>{(desktop || context.openFile) && !/^https?:/i.test(media.path) ? <button type="button" className="icon-button" aria-label={`在系统中打开 ${media.name}`} onClick={openInSystem}><ExternalLink size={14}/></button> : null}</span>

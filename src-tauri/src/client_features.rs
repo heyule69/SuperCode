@@ -106,10 +106,32 @@ pub(crate) fn validate_steering_settings(
 
 const PROGRESS_GUIDANCE: &str = "Progress communication in this interactive app:\n\
 For substantial or multi-step work, proactively send brief, user-visible assistant messages in the user's language. Do not leave the user with only reasoning events and tool records until the final answer.\n\
+Before the first tool call for substantial work, emit one short ordinary assistant text message. Do not go directly from a thinking block to a tool call. Thinking or reasoning content is not a public progress update, even if it contains a sentence addressed to the user.\n\
 Before starting extended analysis, a batch of tool calls, or a potentially slow operation, explain the immediate approach in one or two short sentences. After a meaningful finding, a change of approach, or a completed stage, explain what was established and what comes next.\n\
 If you have made several tool calls without a public update, provide one before the next batch. During sustained work, aim to update roughly every 30-60 seconds when you have an opportunity to speak; do not wait until the entire task is finished. A blocking tool call or a provider that is not returning output may prevent timely updates.\n\
+For long-running tools, use their background or asynchronous operation and short status checks when supported, so you can report verified progress between checks. Avoid multi-minute sleep commands or long blocking polls used only to wait; prefer checks that return within about 30 seconds. This is a polling preference, not a task or model timeout: keep long computations running, do not restart them to provide an update, and do not call a background job finished before checking its actual result.\n\
 These updates must be ordinary assistant text, separate from private reasoning and tool output. Summarize verified actions, useful findings, remaining uncertainty, and the next step without exposing private chain-of-thought. Do not invent progress, claim success early, repeat empty reassurance, or narrate every trivial tool call.\n\
 Answer simple requests directly. Respect an explicit request for silence, minimal output, or a strict output-only format; do not add progress messages that break the requested format.";
+
+const PROGRESS_REMINDER: &str = "[SuperCode communication preference]\nFor substantial work, send a brief ordinary assistant text update in the user's language before the first tool call and between batches of tool calls. A thinking/reasoning block does not count as a public update. Before a long wait, explain what is running; use background execution and short status checks when supported instead of multi-minute sleep/poll calls. Keep long jobs running and report only verified progress. Respect an explicit request for silence or a strict output-only format.\n[User request follows]";
+
+pub(crate) fn progress_context(mut content: Vec<Value>) -> Vec<Value> {
+    // Resumed native sessions can retain an older system-prompt snapshot.
+    // Refresh this small preference with each user turn, preserving the actual
+    // request and media; native slash commands must keep their original input.
+    if content.is_empty()
+        || content.iter().any(|block| {
+            block["type"] == "text"
+                && block["text"]
+                    .as_str()
+                    .is_some_and(|text| text.trim_start().starts_with('/'))
+        })
+    {
+        return content;
+    }
+    content.insert(0, json!({"type":"text","text":PROGRESS_REMINDER}));
+    content
+}
 
 pub fn instructions(app: &AppHandle) -> String {
     let text = app
@@ -640,6 +662,32 @@ pub async fn agent_extensions(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn progress_context_keeps_the_user_request_and_media_intact() {
+        let content = vec![
+            json!({"type":"text","text":"检查这张图片，只返回 JSON，不输出过程。"}),
+            json!({"type":"image","source":{"type":"base64","media_type":"image/png","data":"fixture"}}),
+            json!({"type":"text","text":"附件说明：中文与 emoji 🖼️"}),
+        ];
+        let prepared = progress_context(content.clone());
+        assert_eq!(prepared.len(), content.len() + 1);
+        assert_eq!(&prepared[1..], content.as_slice());
+        assert_eq!(prepared[0]["type"], "text");
+        assert!(prepared[0]["text"].as_str().unwrap().contains("Respect an explicit request for silence or a strict output-only format"));
+    }
+    #[test]
+    fn progress_context_does_not_wrap_native_commands_or_empty_input() {
+        assert!(progress_context(vec![]).is_empty());
+        for command in ["/compact", "  /help", "\n/resume session-id"] {
+            let content = vec![json!({"type":"text","text":command})];
+            assert_eq!(progress_context(content.clone()), content);
+        }
+        let later_command = vec![
+            json!({"type":"text","text":""}),
+            json!({"type":"text","text":"/clear"}),
+        ];
+        assert_eq!(progress_context(later_command.clone()), later_command);
+    }
     #[test]
     fn client_message_identity_accepts_legacy_calls_and_rejects_malformed_ids() {
         assert!(validate_client_message_id(None).is_ok());

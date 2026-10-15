@@ -82,6 +82,14 @@ pub fn format(path: &str) -> Option<(&'static str, &'static str)> {
     })
 }
 
+fn file_error(error: std::io::Error) -> String {
+    match error.kind() {
+        std::io::ErrorKind::NotFound => "媒体文件不存在，可能已移动或删除".into(),
+        std::io::ErrorKind::PermissionDenied => "没有读取此媒体文件的权限".into(),
+        _ => format!("无法读取媒体文件：{error}"),
+    }
+}
+
 fn local_path(value: &str, project: Option<&Path>) -> Result<PathBuf, String> {
     let path = if value.to_ascii_lowercase().starts_with("file:") {
         tauri::Url::parse(value)
@@ -102,16 +110,16 @@ fn local_path(value: &str, project: Option<&Path>) -> Result<PathBuf, String> {
     let path = if path.is_absolute() {
         path
     } else {
-        project.ok_or("相对媒体路径需要所属项目")?.join(path)
+        project.ok_or("相对媒体路径需要工作目录")?.join(path)
     };
     let path = path
         .canonicalize()
-        .map_err(|_| "媒体文件不存在或无法读取")?;
-    let info = fs::metadata(&path).map_err(|_| "媒体文件不存在或无法读取")?;
-    if !info.is_file() || info.len() == 0 {
-        return Err("媒体文件为空或不是普通文件".into());
-    }
+        .map_err(file_error)?;
+    let info = fs::metadata(&path).map_err(file_error)?;
+    if !info.is_file() { return Err("媒体路径不是普通文件".into()); }
+    if info.len() == 0 { return Err("媒体文件为空，可能仍在生成".into()); }
     format(&path.to_string_lossy()).ok_or("不支持预览此文件类型")?;
+    fs::File::open(&path).map_err(file_error)?;
     Ok(path)
 }
 
@@ -536,6 +544,22 @@ pub fn normalize_event(app: &AppHandle, event: &mut Value) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn unavailable_media_distinguishes_missing_empty_unreadable_and_wrong_locations() {
+        let root = std::env::temp_dir().join(format!("supercode-media-errors-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(root.join("renders")).unwrap();
+        fs::write(root.join("renders/旧版.mp4"), b"video-fixture").unwrap();
+        assert!(local_path("旧版.mp4", Some(&root)).unwrap_err().contains("不存在"));
+        assert!(local_path("renders/旧版.mp4", Some(&root)).is_ok());
+        fs::write(root.join("generating.mp4"), b"").unwrap();
+        assert!(local_path("generating.mp4", Some(&root)).unwrap_err().contains("仍在生成"));
+        assert!(local_path("renders", Some(&root)).unwrap_err().contains("不是普通文件"));
+        assert!(file_error(std::io::Error::from(std::io::ErrorKind::PermissionDenied)).contains("权限"));
+        // A later retry resolves the same explicit path once rendering creates it.
+        fs::write(root.join("finished.mp4"), b"finished-fixture").unwrap();
+        assert!(local_path("finished.mp4", Some(&root)).is_ok());
+        fs::remove_dir_all(&root).unwrap();
+    }
     use super::*;
     #[test]
     fn seeking_is_bounded_and_invalid_ranges_are_rejected() {

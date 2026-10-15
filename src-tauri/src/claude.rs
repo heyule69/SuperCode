@@ -43,6 +43,7 @@ pub struct Turn {
 
 #[derive(Default)]
 struct InputState {
+    awaiting_primary: Option<String>,
     pending: HashSet<String>,
     cancel_queued: bool,
     usage: [u64; 5],
@@ -60,11 +61,37 @@ impl InputState {
         } else {
             message["user_message_uuid"].as_str()
         };
+        if message["parent_tool_use_id"].is_null()
+            && matches!(message["type"].as_str(), Some("user" | "result"))
+            && self.awaiting_primary.as_deref().is_some_and(|primary| {
+                ids.iter().copied().chain(single).any(|id| id == primary)
+            })
+        {
+            self.awaiting_primary = None;
+        }
         ids.into_iter()
             .chain(single)
             .filter(|id| self.pending.remove(*id))
             .map(str::to_owned)
             .collect()
+    }
+    fn prompt(&mut self, native: &str, content: Vec<Value>) -> Value {
+        self.next_turn();
+        let id = uuid::Uuid::new_v4().to_string();
+        self.awaiting_primary = Some(id.clone());
+        let content = crate::client_features::progress_context(content);
+        json!({"type":"user","uuid":id,"session_id":native,"parent_tool_use_id":null,"message":{"role":"user","content":content}})
+    }
+    fn accepts_output(&self, message: &Value) -> bool {
+        // --resume can replay a prior result before stdin's new prompt is
+        // acknowledged. That result (and its text/usage) is not this UI turn.
+        self.awaiting_primary.is_none() || !matches!(message["type"].as_str(),
+            Some("assistant" | "stream_event" | "result" | "user" | "tool_progress"))
+            && !(message["type"] == "system" && matches!(message["subtype"].as_str(),
+                Some("task_started" | "task_progress" | "task_updated" | "task_notification" | "compact_boundary")))
+    }
+    fn has_unaccepted(&self) -> bool {
+        self.awaiting_primary.is_some() || !self.pending.is_empty()
     }
     fn usage(&mut self, message: &Value) -> Value {
         let u = &message["usage"];
@@ -143,6 +170,18 @@ fn permission_args(read_only: bool, permission: &str) -> Result<Vec<String>, Str
     // plan file, questions, subagents and ExitPlanMode. A Read/Glob/Grep tool
     // whitelist removes the planning workflow itself.
     Ok(vec!["--permission-mode".into(), mode.into(), "--tools".into(), "default".into()])
+}
+
+fn prompt_snapshot_args(version: Option<&str>) -> Vec<String> {
+    if version
+        .and_then(crate::agent_versions::installed_version)
+        .is_some_and(|version| version >= semver::Version::new(2, 1, 257))
+    {
+        vec!["--system-prompt-snapshot".into(), "off".into()]
+    } else {
+        // Older/unknown CLIs still receive the per-turn communication context.
+        vec![]
+    }
 }
 
 fn result_failure(message: &Value) -> Option<String> {
@@ -291,6 +330,7 @@ impl Runtime {
         uuid::Uuid::parse_str(id).map_err(|_| "引导消息 ID 无效")?;
         crate::client_features::validate_steering_settings(&turn.signature.lock().unwrap(), permission, effort)?;
         turn.inputs.lock().unwrap().pending.insert(id.into());
+        let content = crate::client_features::progress_context(content);
         let result = turn.write(json!({"type":"user","uuid":id,"priority":"next","session_id":turn.native,"parent_tool_use_id":null,"message":{"role":"user","content":content}})).await;
         if result.is_err() {
             turn.inputs.lock().unwrap().pending.remove(id);
@@ -354,7 +394,7 @@ impl Runtime {
         turn.controls.lock().await.remove(&id);
         // Older CLIs leave queued input alive after an interrupt. Close only when needed,
         // rather than allowing a supposedly stopped task to restart behind the user's back.
-        if !cancel_queued && !turn.inputs.lock().unwrap().pending.is_empty() {
+        if !cancel_queued && turn.inputs.lock().unwrap().has_unaccepted() {
             let _ = turn.child.lock().await.start_kill();
         }
         if !matches!(ack, Ok(Ok(ref v)) if v["subtype"] != "error") {
@@ -458,8 +498,8 @@ pub async fn send(
             )?;
             *c.turn.lock().unwrap() = uuid::Uuid::new_v4().to_string();
             c.stopped.store(false, Ordering::Release);
+            let input = c.inputs.lock().unwrap().prompt(&c.native, content);
             c.active.store(true, Ordering::Release);
-            c.inputs.lock().unwrap().next_turn();
             c.last_used
                 .store(crate::storage::now() as u64, Ordering::Relaxed);
             publish(
@@ -471,7 +511,7 @@ pub async fn send(
                     json!({"turn":{"id":c.id()}}),
                 ),
             );
-            if let Err(e) = c.write(json!({"type":"user","session_id":c.native,"parent_tool_use_id":null,"message":{"role":"user","content":content}})).await {
+            if let Err(e) = c.write(input).await {
                 c.active.store(false,Ordering::Release);
                 c.alive.store(false,Ordering::Release);
                 let _ = c.child.lock().await.start_kill();
@@ -492,7 +532,16 @@ pub async fn send(
         None
     };
 
-    let executable = crate::agents::resolve(app, "claude")?.program;
+    let launch = crate::agents::resolve(app, "claude")?;
+    // Feature detection must not hold up a turn if an external CLI is slow.
+    // The per-turn context still works when this bounded probe is unavailable.
+    let cli_version = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        crate::agents::capture(&launch, &["--version"], &state.data_dir),
+    ).await.ok().and_then(Result::ok);
+    let snapshot_args = prompt_snapshot_args(cli_version.as_deref());
+    let snapshot_refreshed = !snapshot_args.is_empty();
+    let executable = launch.program;
     crate::runtime_diagnostics::register_secrets(app, &config);
     let native = session
         .native_id
@@ -522,6 +571,7 @@ pub async fn send(
         crate::client_features::instructions(app),
     ];
     args.extend(permission_args);
+    args.extend(snapshot_args);
     // This flag permits a later explicit plan confirmation to restore full
     // access; it does not activate bypass while the process is in plan mode.
     if permission == "full" || read_only || permission == "read" {
@@ -623,7 +673,7 @@ pub async fn send(
     });
     let log_app = app.clone();
     let log_session = session.id.clone();
-    crate::runtime_diagnostics::record(app, Some(&session.id), "agent_process_started", json!({"source":"claude","pid":turn.pid,"model":model,"protocol":config["protocol"],"connectionId":route.id}));
+    crate::runtime_diagnostics::record(app, Some(&session.id), "agent_process_started", json!({"source":"claude","pid":turn.pid,"model":model,"protocol":config["protocol"],"connectionId":route.id,"cliVersion":cli_version.as_deref().and_then(crate::agent_versions::installed_version).map(|version|version.to_string()),"promptSnapshotRefreshed":snapshot_refreshed}));
     tauri::async_runtime::spawn(async move {
         crate::runtime_diagnostics::stderr(Some(log_app), Some(log_session), "claude", stderr).await;
     });
@@ -668,7 +718,8 @@ pub async fn send(
             .store
             .rename(&session.id, &text.chars().take(24).collect::<String>())?;
     }
-    turn.write(json!({"type":"user","session_id":native,"parent_tool_use_id":null,"message":{"role":"user","content":content}})).await?;
+    let input = turn.inputs.lock().unwrap().prompt(&native, content);
+    turn.write(input).await?;
     publish(
         app,
         event(
@@ -708,6 +759,25 @@ pub async fn send(
             };
             turn.last_used
                 .store(crate::storage::now() as u64, Ordering::Relaxed);
+            let (consumed, primary_received, accepts_output) = {
+                let mut inputs = turn.inputs.lock().unwrap();
+                let primary_pending = inputs.awaiting_primary.is_some();
+                let consumed = inputs.consume(&message);
+                (consumed, primary_pending && inputs.awaiting_primary.is_none(), inputs.accepts_output(&message))
+            };
+            for id in consumed {
+                crate::outbox::native_consumed(&reader_app, &id);
+            }
+            if primary_received {
+                completion.finished();
+                crate::runtime_diagnostics::record(&reader_app, Some(&turn.session), "agent_input_accepted", json!({"turnId":turn.id(),"source":"claude"}));
+            }
+            if !accepts_output && !turn.stopped.load(Ordering::Acquire) {
+                if is_main_result(&message) {
+                    crate::runtime_diagnostics::record(&reader_app, Some(&turn.session), "agent_stale_result_ignored", json!({"turnId":turn.id(),"source":"claude","subtype":message["subtype"],"numTurns":message["num_turns"]}));
+                }
+                continue;
+            }
             let session_state_event = completion.observe(&message);
             if session_state_event {
                 crate::runtime_diagnostics::record(&reader_app, Some(&turn.session), "agent_session_state", json!({"turnId":turn.id(),"state":message["state"]}));
@@ -720,10 +790,6 @@ pub async fn send(
             }
             if message["type"] == "assistant" && message["parent_tool_use_id"].is_string() {
                 crate::runtime_diagnostics::record(&reader_app, Some(&turn.session), "agent_child_message", json!({"turnId":turn.id(),"toolUseId":message["parent_tool_use_id"],"contentBlocks":message["message"]["content"].as_array().map(Vec::len)}));
-            }
-            let consumed = turn.inputs.lock().unwrap().consume(&message);
-            for id in consumed {
-                crate::outbox::native_consumed(&reader_app, &id);
             }
             if message["type"] == "control_response" {
                 if let Some(id) = message["response"]["request_id"].as_str() {
@@ -1366,6 +1432,123 @@ fn same_context_model(left: &str, right: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn prompt_snapshot_refresh_requires_a_compatible_cli() {
+        for version in [None, Some("unavailable"), Some("2.1.256 (Claude Code)"), Some("2.1.257-rc.1")] {
+            assert!(prompt_snapshot_args(version).is_empty(), "{version:?}");
+        }
+        for version in ["2.1.257 (Claude Code)", "v2.1.287", "Claude Code 2.2.0"] {
+            assert_eq!(prompt_snapshot_args(Some(version)), ["--system-prompt-snapshot", "off"]);
+        }
+    }
+    #[test]
+    fn primary_prompts_refresh_progress_context_on_a_reused_process() {
+        let mut inputs = InputState::default();
+        let first = inputs.prompt("resumed-native", vec![json!({"type":"text","text":"检查文件"})]);
+        inputs.consume(&json!({"type":"user","uuid":first["uuid"]}));
+        let next_content = vec![json!({"type":"text","text":"继续处理，但只返回最终结果"})];
+        let second = inputs.prompt("resumed-native", next_content.clone());
+        for prompt in [&first, &second] {
+            assert_eq!(prompt["session_id"], "resumed-native");
+            assert_eq!(prompt["message"]["content"][0]["type"], "text");
+            assert!(prompt["message"]["content"][0]["text"].as_str().unwrap().starts_with("[SuperCode communication preference]"));
+            assert_eq!(prompt["message"]["content"].as_array().unwrap().len(), 2);
+        }
+        assert_eq!(&second["message"]["content"].as_array().unwrap()[1..], next_content.as_slice());
+        assert_ne!(first["uuid"], second["uuid"]);
+        assert!(inputs.has_unaccepted());
+    }
+    #[tokio::test]
+    async fn resumed_jsonl_replay_cannot_finish_new_prompt_before_its_own_response() {
+        let mut inputs = InputState::default();
+        let prompt = inputs.prompt("native", vec![json!({"type":"text","text":"好了吗"})]);
+        uuid::Uuid::parse_str(prompt["uuid"].as_str().unwrap()).unwrap();
+        let frames = vec![
+            json!({"type":"result","subtype":"success","result":"OLD_RESULT","num_turns":0,"usage":{"input_tokens":99999}}),
+            json!({"type":"system","subtype":"session_state_changed","state":"idle"}),
+            json!({"type":"system","subtype":"session_state_changed","state":"running"}),
+            json!({"type":"assistant","message":{"id":"old","content":[{"type":"text","text":"OLD_REPLAY"}]}}),
+            json!({"type":"user","uuid":prompt["uuid"],"isReplay":true}),
+            json!({"type":"assistant","message":{"id":"new","content":[{"type":"text","text":"正在执行"},{"type":"tool_use","id":"tool","name":"Read","input":{"file_path":"fixture.txt"}}]}}),
+            json!({"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"tool","content":"fixture"}]}}),
+            json!({"type":"result","subtype":"success","result":"正在执行","usage":{"input_tokens":32}}),
+            json!({"type":"system","subtype":"session_state_changed","state":"idle"}),
+            json!({"type":"system","subtype":"session_state_changed","state":"idle"}),
+        ];
+        let (mut writer, reader) = tokio::io::duplex(4096);
+        let writing = tokio::spawn(async move {
+            for message in frames {
+                let mut bytes = serde_json::to_vec(&message).unwrap();
+                bytes.push(b'\n');
+                writer.write_all(&bytes).await.unwrap();
+            }
+        });
+        let mut reader = BufReader::new(reader);
+        let mut stream = Stream::default();
+        let mut completion = RunCompletion::default();
+        let mut completed = 0;
+        let mut output = vec![];
+        let mut usage = Value::Null;
+        while let Some(frame) = runtime::read_frame(&mut reader).await.unwrap() {
+            let message: Value = serde_json::from_slice(&frame).unwrap();
+            inputs.consume(&message);
+            if !inputs.accepts_output(&message) { continue; }
+            let state_event = completion.observe(&message);
+            if is_main_result(&message) {
+                completion.result();
+                usage = inputs.usage(&message);
+            } else if !state_event {
+                output.extend(stream.translate(&message, "native", "current"));
+            }
+            if completion.ready(stream.tasks.pending()) {
+                completed += 1;
+                assert!(output.iter().any(|event| event["params"]["item"]["id"] == "tool"));
+                completion.finished();
+            }
+        }
+        writing.await.unwrap();
+        assert_eq!(completed, 1, "one submitted prompt must finish exactly once");
+        assert_eq!(usage["total"]["inputTokens"], 32);
+        assert!(output.iter().any(|event| event["params"]["item"]["text"] == "正在执行"));
+        assert!(!serde_json::to_string(&output).unwrap().contains("OLD_"));
+        assert!(!inputs.has_unaccepted());
+    }
+    #[test]
+    fn reused_process_waits_for_each_primary_prompt_and_retains_matching_errors() {
+        let mut inputs = InputState::default();
+        let first = inputs.prompt("native", vec![]);
+        assert!(inputs.has_unaccepted());
+        inputs.consume(&json!({"type":"user","uuid":first["uuid"]}));
+        assert!(!inputs.has_unaccepted());
+        let second = inputs.prompt("native", vec![]);
+        assert_ne!(first["uuid"], second["uuid"]);
+        let old = json!({"type":"result","user_message_uuid":first["uuid"],"result":"old"});
+        inputs.consume(&old);
+        assert!(!inputs.accepts_output(&old));
+        let failure = json!({"type":"result","user_message_uuid":second["uuid"],"is_error":true,"result":"fixture connection failed"});
+        inputs.consume(&failure);
+        assert!(inputs.accepts_output(&failure));
+        assert_eq!(result_failure(&failure).as_deref(), Some("fixture connection failed"));
+        assert!(!inputs.has_unaccepted());
+    }
+    #[test]
+    fn child_and_queued_input_acknowledgements_cannot_accept_the_primary_prompt() {
+        let mut inputs = InputState::default();
+        let prompt = inputs.prompt("native", vec![]);
+        inputs.pending.insert("queued".into());
+        assert_eq!(inputs.consume(&json!({"type":"user","uuid":"queued"})), vec!["queued"]);
+        inputs.consume(&json!({"type":"user","parent_tool_use_id":"child","uuid":prompt["uuid"]}));
+        assert!(inputs.has_unaccepted());
+        assert!(!inputs.accepts_output(&json!({"type":"result","subtype":"success"})));
+        // Startup metadata and native permissions/control replies remain usable.
+        for message in [json!({"type":"system","subtype":"init"}), json!({"type":"control_request"}), json!({"type":"control_response"})] {
+            assert!(inputs.accepts_output(&message));
+        }
+        let result = json!({"type":"result","user_message_uuids":["queued",prompt["uuid"]]});
+        inputs.consume(&result);
+        assert!(inputs.accepts_output(&result));
+        assert!(!inputs.has_unaccepted());
+    }
     #[test]
     fn all_inflight_agent_calls_survive_the_tool_history_budget() {
         let mut stream = Stream::default();

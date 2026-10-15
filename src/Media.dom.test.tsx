@@ -6,14 +6,17 @@ import Markdown from './Markdown';
 import { MediaContext, MediaList } from './Media';
 import { ResourceMenu } from './ResourceMenu';
 import { call } from './api';
+import { firstVideoFrame } from './videoPreview';
 
 vi.mock('./api', () => ({ desktop: true, call: vi.fn(async () => ({ token: 'full', previewToken: 'small' })) }));
 vi.mock('@tauri-apps/api/core', () => ({ convertFileSrc: (token: string) => `http://supercode-media.localhost/${token}` }));
+vi.mock('./videoPreview', () => ({ firstVideoFrame: vi.fn(async () => 'data:image/jpeg;base64,cG9zdGVy') }));
 let root: Root, container: HTMLDivElement;
 beforeEach(() => {
   (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
   vi.stubGlobal('IntersectionObserver', undefined);
   vi.mocked(call).mockClear();
+  vi.mocked(firstVideoFrame).mockClear();
   container = document.createElement('div'); document.body.append(container); root = createRoot(container);
 });
 afterEach(async () => { await act(async () => root.unmount()); container.remove(); vi.unstubAllGlobals(); });
@@ -48,6 +51,45 @@ it('does not preload audio or automatically play it', async () => {
   await act(async () => root.render(<Markdown text={'![音频](<D:/output/demo.wav>)'}/>));
   const audio = container.querySelector('audio')!;
   expect(audio.controls).toBe(true); expect(audio.preload).toBe('none'); expect(audio.autoplay).toBe(false);
+});
+
+it('shows a first-frame poster without mounting or automatically starting the full player', async () => {
+  await act(async () => root.render(<Markdown text="![视频](clip.mp4)"/>));
+  expect(firstVideoFrame).toHaveBeenCalledWith('http://supercode-media.localhost/full', expect.any(AbortSignal));
+  expect(container.querySelector('video')).toBeNull();
+  const poster = container.querySelector<HTMLImageElement>('.chat-video-poster')!;
+  expect(poster.src).toBe('data:image/jpeg;base64,cG9zdGVy');
+  expect(poster.alt).toContain('首帧');
+  await act(async () => container.querySelector<HTMLButtonElement>('.chat-video-start')!.click());
+  const player = container.querySelector('video')!;
+  expect(player.getAttribute('poster')).toBe(poster.src);
+  expect(player.autoplay).toBe(false);
+});
+
+it('still lets the user open the player when only first-frame extraction fails', async () => {
+  vi.mocked(firstVideoFrame).mockRejectedValueOnce(new Error('unsupported thumbnail'));
+  await act(async () => root.render(<Markdown text="![视频](clip.mp4)"/>));
+  expect(container.textContent).toContain('首帧暂不可用');
+  expect(container.querySelector('.chat-media-error')).toBeNull();
+  await act(async () => container.querySelector<HTMLButtonElement>('.chat-video-start')!.click());
+  expect(container.querySelector('video')?.src).toContain('/full');
+});
+
+it('can reload a video that did not exist until its rendering finished', async () => {
+  vi.mocked(call).mockRejectedValueOnce(new Error('媒体文件不存在，可能已移动或删除'));
+  await act(async () => root.render(<Markdown text="![视频](renders/clip.mp4)"/>));
+  expect(container.textContent).toContain('媒体文件不存在');
+  await act(async () => container.querySelector<HTMLButtonElement>('.chat-media-error button')!.click());
+  expect(vi.mocked(call).mock.calls.filter(([command]) => command === 'prepare_media')).toHaveLength(2);
+  expect(container.querySelector('.chat-media-error')).toBeNull();
+  expect(container.querySelector('.chat-video-poster')).not.toBeNull();
+});
+
+it('does not create a failed card for an old filename merely mentioned in a sentence', async () => {
+  await act(async () => root.render(<Markdown text="旧版是 `樱花草MV-阿梓-旧版表情变化.mp4`，要删掉吗？"/>));
+  expect(container.textContent).toContain('樱花草MV-阿梓-旧版表情变化.mp4');
+  expect(container.querySelector('.chat-media-card')).toBeNull();
+  expect(call).not.toHaveBeenCalled();
 });
 
 
