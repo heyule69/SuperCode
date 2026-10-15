@@ -57,7 +57,7 @@ impl Bridge {
         let state = Arc::new(Connection {
             config,
             token: token.clone(),
-            http: crate::providers::client()?,
+            http: crate::providers::generation_client()?,
             cancel: rx,
             stream_usage: Arc::new(AtomicBool::new(true)),
         });
@@ -618,6 +618,129 @@ mod tests {
         );
         let missing = StreamState::default();
         assert!(missing.finish().is_err());
+    }
+    async fn fixture_bridge(router: Router) -> (Bridge, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        let bridge = Bridge::start(json!({"baseUrl":format!("http://{address}/v1")}))
+            .await
+            .unwrap();
+        (bridge, server)
+    }
+    async fn fixture_request(bridge: &Bridge) -> reqwest::Response {
+        reqwest::Client::new()
+            .post(format!("{}/v1/messages", bridge.base_url))
+            .header("x-api-key", &bridge.token)
+            .json(&json!({"model":"fixture-model","stream":true,"messages":[{"role":"user","content":"hi"}]}))
+            .send()
+            .await
+            .unwrap()
+    }
+    async fn read_until_thinking(response: &mut reqwest::Response) {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            let mut received = Vec::new();
+            while let Some(chunk) = response.chunk().await.unwrap() {
+                received.extend_from_slice(&chunk);
+                if String::from_utf8_lossy(&received).contains("long-thinking") {
+                    return;
+                }
+            }
+            panic!("upstream thinking never reached the client");
+        })
+        .await
+        .unwrap();
+    }
+    #[tokio::test]
+    async fn generation_survives_more_than_three_minutes_without_upstream_data() {
+        let (release, waiting) = watch::channel(false);
+        let router = Router::new().route("/v1/chat/completions", post(move || {
+            let mut waiting = waiting.clone();
+            async move {
+                let stream = async_stream::stream! {
+                    yield Ok::<Event, Infallible>(Event::default().data(json!({"choices":[{"delta":{"reasoning_content":"long-thinking"}}]}).to_string()));
+                    waiting.changed().await.unwrap();
+                    yield Ok(Event::default().data(json!({"choices":[{"delta":{"content":"final-reply"},"finish_reason":"stop"}]}).to_string()));
+                    yield Ok(Event::default().data("[DONE]"));
+                };
+                Sse::new(stream)
+            }
+        }));
+        let (bridge, server) = fixture_bridge(router).await;
+        let mut response = fixture_request(&bridge).await;
+        read_until_thinking(&mut response).await;
+
+        // Advance only after TCP and the response body are established. Resuming
+        // before socket I/O avoids auto-advancing past pending OS readiness.
+        tokio::time::pause();
+        tokio::time::advance(std::time::Duration::from_secs(181)).await;
+        tokio::time::resume();
+        release.send(true).unwrap();
+
+        let tail = tokio::time::timeout(std::time::Duration::from_secs(2), response.text())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(tail.contains("final-reply"), "{tail}");
+        assert!(tail.contains("message_stop"), "{tail}");
+        assert!(!tail.contains("\"type\":\"error\""), "{tail}");
+        drop(bridge);
+        server.abort();
+    }
+    #[tokio::test]
+    async fn stopping_a_generation_cancels_waiting_for_upstream_headers() {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let observed = entered.clone();
+        let router = Router::new().route("/v1/chat/completions", post(move || {
+            let observed = observed.clone();
+            async move {
+                observed.notify_one();
+                std::future::pending::<Json<Value>>().await
+            }
+        }));
+        let (bridge, server) = fixture_bridge(router).await;
+        let url = format!("{}/v1/messages", bridge.base_url);
+        let token = bridge.token.clone();
+        let request = tokio::spawn(async move {
+            reqwest::Client::new().post(url).header("x-api-key", token)
+                .json(&json!({"model":"fixture-model","stream":true,"messages":[{"role":"user","content":"hi"}]}))
+                .send().await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), entered.notified())
+            .await
+            .unwrap();
+        drop(bridge);
+        if let Ok(response) = tokio::time::timeout(std::time::Duration::from_secs(1), request)
+            .await
+            .unwrap()
+            .unwrap()
+        {
+            assert_eq!(response.status(), StatusCode::GONE);
+        }
+        server.abort();
+    }
+    #[tokio::test]
+    async fn stopping_an_idle_stream_does_not_wait_for_upstream_data() {
+        let router = Router::new().route("/v1/chat/completions", post(|| async {
+            let stream = async_stream::stream! {
+                yield Ok::<Event, Infallible>(Event::default().data(json!({"choices":[{"delta":{"reasoning_content":"long-thinking"}}]}).to_string()));
+                std::future::pending::<()>().await;
+            };
+            Sse::new(stream)
+        }));
+        let (bridge, server) = fixture_bridge(router).await;
+        let mut response = fixture_request(&bridge).await;
+        read_until_thinking(&mut response).await;
+        drop(bridge);
+        let tail = tokio::time::timeout(std::time::Duration::from_secs(1), response.text())
+            .await
+            .unwrap();
+        if let Ok(tail) = tail {
+            assert!(!tail.contains("message_stop"), "cancelled stream claimed success: {tail}");
+        }
+        server.abort();
     }
     #[tokio::test]
     async fn loopback_requires_token_and_shuts_down_on_drop() {

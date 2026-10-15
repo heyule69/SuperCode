@@ -508,6 +508,10 @@ fn read(path: Option<String>, agent: &str) -> Result<ReadResult, String> {
     for row in rows {
         let (id, agent, name, raw, current) = match row {
             Ok(row) => row,
+            Err(rusqlite::Error::Utf8Error(..)) => {
+                warnings.push("已跳过非 UTF-8 配置：未转换或修改原文件".into());
+                continue;
+            }
             Err(rusqlite::Error::FromSqlConversionFailure(_, _, error))
                 if error.is::<std::str::Utf8Error>() =>
             {

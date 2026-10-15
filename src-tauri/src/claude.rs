@@ -623,7 +623,7 @@ pub async fn send(
     });
     let log_app = app.clone();
     let log_session = session.id.clone();
-    crate::runtime_diagnostics::record(app, Some(&session.id), "agent_process_started", json!({"source":"claude","pid":turn.pid,"model":model}));
+    crate::runtime_diagnostics::record(app, Some(&session.id), "agent_process_started", json!({"source":"claude","pid":turn.pid,"model":model,"protocol":config["protocol"],"connectionId":route.id}));
     tauri::async_runtime::spawn(async move {
         crate::runtime_diagnostics::stderr(Some(log_app), Some(log_session), "claude", stderr).await;
     });

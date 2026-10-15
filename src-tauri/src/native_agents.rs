@@ -855,7 +855,7 @@ async fn start_for(
             startup_model.or_else(|| session.and_then(|s| s.model.as_deref())),
         );
     }
-    start_configured(app, agent, cwd, session, permission, config, &launch).await
+    start_configured(app, agent, cwd, session, permission, config, &launch, false).await
 }
 async fn start_configured(
     app: &AppHandle,
@@ -865,8 +865,10 @@ async fn start_configured(
     permission: &str,
     config: Value,
     launch: &Launch,
+    connection_test: bool,
 ) -> Result<(Arc<Client>, mpsc::Receiver<Value>, Value), String> {
     let mut env = vec![];
+    let mut probe_launch = None;
     if let Some(session) = session {
         env.push(("SUPERCODE_SESSION_ID".into(), session.id.clone()));
     }
@@ -883,6 +885,13 @@ async fn start_configured(
         let (values, environment) = gemini::configure(&home, &config, permission).await?;
         args.extend(values);
         env.extend(environment);
+        if connection_test {
+            probe_launch = gemini::fast_test_launch(launch, &home).await?;
+            if probe_launch.is_some() {
+                env.push(("GEMINI_CLI_NO_RELAUNCH".into(), "true".into()));
+                env.push(("SUPERCODE_GEMINI_PROBE_BASE".into(), gemini::api_endpoint(&config).0));
+            }
+        }
     } else if agent == "pi" {
         let dir = app.state::<AppState>().data_dir.join("agents/pi-runtime");
         tokio::fs::create_dir_all(&dir)
@@ -945,7 +954,7 @@ async fn start_configured(
     }
     crate::runtime_diagnostics::register_secrets(app, &config);
     let (client, events) = Client::start(
-        launch,
+        probe_launch.as_ref().unwrap_or(launch),
         &args,
         cwd,
         &env,
@@ -979,6 +988,7 @@ pub async fn test_provider_connection(
         "summary",
         profile.config.clone(),
         launch,
+        true,
     )
     .await?;
     let result = tokio::time::timeout(
@@ -1012,6 +1022,22 @@ async fn probe_request(
     }
 }
 fn probe_notification(event: &Value) -> Result<(), String> {
+    if event["type"] == "supercode_gemini_probe_failure" {
+        let mut message = if event["transportError"] == true {
+            "Gemini API 网络请求失败，请检查网络和 API 地址".to_owned()
+        } else {
+            let status = event["status"].as_u64().filter(|status| (400..=599).contains(status))
+                .ok_or("Gemini 连接测试诊断无效")?;
+            crate::providers::http_failure(status as u16)
+        };
+        if let Some(reason) = event["reason"].as_str().filter(|text| !text.is_empty()) {
+            message.push_str(&format!("；供应商原因：{}", protocol::bounded(reason, 2048)));
+        }
+        if let Some(endpoint) = event["endpoint"].as_str() {
+            message.push_str(&format!("；请求地址：{}", protocol::bounded(endpoint, 2048)));
+        }
+        return Err(message);
+    }
     if event["type"] == "supercode_disconnected" {
         return Err("连接测试进程已退出，请检查引擎安装和运行日志".into());
     }
@@ -1799,6 +1825,7 @@ pub async fn summary(
             "summary",
             route.config.clone(),
             &launch,
+            false,
         )
         .await?
     } else {
@@ -1938,6 +1965,60 @@ fn prompt_content(agent: &str, content: &[Value], instructions: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn gemini_probe_returns_the_first_http_failure_without_blaming_credentials_for_503() {
+        let error = probe_notification(&json!({"type":"supercode_gemini_probe_failure","status":503,
+            "reason":"No available Gemini accounts: no available accounts","endpoint":"https://gateway.example/v1beta/models/test:streamGenerateContent"})).unwrap_err();
+        assert!(error.contains("HTTP 503"));
+        assert!(error.contains("No available Gemini accounts"));
+        assert!(!error.contains("检查地址、Key"));
+        assert!(probe_notification(&json!({"type":"supercode_gemini_probe_failure","status":200})).is_err());
+        assert!(probe_notification(&json!({"type":"supercode_gemini_probe_failure","transportError":true})).unwrap_err().contains("网络请求失败"));
+    }
+    #[tokio::test]
+    #[ignore = "requires an installed official Gemini CLI and explicitly supplied real-provider credentials"]
+    async fn official_gemini_cli_real_provider_fast_probe() {
+        let config: Value = serde_json::from_str(&std::env::var("SUPERCODE_GEMINI_REAL_PROBE")
+            .expect("Supply the selected profile through the test process environment")).unwrap();
+        let script = std::path::PathBuf::from(std::env::var("SUPERCODE_GEMINI_PROBE_CLI_PATH").expect("Supply the official CLI entrypoint"));
+        assert!(script.is_absolute() && script.is_file());
+        let model = config["model"].as_str().unwrap().to_owned();
+        let program = process::find_program("node").expect("Node is required");
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().unwrap().join(".supercode");
+        let stage = root.join(format!("gemini-real-rust-probe-{}", uuid::Uuid::new_v4()));
+        let cwd = stage.join("workspace");
+        tokio::fs::create_dir_all(cwd.join(".git")).await.unwrap();
+        let home = gemini::home(&stage, None, true);
+        let (args, mut env) = gemini::configure(&home, &config, "summary").await.unwrap();
+        env.extend([
+            ("GEMINI_CLI_NO_RELAUNCH".into(), "true".into()),
+            ("SUPERCODE_GEMINI_PROBE_BASE".into(), gemini::api_endpoint(&config).0),
+        ]);
+        for name in ["USERPROFILE", "HOME", "APPDATA", "LOCALAPPDATA", "TEMP", "TMP"] {
+            let path = if matches!(name, "USERPROFILE" | "HOME") { home.clone() } else { stage.join(name) };
+            tokio::fs::create_dir_all(&path).await.unwrap();
+            env.push((name.into(), path.to_string_lossy().into_owned()));
+        }
+        let launch = Launch { program, prefix: vec![script.to_string_lossy().into_owned()], source: "explicit-real-provider-probe".into() };
+        let launch = gemini::fast_test_launch(&launch, &home).await.unwrap().unwrap();
+        let started = std::time::Instant::now();
+        let (client, mut events) = Client::start(&launch, &args, &cwd, &env, false, None).await.unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(45), probe_completion(&client, &mut events, "gemini", &config, &model, &cwd)).await;
+        client.close().await;
+        let mut secrets = Vec::new();
+        crate::log_redaction::collect(&config, &mut secrets, 0);
+        let (reply, error) = match &result {
+            Ok(Ok(reply)) => (Some(crate::log_redaction::text(reply, &secrets)), None),
+            Ok(Err(error)) => (None, Some(crate::log_redaction::text(error, &secrets))),
+            Err(_) => (None, Some("等待实际引擎结果超时".to_owned())),
+        };
+        let report = json!({"realProvider":true,"productionRustTransport":true,"model":model,
+            "elapsedMs":started.elapsed().as_millis(),"reply":reply,"error":error,"timedOut":result.is_err()});
+        tokio::fs::write(stage.join("report.json"), serde_json::to_vec_pretty(&report).unwrap()).await.unwrap();
+        println!("{}", report);
+        println!("Real-provider probe report: {}", stage.join("report.json").display());
+        assert!(result.is_ok(), "The real-provider probe did not receive an engine result within 45 seconds");
+    }
     #[tokio::test]
     #[ignore = "requires the downloaded official Gemini CLI bundle; uses only a local fake gateway"]
     async fn official_gemini_cli_connects_through_production_transport_to_a_stream_only_gateway() {

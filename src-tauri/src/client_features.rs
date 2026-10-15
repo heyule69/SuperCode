@@ -104,6 +104,13 @@ pub(crate) fn validate_steering_settings(
     Ok(())
 }
 
+const PROGRESS_GUIDANCE: &str = "Progress communication in this interactive app:\n\
+For substantial or multi-step work, proactively send brief, user-visible assistant messages in the user's language. Do not leave the user with only reasoning events and tool records until the final answer.\n\
+Before starting extended analysis, a batch of tool calls, or a potentially slow operation, explain the immediate approach in one or two short sentences. After a meaningful finding, a change of approach, or a completed stage, explain what was established and what comes next.\n\
+If you have made several tool calls without a public update, provide one before the next batch. During sustained work, aim to update roughly every 30-60 seconds when you have an opportunity to speak; do not wait until the entire task is finished. A blocking tool call or a provider that is not returning output may prevent timely updates.\n\
+These updates must be ordinary assistant text, separate from private reasoning and tool output. Summarize verified actions, useful findings, remaining uncertainty, and the next step without exposing private chain-of-thought. Do not invent progress, claim success early, repeat empty reassurance, or narrate every trivial tool call.\n\
+Answer simple requests directly. Respect an explicit request for silence, minimal output, or a strict output-only format; do not add progress messages that break the requested format.";
+
 pub fn instructions(app: &AppHandle) -> String {
     let text = app
         .state::<AppState>()
@@ -113,7 +120,7 @@ pub fn instructions(app: &AppHandle) -> String {
         .flatten()
         .unwrap_or_default();
     let tools = automation_instructions(&servers(app).unwrap_or_default());
-    format!("Read and write every project text file as UTF-8 without BOM. Tell the user before converting non-UTF-8 files.\nYou are running inside the SuperCode graphical desktop app. The conversation supports inline images, video and audio, not just terminal text. Tool image results are displayed automatically. To show a local media file, write ![descriptive caption](<absolute file path>); use an absolute path with spaces inside angle brackets. The same syntax supports video and audio files. Use ordinary Markdown links for files that should only be referenced. Do not open another application or copy screenshots to the desktop merely to make media visible in the conversation. Never claim a media file was shown unless you actually returned the media result or referenced an existing file.\n{tools}\n{text}")
+    format!("Read and write every project text file as UTF-8 without BOM. Tell the user before converting non-UTF-8 files.\nYou are running inside the SuperCode graphical desktop app. The conversation supports inline images, video and audio, not just terminal text. Tool image results are displayed automatically. To show a local media file, write ![descriptive caption](<absolute file path>); use an absolute path with spaces inside angle brackets. The same syntax supports video and audio files. Use ordinary Markdown links for files that should only be referenced. Do not open another application or copy screenshots to the desktop merely to make media visible in the conversation. Never claim a media file was shown unless you actually returned the media result or referenced an existing file.\n{PROGRESS_GUIDANCE}\n{tools}\n{text}")
 }
 
 #[tauri::command]

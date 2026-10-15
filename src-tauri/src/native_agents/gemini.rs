@@ -16,6 +16,31 @@ pub(super) fn startup_model(mut config: Value, model: Option<&str>) -> Value {
     }
     config
 }
+pub(super) async fn fast_test_launch(
+    launch: &crate::agents::Launch,
+    home: &Path,
+) -> Result<Option<crate::agents::Launch>, String> {
+    // Official managed/global installations launch Node with the JS entrypoint.
+    // Preserve custom binary launchers instead of adding unsupported Node flags.
+    if !launch.prefix.first().is_some_and(|script| {
+        matches!(
+            Path::new(script).extension().and_then(|s| s.to_str()),
+            Some("js" | "mjs")
+        )
+    }) {
+        return Ok(None);
+    }
+    let path = crate::agents::ordinary(home.join(".gemini/supercode-probe.mjs"));
+    tokio::fs::write(&path, include_bytes!("gemini_probe.mjs"))
+        .await
+        .map_err(|_| "无法准备 Gemini 连接测试诊断")?;
+    let url = reqwest::Url::from_file_path(&path).map_err(|_| "Gemini 诊断路径无效")?;
+    let mut prepared = launch.clone();
+    prepared
+        .prefix
+        .splice(0..0, ["--import".into(), url.to_string()]);
+    Ok(Some(prepared))
+}
 
 pub(super) fn api_endpoint(config: &Value) -> (String, String) {
     let base = crate::providers::gemini_api_base(
@@ -181,6 +206,131 @@ pub(super) async fn configure(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn probe_observer_preserves_requests_and_bounds_error_diagnostics_without_credentials() {
+        let Some(program) = crate::process::find_program("node") else {
+            return;
+        };
+        let root =
+            std::env::temp_dir().join(format!("supercode-gemini-probe-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(root.join(".gemini"))
+            .await
+            .unwrap();
+        let entry = root.join("runner.mjs");
+        let script = r#"
+import {createServer} from 'node:http';
+import {writeSync} from 'node:fs';
+// The real ACP entrypoint intercepts this method. The observer must bypass it.
+process.stdout.write=()=>false;
+const scenario=process.env.SUPERCODE_TEST_SCENARIO,key=process.env.GEMINI_API_KEY;
+let calls=0;
+const server=createServer(async(req,res)=>{
+  let body='';for await(const chunk of req)body+=chunk.toString('utf8');
+  if(req.headers['x-goog-api-key']!==key||body!==JSON.stringify({fixture:true}))process.exit(3);
+  calls++;
+  if(req.url.startsWith('/proxy/health')){res.writeHead(503).end('{"message":"health check"}');return;}
+  if(scenario==='success'){res.writeHead(200,{'content-type':'application/json'}).end('{"text":"OK"}');return;}
+  if(scenario==='html'){res.writeHead(503).end('<html>private gateway page</html>');return;}
+  if(scenario==='oversized'){res.writeHead(503).end(JSON.stringify({error:{message:'x'.repeat(32760)+key}}));return;}
+  if(scenario==='encoding'){res.writeHead(503).end(Buffer.from([255,254]));return;}
+  if(scenario==='slow'){res.writeHead(503);res.write('{"error":{"message":"partial');return;}
+  res.writeHead(503,{'content-type':'application/json'}).end(JSON.stringify({error:{message:'No accounts; '+key+'; '+'中'.repeat(700)}}));
+});
+await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
+const base=`http://127.0.0.1:${server.address().port}/proxy`;
+process.env.SUPERCODE_GEMINI_PROBE_BASE=base;
+const send=path=>fetch(base+path+'?key='+key,{method:'POST',headers:{'x-goog-api-key':key},body:JSON.stringify({fixture:true})});
+// Unrelated requests are left to the CLI and must not be reported as model failure.
+await (await send('/health')).arrayBuffer();
+if(scenario==='transport'){await new Promise(resolve=>server.close(resolve));try{await send('/v1beta/models/test:streamGenerateContent');}catch{};}
+else{
+  const response=await send('/v1beta/models/test:streamGenerateContent');
+  if(scenario==='slow'){void response.body.cancel().catch(()=>{});server.closeAllConnections();}
+  else if(!(await response.text()).length)process.exit(4);
+  if(scenario==='reason'){await (await send('/v1beta/models/test:streamGenerateContent')).text();}
+  await new Promise(resolve=>server.close(resolve));
+}
+writeSync(1,JSON.stringify({completed:true,calls})+'\n');
+"#;
+        tokio::fs::write(&entry, script.as_bytes()).await.unwrap();
+        let launch = crate::agents::Launch {
+            program,
+            prefix: vec![entry.to_string_lossy().into_owned()],
+            source: "local-probe-test".into(),
+        };
+        let prepared = fast_test_launch(&launch, &root).await.unwrap().unwrap();
+        assert_eq!(launch.prefix.len(), 1);
+        assert_eq!(prepared.prefix[0], "--import");
+        assert!(prepared.prefix[1].starts_with("file:"));
+        let mut binary = launch.clone();
+        binary.prefix.clear();
+        assert!(fast_test_launch(&binary, &root).await.unwrap().is_none());
+        for scenario in [
+            "success",
+            "reason",
+            "html",
+            "oversized",
+            "encoding",
+            "slow",
+            "transport",
+        ] {
+            let output = tokio::time::timeout(
+                std::time::Duration::from_secs(8),
+                prepared
+                    .command(&[])
+                    .env("GEMINI_API_KEY", "fixture-private-key")
+                    .env("SUPERCODE_TEST_SCENARIO", scenario)
+                    .output(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert!(
+                output.status.success(),
+                "{scenario}: {}",
+                String::from_utf8(output.stderr).unwrap()
+            );
+            let text = String::from_utf8(output.stdout).unwrap();
+            assert!(!text.contains("fixture-private-key"));
+            assert!(!text.contains("?key="));
+            let values = text
+                .lines()
+                .map(|line| serde_json::from_str::<Value>(line).unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(values.last().unwrap()["completed"], true);
+            let failures = values
+                .iter()
+                .filter(|value| value["type"] == "supercode_gemini_probe_failure")
+                .collect::<Vec<_>>();
+            if scenario == "success" {
+                assert!(failures.is_empty());
+            } else {
+                assert_eq!(failures.len(), 1, "{scenario}");
+                assert!(failures[0]["endpoint"]
+                    .as_str()
+                    .unwrap()
+                    .contains("/proxy/v1beta/models/test:streamGenerateContent"));
+                if scenario == "reason" {
+                    assert!(failures[0]["reason"]
+                        .as_str()
+                        .unwrap()
+                        .contains("[REDACTED]"));
+                    assert!(failures[0]["reason"].as_str().unwrap().chars().count() <= 512);
+                } else if scenario == "transport" {
+                    assert_eq!(failures[0]["transportError"], true);
+                } else {
+                    assert_eq!(failures[0]["reason"], "");
+                }
+            }
+        }
+        let resolved = root.canonicalize().unwrap();
+        assert_eq!(
+            resolved.parent(),
+            Some(std::env::temp_dir().canonicalize().unwrap().as_path())
+        );
+        tokio::fs::remove_dir_all(resolved).await.unwrap();
+    }
 
     #[test]
     fn endpoint_version_and_authentication_do_not_duplicate_api_path() {

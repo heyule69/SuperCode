@@ -275,6 +275,27 @@ it('keeps one animated status across tool completion and text output, then remov
   expect(node.querySelector('.activity-item.failed')?.textContent).toContain('失败');
 });
 
+it('keeps public agent explanations visible while reasoning and tools remain collapsed', async () => {
+  const thought = message('thought', 'activity', '内部思考记录', 'reasoning', { status: 'completed' });
+  const firstUpdate = '已经检查了现有素材，接下来核对场景文件。';
+  const rows = [items[0], thought, items[2], message('update-1', 'assistant', firstUpdate, 'agentMessage', { phase: 'commentary' })];
+  await render(rows, false, { sessionStatus: 'running' });
+  expect(node.querySelector('.activity-group-summary')?.getAttribute('aria-expanded')).toBe('false');
+  expect(node.querySelector('.activity-items')).toBeNull();
+  expect(node.textContent).toContain(firstUpdate);
+  expect(node.textContent).not.toContain(thought.text);
+
+  const secondUpdate = '场景文件已找到，正在运行渲染检查。';
+  await render([...rows,
+    message('render', 'tool', '', 'commandExecution', { command: 'node render.js', status: 'running' }),
+    message('update-2', 'assistant', secondUpdate, 'agentMessage', { messageId: 'native-public-update', status: 'completed' }),
+  ], false, { sessionStatus: 'running' });
+  expect(node.textContent).toContain(firstUpdate);
+  expect(node.textContent).toContain(secondUpdate);
+  expect(node.querySelector('.activity-items')).toBeNull();
+  expect(node.querySelector('.working-indicator .pending-text')?.textContent).toBe('正在执行命令');
+});
+
 it('keeps active tool progress visible when assistant text arrives while the tool is still running', async () => {
   const tool = message('command', 'tool', '', 'commandExecution', { command: 'npm run build', status: 'running' });
   await render([items[0], tool, items[1]], false, { sessionStatus: 'running' });

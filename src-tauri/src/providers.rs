@@ -392,12 +392,23 @@ pub fn validate_url(value: &str) -> Result<String, String> {
     }
     Ok(value.trim().trim_end_matches('/').to_owned())
 }
-pub fn client() -> Result<reqwest::Client, String> {
+fn client_builder() -> reqwest::ClientBuilder {
     reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(15))
-        .timeout(std::time::Duration::from_secs(180))
         .redirect(reqwest::redirect::Policy::none())
         .user_agent(concat!("SuperCode/", env!("CARGO_PKG_VERSION")))
+}
+pub fn client() -> Result<reqwest::Client, String> {
+    client_builder()
+        .timeout(std::time::Duration::from_secs(180))
+        .build()
+        .map_err(|_| "无法初始化 API 连接".into())
+}
+pub fn generation_client() -> Result<reqwest::Client, String> {
+    // Model generations can legitimately exceed the editor's request deadline,
+    // including long intervals without data. Keep the bridge's explicit
+    // cancellation and bounded connects without a generation time limit.
+    client_builder()
         .build()
         .map_err(|_| "无法初始化 API 连接".into())
 }
@@ -425,7 +436,7 @@ pub async fn read_json(response: reqwest::Response) -> Result<Value, String> {
     }
     serde_json::from_slice(&bytes).map_err(|_| "API 返回的内容不是受支持的 JSON".to_owned())
 }
-fn http_failure(status: u16) -> String {
+pub(crate) fn http_failure(status: u16) -> String {
     let reason = match status {
         401 => "认证失败，请检查 API Key",
         403 => "访问被拒绝，请检查模型和接口权限",

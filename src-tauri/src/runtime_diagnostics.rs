@@ -88,7 +88,7 @@ pub fn error_type(text: &str) -> &'static str {
         .any(|s| lower.contains(s))
     {
         "authentication"
-    } else if ["timeout", "timed out", "超时"]
+    } else if ["timeout", "timed out", "stream idle", "超时"]
         .iter()
         .any(|s| lower.contains(s))
     {
@@ -351,6 +351,16 @@ pub fn report_frontend_error(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn upstream_stream_idle_is_reported_as_a_timeout_with_the_original_reason() {
+        let message = json!({"method":"turn/completed","params":{"turn":{"id":"turn","status":"failed","error":{"message":"API Error: upstream stream idle for 3m0s"}}}});
+        let (event, details) = turn_details(&message).unwrap();
+        assert_eq!(event, "turn_completed");
+        assert_eq!(details["status"], "failed");
+        assert_eq!(details["errorType"], "timeout");
+        assert_eq!(details["error"], "API Error: upstream stream idle for 3m0s");
+        assert_eq!(error_type("Agent session is idle"), "agent_error");
+    }
     #[test]
     fn errors_are_useful_but_redacted_and_conversations_are_excluded() {
         let message = json!({"method":"turn/completed","params":{"turn":{"id":"turn","status":"failed","error":{"message":"401 authentication failed: private-secret"}},"input":"private-prompt","settings":{"apiKey":"key"}}});

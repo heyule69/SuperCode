@@ -1,6 +1,6 @@
 //! Consistent SQLite snapshots and validated restore on the next application start.
 use crate::{storage::Store, AppState};
-use rusqlite::{Connection, DatabaseName, OpenFlags};
+use rusqlite::{Connection, OpenFlags, MAIN_DB};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -48,6 +48,24 @@ fn hash_file(path: &Path) -> Result<String> {
 }
 fn hash(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
+}
+fn integrity_error(error: rusqlite::Error) -> String {
+    match error.sqlite_error_code() {
+        Some(rusqlite::ErrorCode::DatabaseCorrupt | rusqlite::ErrorCode::NotADatabase) =>
+            "数据库结构异常，原文件已保留；请先保存运行日志，再检查可用备份。不会自动重建或覆盖聊天数据".into(),
+        Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked) =>
+            "数据库正被占用，暂时无法完成检查；原数据已保留，请稍后重试".into(),
+        _ => format!("无法检查数据库，原数据已保留：{error}"),
+    }
+}
+fn check_integrity(conn: &Connection) -> Result<()> {
+    let status: String = conn
+        .query_row("PRAGMA quick_check(1)", [], |row| row.get(0))
+        .map_err(integrity_error)?;
+    if status != "ok" {
+        return Err("数据库结构异常，原文件已保留；请先保存运行日志，再检查可用备份。不会自动重建或覆盖聊天数据".into());
+    }
+    Ok(())
 }
 fn frontend_bytes(entries: &BTreeMap<String, String>) -> Result<Vec<u8>> {
     if entries.len() > 512
@@ -170,7 +188,7 @@ fn checked_copy(path: &Path) -> Result<CheckedDatabase> {
     let original = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
         .map_err(|e| e.to_string())?;
     original
-        .backup(DatabaseName::Main, &checked.0, None)
+        .backup(MAIN_DB, &checked.0, None)
         .map_err(|e| e.to_string())?;
     preflight_database(&checked.0)?;
     Ok(checked)
@@ -264,16 +282,21 @@ fn retire_completed(parent: &Path) {
 }
 
 fn snapshot(conn: &Connection, directory: &Path, reason: &str) -> Result<PathBuf> {
+    // Check and copy the same read snapshot. A concurrent writer must not be
+    // able to change the validated view before the online backup reads it.
+    let read = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+    check_integrity(&read)?;
     fs::create_dir_all(directory).map_err(|e| e.to_string())?;
     let path = directory.join(format!(
         "{reason}-{}-{}.db",
         crate::storage::now(),
         uuid::Uuid::new_v4()
     ));
-    if let Err(error) = conn.backup(DatabaseName::Main, &path, None) {
+    if let Err(error) = read.backup(MAIN_DB, &path, None) {
         let _ = fs::remove_file(&path);
         return Err(error.to_string());
     }
+    read.commit().map_err(|e| e.to_string())?;
     Ok(path)
 }
 fn retain_snapshots(directory: &Path) -> Result<()> {
@@ -325,7 +348,7 @@ fn startup(path: &Path) -> Result<()> {
             snapshot(&conn, &parent.join("backups"), "before-restore")?;
         }
         conn.restore(
-            DatabaseName::Main,
+            MAIN_DB,
             &normalized.0,
             None::<fn(rusqlite::backup::Progress)>,
         )
@@ -346,7 +369,11 @@ fn startup(path: &Path) -> Result<()> {
         retire_completed(parent);
     }
     if path.is_file() {
-        let conn = Connection::open(path).map_err(|e| e.to_string())?;
+        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(integrity_error)?;
+        conn.busy_timeout(std::time::Duration::from_secs(3))
+            .map_err(integrity_error)?;
+        check_integrity(&conn)?;
         let version: u32 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .map_err(|e| e.to_string())?;
@@ -616,6 +643,93 @@ mod tests {
             .to_string_lossy()
             .starts_with("supercode-backup-"));
         fs::remove_dir_all(root).unwrap();
+    }
+
+    fn corrupt_btree_page(path: &Path, page: u32) {
+        let mut bytes = fs::read(path).unwrap();
+        let page_size = u16::from_be_bytes([bytes[16], bytes[17]]) as usize;
+        let offset = (page as usize - 1) * page_size + if page == 1 { 100 } else { 0 };
+        bytes[offset] = 0; // An invalid B-tree type, leaving the database header intact.
+        fs::write(path, bytes).unwrap();
+    }
+
+    #[test]
+    fn corrupted_schema_is_rejected_before_migration_without_changing_original_bytes() {
+        let root = temporary_root();
+        let path = root.join("supercode.db");
+        let store = Store::open(&path).unwrap();
+        store.set_setting("preserve", "user-data").unwrap();
+        store.0.lock().unwrap().pragma_update(None, "user_version", 0).unwrap();
+        drop(store);
+        corrupt_btree_page(&path, 1);
+        let before = hash_file(&path).unwrap();
+        let error = before_open(&path).unwrap_err().to_string();
+        assert!(error.contains("数据库结构异常"), "{error}");
+        assert_eq!(hash_file(&path).unwrap(), before);
+        assert!(!root.join("backups").exists());
+        remove_test_root(&root);
+    }
+
+    #[test]
+    fn corrupt_index_cannot_be_exported_as_a_successful_backup() {
+        let root = temporary_root();
+        let path = root.join("supercode.db");
+        let store = Store::open(&path).unwrap();
+        let index: u32 = store.0.lock().unwrap().query_row(
+            "SELECT rootpage FROM sqlite_master WHERE name='sqlite_autoindex_projects_1'",
+            [], |row| row.get(0),
+        ).unwrap();
+        drop(store);
+        corrupt_btree_page(&path, index);
+        let before = hash_file(&path).unwrap();
+        let conn = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        let archive = root.join("corrupt.supercode-backup");
+        let error = export(&conn, BTreeMap::new(), &archive, &root.join("backups")).unwrap_err();
+        assert!(error.contains("数据库结构异常"), "{error}");
+        assert!(!archive.exists());
+        assert!(!root.join("backups").exists());
+        assert!(conn.is_autocommit(), "failed inspection left a read transaction open");
+        drop(conn);
+        assert_eq!(hash_file(&path).unwrap(), before);
+        remove_test_root(&root);
+    }
+
+    #[test]
+    fn snapshots_remain_valid_while_another_wal_connection_writes() {
+        let root = temporary_root();
+        let path = root.join("supercode.db");
+        let store = Store::open(&path).unwrap();
+        store.set_setting("left", "0").unwrap();
+        store.set_setting("right", "0").unwrap();
+        let gate = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let writer_gate = gate.clone();
+        let writer_path = path.clone();
+        let writer = std::thread::spawn(move || {
+            let mut conn = Connection::open(writer_path).unwrap();
+            conn.busy_timeout(std::time::Duration::from_secs(3)).unwrap();
+            writer_gate.wait();
+            for value in 1..=40 {
+                let tx = conn.transaction().unwrap();
+                tx.execute("UPDATE settings SET value=?1 WHERE key='left'", [value.to_string()]).unwrap();
+                std::thread::yield_now();
+                tx.execute("UPDATE settings SET value=?1 WHERE key='right'", [value.to_string()]).unwrap();
+                tx.commit().unwrap();
+            }
+        });
+        let conn = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        conn.busy_timeout(std::time::Duration::from_secs(3)).unwrap();
+        gate.wait();
+        for _ in 0..8 {
+            let saved = snapshot(&conn, &root.join("backups"), "concurrent").unwrap();
+            let copy = Connection::open_with_flags(saved, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+            check_integrity(&copy).unwrap();
+            let value = |key| copy.query_row::<String, _, _>("SELECT value FROM settings WHERE key=?1", [key], |row| row.get(0)).unwrap();
+            assert_eq!(value("left"), value("right"));
+        }
+        writer.join().unwrap();
+        drop(conn);
+        drop(store);
+        remove_test_root(&root);
     }
 
     #[test]
