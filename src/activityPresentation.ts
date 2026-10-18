@@ -1,7 +1,7 @@
 import type { Message } from './types';
 
 export type ActivityCategory = 'command' | 'edit' | 'read' | 'search' | 'web' | 'browser' | 'computer' | 'plan' | 'reasoning' | 'context' | 'tool';
-interface ActivitySummary { label: string; category: ActivityCategory; status: string }
+interface ActivitySummary { label: string; category: ActivityCategory; status: string; earlierFailure?: true }
 
 export function activityStatus(message: Message) {
   const data = message.data;
@@ -65,12 +65,20 @@ export function summarizeActivities(messages: Message[], live = false): Activity
   }
   const categories = new Map<ActivityCategory, { active: boolean; paths: Set<string> }>();
   let status = 'completed';
+  let latestActionState: string | undefined;
+  let earlierFailure = false;
   const rank: Record<string, number> = { completed: 0, inProgress: 1, running: 1, preparing: 1, interrupted: 2, declined: 3, failed: 4 };
   for (const message of messages) {
     const data = message.data ?? {};
     const state = activityStatus(message);
     if ((rank[state] ?? 0) > (rank[status] ?? 0)) status = state;
     const add = (category: ActivityCategory, paths: unknown[] = []) => {
+      // Historical failures stay on their own rows. A later real tool result
+      // determines the summary; reasoning/plan text cannot manufacture success.
+      if (!['reasoning', 'plan', 'context'].includes(category)) {
+        latestActionState = state;
+        earlierFailure ||= state === 'failed';
+      }
       const value = categories.get(category) ?? { active: false, paths: new Set<string>() };
       value.active ||= activeStatuses.has(state);
       for (const path of paths) if (typeof path === 'string' && path) {
@@ -104,12 +112,14 @@ export function summarizeActivities(messages: Message[], live = false): Activity
     }
   }
   if (categories.size > 1) categories.delete('reasoning');
+  if (latestActionState !== undefined && !activeStatuses.has(latestActionState)) status = latestActionState;
   const entries = [...categories];
   const label = entries.map(([category, value]) => {
     if (category === 'edit' && value.paths.size > 1) return value.active ? '正在编辑多个文件' : '编辑了多个文件';
     return activityLabels[category][value.active ? 1 : 0];
   }).join('、');
-  return { label, category: entries[0]?.[0] ?? 'tool', status };
+  return { label, category: entries[0]?.[0] ?? 'tool', status,
+    ...(earlierFailure && status === 'completed' ? { earlierFailure: true as const } : {}) };
 }
 
 export function compactActivities(messages: Message[]) {

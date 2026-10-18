@@ -586,6 +586,7 @@ pub(crate) fn cue_ready(app: &AppHandle) -> bool {
         && ready.pointer
         && ready.keyboard
         && ready.mouse
+        && ready.banner
         && state
             .gate
             .lock()
@@ -699,8 +700,8 @@ pub fn stop_session(app: &AppHandle, session: &str) {
     revoke_control(app, true, "chat_stop", Some(session));
 }
 
-/// Manual input takes priority. Mouse/ordinary keys keep the user's foreground;
-/// Esc and the chat's Stop button may bring the chat back.
+/// Esc, explicit chat stops and unavailable cues revoke control. Ordinary mouse,
+/// keyboard and focus changes do not revoke the grant.
 pub(crate) fn takeover_reason(app: &AppHandle, bring_back: bool, reason: &str) {
     revoke_control(app, bring_back, reason, None);
 }

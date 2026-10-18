@@ -27,7 +27,7 @@ export function usePanelResize(left: boolean, right: boolean, disabled: boolean,
   const storageKey = panel === 'workspace' ? key : `${key}.${panel}`;
   const rightDefault = panel === 'workspace' ? defaultWidths.right : 520;
   const root = useRef<HTMLDivElement>(null);
-  const [widths, setWidths] = useState(() => decodePanelWidths(localStorage.getItem(key)));
+  const [widths, setWidths] = useState(() => ({ ...decodePanelWidths(localStorage.getItem(key)), right:decodePanelWidths(localStorage.getItem(storageKey), rightDefault).right }));
   const preferred = useRef(widths);
   const options = useRef({ left, right, disabled, expanded });
   options.current = { left, right, disabled, expanded };
@@ -38,8 +38,9 @@ export function usePanelResize(left: boolean, right: boolean, disabled: boolean,
     const size = panelLayout(preferred.current, el.clientWidth, o.left, o.right, panel);
     const rightWidth = o.expanded ? Math.max(size.right, Math.min(820, el.clientWidth - (o.left ? size.left : 0) - (size.overlay ? 32 : 360))) : size.right;
     el.style.setProperty('--context-width', `${rightWidth}px`);
-    // Stable track count allows native CSS interpolation while panes open and close.
-    el.style.gridTemplateColumns = `${o.left && !o.disabled ? size.left : 0}px minmax(0,1fr) ${o.right && !size.overlay && !o.disabled ? rightWidth : 0}px`;
+    // Full-page settings span all tracks. Keep the hidden chat's columns intact
+    // so returning to it never animates its sidebar through a zero-width column.
+    el.style.gridTemplateColumns = `${o.left ? size.left : 0}px minmax(0,1fr) ${o.right && !size.overlay ? rightWidth : 0}px`;
   }
   function commit() {
     setWidths({ ...preferred.current });
@@ -49,9 +50,15 @@ export function usePanelResize(left: boolean, right: boolean, disabled: boolean,
     } catch { /* Layout still works if storage is full. */ }
   }
   useLayoutEffect(()=>{
+    const el=root.current;
+    const transition=el?.style.transition;
+    // Restore saved tracks before the first paint, without animating from CSS
+    // defaults after apply() measures the container and flushes its old layout.
+    if(el)el.style.transition='none';
     const saved=localStorage.getItem(storageKey);
     preferred.current={...preferred.current,right:decodePanelWidths(saved, rightDefault).right};
     setWidths({...preferred.current});apply();
+    if(el){el.getBoundingClientRect();if(transition)el.style.transition=transition;else el.style.removeProperty('transition');}
   },[panel]);
   useLayoutEffect(() => {
     apply(); const observer = new ResizeObserver(apply); if (root.current) observer.observe(root.current);

@@ -13,6 +13,28 @@ beforeEach(()=>{(globalThis as any).IS_REACT_ACT_ENVIRONMENT=true;vi.mocked(call
 afterEach(async()=>{await act(async()=>root.unmount());node.remove();});
 async function render(visible=true){await act(async()=>{root.render(<BrowserPanel sessionId="s" visible={visible} close={close} resizeHandle={null} expanded={false} expand={()=>{}}/>);await new Promise(resolve=>setTimeout(resolve,30));});}
 it('only accepts web addresses and excludes embedded credentials',()=>{expect(browserAddress('example.com')).toBe('https://example.com/');for(const url of ['javascript:alert(1)','file:///C:/secret','https://user:secret@example.com'])expect(()=>browserAddress(url)).toThrow();});
+it('parks the native view behind an image preview and restores it without stopping automation',async()=>{
+  await render();const overlay=document.createElement('div');overlay.className='image-preview-backdrop';document.body.append(overlay);
+  await act(async()=>{window.dispatchEvent(new Event('supercode-media-overlay'));await new Promise(resolve=>setTimeout(resolve,40));});
+  expect(call).toHaveBeenLastCalledWith('browser_layout',expect.objectContaining({visible:false}));
+  overlay.remove();
+  await act(async()=>{window.dispatchEvent(new Event('supercode-media-overlay'));await new Promise(resolve=>setTimeout(resolve,40));});
+  expect(call).toHaveBeenLastCalledWith('browser_layout',expect.objectContaining({visible:true}));
+  expect(call).not.toHaveBeenCalledWith('browser_takeover',expect.anything());
+});
+it('resizes and reopens the preview without recreating, navigating or taking over its page',async()=>{
+  await render();
+  const initialMount=vi.mocked(call).mock.calls.find(([command])=>command==='browser_open')?.[1]?.mountId;
+  const viewport=node.querySelector<HTMLElement>('.browser-viewport')!;
+  viewport.getBoundingClientRect=()=>({x:20,y:80,width:240,height:650}) as DOMRect;
+  await act(async()=>{window.dispatchEvent(new Event('resize'));await new Promise(resolve=>setTimeout(resolve,40));});
+  expect(call).toHaveBeenCalledWith('browser_layout',expect.objectContaining({mountId:initialMount,width:240,height:650,visible:true}));
+  await render(false);await render(true);
+  expect(vi.mocked(call).mock.calls.filter(([command])=>command==='browser_open')).toHaveLength(1);
+  for(const command of ['browser_close','browser_manual','browser_takeover','interrupt_turn']){
+    expect(call).not.toHaveBeenCalledWith(command,expect.anything());
+  }
+});
 it('waits for native creation before sending layout, including a visibility change while opening',async()=>{
   let finish!:(value:unknown)=>void;
   const pending=new Promise<unknown>(resolve=>{finish=resolve;});

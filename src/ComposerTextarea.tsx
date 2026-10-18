@@ -1,16 +1,18 @@
 import { forwardRef, useImperativeHandle, useLayoutEffect, useRef, type ComponentProps } from 'react';
 
-function resize(textarea: HTMLTextAreaElement | null) {
-  if (!textarea) return;
+function resize(textarea: HTMLTextAreaElement | null, minHeight: number) {
+  // Settings keep the chat mounted but hidden; measuring there would collapse
+  // a long draft to zero before the chat becomes visible again.
+  if (!textarea || textarea.closest('[hidden]')) return;
   textarea.style.height = '0px';
-  textarea.style.height = `${textarea.scrollHeight}px`;
+  textarea.style.height = `${Math.max(minHeight, textarea.scrollHeight)}px`;
 }
 
 /** Both chat surfaces grow with the draft, then scroll at their CSS height limit. */
-export const ComposerTextarea = forwardRef<HTMLTextAreaElement, ComponentProps<'textarea'>>(function ComposerTextarea(props, forwardedRef) {
+export const ComposerTextarea = forwardRef<HTMLTextAreaElement, ComponentProps<'textarea'> & { minHeight?: number }>(function ComposerTextarea({ minHeight = 0, ...props }, forwardedRef) {
   const element = useRef<HTMLTextAreaElement>(null);
   useImperativeHandle(forwardedRef, () => element.current!, []);
-  useLayoutEffect(() => { resize(element.current); }, [props.value, props.rows]);
+  useLayoutEffect(() => { resize(element.current, minHeight); }, [props.value, props.rows, minHeight]);
   useLayoutEffect(() => {
     const textarea = element.current;
     if (!textarea) return;
@@ -19,10 +21,10 @@ export const ComposerTextarea = forwardRef<HTMLTextAreaElement, ComponentProps<'
     const observer = new ResizeObserver(() => {
       if (textarea.clientWidth === width) return;
       width = textarea.clientWidth;
-      resize(textarea);
+      resize(textarea, minHeight);
     });
     observer.observe(textarea);
     return () => observer.disconnect();
-  }, []);
+  }, [minHeight]);
   return <textarea {...props} ref={element}/>;
 });

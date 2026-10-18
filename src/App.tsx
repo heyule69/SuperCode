@@ -40,10 +40,11 @@ import type { ClientTab, Skill } from './ClientSettings';
 import { version as appVersion } from '../package.json';
 import AppUpdateSettings, { AppUpdateNotice } from './AppUpdate';
 import { sourceForProfile, type ModelOption } from './modelPicker';
+import { initialModelSelection, saveModelSelection } from './modelSelection';
 import { loadLocalSkills, skillSource, type SkillCatalog } from './skills';
 import { DesktopTitleBar, type DesktopMenu } from './DesktopTitleBar';
 import { emptyNavigation, travel, visit } from './navigation';
-import type { SettingsTab } from './SettingsPage';
+import { SettingsPage, GeneralSettings, type SettingsTab } from './SettingsPage';
 import { createChatSession } from './chatSession';
 import { inUseProviderConnections, type ProviderConnection } from './providerActivity';
 import { isProviderRequired, requireChatConnection } from './chatConnection';
@@ -61,8 +62,6 @@ import { planFollowup, type PlanDecision } from './planPresentation';
 import './browser-dock.css';
 import { useChatReadReceipt } from './useChatReadReceipt';
 import { clipboardImages, imageBase64, imageBytes, MAX_ATTACHMENTS, MAX_TOTAL_IMAGE_BYTES, mergeAttachments, readClipboardImages, validateImageFile } from './attachments';
-const SettingsPage = lazy(() => import('./SettingsPage').then(module => ({ default: module.SettingsPage })));
-const GeneralSettings = lazy(() => import('./SettingsPage').then(module => ({ default: module.GeneralSettings })));
 const AgentSettings = lazy(() => import('./AgentSettings'));
 const ClientSettings = lazy(() => import('./ClientSettings'));
 const UsagePanel = lazy(() => import('./UsagePanel'));
@@ -342,6 +341,7 @@ export default function App() {
       if (disposed || request !== modelRequest.current) return;
       setModels(result.data); setModelCatalogRevision(profileRevision); setModelCatalogWarning(result.warning || result.notice || ''); setModelSource(result.source);
       modelLoadedAt.current = Date.now();
+      if (!session?.model && model && !result.data.some(m => m.model === model)) setEffort('');
       setModel(previous => session?.model ? session.model : result.data.some(m => m.model === previous) ? previous : result.data.find(m => m.isDefault)?.model ?? '');
     })().catch(e => { if (!disposed && request === modelRequest.current) report(e); }).finally(() => { if (!disposed && request === modelRequest.current) setLoadingModels(false); });
     return () => { disposed = true; };
@@ -410,10 +410,11 @@ export default function App() {
       if (disposed) return;
       const { session: first, project: p } = restoreWorkspace(data, savedWorkspace);
       if (p) { setProjectId(p.id); current.current.projectId = p.id; }
-      if (first) { setSessionId(first.id); setAgentId(first.agent); setModel(first.model ?? ''); draftKey.current = first.id; draftStore.read(first.id); current.current = { sessionId: first.id, projectId: first.projectId, nativeId: first.nativeId }; void loadMessages(first.id).catch(report); }
+      if (first) { setSessionId(first.id); setAgentId(first.agent); setModel(first.model ?? ''); draftKey.current = first.id; const selection = draftStore.read(first.id)?.selection; setEffort(selection && selection.connectionId === first.connectionId && selection.model === first.model ? selection.effort ?? '' : ''); current.current = { sessionId: first.id, projectId: first.projectId, nativeId: first.nativeId }; void loadMessages(first.id).catch(report); }
       else {
-        draftKey.current = `${p?.id ?? ''}:${localStorage.getItem('supercode.agent') ?? 'claude'}`;
-        const selection = draftStore.read(draftKey.current)?.selection;
+        const agent = agentRef.current;
+        draftKey.current = `${p?.id ?? ''}:${agent}`;
+        const selection = initialModelSelection(agent, data.profiles ?? [], data.officialAgents ?? [], draftStore.read(draftKey.current), savedWorkspace.fresh);
         setDraftConnectionId(selection?.connectionId); setModel(selection?.model ?? ''); setEffort(selection?.effort ?? '');
       }
       setInput(drafts.current.get(draftKey.current) ?? ''); setAttachments(attachmentDrafts.current.get(draftKey.current) ?? []); setReady(true);
@@ -519,15 +520,15 @@ export default function App() {
   }, []);
   useEffect(() => {
     if (!desktop) return;
-    return watchWindowTheme(prefs.theme, report);
-  }, [prefs.theme]);
+    return watchWindowTheme(prefs.theme, report, prefs.themeColors);
+  }, [prefs.theme, prefs.themeColors]);
   useEffect(() => {
     if (settingsOpen && settingsTab === 'resources' && desktop) void inspectRuntime();
   }, [settingsOpen, settingsTab]);
   useEffect(() => { setUsage(undefined); if (!desktop || !sessionId) return; let disposed=false; const revision=usageRevision.current; void call<{records:UsageRecord[]}>('get_usage',{sessionId}).then(r=>{if(!disposed && revision===usageRevision.current)setUsage(r.records[0]?.data);}).catch(report); return ()=>{disposed=true;}; }, [sessionId, setUsage]);
   useEffect(() => { localStorage.setItem('supercode.agent', agentId); }, [agentId]);
   useEffect(() => { if (ready && !detached) { localStorage.setItem('supercode.session', sessionId); localStorage.setItem('supercode.project', projectId); } }, [ready, sessionId, projectId, detached]);
-  useDraftPersistence(draftStore, { ready, key: draftKey.current, text: input, attachments, selection: !sessionId && draftConnectionId ? { connectionId: draftConnectionId, model, effort } : undefined }, { text: inputRef, attachments: attachmentsRef });
+  useDraftPersistence(draftStore, { ready, key: draftKey.current, text: input, attachments, selection: model ? { connectionId, model, effort } : undefined }, { text: inputRef, attachments: attachmentsRef });
   useEffect(() => { setCommandSelection(0); if (!input.startsWith('/')) setCommandsDismissed(false); }, [input]);
   useEffect(() => { setCommandsDismissed(false); }, [agentId]);
   useEffect(() => { revealScrollItem(document.getElementById('agent-commands'), document.getElementById(`agent-command-${slashIndex}`)); }, [slashIndex, slashOptions.length]);
@@ -551,7 +552,6 @@ export default function App() {
     if (prependScroll.current && el) { el.scrollTop = prependScroll.current.top + el.scrollHeight - prependScroll.current.height; prependScroll.current = null; }
     else if (stickToBottom.current) scrollToLatest(el);
   }, [messages, currentRequests.length]);
-  useLayoutEffect(() => { const el = textarea.current; if (el) { el.style.height = 'auto'; el.style.height = `${questionPending && !input ? 28 : Math.min(196, Math.max(questionPending ? 28 : 48, el.scrollHeight))}px`; } }, [input, attachments, questionPending]);
   useLayoutEffect(() => {
     const area = scrollArea.current;
     const content = area?.querySelector('.messages');
@@ -593,7 +593,7 @@ export default function App() {
     const sameProject = current.current.projectId === (p?.id ?? '');
     draftStore.save(draftKey.current, inputRef.current, attachmentsRef.current);
     draftKey.current = `${(p?.id ?? '')}:${nextAgent}`;
-    const selection = draftStore.read(draftKey.current)?.selection;
+    const selection = initialModelSelection(nextAgent, profiles, officialAgents, draftStore.read(draftKey.current));
     setAgentId(nextAgent); setModels([]); setModelCatalogRevision(''); modelRequest.current++;
     setDraftConnectionId(selection?.connectionId); setModel(selection?.model ?? ''); setModelSource(undefined); setUsage(undefined); setEffort(selection?.effort ?? '');
     setAttachments(attachmentDrafts.current.get(draftKey.current) ?? []); setInput(drafts.current.get(draftKey.current) ?? '');
@@ -605,8 +605,8 @@ export default function App() {
   async function selectSession(s: Session) {
     setSettingsOpen(false);
     draftStore.save(draftKey.current, inputRef.current, attachmentsRef.current);
-    draftStore.read(s.id); setAttachments(attachmentDrafts.current.get(s.id) ?? []);
-    const editingPayload=followupEditor.payloadFor(s.id);setEffort(editingPayload?.effort??'');if(editingPayload)setPermissionMode(editingPayload.permissionMode as PermissionMode,s.agent);
+    const selection = draftStore.read(s.id)?.selection; setAttachments(attachmentDrafts.current.get(s.id) ?? []);
+    const editingPayload=followupEditor.payloadFor(s.id);setEffort(editingPayload?.effort??(selection && selection.connectionId === s.connectionId && selection.model === s.model ? selection.effort ?? '' : ''));if(editingPayload)setPermissionMode(editingPayload.permissionMode as PermissionMode,s.agent);
     setDraftConnectionId(undefined);
     draftKey.current = s.id; setInput(drafts.current.get(s.id) ?? ''); setHasMore(false); setShowJump(false);
     flush(); setSessionId(s.id); setProjectId(s.projectId); setMessages([]); setAgentId(s.agent); setModels([]); setModelCatalogRevision(''); setModelSource(profiles.find(p => p.id === s.connectionId)?.modelSource); setModel(s.model ?? ''); setUsage(undefined); setError(''); setCommandMessage(''); stickToBottom.current = true;
@@ -629,8 +629,8 @@ export default function App() {
     if (configuringLock.current) return;
     const freshPendingDraft = !sessionId && sendLocks.current.has(draftKey.current);
     // Repeated clicks keep the same unsent draft, including its model and attachments.
-    if (sessionId || projectId !== (target?.id ?? '') || freshPendingDraft) { selectProject(target, prefsRef.current.defaultAgent); setPermissionMode(compatiblePermission(prefsRef.current.defaultPermission, prefsRef.current.defaultAgent), prefsRef.current.defaultAgent); }
-    if (freshPendingDraft) { draftKey.current = `${target?.id ?? ''}:${prefsRef.current.defaultAgent}:${crypto.randomUUID()}`; setInput(''); setAttachments([]); }
+    if (sessionId || projectId !== (target?.id ?? '') || freshPendingDraft) { selectProject(target, agentId); setPermissionMode(compatiblePermission(agentId === prefsRef.current.defaultAgent ? prefsRef.current.defaultPermission : 'ask', agentId), agentId); }
+    if (freshPendingDraft) { draftKey.current = `${target?.id ?? ''}:${agentId}:${crypto.randomUUID()}`; setInput(''); setAttachments([]); }
     if (target) setCollapsedProjects(old => { const next = new Set(old); next.delete(target.id); return next; });
     setModal(null); setError('');
     requestAnimationFrame(() => textarea.current?.focus());
@@ -793,9 +793,18 @@ export default function App() {
       return { ...old, connectionId: next, payload: old.payload ? { ...old.payload, model: data.profiles.find(p=>p.id===next)?.model ?? null } : old.payload };
     });
   }
+  function rememberModel(connectionId: string, model: string, effort: string) {
+    const selection = { connectionId, model, effort };
+    draftModels.current.set(draftKey.current, selection);
+    try { saveModelSelection(agentId, selection); } catch { report('模型偏好暂未保存，请检查可用磁盘空间。'); }
+  }
+  function chooseEffort(value: string) {
+    setEffort(value);
+    if (model) rememberModel(connectionId, model, value);
+  }
   async function chooseModel(option: ModelOption) {
     if (busy || configuringLock.current) return;
-    if (option.connectionId === connectionId && option.model === model) return;
+    if (option.connectionId === connectionId && option.model === model) { rememberModel(connectionId, model, effort); return; }
     setConfiguring(true);
     setHandoffTarget(option.source.providerName || option.displayName);
     modelRequest.current++;
@@ -804,7 +813,7 @@ export default function App() {
       if (!sessionId) {
         setDraftConnectionId(option.connectionId); setModel(option.model); setModelSource(option.source); setModels([]); setModelCatalogRevision(''); setUsage(undefined);
         setEffort(option.defaultReasoningEffort ?? '');
-        draftModels.current.set(draftKey.current, { connectionId: option.connectionId, model: option.model, effort: option.defaultReasoningEffort ?? '' });
+        rememberModel(option.connectionId, option.model, option.defaultReasoningEffort ?? '');
         return;
       }
       const id = sessionId;
@@ -813,6 +822,7 @@ export default function App() {
         current.current.nativeId = saved.nativeId;
         setModel(saved.model ?? option.model); setModels([]); setModelCatalogRevision(''); setModelSource(option.source); setUsage(undefined);
         setEffort(option.defaultReasoningEffort ?? '');
+        rememberModel(option.connectionId, saved.model ?? option.model, option.defaultReasoningEffort ?? '');
         await loadMessages(id);
       }
       await refresh();
@@ -1037,7 +1047,7 @@ export default function App() {
           {followupEditor.editingId?<div className="composer-editing"><span>编辑排队消息</span><button type="button" disabled={followupEditor.busy} onClick={()=>void followupEditor.cancel()}>取消编辑</button></div>:null}
           {slashOptions.length || composerFocused && skillQuery && !commandsDismissed && (skillsLoading || skillsError) ? <div className="slash-menu" id="agent-commands" role="listbox" aria-label="命令与技能" aria-busy={skillsLoading}>{slashOptions.map((c, index) => <button id={`agent-command-${index}`} className={index === slashIndex ? 'selected' : ''} type="button" role="option" aria-selected={index === slashIndex} key={c.name} onMouseDown={e => e.preventDefault()} onClick={() => selectCommand(index)}><span className="slash-option-name">{c.skill ? <Sparkles size={14}/> : <Terminal size={14}/>}<code>{c.name}</code></span><span className="slash-option-detail" title={c.detail}>{c.detail}{c.skill ? <small>{skillSource(c.skill)}</small> : null}</span>{c.skill ? <small className="slash-option-kind">技能</small> : null}</button>)}{skillsLoading ? <div className="slash-menu-status" role="status">读取技能…</div> : skillsError ? <div className="slash-menu-status error-text" role="alert">{skillsError}</div> : null}</div> : null}
           <AttachmentStrip attachments={attachments} loading={importingImages} remove={path => setAttachments(old => old.filter(a => a.path !== path))} />
-          <div className="composer-input"><ComposerSkills attachments={attachments} remove={path => { setAttachments(old => old.filter(a => a.path !== path)); requestAnimationFrame(() => textarea.current?.focus()); }} /><ComposerTextarea ref={textarea} disabled={!ready||followupEditor.busy} onFocus={() => { setComposerFocused(true); setCommandsDismissed(false); }} onBlur={() => { setComposerFocused(false); setCommandsDismissed(true); }} value={input} onPaste={pasteImages} onChange={e => { setInput(e.target.value); setCommandsDismissed(false); setCommandSelection(0); }} aria-controls={slashOptions.length ? "agent-commands" : undefined} aria-expanded={!!slashOptions.length} aria-autocomplete="list" aria-activedescendant={slashOptions.length ? `agent-command-${slashIndex}` : undefined} placeholder={questionPending ? '随心输入' : planning ? '描述你的任务以生成计划…' : attachments.some(a => a.kind === 'skill') ? '' : project ? '随心输入，输入 / 查看命令与技能' : '描述你的想法，或先选择一个项目…'} aria-label="消息" rows={questionPending ? 1 : 2} onKeyDown={e => { if (e.nativeEvent.isComposing) return; if (e.key === 'Backspace' && !e.repeat && !e.ctrlKey && !e.altKey && !e.metaKey && e.currentTarget.selectionStart === 0 && e.currentTarget.selectionEnd === 0) { const lastSkill = attachments.filter(a => a.kind === 'skill').at(-1); if (lastSkill) { e.preventDefault(); setAttachments(old => old.filter(a => a.path !== lastSkill.path)); return; } } if (slashOptions.length && ['ArrowDown','ArrowUp'].includes(e.key)) { e.preventDefault(); setCommandSelection(commandIndex(e.key, slashIndex, slashOptions.length)); } else if (slashOptions.length && e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); setCommandsDismissed(true); } else if (slashOptions.length && (e.key === 'Tab' || e.key === 'Enter' && !e.shiftKey)) { e.preventDefault(); selectCommand(slashIndex); } else if (skillsLoading && skillQuery && e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); } else if (e.key === 'Enter' && (prefs.enterSend || e.ctrlKey || e.metaKey) && !e.shiftKey && !e.nativeEvent.isComposing) { e.preventDefault(); void send(); } }} /></div>
+          <div className="composer-input"><ComposerSkills attachments={attachments} remove={path => { setAttachments(old => old.filter(a => a.path !== path)); requestAnimationFrame(() => textarea.current?.focus()); }} /><ComposerTextarea ref={textarea} minHeight={questionPending ? 28 : 48} disabled={!ready||followupEditor.busy} onFocus={() => { setComposerFocused(true); setCommandsDismissed(false); }} onBlur={() => { setComposerFocused(false); setCommandsDismissed(true); }} value={input} onPaste={pasteImages} onChange={e => { setInput(e.target.value); setCommandsDismissed(false); setCommandSelection(0); }} aria-controls={slashOptions.length ? "agent-commands" : undefined} aria-expanded={!!slashOptions.length} aria-autocomplete="list" aria-activedescendant={slashOptions.length ? `agent-command-${slashIndex}` : undefined} placeholder={questionPending ? '随心输入' : planning ? '描述你的任务以生成计划…' : attachments.some(a => a.kind === 'skill') ? '' : project ? '随心输入，输入 / 查看命令与技能' : '描述你的想法，或先选择一个项目…'} aria-label="消息" rows={questionPending ? 1 : 2} onKeyDown={e => { if (e.nativeEvent.isComposing) return; if (e.key === 'Backspace' && !e.repeat && !e.ctrlKey && !e.altKey && !e.metaKey && e.currentTarget.selectionStart === 0 && e.currentTarget.selectionEnd === 0) { const lastSkill = attachments.filter(a => a.kind === 'skill').at(-1); if (lastSkill) { e.preventDefault(); setAttachments(old => old.filter(a => a.path !== lastSkill.path)); return; } } if (slashOptions.length && ['ArrowDown','ArrowUp'].includes(e.key)) { e.preventDefault(); setCommandSelection(commandIndex(e.key, slashIndex, slashOptions.length)); } else if (slashOptions.length && e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); setCommandsDismissed(true); } else if (slashOptions.length && (e.key === 'Tab' || e.key === 'Enter' && !e.shiftKey)) { e.preventDefault(); selectCommand(slashIndex); } else if (skillsLoading && skillQuery && e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); } else if (e.key === 'Enter' && (prefs.enterSend || e.ctrlKey || e.metaKey) && !e.shiftKey && !e.nativeEvent.isComposing) { e.preventDefault(); void send(); } }} /></div>
           <div className="composer-toolbar"><div className="composer-options">
             <AddMenu key={`${projectId}:${agentId}`} projectId={projectId} agent={agentId} permissionMode={permissionMode} attachments={attachments}
               addAttachments={addAttachments} busy={!ready || sending || importingImages} modeBusy={busy || configuring} project={() => void addProject()}
@@ -1046,7 +1056,7 @@ export default function App() {
             <PermissionMenu value={permissionMode} agent={agentId} busy={busy} onChange={mode => {setPermissionMode(mode);}} />
           </div><div className="composer-right">
             <AgentMenu value={agentId} agents={agents} busy={configuring} choose={switchAgent}/>
-            <ModelMenu value={model} models={modelSourceRevision === profileRevision ? models : []} catalogLoaded={modelCatalogRevision === profileRevision} catalogWarning={modelCatalogRevision === profileRevision ? modelCatalogWarning : ''} profiles={profiles} activeProfile={activeProfile} connectionId={connectionId} order={connectionOrder} source={currentModelSource} busy={busy || configuring} loading={loadingModels} agent={agentId} choose={chooseModel} reload={force => void loadModels(force)} manage={() => {setProviderSettingsAgent(agentId);setSettingsTab('providers');openSettings();}} effort={effort} setEffort={setEffort} hasConversation={!!session?.nativeId} />
+            <ModelMenu value={model} models={modelSourceRevision === profileRevision ? models : []} catalogLoaded={modelCatalogRevision === profileRevision} catalogWarning={modelCatalogRevision === profileRevision ? modelCatalogWarning : ''} profiles={profiles} activeProfile={activeProfile} connectionId={connectionId} order={connectionOrder} source={currentModelSource} busy={busy || configuring} loading={loadingModels} agent={agentId} choose={chooseModel} reload={force => void loadModels(force)} manage={() => {setProviderSettingsAgent(agentId);setSettingsTab('providers');openSettings();}} effort={effort} setEffort={chooseEffort} hasConversation={!!session?.nativeId} />
             <button className={`send-button${stopMode ? ' stop-button' : ''}`} type={stopMode ? 'button' : 'submit'} disabled={stopMode ? !session?.turnId || stopping : configuring || !hasDraft || sending || importingImages || followupEditor.busy} onClick={stopMode ? () => void stop() : undefined} aria-label={stopMode ? '停止生成' : followupEditor.editingId ? '发送修改' : busy && hasDraft ? '加入队列' : '发送消息'} title={stopMode ? '停止生成' : followupEditor.editingId ? '发送修改，保留原来的顺序' : busy && hasDraft ? '加入队列，当前任务完成后发送' : '发送消息'}>{stopMode ? <Square size={14} fill="currentColor" /> : <ArrowUp size={18} />}</button></div></div>
         </form><div className="composer-footnote"><span /><div>{showPlatformQuota ? <PlatformUsageIndicator key={`${agentId}:${connectionId}`} agent={agentId} connectionId={agentId === 'codex' && connectionId === '@local' ? '@official' : connectionId} revision={quotaRevision} source={quotaSource} openStats={() => {setSettingsTab('quota');openSettings();}} /> : null}<UsageIndicator key={`${sessionId}:${agentId}:${connectionId}:${model}`} usage={usage} contextWindow={contextFallbackWindow} /><span>{prefs.enterSend ? 'Enter 发送' : 'Ctrl Enter 发送'} · Shift Enter 换行</span></div></div>
       </div>
@@ -1066,7 +1076,7 @@ export default function App() {
       {showSubagents ? <Suspense fallback={<aside className="subagent-panel" hidden={!visibleSubagents}><span className="pending-text">正在打开子智能体...</span></aside>}><SubagentPanel embedded hidden={!visibleSubagents} agents={subagents} onStatus={updateSubagentStatus} selected={subagentSelection?.key??null} select={key=>setSubagentSelection({sessionId,key})} close={closeSubagents} sessionId={sessionId} projectId={projectId} openFile={showFile} showDiff={showDiff} openPath={openPath} expanded={workspaceExpanded} expand={()=>setWorkspaceExpanded(value=>!value)}/></Suspense> : null}
     </RightPane>
 
-    {settingsOpen ? <Suspense fallback={<main className="settings-loading" role="status"><span className="pending-text">正在加载设置…</span></main>}><SettingsPage tab={settingsTab} select={setSettingsTab} blocked={!!modal || !!selectionDetail || sidebarDialog || updateDialog}>
+    {settingsOpen ? <SettingsPage tab={settingsTab} select={setSettingsTab} blocked={!!modal || !!selectionDetail || sidebarDialog || updateDialog}>
       {modalError ? <div className="error-banner modal-error" role="alert"><span>{modalError}</span><button className="icon-button" aria-label="关闭错误提示" onClick={() => setModalError('')}><X size={14} /></button></div> : null}
       {settingsTab === 'agents' ? <Suspense fallback={<p className="muted pending-text" role="status">正在加载 Agent…</p>}><AgentSettings agents={agents} busy={anyBusy || configuring} loadMcp={loadMcp} setLoadMcp={setLoadMcp} saveMcp={saveCodex}/></Suspense> : null}
       {settingsTab === 'providers' ? <Suspense fallback={<p className="muted">正在加载模型连接…</p>}><ProviderSettings profiles={profiles} officialAgents={officialAgents} order={connectionOrder} runningConnections={runningConnections} updated={connectionUpdated} initialAgent={providerSettingsAgent} /></Suspense> : null}
@@ -1076,7 +1086,7 @@ export default function App() {
       {settingsTab === 'about' ? <div className="about-settings"><div className="settings-page-heading"><h2>关于</h2></div><div className="about-app"><img className="app-brand-icon" src="/app-icon.png" alt="SuperCode 图标" width={56} height={56} /><div><strong>SuperCode</strong><span>当前版本 {appVersion}</span></div></div><AppUpdateSettings busy={anyBusy}/></div> : null}
       {['appearance','personalization','notifications','skills','plugins','automation'].includes(settingsTab) ? <Suspense fallback={<p className="muted">加载中…</p>}><ClientSettings key={settingsTab} tab={settingsTab as ClientTab} prefs={prefs} setPrefs={setPrefs} projectId={projectId} busy={anyBusy} addSkill={addSkill} /></Suspense> : null}
 {settingsTab === 'resources' ? <><div className="settings-page-heading"><h2>资源</h2><button className="icon-button" title="刷新内存" onClick={() => void inspectRuntime()}><RefreshCw size={14} /></button></div><div className="settings-section">{runtime && desktop ? <><div className="memory-grid"><div><span>应用与 WebView</span><strong>{(runtime.shellBytes / 1024 / 1024).toFixed(0)}<small> MiB</small></strong></div><div><span>Agent 与工具</span><strong>{(runtime.agentBytes / 1024 / 1024).toFixed(0)}<small> MiB</small></strong></div></div><p className="muted">{runtime.running ? 'Agent 运行中' : 'Agent 未运行'}</p></> : <p className="muted">{desktop ? '正在读取内存…' : '桌面版可查看内存'}</p>}<dl className="resource-info">{runtime && desktop ? <div><dt>空闲释放</dt><dd>{runtime.idleReleaseSeconds % 60 === 0 ? `${runtime.idleReleaseSeconds / 60} 分钟` : `${runtime.idleReleaseSeconds} 秒`}</dd></div> : null}<div><dt>会话保存</dt><dd>本机</dd></div></dl>{desktop ? <button className="quiet-button" disabled={anyBusy} onClick={() => { void call('release_runtime').then(inspectRuntime).catch(report); }}>释放空闲进程</button> : null}</div></> : null}
-    </SettingsPage></Suspense> : null}
+    </SettingsPage> : null}
 
     {modal ? <div className="modal-backdrop" onMouseDown={e => { if (e.target === e.currentTarget && !modalWorking) setModal(null); }}><section className="modal" ref={modalElement} tabIndex={-1} role="dialog" aria-modal="true" aria-label={modal === 'search' ? '搜索会话' : modal === 'rename' ? '会话设置' : modal === 'provider' ? '添加模型供应商' : '添加项目'}><div className="modal-header"><h2>{modal === 'search' ? '搜索会话' : modal === 'rename' ? '会话设置' : modal === 'provider' ? '添加模型供应商' : '添加项目'}</h2><button className="icon-button" title="关闭" disabled={modalWorking} onClick={() => setModal(null)}><X size={18}/></button></div>
       {modal === 'provider' ? <><p>{agents.find(a=>a.id===providerRequiredAgent)?.name ?? (({claude:'Claude Code',codex:'Codex',opencode:'OpenCode',pi:'Pi',gemini:'Gemini CLI'} as Record<string,string>)[providerRequiredAgent] ?? providerRequiredAgent)} 当前对话没有可用的连接。请先添加模型供应商，再发送消息。</p><div className="modal-actions"><button type="button" className="quiet-button" onClick={()=>setModal(null)}>取消</button><button type="button" className="primary-button" onClick={()=>{setProviderSettingsAgent(providerRequiredAgent);setSettingsTab('providers');openSettings();}}>去添加</button></div></> : null}

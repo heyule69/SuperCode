@@ -3,15 +3,11 @@ pub const INPUT_TAG: usize = 0x53434f44;
 pub const ENVIRONMENT: &str = "SUPERCODE_COMPUTER_STOP_EVENT";
 pub(crate) const FOREGROUND_CHANGED: &str = "Target is no longer the foreground window.";
 
-pub(crate) fn verify_foreground(
-    matches: bool,
-    revoke: impl FnOnce() -> Result<(), String>,
-) -> Result<(), String> {
+pub(crate) fn verify_foreground(matches: bool) -> Result<(), String> {
     if matches { return Ok(()); }
-    // Focus loss closes the same authoritative input gate as user takeover;
-    // a model-facing instruction alone cannot prevent a subsequent refocus.
-    let failure = revoke().err().map(|error| format!(" ({error})")).unwrap_or_default();
-    Err(format!("{FOREGROUND_CHANGED} Desktop control revoked{failure}. Continue conversation or permitted non-control work; do not refocus without renewed user authorization"))
+    // Ordinary focus changes invalidate this action, not the user's control grant.
+    // Never send input to the wrong window; observe again before continuing.
+    Err(format!("{FOREGROUND_CHANGED} 目标窗口已变化，本次操作已中断，电脑控制仍有效。请重新观察窗口后继续，不要盲目重复可能已执行的操作。"))
 }
 pub fn event_name(token: &str) -> String {
     format!("Local\\SuperCodeComputer-{token}")
@@ -146,21 +142,17 @@ mod tests {
         new.stop();
     }
     #[test]
-    fn foreground_loss_revokes_input_without_operating_the_desktop() {
+    fn foreground_loss_requires_observation_without_revoking_control() {
         let name = event_name(&uuid::Uuid::new_v4().to_string());
         let gate = Gate::create(&name).unwrap();
         gate.arm().unwrap();
-        verify_foreground(true, || panic!("safe foreground must retain its grant")).unwrap();
+        verify_foreground(true).unwrap();
         assert!(!gate.stopped());
-        let error = verify_foreground(false, || {
-            #[cfg(windows)]
-            { Gate::revoke(&name) }
-            #[cfg(not(windows))]
-            { gate.stop(); Ok(()) }
-        }).unwrap_err();
+        let error = verify_foreground(false).unwrap_err();
         assert!(error.starts_with(FOREGROUND_CHANGED));
-        assert!(gate.stopped());
+        assert!(!gate.stopped());
         #[cfg(windows)]
-        assert!(Gate::open(&name).unwrap().stopped());
+        assert!(!Gate::open(&name).unwrap().stopped());
+        verify_foreground(true).unwrap();
     }
 }

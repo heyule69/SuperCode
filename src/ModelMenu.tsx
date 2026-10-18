@@ -22,7 +22,7 @@ function ModelSetting({ label, value, options, choose }: { label: string; value:
     return () => { document.removeEventListener('pointerdown', outside); document.removeEventListener('focusin', outside); };
   }, [open]);
   useLayoutEffect(() => {
-    if (open) menu.current?.querySelector<HTMLButtonElement>('[aria-checked="true"]')?.focus();
+    if (open) menu.current?.querySelector<HTMLButtonElement>('[aria-checked="true"]')?.focus({ preventScroll: true });
   }, [open]);
   function move(event: React.KeyboardEvent) {
     if (!['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key)) return;
@@ -40,7 +40,7 @@ function ModelSetting({ label, value, options, choose }: { label: string; value:
         <span>{(options.find(option => option.value === value)?.label ?? effortLabels[value] ?? value) || '默认'}</span><ChevronDown size={13}/>
       </button>
       {open ? <div ref={menu} className="model-setting-menu" role="menu" aria-label={label}>
-        {options.map(option => <button type="button" role="menuitemradio" aria-checked={option.value === value} key={option.value} onClick={() => { setOpen(false); trigger.current?.focus(); choose(option.value); }}>
+        {options.map(option => <button type="button" role="menuitemradio" aria-checked={option.value === value} key={option.value} onClick={() => { setOpen(false); trigger.current?.focus({ preventScroll: true }); choose(option.value); }}>
           <span>{option.label}</span><span className="model-option-check">{option.value === value ? <Check size={14}/> : null}</span>
         </button>)}
       </div> : null}
@@ -88,9 +88,11 @@ export function ModelMenu({ value, models, catalogLoaded, catalogWarning, profil
   const visible = filterModelGroups(groups, search, filter);
   const available = groups.filter(g => g.options.length > 0);
   const efforts = selected?.supportedReasoningEfforts?.map(e => e.reasoningEffort) ?? (selected && agent === 'claude' ? ['low', 'medium', 'high', 'max'] : []);
+  const effectiveEffort = effort || selected?.defaultReasoningEffort;
+  const effortName = selected && (efforts.length || effectiveEffort) ? effectiveEffort ? effortLabels[effectiveEffort] ?? effectiveEffort : '默认' : '';
   const contextVariants = selected && isKimiSource(selected.source) && agent === 'claude' && selected.rawIds.some(id => /^k3\[1m\]$/i.test(id)) && selected.rawIds.includes('k3') ? selected.rawIds : [];
 
-  function close(focus = false) { setOpen(false); setShowNote(false); if (focus) trigger.current?.focus(); }
+  function close(focus = false) { setOpen(false); setShowNote(false); if (focus) trigger.current?.focus({ preventScroll: true }); }
   useEffect(() => { if (busy) setOpen(false); }, [busy]);
   useEffect(() => { if (!open) setShowNote(false); }, [open]);
   useEffect(() => { setLoggedInAgents([]); }, [agent, profiles]);
@@ -110,20 +112,31 @@ export function ModelMenu({ value, models, catalogLoaded, catalogWarning, profil
   }, [showNote]);
   useLayoutEffect(() => {
     if (!open) return;
+    const host = anchor.current?.closest<HTMLElement>('.workspace,.side-chat');
     function position() {
       const parent = anchor.current?.getBoundingClientRect();
+      const boundary = host?.getBoundingClientRect();
+      const leftEdge = boundary && boundary.width > 0 ? Math.max(12, boundary.left + 12) : 12;
+      const rightEdge = boundary && boundary.width > 0 ? Math.min(window.innerWidth - 12, boundary.right - 12) : window.innerWidth - 12;
+      if (popover.current) popover.current.style.maxWidth = `${Math.max(0, rightEdge - leftEdge)}px`;
       const popup = popover.current?.getBoundingClientRect();
       const scroll = list.current?.getBoundingClientRect();
       if (parent && popup && scroll) {
-        setLeft(Math.max(12, Math.min(parent.left, window.innerWidth - popup.width - 12)) - parent.left);
+        setLeft(Math.max(leftEdge, Math.min(parent.left, rightEdge - popup.width)) - parent.left);
         const controls = popup.height - scroll.height;
         setListHeight(Math.max(65, Math.min(264, parent.top - 22 - controls)));
       }
     }
     position(); window.addEventListener('resize', position);
     const observer = new ResizeObserver(position); if (popover.current) observer.observe(popover.current);
+    if (host) observer.observe(host);
     return () => { window.removeEventListener('resize', position); observer.disconnect(); };
   }, [open, models, profiles, search, filter, contextVariants.length, efforts.length, hasConversation]);
+  useLayoutEffect(() => {
+    // Autofocus runs before the popup's viewport position is measured and can
+    // scroll the entire chat to reveal its still-offscreen search field.
+    if (open) searchInput.current?.focus({ preventScroll: true });
+  }, [open]);
 
   async function select(option: ModelOption) {
     close(true);
@@ -143,17 +156,18 @@ export function ModelMenu({ value, models, catalogLoaded, catalogWarning, profil
   }
   return <div className="composer-menu-anchor" ref={anchor}>
     <button ref={trigger} type="button" className="composer-chip model-chip" aria-label={needsProvider ? '添加模型供应商' : '选择模型'} aria-haspopup={needsProvider ? undefined : 'dialog'} aria-expanded={open} disabled={busy}
-      title={[selectedName, selectedSource && sourceLabel(selectedSource), selected && `模型 ID：${selected.model}`].filter(Boolean).join('\n')}
+      title={[selectedName, selectedSource && sourceLabel(selectedSource), selected && `模型 ID：${selected.model}`, effortName && `推理强度：${effortName}${!effort && effectiveEffort ? '（默认）' : ''}`].filter(Boolean).join('\n')}
       onClick={() => { if (needsProvider) { manage(); return; } setOpen(v => !v); setSearch(''); setFilter(null); if (!open && desktop && !loading && (officialCodex || !models.length)) reload(); }}>
       {selectedSource?.mark ? <span className="model-provider-mark" aria-hidden="true"><ProviderIcon provider={selectedSource.providerId} name={selectedSource.connectionName || selectedSource.providerName} mark={selectedSource.mark}/></span> : null}
       <span className="model-chip-name">{selectedName}</span>
+      {effortName ? <span className="model-chip-effort" title={`推理强度：${effortName}`}>{effortName}</span> : null}
       {selectedSource?.providerName ? <span className="model-chip-provider">{selectedSource.providerName}</span> : null}
       {needsProvider ? <Plus size={12}/> : <ChevronDown size={11} />}
     </button>
     {open ? <div ref={popover} className="composer-popover model-popover" style={{ left }} role="dialog" aria-label="模型选择" onKeyDown={move}>
       <div className="model-menu-heading"><h2>选择模型</h2><span title={selectedName}>{selectedName}</span><button type="button" className="icon-button" aria-label="关闭模型选择" onClick={() => close(true)}><X size={15}/></button></div>
       <div className="model-picker-search search-field">
-        <Search size={15}/><input ref={searchInput} autoFocus aria-label="搜索模型菜单" placeholder="搜索模型或供应商" value={search} onChange={e => setSearch(e.target.value)} />
+        <Search size={15}/><input ref={searchInput} aria-label="搜索模型菜单" placeholder="搜索模型或供应商" value={search} onChange={e => setSearch(e.target.value)} />
         <button type="button" className="icon-button" aria-label="刷新模型" title="刷新模型" disabled={loading || busy || !desktop} onClick={() => reload(true)}>{loading ? <LoaderCircle size={15} className="spin" /> : <RefreshCw size={15} />}</button>
       </div>
       {available.length > 1 ? <div className="model-provider-filters" role="group" aria-label="按供应商筛选">

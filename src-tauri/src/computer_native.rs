@@ -186,11 +186,6 @@ mod native {
     unsafe fn foreground(window: HWND) -> Result<(), String> {
         crate::computer_gate::verify_foreground(
             IsIconic(window) == 0 && IsWindowVisible(window) != 0 && GetForegroundWindow() == window,
-            || {
-                let name = std::env::var(crate::computer_gate::ENVIRONMENT)
-                    .map_err(|_| "电脑操作停止机制未连接".to_owned())?;
-                crate::computer_gate::Gate::revoke(&name)
-            },
         )
     }
     unsafe fn geometry(window: HWND) -> Result<Value, String> {
@@ -715,7 +710,7 @@ mod native {
                         };
                         if GetAncestor(target, GA_ROOT) != window {
                             return Err(
-                                "Focused control changed; cancel desktop input and continue conversation or permitted non-control work. Do not retry control without renewed user authorization".into()
+                                format!("{} 请重新观察当前焦点后继续。", crate::computer_gate::FOREGROUND_CHANGED)
                             );
                         }
                         let scan = MapVirtualKeyW(VK_ESCAPE as u32, MAPVK_VK_TO_VSC) as isize;

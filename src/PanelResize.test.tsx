@@ -6,8 +6,8 @@ import { decodePanelWidths, defaultWidths, panelLayout, usePanelResize } from '.
 
 let root: Root, container: HTMLDivElement;
 let narrow = false;
-function Layout({panel='workspace',left=true,right=true,expanded=false}:{panel?:'workspace'|'browser'|'conversation'|'content';left?:boolean;right?:boolean;expanded?:boolean}) {
-  const panels = usePanelResize(left, right, false, panel, expanded);
+function Layout({panel='workspace',left=true,right=true,expanded=false,disabled=false}:{panel?:'workspace'|'browser'|'conversation'|'content';left?:boolean;right?:boolean;expanded?:boolean;disabled?:boolean}) {
+  const panels = usePanelResize(left, right, disabled, panel, expanded);
   return <div ref={panels.root}><div {...panels.handle('left')}/><div {...panels.handle('right')}/></div>;
 }
 beforeEach(() => {
@@ -33,6 +33,18 @@ it('drags both boundaries in the correct direction and restores persisted widths
   await act(async () => root.render(<Layout/>));
   expect(handle('left').getAttribute('aria-valuenow')).toBe('350');
   expect(handle('right').getAttribute('aria-valuenow')).toBe('400');
+});
+it('restores the selected pane width before its first measured frame without a startup transition', async () => {
+  localStorage.setItem('supercode.panel-widths', JSON.stringify({left:310,right:280}));
+  localStorage.setItem('supercode.panel-widths.content', JSON.stringify({left:288,right:600}));
+  const frames: {transition:string;columns:string;right:string|null}[] = [];
+  vi.spyOn(HTMLElement.prototype,'getBoundingClientRect').mockImplementation(function(this:HTMLElement){
+    if(this===container.firstElementChild)frames.push({transition:this.style.transition,columns:this.style.gridTemplateColumns,right:this.querySelector('.right')?.getAttribute('aria-valuenow')??null});
+    return new DOMRect(0,0,1400,800);
+  });
+  await act(async () => root.render(<Layout panel="content"/>));
+  expect(frames[0]).toEqual({transition:'none',columns:'310px minmax(0,1fr) 600px',right:'600'});
+  expect((container.firstElementChild as HTMLElement).style.transition).toBe('');
 });
 it('cancels a drag, supports keyboard resizing and resets on double click', async () => {
   await act(async () => root.render(<Layout/>));
@@ -83,6 +95,14 @@ it('uses stable tracks to animate hidden panes and restores saved widths after e
   expect(container.firstElementChild?.getAttribute('style')).toContain('288px minmax(0,1fr) 752px');
   await act(async () => root.render(<Layout/>));
   expect(container.firstElementChild?.getAttribute('style')).toContain('288px minmax(0,1fr) 284px');
+});
+it('keeps the underlying chat columns stable when full-page settings open and close', async () => {
+  await act(async () => root.render(<Layout panel="content"/>));
+  const columns = (container.firstElementChild as HTMLElement).style.gridTemplateColumns;
+  await act(async () => root.render(<Layout panel="content" disabled/>));
+  expect((container.firstElementChild as HTMLElement).style.gridTemplateColumns).toBe(columns);
+  await act(async () => root.render(<Layout panel="content"/>));
+  expect((container.firstElementChild as HTMLElement).style.gridTemplateColumns).toBe(columns);
 });
 it('uses a shared reading width and reserves no column after the content dock closes',async()=>{
   await act(async()=>root.render(<Layout panel="content"/>));

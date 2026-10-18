@@ -36,6 +36,11 @@ describe('notification preferences', () => {
   });
 });
 
+it('restores only valid custom colors without changing unrelated preferences', () => {
+  stored({theme:'dark',enterSend:false,themeColors:{dark:{accent:'#06f',background:'#111111',foreground:'invalid'},light:{foreground:'#123456'}}});
+  expect(loadPreferences()).toMatchObject({theme:'dark',enterSend:false,themeColors:{dark:{accent:'#0066FF',background:'#111111'},light:{foreground:'#123456'}}});
+});
+
 it('restores Agent-compatible native default permissions without widening legacy read-only', () => {
   for (const [defaultAgent, defaultPermission, expected] of [['codex', 'edit', 'ask'], ['codex', 'read', 'read'], ['claude', 'edit', 'edit'], ['pi', 'auto', 'ask']]) {
     stored({ defaultAgent, defaultPermission });

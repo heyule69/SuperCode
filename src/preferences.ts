@@ -1,8 +1,10 @@
 import { compatiblePermission } from './permissions';
+import { applyThemeColors, effectiveColorTheme, normalizeThemeColors, type ThemeColorPreferences } from './themeColors';
 export type Theme = 'light' | 'dark' | 'graphite' | 'sand' | 'system';
 export interface Preferences {
   typographyVersion?: number;
   theme: Theme; uiFont: string; codeFont: string; uiSize: number; chatSize: number;
+  themeColors?: ThemeColorPreferences;
   animations: boolean; notifyComplete: boolean; notifyError: boolean; notifyApproval: boolean; sound: boolean;
   notificationsEnabled: boolean; notificationMode: 'unseen' | 'background' | 'always'; notificationDetails: boolean;
   enterSend: boolean; defaultAgent: string; defaultPermission: string;
@@ -18,6 +20,8 @@ export function loadPreferences(): Preferences {
       prefs.uiSize = defaults.uiSize; prefs.chatSize = defaults.chatSize;
     }
     prefs.typographyVersion = defaults.typographyVersion;
+    if (raw.themeColors != null) prefs.themeColors = normalizeThemeColors(raw.themeColors);
+    if (!['light', 'dark', 'graphite', 'sand', 'system'].includes(prefs.theme)) prefs.theme = defaults.theme;
     prefs.defaultPermission = compatiblePermission(prefs.defaultPermission, prefs.defaultAgent);
     for (const key of ['notificationsEnabled', 'notificationDetails', 'notifyComplete', 'notifyError', 'notifyApproval', 'sound'] as const) {
       if (typeof prefs[key] !== 'boolean') prefs[key] = defaults[key];
@@ -28,7 +32,9 @@ export function loadPreferences(): Preferences {
 }
 export function applyPreferences(p: Preferences) {
   const root = document.documentElement;
-  root.dataset.theme = p.theme === 'system' ? window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light' : p.theme;
+  const theme = effectiveColorTheme(p.theme, window.matchMedia('(prefers-color-scheme: dark)').matches);
+  root.dataset.theme = theme;
+  applyThemeColors(root, theme, p.themeColors);
   root.dataset.motion = p.animations ? 'on' : 'off';
   root.style.setProperty('--ui-font', p.uiFont === 'system' ? systemFont : `"${p.uiFont}", "Microsoft YaHei", sans-serif`);
   root.style.setProperty('--code-font', `"${p.codeFont}", Consolas, monospace`);

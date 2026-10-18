@@ -14,11 +14,14 @@ use tauri::{
     AppHandle, Manager,
 };
 use tauri_plugin_opener::OpenerExt;
+#[path = "process_media.rs"]
+mod process_cache;
 
 const CHUNK: u64 = 1024 * 1024;
 const BLOB_LIMIT: usize = 10 * 1024 * 1024;
 const MAX_MEDIA: usize = 12;
 static PREVIEW_WORK: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+static PROCESS_CACHE_WORK: Mutex<()> = Mutex::new(());
 
 #[derive(Clone)]
 struct Entry {
@@ -212,6 +215,7 @@ pub async fn prepare_media(
     path: String,
     project_id: Option<String>,
     session_id: Option<String>,
+    process_preview: Option<bool>,
     app: AppHandle,
     webview: tauri::Webview,
 ) -> Result<Value, String> {
@@ -219,20 +223,29 @@ pub async fn prepare_media(
     let _permit = PREVIEW_WORK.acquire().await.map_err(|e| e.to_string())?;
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<crate::AppState>();
+        let _cache_work = PROCESS_CACHE_WORK.lock().map_err(|_| "过程截图缓存暂不可用")?;
+        let media_root=state.data_dir.join("media");
+        let cached=process_cache::owned(Path::new(&path),&media_root);
+        if cached {
+            process_cache::prune(&media_root.join(process_cache::DIRECTORY),std::time::SystemTime::now(),None)?;
+            if !Path::new(&path).exists() {return Ok(json!({"unavailable":"expired"}));}
+        }
         let path = resolve_file(&app, &path, project_id, session_id)?;
         let (kind, mime) = format(&path.to_string_lossy()).ok_or("不支持预览此文件类型")?;
         if kind == "image" && fs::metadata(&path).map_err(|e| e.to_string())?.len() > BLOB_LIMIT as u64 { return Err("图片超过 10 MB，请在系统中打开".into()); }
         let registry = app.state::<Media>();
         let token = registry.register(&principal, path.clone(), mime, kind == "image")?;
         let mut preview = token.clone();
-        // Raster previews decode off the UI thread and cache a 960px image.
+        // One decoder at a time, only on demand; thumbnails are stored on disk.
         if matches!(mime, "image/png" | "image/jpeg" | "image/webp") {
-            let root = state.data_dir.join("media");
+            let process=process_preview.unwrap_or(false) || cached;
+            let root = if process {process_cache::directory(&media_root)?} else {media_root};
             fs::create_dir_all(&root).map_err(|e| e.to_string())?;
             let bytes = crate::image_attachments::read_image(&path, BLOB_LIMIT as u64)?;
             let key = format!("{:x}", Sha256::digest(&bytes));
-            let thumb = root.join(format!("{key}.preview.png"));
-            if !thumb.exists() { fs::write(&thumb, crate::image_attachments::thumbnail_size(&bytes, 960, 720)?).map_err(|e| e.to_string())?; }
+            let thumb = root.join(if process {format!("{key}.preview.png")}else{format!("{key}.preview-320.png")});
+            if !thumb.exists() { fs::write(&thumb, crate::image_attachments::thumbnail_size(&bytes, if process {224}else{320}, if process {160}else{200})?).map_err(|e| e.to_string())?; }
+            if process {process_cache::prune(&root,std::time::SystemTime::now(),Some(&thumb))?;}
             preview = registry.register(&principal, thumb, "image/png", true)?;
         }
         Ok(json!({"token":token,"previewToken":preview,"kind":kind,"mimeType":mime,"path":path.to_string_lossy(),"name":path.file_name().unwrap_or_default().to_string_lossy()}))
@@ -304,7 +317,7 @@ pub fn response(media: &Media, webview: &str, request: Request<Vec<u8>>) -> Resp
             .header("X-Content-Type-Options", "nosniff")
             .header("Access-Control-Allow-Origin", &entry.principal.origin)
             .header("Vary", "Origin")
-            .header("Cache-Control", "no-cache");
+            .header("Cache-Control", "no-store");
         if request.method() == "HEAD" {
             return builder
                 .header("Content-Length", len)
@@ -367,6 +380,7 @@ fn cache_blob(
     mime: &str,
     name: Option<&str>,
     budget: &mut usize,
+    process: bool,
 ) -> Result<Value, String> {
     let extension = match mime {
         "image/png" => "png",
@@ -395,15 +409,23 @@ fn cache_blob(
         return Err("工具返回的图片类型与内容不一致".into());
     }
     *budget -= bytes.len();
-    fs::create_dir_all(root).map_err(|e| e.to_string())?;
+    let process=process && mime.starts_with("image/");
+    let _cache_work=if process {Some(PROCESS_CACHE_WORK.lock().map_err(|_| "过程截图缓存暂不可用")?)} else {None};
+    let root=if process {process_cache::directory(root)?} else {root.to_path_buf()};
+    fs::create_dir_all(&root).map_err(|e| e.to_string())?;
     let path = root.join(format!("{:x}.{extension}", Sha256::digest(&bytes)));
     if !path.exists() {
         fs::write(&path, bytes).map_err(|e| e.to_string())?;
     }
+    if process {
+        let now=std::time::SystemTime::now();
+        if let Ok(file)=fs::File::options().write(true).open(&path) {let _=file.set_modified(now);}
+        process_cache::prune(&root,now,Some(&path))?;
+    }
     let kind = format(&path.to_string_lossy()).unwrap().0;
-    Ok(
-        json!({"type":"media","kind":kind,"path":path.to_string_lossy(),"mimeType":mime,"name":name.map(|n| n.chars().filter(|c| !c.is_control()).take(160).collect::<String>()).unwrap_or_else(|| format!("{}.{extension}",if kind=="image"{"截图"}else if kind=="video"{"视频"}else{"音频"}))}),
-    )
+    let mut media=json!({"type":"media","kind":kind,"path":path.to_string_lossy(),"mimeType":mime,"name":name.map(|n| n.chars().filter(|c| !c.is_control()).take(160).collect::<String>()).unwrap_or_else(|| format!("{}.{extension}",if kind=="image"{"截图"}else if kind=="video"{"视频"}else{"音频"}))});
+    if process {media["purpose"]=json!("process");}
+    Ok(media)
 }
 
 /// Replace binary blocks before either IPC or persistence; text remains intact.
@@ -415,6 +437,7 @@ pub fn normalize_item(root: &Path, item: &mut Value) {
         errors: &mut Vec<String>,
         budget: &mut usize,
         depth: usize,
+        process: bool,
     ) {
         if depth > 12 {
             return;
@@ -457,7 +480,8 @@ pub fn normalize_item(root: &Path, item: &mut Value) {
                 let cached = if refs.len() >= MAX_MEDIA {
                     Err("单次工具结果最多展示 12 个媒体".into())
                 } else {
-                    cache_blob(root, encoded, mime, block["name"].as_str(), budget)
+                    cache_blob(root, encoded, mime, block["name"].as_str(), budget,
+                        process || block["_meta"]["supercode"]["purpose"]=="observation")
                 };
                 match cached {
                     Ok(media) => {
@@ -486,7 +510,9 @@ pub fn normalize_item(root: &Path, item: &mut Value) {
             };
             if let Some((kind, mime)) = format(&path).or(hint) {
                 if !source.starts_with("data:") && source.len() <= 8192 && refs.len() < MAX_MEDIA {
-                    refs.push(json!({"type":"media","kind":kind,"path":source,"mimeType":mime,"name":value["name"].as_str().unwrap_or("媒体")}));
+                    let mut media=json!({"type":"media","kind":kind,"path":source,"mimeType":mime,"name":value["name"].as_str().unwrap_or("媒体")});
+                    if process_cache::owned(Path::new(&source),root) {media["purpose"]=json!("process");}
+                    refs.push(media);
                 }
             }
         }
@@ -498,12 +524,12 @@ pub fn normalize_item(root: &Path, item: &mut Value) {
         match value {
             Value::Array(values) => {
                 for v in values.iter_mut().take(100) {
-                    visit(root, v, refs, errors, budget, depth + 1);
+                    visit(root, v, refs, errors, budget, depth + 1, process);
                 }
             }
             Value::Object(values) => {
                 for (_, v) in values.iter_mut().take(100) {
-                    visit(root, v, refs, errors, budget, depth + 1);
+                    visit(root, v, refs, errors, budget, depth + 1, process);
                 }
             }
             _ => {}
@@ -512,9 +538,10 @@ pub fn normalize_item(root: &Path, item: &mut Value) {
     let mut refs = vec![];
     let mut errors = vec![];
     let mut budget = 20 * 1024 * 1024;
+    let process=process_cache::observation(item);
     for key in ["result", "contentItems", "content", "structuredContent"] {
         if let Some(value) = item.get_mut(key) {
-            visit(root, value, &mut refs, &mut errors, &mut budget, 0);
+            visit(root, value, &mut refs, &mut errors, &mut budget, 0, process);
         }
     }
     if item["type"] == "imageView" {
@@ -542,8 +569,66 @@ pub fn normalize_event(app: &AppHandle, event: &mut Value) {
     }
 }
 
+pub fn install(app:&AppHandle) {
+    let app=app.clone();
+    tauri::async_runtime::spawn(async move {
+        loop {
+            let root=app.state::<crate::AppState>().data_dir.join("media").join(process_cache::DIRECTORY);
+            let result=tauri::async_runtime::spawn_blocking(move||{
+                let _cache_work=PROCESS_CACHE_WORK.lock().map_err(|_| "过程截图缓存暂不可用")?;
+                process_cache::prune(&root,std::time::SystemTime::now(),None)
+            }).await;
+            if let Err(error)=result.unwrap_or_else(|e|Err(e.to_string())) {
+                crate::runtime_diagnostics::message(&app,None,"media","warn","process_cache_cleanup",&error);
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(30*60)).await;
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn observation_bytes_are_deduplicated_on_disk_and_reopen_without_base64() {
+        let fixture = std::env::temp_dir().join(format!("supercode-process-media-{}", uuid::Uuid::new_v4()));
+        let root = fixture.join("media");
+        let mut bytes = std::io::Cursor::new(vec![]);
+        image::DynamicImage::new_rgb8(12,8).write_to(&mut bytes,image::ImageFormat::Png).unwrap();
+        let encoded=base64::engine::general_purpose::STANDARD.encode(bytes.get_ref());
+        let image=json!({"type":"image","data":encoded,"mimeType":"image/png"});
+        let mut tagged=image.clone();
+        tagged["_meta"]=json!({"supercode":{"purpose":"observation"}});
+        let mut saved_path=None;
+        for mut item in [
+            json!({"type":"claudeToolCall","id":"browser","tool":"mcp__supercode_browser__browser_snapshot","contentItems":[image.clone()]}),
+            json!({"type":"mcpToolCall","id":"desktop","server":"supercode_computer","tool":"desktop_click","result":{"content":[image.clone()]}}),
+            json!({"type":"claudeToolCall","id":"read","tool":"Read","contentItems":[image.clone()]}),
+            json!({"type":"mcpToolCall","id":"meta","result":{"content":[tagged]}}),
+        ] {
+            normalize_item(&root,&mut item);
+            let path=PathBuf::from(item["media"][0]["path"].as_str().unwrap());
+            assert!(process_cache::owned(&path,&root));
+            assert_eq!(item["media"][0]["purpose"],"process");
+            assert_eq!(fs::read(&path).unwrap(),*bytes.get_ref());
+            assert!(!item.to_string().contains(&encoded));
+            if let Some(previous)=&saved_path {assert_eq!(previous,&path);} else {saved_path=Some(path.clone());}
+            normalize_item(&root,&mut item);
+            let (_,_,_,saved)=crate::protocol::item_message(&item).unwrap();
+            assert_eq!(saved["media"][0]["path"],path.to_string_lossy().as_ref());
+            assert_eq!(saved["media"][0]["purpose"],"process");
+        }
+        assert_eq!(fs::read_dir(root.join(process_cache::DIRECTORY)).unwrap().count(),1);
+        // An ordinary generated result with identical pixels is saved separately.
+        let mut result=json!({"type":"mcpToolCall","id":"final","tool":"GenerateImage","result":{"content":[image]}});
+        normalize_item(&root,&mut result);
+        let durable=PathBuf::from(result["media"][0]["path"].as_str().unwrap());
+        assert_eq!(durable.parent(),Some(root.as_path()));
+        assert!(result["media"][0]["purpose"].is_null());
+        process_cache::prune(&root.join(process_cache::DIRECTORY),std::time::SystemTime::now()+std::time::Duration::from_secs(25*60*60),None).unwrap();
+        assert!(!saved_path.unwrap().exists());
+        assert!(durable.exists());
+        fs::remove_dir_all(fixture).unwrap();
+    }
     #[test]
     fn unavailable_media_distinguishes_missing_empty_unreadable_and_wrong_locations() {
         let root = std::env::temp_dir().join(format!("supercode-media-errors-{}", uuid::Uuid::new_v4()));

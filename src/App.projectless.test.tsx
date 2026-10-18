@@ -1,6 +1,7 @@
 // @vitest-environment happy-dom
 import { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
+import { flushSync } from 'react-dom';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import App from './App';
 import { call, subscribe } from './api';
@@ -11,6 +12,7 @@ import type { Followup } from './Followups';
 import { PlatformUsageIndicator } from './PlatformUsageView';
 import { AppUpdateNotice } from './AppUpdate';
 import { readWorkspaceDraft } from './workspaceDrafts';
+import { loadModelSelection, saveModelSelection } from './modelSelection';
 
 vi.mock('./api', () => ({ desktop:true, call:vi.fn(), subscribe:vi.fn(async()=>()=>{}) }));
 vi.mock('@tauri-apps/api/event', () => ({ listen:vi.fn(async()=>()=>{}) }));
@@ -67,6 +69,131 @@ async function type(text: string) {
 async function send() {
   await act(async()=>{container.querySelector<HTMLFormElement>('.composer')!.dispatchEvent(new Event('submit',{bubbles:true,cancelable:true}));await new Promise(resolve=>setTimeout(resolve,30));});
 }
+
+it('opens and closes the model picker without asking the browser to scroll the chat for focus', async () => {
+  await render();
+  const focus = vi.spyOn(HTMLElement.prototype, 'focus');
+  const trigger = container.querySelector<HTMLButtonElement>('.model-chip')!;
+  await act(async () => trigger.click());
+  const search = container.querySelector<HTMLInputElement>('[aria-label="搜索模型菜单"]')!;
+  expect(document.activeElement).toBe(search);
+  const searchFocus = focus.mock.contexts.findIndex(element => element === search);
+  expect(focus.mock.calls[searchFocus]).toEqual([{ preventScroll: true }]);
+  await act(async () => container.querySelector<HTMLButtonElement>('[aria-label="关闭模型选择"]')!.click());
+  expect(document.activeElement).toBe(trigger);
+  expect(focus.mock.calls.at(-1)).toEqual([{ preventScroll: true }]);
+});
+
+it('keeps the model popup inside a narrow chat pane so it cannot create a horizontal scrollbar', async () => {
+  await render();
+  const workspace = container.querySelector<HTMLElement>('.workspace')!;
+  const trigger = container.querySelector<HTMLButtonElement>('.model-chip')!;
+  const anchor = trigger.parentElement!;
+  const original = HTMLElement.prototype.getBoundingClientRect;
+  vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(function (this: HTMLElement) {
+    if (this === workspace) return new DOMRect(300,40,320,674);
+    if (this === anchor) return new DOMRect(550,600,150,28);
+    if (this.classList.contains('model-popover')) return new DOMRect(550+parseFloat(this.style.left || '0'),300,Math.min(400,parseFloat(this.style.maxWidth || '400')),280);
+    return original.call(this);
+  });
+  await act(async () => trigger.click());
+  const popup = container.querySelector<HTMLElement>('.model-popover')!;
+  const bounds = popup.getBoundingClientRect(), host = workspace.getBoundingClientRect();
+  expect(bounds.left).toBeGreaterThanOrEqual(host.left+12);
+  expect(bounds.right).toBeLessThanOrEqual(host.right-12);
+  expect(popup.querySelector('.model-option')).not.toBeNull();
+  expect(workspace.scrollLeft).toBe(0);
+});
+
+it('renders the first settings page immediately and keeps the hidden chat geometry for returning', async () => {
+  await render();
+  const app = container.querySelector<HTMLElement>('.app')!;
+  const columns = app.style.gridTemplateColumns;
+  const textarea = container.querySelector<HTMLTextAreaElement>('.composer textarea')!;
+  await act(async () => {
+    flushSync(() => container.querySelector<HTMLButtonElement>('button[aria-label="设置"]')!.click());
+    expect(container.querySelector('.settings-page h1')?.textContent).toBe('设置');
+    expect(container.querySelector('.settings-page-heading h2')?.textContent).toBe('常规');
+    expect(container.querySelector('.settings-loading')).toBeNull();
+  });
+  expect(app.style.gridTemplateColumns).toBe(columns);
+  await act(async () => container.querySelector<HTMLButtonElement>('button[aria-label="聊天"]')!.click());
+  expect(app.style.gridTemplateColumns).toBe(columns);
+  expect(container.querySelector('.composer textarea')).toBe(textarea);
+  expect(textarea.style.height).toBe('48px');
+});
+
+it('remembers an explicit model and reasoning choice immediately and restores it in a fresh window', async () => {
+  data.profiles[0].models = ['test-model', 'last-picked'];
+  const base = vi.mocked(call).getMockImplementation()!;
+  vi.mocked(call).mockImplementation(async(command,args={}) => command === 'list_models' ? {data:['test-model','last-picked'].map(model => ({id:model,model,displayName:model,isDefault:model==='test-model',supportedReasoningEfforts:[{reasoningEffort:'low'},{reasoningEffort:'high'}]})),source:{providerId:'custom',providerName:'Test API',mark:'T',available:true}} : base(command,args));
+  await render();
+  await act(async()=>container.querySelector<HTMLButtonElement>('.model-chip')!.click());
+  await act(async()=>[...container.querySelectorAll<HTMLButtonElement>('.model-option')].find(button=>button.textContent?.includes('last-picked'))!.click());
+  await act(async()=>container.querySelector<HTMLButtonElement>('.model-chip')!.click());
+  await act(async()=>container.querySelector<HTMLButtonElement>('[aria-label="选择推理强度"]')!.click());
+  await act(async()=>[...container.querySelectorAll<HTMLButtonElement>('.model-setting-menu button')].find(button=>button.textContent==='高')!.click());
+  expect(loadModelSelection('claude',data.profiles,[])).toEqual({connectionId:'api:claude',model:'last-picked',effort:'high'});
+  await act(async()=>root.unmount());
+  localStorage.setItem('supercode.draft.v2:%3Aclaude',JSON.stringify({version:2,updatedAt:1,draft:{text:'保留草稿',attachments:[],selection:{connectionId:'api:claude',model:'test-model',effort:'low'}}}));
+  vi.stubGlobal('location',new URL('http://localhost/?window=new'));
+  root=createRoot(container); await render();
+  expect(container.querySelector('.model-chip-name')?.textContent).toBe('last-picked');
+  expect(container.querySelector('.model-chip-effort')?.textContent).toBe('高');
+  await type('新窗口使用上次选择'); await send();
+  expect(call).toHaveBeenCalledWith('send_chat_message',expect.objectContaining({model:'last-picked',effort:'high'}));
+});
+
+it('starts a new chat with the current Agent and its remembered connection instead of configured defaults', async () => {
+  localStorage.setItem('supercode.session','pi-chat');
+  data.profiles.push({id:'api:pi',agent:'pi',name:'Pi API',model:'pi-default',models:['pi-picked'],hasCredential:true,current:true});
+  data.sessions=[{id:'pi-chat',projectId:'existing',title:'Pi 会话',agent:'pi',connectionId:'api:pi',model:'pi-default',status:'idle',nativeId:null,turnId:null,updatedAt:1}];
+  saveModelSelection('pi',{connectionId:'api:pi',model:'pi-picked',effort:'high'});
+  const base = vi.mocked(call).getMockImplementation()!;
+  vi.mocked(call).mockImplementation(async(command,args={}) => command === 'list_models' && args.agent === 'pi' ? {data:['pi-default','pi-picked'].map(model=>({id:model,model,displayName:model,isDefault:model==='pi-default',supportedReasoningEfforts:[{reasoningEffort:'high'}]}))} : base(command,args));
+  await render();
+  expect(container.querySelector('.model-chip-name')?.textContent).toBe('pi-default');
+  await act(async()=>window.dispatchEvent(new KeyboardEvent('keydown',{key:'n',ctrlKey:true,bubbles:true,cancelable:true})));
+  expect(container.querySelector('.model-chip-name')?.textContent).toBe('pi-picked');
+  expect(container.querySelector('.model-chip-effort')?.textContent).toBe('高');
+  await type('沿用 Pi'); await send();
+  expect(call).toHaveBeenCalledWith('create_session',expect.objectContaining({agent:'pi',connectionId:'api:pi',model:'pi-picked'}));
+});
+
+it('falls back to a catalog default without retaining the removed model reasoning override', async () => {
+  saveModelSelection('claude',{connectionId:'api:claude',model:'removed-model',effort:'max'});
+  await render(); await type('使用可用模型'); await send();
+  expect(call).toHaveBeenCalledWith('send_chat_message',expect.objectContaining({model:'test-model',effort:null}));
+});
+
+it('restores the reasoning level of an existing chat without replacing it with the new-chat preference', async () => {
+  localStorage.setItem('supercode.session','saved-effort');
+  data.sessions=[{id:'saved-effort',projectId:'existing',title:'已有聊天',agent:'claude',connectionId:'api:claude',model:'test-model',status:'idle',nativeId:null,turnId:null,updatedAt:1}];
+  localStorage.setItem('supercode.draft.v2:saved-effort',JSON.stringify({version:2,updatedAt:1,draft:{text:'',attachments:[],selection:{connectionId:'api:claude',model:'test-model',effort:'max'}}}));
+  saveModelSelection('claude',{connectionId:'api:claude',model:'another-model',effort:'low'});
+  await render();
+  expect(container.querySelector('.model-chip-name')?.textContent).toBe('test-model');
+  expect(container.querySelector('.model-chip-effort')?.textContent).toBe('最高');
+  await type('继续当前聊天'); await send();
+  expect(call).toHaveBeenCalledWith('send_chat_message',expect.objectContaining({model:'test-model',effort:'max'}));
+});
+
+it('does not replace the remembered model when switching an existing chat fails', async () => {
+  localStorage.setItem('supercode.session','model-chat');
+  data.sessions=[{id:'model-chat',projectId:'existing',title:'模型会话',agent:'claude',connectionId:'api:claude',model:'test-model',status:'idle',nativeId:null,turnId:null,updatedAt:1}];
+  data.profiles[0].models=['test-model','failed-model'];
+  saveModelSelection('claude',{connectionId:'api:claude',model:'test-model',effort:'high'});
+  const base = vi.mocked(call).getMockImplementation()!;
+  vi.mocked(call).mockImplementation(async(command,args={})=>{
+    if(command==='switch_session_model')throw new Error('switch failed');
+    if(command==='list_models')return {data:['test-model','failed-model'].map(model=>({id:model,model,displayName:model,isDefault:model==='test-model'}))};
+    return base(command,args);
+  });
+  await render();
+  await act(async()=>container.querySelector<HTMLButtonElement>('.model-chip')!.click());
+  await act(async()=>[...container.querySelectorAll<HTMLButtonElement>('.model-option')].find(button=>button.textContent?.includes('failed-model'))!.click());
+  expect(loadModelSelection('claude',data.profiles,[])).toEqual({connectionId:'api:claude',model:'test-model',effort:'high'});
+});
 
 it('does not resurrect a resolved approval when initial recovery returns late', async () => {
   const original = vi.mocked(call).getMockImplementation()!;
@@ -165,9 +292,9 @@ it('flushes the current draft before unload without overwriting a draft saved by
 it('isolates selected-content details, traps focus, blocks shortcuts and closes with Escape', async () => {
   localStorage.setItem('supercode.session', 'selection-chat');
   data.sessions = [{ id:'selection-chat',projectId:'existing',title:'选中文字',agent:'claude',connectionId:'api:claude',model:'test-model',status:'idle',nativeId:'native',turnId:null,updatedAt:1 }];
-  messages = [{ id:'user',seq:1,sessionId:'selection-chat',role:'user',kind:'userMessage',text:'需要进一步查看的文字',data:null }];
+  messages = [{ id:'assistant',seq:1,sessionId:'selection-chat',role:'assistant',kind:'assistantMessage',text:'需要进一步查看的文字',data:null }];
   await render();
-  const range = document.createRange(); range.selectNodeContents(container.querySelector('.message-text')!);
+  const range = document.createRange(); range.selectNodeContents(container.querySelector('.message.assistant .message-content')!);
   Object.defineProperty(range, 'getBoundingClientRect', { value:() => new DOMRect(100,100,100,20) });
   window.getSelection()!.addRange(range);
   await act(async () => container.querySelector('.chat-scroll')!.dispatchEvent(new MouseEvent('mouseup', { bubbles:true })));
@@ -180,6 +307,23 @@ it('isolates selected-content details, traps focus, blocks shortcuts and closes 
   await act(async () => document.dispatchEvent(new KeyboardEvent('keydown', { key:'Escape',bubbles:true,cancelable:true })));
   expect(container.querySelector('[aria-label="选中内容"]')).toBeNull();
   expect(container.querySelector<HTMLElement>('main.workspace')?.inert).toBe(false);
+});
+
+it('opens only a side-chat question for selected user text without adding or sending it', async () => {
+  localStorage.setItem('supercode.session', 'selection-chat');
+  data.sessions = [{ id:'selection-chat',projectId:'existing',title:'选中文字',agent:'claude',connectionId:'api:claude',model:'test-model',status:'idle',nativeId:'native',turnId:null,updatedAt:1 }];
+  messages = [{ id:'user',seq:1,sessionId:'selection-chat',role:'user',kind:'userMessage',text:'需要侧边提问的文字',data:null }];
+  await render(); await type('保留主输入草稿');
+  const range = document.createRange(); range.selectNodeContents(container.querySelector('.message.user .message-text')!);
+  Object.defineProperty(range, 'getBoundingClientRect', { value:() => new DOMRect(100,100,100,20) });
+  window.getSelection()!.addRange(range);
+  await act(async () => container.querySelector('.chat-scroll')!.dispatchEvent(new MouseEvent('mouseup', { bubbles:true })));
+  expect([...container.querySelectorAll('.selection-actions button')].map(button => button.textContent)).toEqual(['在侧边聊天中提问']);
+  await act(async () => container.querySelector<HTMLButtonElement>('.selection-actions button')!.click());
+  await act(async () => { await vi.dynamicImportSettled(); });
+  expect(container.querySelector<HTMLTextAreaElement>('[aria-label="侧边聊天消息"]')!.value).toContain('需要侧边提问的文字');
+  expect(container.querySelector<HTMLTextAreaElement>('.workspace .composer textarea')!.value).toBe('保留主输入草稿');
+  expect(vi.mocked(call).mock.calls.some(([command]) => command === 'send_chat_message')).toBe(false);
 });
 
 it('blocks workspace and sidebar shortcuts while the update dialog is open', async () => {

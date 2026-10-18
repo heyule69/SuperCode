@@ -33,6 +33,8 @@ mod connection_usage;
 mod credentials;
 mod desktop_control;
 mod desktop_control_smoke;
+#[cfg(windows)]
+mod desktop_banner;
 mod desktop_glow;
 mod desktop_lifecycle;
 mod desktop_smoke;
@@ -126,6 +128,7 @@ pub fn run() {
         .any(|arg| matches!(arg.as_str(), "--desktop-smoke-test" | "--tray-hover-test"));
     let desktop_control_test = std::env::args().any(|arg| arg == "--desktop-control-test");
     let browser_test = std::env::args().any(|arg| arg == "--browser-smoke-test");
+    let browser_viewport_test = std::env::args().any(|arg| arg == "--browser-viewport-test");
     let installation_test = std::env::args().any(|arg| {
         matches!(
             arg.as_str(),
@@ -150,14 +153,17 @@ pub fn run() {
         || desktop_test
         || desktop_control_test
         || browser_test
+        || browser_viewport_test
         || followup_test
         || update_test
         || installation_test)
         .then(|| {
             std::env::current_dir()
                 .unwrap_or_default()
-                .join(".supercode/smoke")
-                .join(if agents_test {
+                .join(if browser_viewport_test { ".supercode/browser-viewport-audit" } else { ".supercode/smoke" })
+                .join(if browser_viewport_test {
+                    "runtime".into()
+                } else if agents_test {
                     format!("Agent test 测试 {}", uuid::Uuid::new_v4())
                 } else {
                     uuid::Uuid::new_v4().to_string()
@@ -183,6 +189,7 @@ pub fn run() {
         || desktop_test
         || desktop_control_test
         || browser_test
+        || browser_viewport_test
         || followup_test
         || installation_test
     {
@@ -263,6 +270,7 @@ pub fn run() {
                 change_snapshots: std::sync::Mutex::new(file_changes::Tracker::default()),
             });
             runtime_diagnostics::record(app.handle(), None, "app_started", serde_json::json!({}));
+            media::install(app.handle());
             if let Err(error) = desktop_control::install(app.handle()) {
                 runtime_diagnostics::message(app.handle(),None,"desktop_control","warn","desktop_control_install_error",&error.to_string());
             }
@@ -273,7 +281,9 @@ pub fn run() {
             let outbox_handle = app.handle().clone();
             tauri::async_runtime::spawn(async move { outbox::watch(outbox_handle).await });
             let handle = app.handle().clone();
-            if browser_test {
+            if browser_viewport_test {
+                tauri::async_runtime::spawn(async move { browser::viewport_smoke(handle).await; });
+            } else if browser_test {
                 tauri::async_runtime::spawn(async move {
                     browser::smoke(handle).await;
                 });

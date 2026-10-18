@@ -15,7 +15,7 @@
 .browser-status-dot.error{background:#da826e}
 .browser-status kbd{font:inherit;opacity:.8}
 .browser-takeover{display:flex;align-items:center;gap:5px;border:1px solid var(--line);border-radius:7px;padding:3px 7px;background:transparent;color:var(--text);font:inherit;cursor:pointer}
-.browser-viewport{flex:1;min-height:0;position:relative;background:#fff}
+.browser-viewport{flex:1;min-height:0;position:relative;background:var(--bg)}
 .browser-empty{height:100%;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:16px;background:var(--bg);color:var(--muted);font-size:12px}
 .browser-error{display:flex;align-items:center;gap:6px;padding:7px 12px;font-size:12px;color:var(--danger,#c45548)}
 .browser-error span{flex:1;overflow-wrap:anywhere}

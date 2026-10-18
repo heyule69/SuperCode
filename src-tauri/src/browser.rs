@@ -11,6 +11,8 @@ use std::{
     time::{Duration, Instant},
 };
 use tauri::{AppHandle, Emitter, Manager, Webview};
+#[path = "browser_viewport.rs"]
+mod viewport;
 
 #[derive(Clone)]
 struct Lease {
@@ -52,6 +54,7 @@ pub(crate) struct Tab {
     pub hwnd: isize,
     pub scale: AtomicU64,
     pub rect: Mutex<(f64, f64, f64, f64)>,
+    presentation_scale: AtomicU64,
     used: Mutex<Instant>,
     layout_revision: AtomicU64,
     revision: AtomicU64,
@@ -323,7 +326,8 @@ async fn ensure_tab(app: &AppHandle, session: &str, window: &str) -> Result<Arc<
         recovery_attempts: Mutex::new(Vec::new()),
         hwnd,
         scale: AtomicU64::new(scale.to_bits()),
-        rect: Mutex::new((10000., 0., 960., 640.)),
+        rect: Mutex::new((10000., 0., viewport::WIDTH, viewport::HEIGHT)),
+        presentation_scale: AtomicU64::new(f64::NAN.to_bits()),
         used: Mutex::new(Instant::now()),
         layout_revision: AtomicU64::new(0),
         revision: AtomicU64::new(0),
@@ -354,7 +358,7 @@ async fn ensure_tab(app: &AppHandle, session: &str, window: &str) -> Result<Arc<
         .add_child(
             builder,
             tauri::LogicalPosition::new(10000., 0.),
-            tauri::LogicalSize::new(960., 640.),
+            tauri::LogicalSize::new(viewport::WIDTH, viewport::HEIGHT),
         )
         .map_err(|e| e.to_string())?;
     view.hide().map_err(|e| e.to_string())?;
@@ -364,6 +368,12 @@ async fn ensure_tab(app: &AppHandle, session: &str, window: &str) -> Result<Arc<
         .lock()
         .unwrap()
         .insert(session.into(), tab.clone());
+    if let Err(error) = cdp(app, &tab, "Emulation.setDeviceMetricsOverride", viewport::metrics(viewport::WIDTH), None).await {
+        state.tabs.lock().unwrap().remove(session);
+        let _ = view.close();
+        return Err(error);
+    }
+    tab.presentation_scale.store(1f64.to_bits(), Ordering::Release);
     Ok(tab)
 }
 fn inactive_hidden_tab(tabs: &HashMap<String, Arc<Tab>>, leases: &[Lease]) -> Option<String> {
@@ -453,27 +463,41 @@ pub async fn browser_layout(
         {
             return Ok(());
         }
-        let bounds = (x, y, width, height);
-        if *tab.rect.lock().unwrap() != bounds {
-            tab.revision.fetch_add(1, Ordering::AcqRel);
-            *tab.rect.lock().unwrap() = bounds;
-        }
+        let mut dpi = f64::from_bits(tab.scale.load(Ordering::Acquire));
         if let Some(window) = app.get_window(&tab.window) {
             if let Ok(scale) = window.scale_factor() {
                 tab.scale.store(scale.to_bits(), Ordering::Release);
+                dpi = scale;
             }
         }
-        view.set_bounds(tauri::Rect {
-            position: tauri::LogicalPosition::new(x, y).into(),
-            size: tauri::LogicalSize::new(width, height).into(),
-        })
-        .map_err(|e| e.to_string())?;
-        if tab.layout_revision.load(Ordering::Acquire) != layout_revision {
+        let bounds = viewport::fit(x, y, width, height, dpi);
+        let presentation_scale = bounds.2 / viewport::WIDTH;
+        if *tab.rect.lock().unwrap() != bounds
+            || tab.presentation_scale.load(Ordering::Acquire) != presentation_scale.to_bits() {
+            // Only the presentation changes. DOM refs and page layout stay valid.
+            cdp(&app, &tab, "Emulation.setDeviceMetricsOverride", viewport::metrics(bounds.2), None).await?;
+            tab.presentation_scale.store(presentation_scale.to_bits(), Ordering::Release);
+        }
+        // Serialize the final UI commit with close/open. Do not hold this lock
+        // across CDP awaits, and do not let a delayed layout undo a user's close.
+        let mounted = tab.mount.lock().unwrap();
+        if *mounted != mount_id || tab.layout_revision.load(Ordering::Acquire) != layout_revision {
             return Ok(());
         }
+        // Restore the native position even when the preview size is unchanged:
+        // closing parks the view outside the window but retains its saved rect.
+        view.set_bounds(tauri::Rect {
+            position: tauri::LogicalPosition::new(bounds.0, bounds.1).into(),
+            size: tauri::LogicalSize::new(bounds.2, bounds.3).into(),
+        }).map_err(|e| e.to_string())?;
+        *tab.rect.lock().unwrap() = bounds;
         view.show().map_err(|e| e.to_string())?;
         tab.visible.store(true, Ordering::Release);
     } else {
+        let mounted = tab.mount.lock().unwrap();
+        if *mounted != mount_id || tab.layout_revision.load(Ordering::Acquire) != layout_revision {
+            return Ok(());
+        }
         hide_panel(&app, &tab);
         // Preserve the viewport and observation: hiding the UI is not a page resize.
         park_view(&view)?;
@@ -497,7 +521,8 @@ pub async fn browser_close(
     if tab.window != webview.window().label() {
         return Err("浏览器不属于此窗口".into());
     }
-    if *tab.mount.lock().unwrap() != mount_id {
+    let mounted = tab.mount.lock().unwrap();
+    if *mounted != mount_id {
         return Ok(());
     }
     tab.layout_revision.fetch_add(1, Ordering::AcqRel);
@@ -743,12 +768,12 @@ async fn snapshot(app: &AppHandle, tab: &Tab, lease: &Lease) -> Result<Value, St
         app,
         tab,
         "Page.captureScreenshot",
-        json!({"format":"jpeg","quality":65,"captureBeyondViewport":false}),
+        viewport::screenshot(value["scrollX"].as_f64().unwrap_or(0.), value["scrollY"].as_f64().unwrap_or(0.)),
         Some(lease),
     )
     .await;
     let mut content = vec![json!({"type":"text","text":value.to_string()})];
-    match image {Ok(image) if image["data"].as_str().is_some_and(|s|s.len()<4*1024*1024)=>content.push(json!({"type":"image","mimeType":"image/jpeg","data":image["data"]})),Err(error)=>content.push(json!({"type":"text","text":format!("Screenshot unavailable: {error}. The DOM snapshot above is real; do not pretend you saw an image.")})),_=>{}}
+    match image {Ok(image) if image["data"].as_str().is_some_and(|s|s.len()<4*1024*1024)=>content.push(json!({"type":"image","mimeType":"image/jpeg","data":image["data"],"_meta":{"supercode":{"purpose":"observation"}}})),Err(error)=>content.push(json!({"type":"text","text":format!("Screenshot unavailable: {error}. The DOM snapshot above is real; do not pretend you saw an image.")})),_=>{}}
     lease.check()?;
     Ok(json!({"content":content,"isError":false}))
 }
@@ -961,12 +986,16 @@ async fn execute(
                 observation(tab,&args["snapshotId"])?;
                 tab.observation.lock().unwrap().take();
                 may_have_run=true;
-                for phase in ["mousePressed","mouseReleased"]{cdp(app,tab,"Input.dispatchMouseEvent",json!({"type":phase,"x":point["x"],"y":point["y"],"button":"left","clickCount":1}),Some(lease)).await?;}
+                let input=viewport::input_point(&point,f64::from_bits(tab.presentation_scale.load(Ordering::Acquire)));
+                for phase in ["mousePressed","mouseReleased"]{cdp(app,tab,"Input.dispatchMouseEvent",json!({"type":phase,"x":input["x"],"y":input["y"],"button":"left","clickCount":1}),Some(lease)).await?;}
                 if name=="browser_fill" {focused_field(app,tab,&args,context,lease).await?;key(app,tab,"CTRL+A",lease).await?;focused_field(app,tab,&args,context,lease).await?;cdp(app,tab,"Input.insertText",json!({"text":args["text"]}),Some(lease)).await?;}
             }else if name=="browser_scroll"{
                 let center=evaluate(app,tab,"({x:innerWidth/2,y:innerHeight/2})".into(),Some(context),Some(lease)).await?;
                 cue(app,tab,Some(center.clone()),true,Some(lease)).await?;
-                tab.observation.lock().unwrap().take();may_have_run=true;cdp(app,tab,"Input.dispatchMouseEvent",json!({"type":"mouseWheel","x":center["x"],"y":center["y"],"deltaY":args["deltaY"],"deltaX":args.get("deltaX").cloned().unwrap_or(json!(0))}),Some(lease)).await?;
+                let scale=f64::from_bits(tab.presentation_scale.load(Ordering::Acquire));
+                let input=viewport::input_point(&center,scale);
+                // Positions address the scaled host; wheel distances remain page CSS pixels.
+                tab.observation.lock().unwrap().take();may_have_run=true;cdp(app,tab,"Input.dispatchMouseEvent",json!({"type":"mouseWheel","x":input["x"],"y":input["y"],"deltaY":args["deltaY"],"deltaX":args.get("deltaX").cloned().unwrap_or(json!(0))}),Some(lease)).await?;
             }else{tab.observation.lock().unwrap().take();may_have_run=true;key(app,tab,args["key"].as_str().unwrap(),lease).await?;}
         }
         tokio::select!{_=tokio::time::sleep(Duration::from_millis(400))=>{},_=cancelled(lease)=>return Err("user_takeover".into())};
@@ -1354,6 +1383,9 @@ pub async fn probe(app: &AppHandle, cancel: &Arc<AtomicBool>) -> Result<(usize, 
 }
 #[path = "browser_smoke.rs"]
 mod smoke_checks;
+#[path = "browser_viewport_smoke.rs"]
+mod viewport_checks;
+pub async fn viewport_smoke(app: AppHandle) { viewport_checks::run(app).await; }
 pub async fn smoke(app: AppHandle) {
     let result = async {
         let probe = probe(&app, &Arc::new(AtomicBool::new(false))).await?;
@@ -1458,6 +1490,7 @@ mod tests {
             hwnd: 0,
             scale: AtomicU64::new(1f64.to_bits()),
             rect: Mutex::new((0., 0., 500., 400.)),
+            presentation_scale: AtomicU64::new(1f64.to_bits()),
             used: Mutex::new(Instant::now()),
             layout_revision: AtomicU64::new(0),
             revision: AtomicU64::new(1),
@@ -1537,6 +1570,7 @@ mod tests {
             hwnd: 0,
             scale: AtomicU64::new(1f64.to_bits()),
             rect: Mutex::new((0., 0., 500., 400.)),
+            presentation_scale: AtomicU64::new(1f64.to_bits()),
             used: Mutex::new(Instant::now()),
             layout_revision: AtomicU64::new(0),
             revision: AtomicU64::new(1),

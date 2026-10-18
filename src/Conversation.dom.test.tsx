@@ -253,6 +253,22 @@ it('shows animated current reasoning, editing and running after a tool failure w
   }
 });
 
+it('updates a failed historical summary after a later command succeeds, keeping both details', async () => {
+  const failed=message('failed-command','tool','未找到浏览器','commandExecution',{command:'ls missing-browser',status:'completed',exitCode:1});
+  const success=message('successful-command','tool','截图已保存','commandExecution',{command:'render preview.png',status:'completed',exitCode:0});
+  const thought=message('final-thought','activity','检查截图。','reasoning',{status:'completed'});
+  await render([items[0],failed,success,thought,items[3],run('completed')],false,{sessionStatus:'idle'});
+  await toggle();
+  const summary=node.querySelector<HTMLButtonElement>('.activity-group-summary')!;
+  expect(summary.textContent).toContain('后续调用成功');
+  expect(summary.textContent).not.toContain('调用失败');
+  expect(summary.closest('.activity-group')?.classList.contains('failed')).toBe(false);
+  await act(async()=>summary.click());
+  expect(node.querySelector('.activity-item.failed')?.textContent).toContain('ls missing-browser');
+  expect(node.querySelector('.activity-item.failed .activity-state')?.textContent).toContain('失败');
+  expect(node.querySelector('.activity-item.completed')?.textContent).toContain('render preview.png');
+});
+
 it('keeps one animated status across tool completion and text output, then removes it when the turn ends', async () => {
   const failed = message('failure', 'tool', '失败', 'commandExecution', { status: 'completed', exitCode: 1 });
   const trace = [items[0], failed];

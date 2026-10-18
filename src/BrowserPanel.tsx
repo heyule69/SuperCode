@@ -26,7 +26,7 @@ export default function BrowserPanel({ sessionId, visible, close, resizeHandle, 
       if(!opened || disposed)return;
       cancelAnimationFrame(frame);frame=requestAnimationFrame(()=>{
         if(disposed || !area.current)return;const r=area.current.getBoundingClientRect();
-        void call('browser_layout',{sessionId,mountId,x:r.x,y:r.y,width:r.width,height:r.height,visible:visibility.current && document.visibilityState!=='hidden'}).catch(e=>{if(!disposed)setError(String(e));});
+        void call('browser_layout',{sessionId,mountId,x:r.x,y:r.y,width:r.width,height:r.height,visible:visibility.current && document.visibilityState!=='hidden' && !document.querySelector('.image-preview-backdrop')}).catch(e=>{if(!disposed)setError(String(e));});
       });
     };
     requestLayout.current=layout;
@@ -43,10 +43,10 @@ export default function BrowserPanel({ sessionId, visible, close, resizeHandle, 
         setState(old=>({...old,...result,url:result.url||old.url,title:result.title||old.title}));setReady(true);
         setAddress(result.url==='about:blank'?'':result.url);
         observer=new ResizeObserver(layout);if(area.current){observer.observe(area.current);const surface=area.current.closest('.conversation-surface');if(surface)observer.observe(surface);}layout();
-        window.addEventListener('resize',layout);document.addEventListener('visibilitychange',layout);
+        window.addEventListener('resize',layout);window.addEventListener('supercode-media-overlay',layout);document.addEventListener('visibilitychange',layout);
       }catch(e){if(!disposed)setError(String(e));}
     })();
-    return ()=>{disposed=true;live.current=false;cancelAnimationFrame(frame);offs.forEach(off=>off());observer?.disconnect();window.removeEventListener('resize',layout);document.removeEventListener('visibilitychange',layout);if(opened)void call('browser_close',{sessionId,mountId}).catch(()=>{});};
+    return ()=>{disposed=true;live.current=false;cancelAnimationFrame(frame);offs.forEach(off=>off());observer?.disconnect();window.removeEventListener('resize',layout);window.removeEventListener('supercode-media-overlay',layout);document.removeEventListener('visibilitychange',layout);if(opened)void call('browser_close',{sessionId,mountId}).catch(()=>{});};
   },[sessionId]);
   useEffect(()=>requestLayout.current(),[visible,expanded,ready]);
   useEffect(()=>{

@@ -1,4 +1,5 @@
 /* Approved compact model picker; shares the app's appearance and font settings. */
+.model-chip-effort { flex:none; padding-left:6px; border-left:1px solid var(--line); color:var(--muted); font-size:calc(var(--ui-size) - 2px); white-space:nowrap; }
 .composer-popover.model-popover {
   --model-selected:color-mix(in srgb,var(--hover) 75%,var(--text) 5%);
   --model-menu-size:max(12px,calc(var(--ui-size) - 1px));

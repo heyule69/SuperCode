@@ -1,0 +1,10 @@
+# 主程序和安装器共用构建缓存，避免各自生成一套 target。
+[build]
+target-dir = "src-tauri/target"
+
+# 优先节省本地开发与测试的硬盘空间；test 默认继承 dev。
+# 不生成调试符号和增量缓存，代价是调试信息减少、重新编译变慢。
+# 正式发布继续使用各 Cargo.toml 中已有的 release 配置。
+[profile.dev]
+debug = 0
+incremental = false

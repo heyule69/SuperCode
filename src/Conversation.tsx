@@ -10,7 +10,7 @@ import './activity-details.css';
 import { ResourceMenu, type OpenPath } from './ResourceMenu';
 import { ConversationIndex } from './ConversationIndex';
 import { AttachmentImage } from './AttachmentImage';
-import { MediaContext, MediaList } from './Media';
+import { MediaContext, MediaList, ProcessMedia } from './Media';
 import { messageMedia } from './mediaSources';
 import { presentTurn, type TurnLifecycle } from './turnPresentation';
 import { QuestionHistory } from './QuestionHistory';
@@ -114,16 +114,17 @@ const ActivityItem = memo(function ActivityItem({ message: m, autoExpand, showDi
 function ActivityGroup({ messages, autoExpand, live, processDisplay, showDiff }: { messages: Message[]; autoExpand: boolean; live: boolean; processDisplay: ProcessDisplay; showDiff:(name:string,text:string)=>void }) {
   const [collapsed, setCollapsed] = useState(!autoExpand);
   useEffect(() => setCollapsed(!autoExpand), [autoExpand]);
-  const { label, category, status } = summarizeActivities(messages, live);
+  const { label, category, status, earlierFailure } = summarizeActivities(messages, live);
   const Icon = { command: SquareTerminal, edit: Pencil, read: FileSearch, search: FileSearch, web: Globe, browser: Globe, computer: Monitor, plan: ListChecks, reasoning: Brain, context: ListChecks, tool: Wrench }[category];
-  const stateText = status === 'failed' ? '调用失败' : status === 'declined' ? '已拒绝' : status === 'interrupted' ? '已停止' : '';
-  const media = [...new Map(messages.flatMap(messageMedia).map(ref => [ref.path, ref])).values()].slice(0, 12);
+  const stateText = status === 'failed' ? '调用失败' : status === 'declined' ? '已拒绝' : status === 'interrupted' ? '已停止' : earlierFailure ? '后续调用成功' : '';
+  const media = [...new Map(messages.flatMap(messageMedia).map(ref => [ref.path, ref])).values()];
   const mediaErrors = messages.flatMap(m => Array.isArray(m.data?.mediaErrors) ? m.data.mediaErrors.filter((error: unknown) => typeof error === 'string') as string[] : []).slice(0, 3);
   const generatingPlan = live && collapsed && processDisplay === 'collapsible' ? [...messages].reverse().find(m => m.kind === 'claudeToolCall' && m.data?.tool === 'ExitPlanMode' && pending(m.data.status)) : undefined;
   const draftPlan = generatingPlan ? planText(generatingPlan.data?.arguments) || planText(generatingPlan.data?.inputText, true) : '';
+  if (media.length && messages.every(message=>message.kind==='imageView')) return <><ProcessMedia media={media}/>{mediaErrors.map((error,index)=><p className="inline-error" role="status" key={index}>{error}</p>)}</>;
   if (processDisplay === 'timeline') return <div className="activity-timeline">
     {messages.map(m => <ActivityItem key={m.id} message={m} autoExpand={m.kind === 'executionPlan'} showDiff={showDiff} />)}
-    <MediaList media={media}/>{mediaErrors.map((error, index) => <p className="inline-error" role="status" key={index}>{error}</p>)}
+    <ProcessMedia media={media}/>{mediaErrors.map((error, index) => <p className="inline-error" role="status" key={index}>{error}</p>)}
   </div>;
   return <div className={`activity-group ${status}`}>
     <button className="activity-group-summary" aria-label={`${label}${stateText ? ` · ${stateText}` : ''}，${messages.length} 条记录`} aria-expanded={!collapsed} onClick={() => setCollapsed(value => !value)}>
@@ -131,7 +132,7 @@ function ActivityGroup({ messages, autoExpand, live, processDisplay, showDiff }:
     </button>
     {collapsed ? null : <div className="activity-items">{messages.map(m => <ActivityItem key={m.id} message={m} autoExpand={autoExpand} showDiff={showDiff} />)}</div>}
     {draftPlan ? <div className="plan-generation" aria-label="正在生成计划"><Suspense fallback={<span className="pending-text">正在加载计划文档…</span>}><PlanCard text={draftPlan} streaming /></Suspense></div> : null}
-    <MediaList media={media}/>{mediaErrors.map((error, index) => <p className="inline-error" role="status" key={index}>{error}</p>)}
+    <ProcessMedia media={media}/>{mediaErrors.map((error, index) => <p className="inline-error" role="status" key={index}>{error}</p>)}
   </div>;
 }
 

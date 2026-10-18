@@ -3,7 +3,7 @@ import { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import Markdown from './Markdown';
-import { MediaContext, MediaList } from './Media';
+import { MediaContext, MediaList, ProcessMedia } from './Media';
 import { ResourceMenu } from './ResourceMenu';
 import { call } from './api';
 import { firstVideoFrame } from './videoPreview';
@@ -20,6 +20,56 @@ beforeEach(() => {
   container = document.createElement('div'); document.body.append(container); root = createRoot(container);
 });
 afterEach(async () => { await act(async () => root.unmount()); container.remove(); vi.unstubAllGlobals(); });
+
+it('loads process images only after a click and unmounts previews when folded again', async()=>{
+  const media=[{path:'D:/cache/step.jpg',name:'过程截图',kind:'image' as const}];
+  await act(async()=>root.render(<ProcessMedia media={media}/>));
+  expect(container.textContent).toContain('已查看 1 张图像');
+  expect(container.querySelector('img')).toBeNull();expect(call).not.toHaveBeenCalled();
+  const toggle=container.querySelector<HTMLButtonElement>('.process-media-summary')!;
+  await act(async()=>toggle.click());
+  expect(call).toHaveBeenCalledWith('prepare_media',{path:'D:/cache/step.jpg',projectId:null,sessionId:null,processPreview:true});
+  expect(container.querySelector('.chat-media-process img')).not.toBeNull();
+  await act(async()=>container.querySelector<HTMLButtonElement>('.chat-image-button')!.click());
+  expect(document.querySelector('[role="dialog"]')).not.toBeNull();
+  await act(async()=>toggle.click());
+  expect(container.querySelector('img')).toBeNull();expect(document.querySelector('[role="dialog"]')).toBeNull();
+  expect(container.querySelector('.chat-media-card')).toBeNull();
+});
+
+it('ignores a late preparation result after the user folds the process images',async()=>{
+  let finish!:(value:unknown)=>void;
+  vi.mocked(call).mockImplementationOnce(()=>new Promise(resolve=>{finish=resolve;}));
+  await act(async()=>root.render(<ProcessMedia media={[{path:'D:/cache/late.jpg',name:'截图',kind:'image'}]}/>));
+  const toggle=container.querySelector<HTMLButtonElement>('.process-media-summary')!;
+  await act(async()=>toggle.click());await act(async()=>toggle.click());
+  await act(async()=>finish({token:'late-full',previewToken:'late-small'}));
+  expect(container.querySelector('img')).toBeNull();expect(container.querySelector('.chat-media-card')).toBeNull();
+});
+
+it('explains an expired process screenshot without a broken image or unusable file action',async()=>{
+  vi.mocked(call).mockResolvedValueOnce({unavailable:'expired'});
+  await act(async()=>root.render(<ProcessMedia media={[{path:'D:/cache/process-captures/old.jpg',name:'截图',kind:'image'}]}/>));
+  await act(async()=>container.querySelector<HTMLButtonElement>('.process-media-summary')!.click());
+  expect(container.textContent).toContain('过程截图已自动清理');expect(container.querySelector('img')).toBeNull();
+  expect(container.querySelector('[aria-label^="在系统中打开"]')).toBeNull();
+  expect(container.querySelector('.chat-media-card')?.hasAttribute('data-media-source')).toBe(false);
+});
+
+it('counts every process image but mounts at most one page, keeping the open page stable during new snapshots',async()=>{
+  const media=Array.from({length:25},(_,index)=>({path:`D:/cache/${index}.jpg`,name:`截图${index}`,kind:'image' as const}));
+  await act(async()=>root.render(<ProcessMedia media={media}/>));
+  expect(container.textContent).toContain('已查看 25 张图像');expect(call).not.toHaveBeenCalled();
+  await act(async()=>container.querySelector<HTMLButtonElement>('.process-media-summary')!.click());
+  expect(container.querySelectorAll('.chat-media-card')).toHaveLength(12);
+  expect(container.querySelector('[data-media-source="D:/cache/24.jpg"]')).not.toBeNull();
+  await act(async()=>root.render(<ProcessMedia media={[...media,{path:'D:/cache/25.jpg',name:'截图25',kind:'image'}]}/>));
+  expect(container.querySelector('[data-media-source="D:/cache/25.jpg"]')).toBeNull();
+  await act(async()=>container.querySelector<HTMLButtonElement>('.process-media-pages button')!.click());
+  expect(container.querySelectorAll('.chat-media-card')).toHaveLength(12);
+  expect(container.querySelector('[data-media-source="D:/cache/12.jpg"]')).not.toBeNull();
+  expect(container.querySelector('[data-media-source="D:/cache/24.jpg"]')).toBeNull();
+});
 
 it('loads thumbnails, opens the original on one click, and closes with Escape', async () => {
   await act(async () => root.render(<MediaContext.Provider value={{ projectId: 'p' }}><Markdown text={'![截图](<D:/output/截图.png>)'}/></MediaContext.Provider>));

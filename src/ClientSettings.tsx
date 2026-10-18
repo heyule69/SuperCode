@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useState, type CSSProperties } from 'react';
 import { Check, ChevronRight, FileText, Plus, RefreshCw, Search, X } from 'lucide-react';
 import { call, desktop } from './api';
 import type { Preferences, Theme } from './preferences';
@@ -7,6 +7,8 @@ import { loadLocalSkills, skillSource, type Skill } from './skills';
 import ExtensionsSettings from './ExtensionsSettings';
 import AutomationSettings from './AutomationSettings';
 import NotificationSettings from './NotificationSettings';
+import { ThemeColorSettings } from './ThemeColorSettings';
+import { themeColorVariables, type ColorTheme } from './themeColors';
 export type { Skill } from './skills';
 export type ClientTab = 'appearance' | 'notifications' | 'personalization' | 'skills' | 'plugins' | 'automation';
 const themeNames: Record<Theme, string> = { light: '白色', dark: '暗黑', graphite: '石墨', sand: '暖色', system: '跟随系统' };
@@ -22,7 +24,8 @@ export default function ClientSettings({ tab, prefs, setPrefs, projectId, busy, 
   if (tab === 'notifications') return <NotificationSettings prefs={prefs} setPrefs={setPrefs}/>;
   return <div className={`client-settings-page${tab === 'skills' && !creating && !selected ? ' skills-catalog' : ''}`}><div className="settings-page-heading"><h2>{tab === 'appearance' ? '外观' : tab === 'personalization' ? '个性化' : tab === 'skills' ? '技能' : '自动化工具'}</h2><div>{tab === 'skills' ? <><span className="skill-list-count">{skills.length} 个</span><button className="icon-button" title="刷新技能" disabled={working || !desktop} onClick={() => void run(loadSkills)}><RefreshCw size={14} /></button><button className="quiet-button" disabled={!desktop || working || busy} onClick={() => { setCreating(true); setSelected(undefined); setSkillText(''); }}><Plus size={14} />新建</button></> : null}</div></div>{error ? <p className="cc-error" role="alert">{error}</p> : null}{message ? <p className="provider-feedback" role="status"><Check size={14} />{message}</p> : null}
     {tab === 'appearance' ? <>
-      <SettingsGroup title="主题"><div className="theme-grid">{Object.entries(themeNames).map(([id, label]) => <button key={id} aria-pressed={prefs.theme === id} className={`theme-option ${prefs.theme === id ? 'selected' : ''}`} onClick={() => update('theme', id)}><div className={`theme-preview theme-${id}`}><span /><div><i /><i /><b /></div></div><span>{label}{prefs.theme === id ? <Check size={13} /> : null}</span></button>)}</div></SettingsGroup>
+      <SettingsGroup title="主题"><div className="theme-grid">{Object.entries(themeNames).map(([id, label]) => <button key={id} aria-pressed={prefs.theme === id} className={`theme-option ${prefs.theme === id ? 'selected' : ''}`} onClick={() => update('theme', id)}><div className={`theme-preview theme-${id}`} style={id === 'system' ? undefined : themeColorVariables(id as ColorTheme, prefs.themeColors?.[id as ColorTheme]) as CSSProperties}><span /><div><i /><i /><b /></div></div><span>{label}{prefs.theme === id ? <Check size={13} /> : null}</span></button>)}</div></SettingsGroup>
+      <ThemeColorSettings prefs={prefs} setPrefs={setPrefs}/>
       <SettingsGroup title="字体">
         <SettingRow title="界面字体"><select aria-label="界面字体" value={prefs.uiFont} onChange={e => update('uiFont', e.target.value)}><option value="system">系统默认</option><option>Microsoft YaHei</option><option>Segoe UI</option></select></SettingRow>
         <SettingRow title="代码字体"><select aria-label="代码字体" value={prefs.codeFont} onChange={e => update('codeFont', e.target.value)}><option>Consolas</option><option>Cascadia Code</option><option>Courier New</option></select></SettingRow>

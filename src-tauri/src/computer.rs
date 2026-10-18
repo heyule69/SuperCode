@@ -60,7 +60,7 @@ pub fn tools() -> Vec<Value> {
     let coord = json!({"type":"integer","minimum":0,"description":"Pixel in the returned screenshot, NOT desktop coordinates."});
     vec![
         tool("desktop_list_windows", "List visible desktop windows and the foreground window. Built into SuperCode; no Python or external desktop MCP is needed.", json!({}), &[], true),
-        tool("desktop_focus_window", "Bring an observed window to the foreground. Fails if Windows refuses focus. Returns a fresh screenshot and snapshotId. If the user changed focus, stop instead of refocusing.", json!({"windowId":window}), &["windowId"], false),
+        tool("desktop_focus_window", "Bring an observed window to the foreground. Fails if Windows refuses focus. Returns a fresh screenshot and snapshotId. If focus changed, obtain a fresh observation before acting; the control grant remains active.", json!({"windowId":window}), &["windowId"], false),
         tool("desktop_snapshot", "Read the foreground window: screenshot and bounded accessibility tree. Select a windowId or use the foreground window. Does not change focus. Snapshot coordinates are image pixels. If the window is obscured, focus it first. UIA failure is reported alongside the screenshot.", json!({"windowId":window,"includeImage":{"type":"boolean","default":true},"includeTree":{"type":"boolean","default":true}}), &[], true),
         tool("desktop_move", "Move the visible pointer smoothly to an observed screenshot coordinate. Verify the window remains foreground.", json!({"snapshotId":sid,"x":coord,"y":coord}), &["snapshotId","x","y"], false),
         tool("desktop_click", "Click a coordinate in a recent snapshot. Requires the same foreground window and geometry. Returns a fresh screenshot and snapshotId; use the returned ID for the next action. Never blindly retry a failed action.", json!({"snapshotId":sid,"x":coord,"y":coord,"button":{"type":"string","enum":["left","right","middle"],"default":"left"},"count":{"type":"integer","minimum":1,"maximum":2,"default":1}}), &["snapshotId","x","y"], false),
@@ -108,7 +108,7 @@ pub(crate) fn takeover_result(action_may_have_run: bool) -> Value {
     text_result(
         json!({"status":"stopped","code":"user_takeover","actionMayHaveRun":action_may_have_run,
         "scope":"desktop_control",
-        "message":"User took control. Desktop operation cancelled; the tool connection is still available.",
+        "message":"电脑控制已停止。按 Esc 或明确停止后，需要用户重新授权才能继续操作。工具连接和对话仍可使用。",
         "nextStep":CONTROL_STOP_NEXT_STEP}),
     )
 }
@@ -117,20 +117,17 @@ pub(crate) fn control_unavailable_result(message: &str) -> Value {
     text_result(json!({"status":"stopped","code":"computer_control_unavailable","scope":"desktop_control","actionMayHaveRun":false,
         "message":message,"nextStep":CONTROL_STOP_NEXT_STEP}))
 }
-fn foreground_revoked_result(action_may_have_run: bool) -> Value {
-    text_result(json!({"status":"stopped","code":"computer_control_revoked","reason":"foreground_changed",
+fn foreground_changed_result(action_may_have_run: bool) -> Value {
+    text_result(json!({"status":"observation_required","code":"foreground_changed","reason":"foreground_changed",
         "scope":"desktop_control","actionMayHaveRun":action_may_have_run,
-        "message":"The target window lost foreground focus. Desktop control was revoked; the tool connection is still available.",
-        "nextStep":CONTROL_STOP_NEXT_STEP}))
+        "message":"目标窗口已变化，电脑控制仍有效。请重新观察窗口后继续。",
+        "nextStep":"Obtain a fresh window list/snapshot. If needed, focus the observed intended window and observe it again before continuing. Do not blindly repeat an action that may have partly run. Only Esc or an explicit stop revokes the control grant."}))
 }
-fn desktop_call_result(result: Result<Value, String>, gate_stopped: bool, foreground_revoked: &mut bool) -> Value {
-    if result.as_ref().err().is_some_and(|error| error.starts_with(crate::computer_gate::FOREGROUND_CHANGED)) {
-        *foreground_revoked = true;
-    }
-    if *foreground_revoked {
-        foreground_revoked_result(true)
-    } else if gate_stopped {
+fn desktop_call_result(result: Result<Value, String>, gate_stopped: bool) -> Value {
+    if gate_stopped {
         takeover_result(true)
+    } else if result.as_ref().err().is_some_and(|error| error.starts_with(crate::computer_gate::FOREGROUND_CHANGED)) {
+        foreground_changed_result(true)
     } else {
         result.unwrap_or_else(|error| json!({"isError":true,"content":[{"type":"text","text":error}]}))
     }
@@ -151,6 +148,12 @@ struct Engine {
     observation: Option<(String, Instant, Value)>,
 }
 impl Engine {
+    fn finish_call(&mut self, result: Result<Value, String>, gate_stopped: bool) -> Value {
+        if result.as_ref().err().is_some_and(|error| error.starts_with(crate::computer_gate::FOREGROUND_CHANGED)) {
+            self.observation = None;
+        }
+        desktop_call_result(result, gate_stopped)
+    }
     fn arguments(name: &str, args: &Value) -> Result<(), String> {
         let schema = tools()
             .into_iter()
@@ -293,7 +296,7 @@ impl Engine {
             result["content"]
                 .as_array_mut()
                 .unwrap()
-                .push(json!({"type":"image","mimeType":"image/jpeg","data":image}));
+                .push(json!({"type":"image","mimeType":"image/jpeg","data":image,"_meta":{"supercode":{"purpose":"observation"}}}));
         }
         Ok(result)
     }
@@ -429,7 +432,6 @@ pub fn run() -> Result<(), String> {
     });
     let mut engine = Engine::default();
     let mut lease: Option<String> = None;
-    let mut foreground_revoked = false;
     while let Ok(v) = rx.recv() {
         if closed.load(Ordering::Acquire) {
             break;
@@ -443,7 +445,7 @@ pub fn run() -> Result<(), String> {
         }
         let result = match v["method"].as_str() {
             Some("initialize") => Ok(
-                json!({"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"SuperCode Computer","version":VERSION},"instructions":"SuperCode's bundled desktop engine. Discover windows, focus the intended window, then observe before acting. Use screenshot image pixels and fresh snapshot IDs; verify actions. User approvals remain required according to the Agent's policy. SuperCode arms visible blue desktop/pointer cues and a native stop mechanism before calls. User keyboard/mouse input or Esc immediately cancels desktop control only; the agent task and tool connection remain available. Continue conversation and permitted non-control tools, and ask the user only if the task is blocked. Do not retry desktop/browser operations, refocus, or use shell/PowerShell or other control tools to bypass takeover without renewed user authorization. Modifying actions return a fresh screenshot and snapshotId. Use that new ID; old IDs expire after actions. A foreground mismatch means control changed: cancel desktop control instead of retrying focus."}),
+                json!({"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"SuperCode Computer","version":VERSION},"instructions":"SuperCode's bundled desktop engine. Discover windows, focus the intended window, then observe before acting. Use screenshot image pixels and fresh snapshot IDs; verify actions. User approvals remain required according to the Agent's policy. SuperCode arms visible blue desktop/pointer cues and a native stop mechanism before calls. Only user Esc cancels desktop control. Ordinary mouse movements, clicks, typing, and focus changes do not revoke control. Explicit Stop and unavailable control cues still stop input. The visible Chinese banner says: SuperCode 正在控制电脑 · 按 Esc 取消. The agent task and tool connection remain available. Continue conversation and permitted non-control tools, and ask the user only if the task is blocked. Do not retry desktop/browser operations, refocus, or use shell/PowerShell or other control tools to bypass takeover without renewed user authorization. Modifying actions return a fresh screenshot and snapshotId. Use that new ID; old IDs expire after actions. A foreground mismatch requires a fresh observation, not a new authorization. Obtain a fresh window list, focus the observed intended window if necessary, and observe again before continuing. Never blindly repeat an action that may have partly completed."}),
             ),
             Some("ping") => Ok(json!({})),
             Some("tools/list") => Ok(json!({"tools":tools()})),
@@ -454,7 +456,6 @@ pub fn run() -> Result<(), String> {
                         if lease.as_deref() != Some(name) {
                             engine.observation = None;
                             lease = Some(name.into());
-                            foreground_revoked = false;
                         }
                         // Single execution thread; each disposable worker inherits
                         // this exact gate, even if the host has already started a later turn.
@@ -471,10 +472,6 @@ pub fn run() -> Result<(), String> {
                         &out,
                         json!({"jsonrpc":"2.0","id":id,"result":takeover_result(false)}),
                     );
-                    continue;
-                }
-                if foreground_revoked {
-                    send(&out, json!({"jsonrpc":"2.0","id":id,"result":foreground_revoked_result(false)}));
                     continue;
                 }
                 let cancel = || {
@@ -494,7 +491,7 @@ pub fn run() -> Result<(), String> {
                 let gate_stopped = gate.as_ref().is_some_and(|gate| gate.stopped());
                 #[cfg(not(windows))]
                 let gate_stopped = false;
-                Ok(desktop_call_result(result, gate_stopped, &mut foreground_revoked))
+                Ok(engine.finish_call(result, gate_stopped))
             }
             _ => Err(error(id.clone(), -32601, "Method not found")),
         };
@@ -513,20 +510,24 @@ pub fn run() -> Result<(), String> {
 mod tests {
     use super::*;
     #[test]
-    fn foreground_revocation_is_structured_and_preserves_conversation_even_if_kernel_revocation_fails() {
-        let mut revoked = false;
-        let result = desktop_call_result(Err(format!("{} gate unavailable", crate::computer_gate::FOREGROUND_CHANGED)), false, &mut revoked);
-        assert!(revoked);
+    fn foreground_changes_are_recoverable_and_escape_still_takes_priority() {
+        let changed = || Err(format!("{} observe again", crate::computer_gate::FOREGROUND_CHANGED));
+        let mut engine = Engine {
+            observation: Some(("old-snapshot".into(), Instant::now(), json!({"imageWidth":100,"imageHeight":100}))),
+        };
+        let result = engine.finish_call(changed(), false);
+        assert!(engine.observation.is_none());
+        assert!(engine.call("desktop_move", json!({"snapshotId":"old-snapshot","x":10,"y":10}), &|| false).is_err());
         assert_eq!(result["isError"], false);
         let detail: Value = serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
-        assert_eq!(detail["code"], "computer_control_revoked");
+        assert_eq!(detail["code"], "foreground_changed");
+        assert_eq!(detail["status"], "observation_required");
         assert_eq!(detail["reason"], "foreground_changed");
-        assert!(detail["nextStep"].as_str().unwrap().contains("Continue the user's task"));
-        assert!(!detail["message"].as_str().unwrap().contains("User took control"));
-        let retry = foreground_revoked_result(false);
-        let detail: Value = serde_json::from_str(retry["content"][0]["text"].as_str().unwrap()).unwrap();
-        assert_eq!(detail["actionMayHaveRun"], false);
-        assert_eq!(detail["code"], "computer_control_revoked");
+        assert!(detail["nextStep"].as_str().unwrap().contains("fresh window list/snapshot"));
+        assert_eq!(engine.finish_call(Ok(json!({"completed":true})), false)["completed"], true);
+        let stopped = engine.finish_call(changed(), true);
+        let detail: Value = serde_json::from_str(stopped["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(detail["code"], "user_takeover");
     }
     #[test]
     fn takeover_is_a_control_result_with_no_instruction_to_reconnect_or_retry() {

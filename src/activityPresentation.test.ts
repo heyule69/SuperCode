@@ -55,6 +55,21 @@ describe('activity summaries', () => {
     expect(summarizeActivities([...earlier, thinking, tool('write', 'Write', 'b.ts', 'preparing')], true)).toEqual({ label: '正在准备写文件', category: 'edit', status: 'preparing' });
     expect(summarizeActivities([...earlier, thinking, item('command', { status: 'running' })], true)).toEqual({ label: '正在执行命令', category: 'command', status: 'running' });
   });
+  it('shows later successful calls while retaining the earlier failure in the source history', () => {
+    const failed = item('failed', {exitCode:1});
+    const thought = {...item('thought',{status:'completed'}),kind:'reasoning',role:'activity'};
+    const success = item('success',{exitCode:0});
+    const history = [failed,thought,success,tool('read','Read','preview.png'),thought];
+    expect(summarizeActivities(history)).toMatchObject({status:'completed',earlierFailure:true});
+    expect(history[0]).toBe(failed);
+    expect(summarizeActivities([failed,thought])).toMatchObject({status:'failed'});
+    expect(summarizeActivities([success,failed,thought])).toMatchObject({status:'failed'});
+  });
+  it('uses the later declined or interrupted tool result instead of an old failure', () => {
+    for(const status of ['declined','interrupted']){
+      expect(summarizeActivities([item('failed',{exitCode:1}),item('last',{status})]).status).toBe(status);
+    }
+  });
   it('does not claim thinking after tool completion or reuse an older plan as current activity', () => {
     const plan = { ...item('plan', { status: 'inProgress' }), role: 'activity', kind: 'executionPlan' };
     expect(summarizeActivities([plan, tool('read', 'Read', 'a.ts')], true)).toEqual({ label: '正在处理', category: 'tool', status: 'inProgress' });

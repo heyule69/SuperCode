@@ -96,6 +96,7 @@ fn renderer() -> Tab {
         hwnd: 0,
         scale: AtomicU64::new(1f64.to_bits()),
         rect: Mutex::new((0., 0., 1400., 900.)),
+        presentation_scale: AtomicU64::new(1f64.to_bits()),
         used: Mutex::new(Instant::now()),
         layout_revision: AtomicU64::new(0),
         revision: AtomicU64::new(0),

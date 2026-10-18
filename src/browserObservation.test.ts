@@ -21,6 +21,11 @@ afterEach(() => {
   vi.restoreAllMocks(); vi.unstubAllGlobals(); document.body.innerHTML = '';
 });
 
+it('reports scroll offsets so a screenshot captures the current full viewport after scrolling', () => {
+  vi.stubGlobal('scrollX', 40); vi.stubGlobal('scrollY', 375);
+  expect(snapshot()).toMatchObject({width:800,height:600,scrollX:40,scrollY:375});
+});
+
 it('follows the same control after a large lazy-image layout shift', () => {
   snapshot();
   vi.spyOn(hit!, 'getBoundingClientRect').mockReturnValue(rect(260, 290, 140, 55));

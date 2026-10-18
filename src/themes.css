@@ -4,6 +4,8 @@
   --code-font:ui-monospace,"SFMono-Regular","SF Mono",Menlo,Consolas,"Liberation Mono",monospace;
   --ui-size:13px;
   --chat-size:14px;
+  --selection-bg:color-mix(in srgb,var(--text) 18%,transparent);
+  --on-accent:var(--bg);
   --composer-bg:var(--surface);
   --window-bg:var(--bg);
   --shadow:0 4px 24px #0000000a;
@@ -84,3 +86,4 @@ body, #root { background:var(--bg); }
 .theme-preview b { background:var(--composer-bg); border-color:var(--line); opacity:1; }
 .theme-preview.theme-system { background:linear-gradient(90deg,#f3f4f5 50%,#181818 50%); color:#8b9095; }
 .theme-preview.theme-system > span { background:#eceff2; border-color:#d8dce0; }
+:root .primary-button { color:var(--on-accent); }

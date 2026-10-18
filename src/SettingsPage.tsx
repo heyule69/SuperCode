@@ -13,7 +13,7 @@ const groups = [
   { label: '个人', items: [
     { id: 'general', label: '常规', icon: Settings2, terms: '权限 默认 Agent 发送 快捷键' },
     { id: 'notifications', label: '通知', icon: Bell, terms: '系统 任务完成 失败 审批 提示音 后台 隐私' },
-    { id: 'appearance', label: '外观', icon: Palette, terms: '主题 字体 字号 动画' },
+    { id: 'appearance', label: '外观', icon: Palette, terms: '主题 字体 字号 动画 颜色 强调色 背景 前景' },
     { id: 'personalization', label: '个性化', icon: UserRound, terms: '自定义指令' },
   ] },
   { label: '工作区', items: [

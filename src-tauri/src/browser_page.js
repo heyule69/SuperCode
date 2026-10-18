@@ -39,5 +39,5 @@
   };
   visit(document);
   globalThis.__supercodeBrowserObservation = {refs, identify, disabled, controls, document, url:location.href};
-  return { url:location.href, title:document.title, text:(document.body?.innerText || '').slice(0,16000), width:innerWidth, height:innerHeight, elements:nodes, images, truncated:visited > 6000 || nodes.length >= 200 || images.length >= 80, limitations:document.querySelector('iframe') ? 'Embedded frames are not included in this DOM snapshot; do not guess their controls.' : undefined };
+  return { url:location.href, title:document.title, text:(document.body?.innerText || '').slice(0,16000), width:innerWidth, height:innerHeight, scrollX, scrollY, elements:nodes, images, truncated:visited > 6000 || nodes.length >= 200 || images.length >= 80, limitations:document.querySelector('iframe') ? 'Embedded frames are not included in this DOM snapshot; do not guess their controls.' : undefined };
 })()

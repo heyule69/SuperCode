@@ -30,3 +30,11 @@ it('preserves normalized screenshot references when large tool diagnostics are b
   expect(messageMedia(message)).toEqual([{ kind: 'image', path: 'D:/cache/截图.png', name: '截图' }]);
   expect(JSON.stringify(message.data).length).toBeLessThan(140 * 1024);
 });
+
+it('retains the process cache marker without trusting other purpose values', () => {
+  const media = ['process', 'other'].map((purpose, index) => ({kind:'image',path:`D:/cache/${index}.png`,name:'截图',purpose}));
+  expect(messageMedia({seq:1,id:'shot',sessionId:'s',role:'tool',text:'',kind:'mcpToolCall',data:{media}})).toEqual([
+    {kind:'image',path:'D:/cache/0.png',name:'截图',purpose:'process'},
+    {kind:'image',path:'D:/cache/1.png',name:'截图'},
+  ]);
+});

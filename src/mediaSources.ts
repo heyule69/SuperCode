@@ -2,7 +2,7 @@ import { describeLink } from './links';
 import type { Message } from './types';
 
 export type MediaKind = 'image' | 'video' | 'audio';
-export interface MediaReference { path: string; name: string; kind: MediaKind }
+export interface MediaReference { path: string; name: string; kind: MediaKind; purpose?: 'process' }
 
 export function mediaKind(source: string): MediaKind | null {
   let path = source;
@@ -36,7 +36,7 @@ export function messageMedia(message: Message): MediaReference[] {
     const item = value as Record<string, unknown>;
     if (typeof item.path !== 'string' || !['image', 'video', 'audio'].includes(String(item.kind))) return [];
     const ref = mediaReference(item.path, typeof item.name === 'string' ? item.name : undefined, item.kind as MediaKind);
-    return ref ? [ref] : [];
+    return ref ? [{...ref,...(item.purpose==='process'?{purpose:'process' as const}:{})}] : [];
   });
   if (message.kind === 'imageView' && !result.length) { const ref = mediaReference(String(message.data?.path ?? message.text), undefined, 'image'); if (ref) result.push(ref); }
   return [...new Map(result.map(ref => [ref.path, ref])).values()];

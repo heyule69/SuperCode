@@ -22,6 +22,7 @@ pub struct Status {
     pub pointer: bool,
     pub keyboard: bool,
     pub mouse: bool,
+    pub banner: bool,
 }
 impl Glow {
     pub fn new(app: AppHandle, gate: Arc<crate::computer_gate::Gate>) -> Self {
@@ -214,7 +215,7 @@ mod native {
                     }
                     cleanup_input(input_window, &original);
                     let _ = tx.send(Err(
-                        "无法启用键鼠接管或全局 Esc 停止，已阻止电脑操作".to_string()
+                        "无法启用全局 Esc 停止与输入监听，已阻止电脑操作".to_string()
                     ));
                     return;
                 }
@@ -314,27 +315,16 @@ mod native {
             let key = raw.data.keyboard;
             if key.Flags & RI_KEY_BREAK as u16 == 0
                 && key.ExtraInformation != crate::computer_gate::INPUT_TAG as u32
+                && key.VKey == VK_ESCAPE
             {
-                return Some(key.VKey == VK_ESCAPE);
-            }
-        } else if raw.header.dwType == RIM_TYPEMOUSE {
-            if read < std::mem::size_of::<RAWINPUT>() as u32 {
-                return None;
-            }
-            let mouse = raw.data.mouse;
-            if mouse.ulExtraInformation != crate::computer_gate::INPUT_TAG as u32
-                && (mouse.lLastX != 0
-                    || mouse.lLastY != 0
-                    || mouse.Anonymous.Anonymous.usButtonFlags & 0x0d55 != 0)
-            {
-                return Some(false);
+                return Some(true);
             }
         }
         None
     }
     #[cfg(test)]
     #[test]
-    fn hardware_takeover_ignores_releases_and_our_input_and_checks_packet_size() {
+    fn only_hardware_escape_stops_control_ordinary_keys_and_mouse_do_not() {
         unsafe {
             let mut raw: RAWINPUT = std::mem::zeroed();
             raw.header.hDevice = 1usize as _;
@@ -342,8 +332,11 @@ mod native {
             raw.data.keyboard.VKey = VK_ESCAPE;
             let size = std::mem::size_of::<RAWINPUT>() as u32;
             assert_eq!(hardware_takeover(&raw, size), Some(true));
-            raw.data.keyboard.VKey = 0x7b;
-            assert_eq!(hardware_takeover(&raw, size), Some(false));
+            for key in [0x7b, 0x41, 0x0d, 0x10, 0x11, 0x12, 0x5b] {
+                raw.data.keyboard.VKey = key;
+                assert_eq!(hardware_takeover(&raw, size), None);
+            }
+            raw.data.keyboard.VKey = VK_ESCAPE;
             raw.data.keyboard.Flags = RI_KEY_BREAK as u16;
             assert_eq!(hardware_takeover(&raw, size), None);
             raw.data.keyboard.Flags = 0;
@@ -357,7 +350,9 @@ mod native {
             raw.header.dwType = RIM_TYPEMOUSE;
             raw.data.mouse = std::mem::zeroed();
             raw.data.mouse.lLastX = 1;
-            assert_eq!(hardware_takeover(&raw, size), Some(false));
+            assert_eq!(hardware_takeover(&raw, size), None);
+            raw.data.mouse.Anonymous.Anonymous.usButtonFlags = 0x0d55;
+            assert_eq!(hardware_takeover(&raw, size), None);
             raw.data.mouse.ulExtraInformation = crate::computer_gate::INPUT_TAG as u32;
             assert_eq!(hardware_takeover(&raw, size), None);
         }
@@ -396,15 +391,10 @@ mod native {
                 if down && stopped() {
                     return 1;
                 }
-            } else if down {
+            } else if down && stop_escape(key.vkCode, key.dwExtraInfo) {
                 // A kernel signal stops workers/queued injected input before any UI work.
-                yield_input(
-                    stop_escape(key.vkCode, key.dwExtraInfo),
-                    if key.vkCode == VK_ESCAPE as u32 { 1 } else { 2 },
-                );
-                if stop_escape(key.vkCode, key.dwExtraInfo) {
-                    return 1;
-                }
+                yield_input(true, 1);
+                return 1;
             }
         }
         CallNextHookEx(null_mut(), code, w, l)
@@ -436,8 +426,6 @@ mod native {
                         0,
                     );
                 }
-            } else if action {
-                yield_input(false, 3);
             }
         }
         CallNextHookEx(null_mut(), code, w, l)
@@ -473,7 +461,7 @@ mod native {
     }
     impl Strip {
         unsafe fn new(rect: RECT, screen: RECT) -> Result<Self, String> {
-            Self::create(rect, screen, false)
+            Self::create(rect, screen, false, None)
         }
         unsafe fn halo() -> Result<Self, String> {
             let mut p: POINT = std::mem::zeroed();
@@ -486,9 +474,23 @@ mod native {
                 right: p.x + POINTER_HOTSPOT,
                 bottom: p.y + POINTER_HOTSPOT,
             };
-            Self::create(r, r, true)
+            Self::create(r, r, true, None)
         }
-        unsafe fn create(rect: RECT, screen: RECT, halo: bool) -> Result<Self, String> {
+        unsafe fn banner() -> Result<Self, String> {
+            let foreground = GetForegroundWindow();
+            let monitor = MonitorFromWindow(foreground, MONITOR_DEFAULTTOPRIMARY);
+            let mut info: MONITORINFO = std::mem::zeroed();
+            info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+            if GetMonitorInfoW(monitor, &mut info) == 0 { return Err("无法定位电脑控制提示条".into()); }
+            let scale = GetDpiForWindow(foreground).max(96) as f32 / 96.0;
+            let margin = (16.0 * scale).round() as i32;
+            let art = crate::desktop_banner::render(scale, info.rcWork.right - info.rcWork.left - margin * 2)?;
+            let left = info.rcWork.left + (info.rcWork.right - info.rcWork.left - art.width) / 2;
+            let top = info.rcWork.top + margin;
+            let rect = RECT { left, top, right: left + art.width, bottom: top + art.height };
+            Self::create(rect, rect, false, Some(&art.pixels))
+        }
+        unsafe fn create(rect: RECT, screen: RECT, halo: bool, artwork: Option<&[u8]>) -> Result<Self, String> {
             let width = rect.right - rect.left;
             let height = rect.bottom - rect.top;
             let window = CreateWindowExW(
@@ -537,7 +539,9 @@ mod native {
                 pixels.cast::<u8>(),
                 width as usize * height as usize * 4,
             );
-            for y in 0..height {
+            if let Some(artwork) = artwork {
+                buffer.copy_from_slice(artwork);
+            } else { for y in 0..height {
                 for x in 0..width {
                     let gx = rect.left + x;
                     let gy = rect.top + y;
@@ -560,7 +564,7 @@ mod native {
                     buffer[i + 2] = (132u16 * a as u16 / 255) as u8;
                     buffer[i + 3] = a;
                 }
-            }
+            }}
             // Keep the visual cue out of supported Windows screenshot APIs.
             SetWindowDisplayAffinity(window, WDA_EXCLUDEFROMCAPTURE);
             let strip = Self {
@@ -821,6 +825,7 @@ mod native {
             let mut windows = vec![];
             let mut hooks: Option<Hooks> = None;
             let mut halo: Option<Strip> = None;
+            let mut banner: Option<Strip> = None;
             let mut clicked: Option<Instant> = None;
             // Create the message queue before installing hooks/posting stop messages.
             let mut message: MSG = std::mem::zeroed();
@@ -870,6 +875,7 @@ mod native {
                                 if !active {
                                     halo = Some(Strip::halo()?);
                                     windows = strips()?;
+                                    banner = Some(Strip::banner()?);
                                     if windows.is_empty() {
                                         return Err("无法显示屏幕边缘光效".into());
                                     }
@@ -880,6 +886,9 @@ mod native {
                                     let halo = halo.as_mut().unwrap();
                                     halo.show(true);
                                     if !halo.follow(None)
+                                        || !banner.as_ref().is_some_and(|b| {
+                                            b.paint(255) && IsWindowVisible(b.window) != 0
+                                        })
                                         || windows.iter().any(|w| {
                                             !w.paint(255) || IsWindowVisible(w.window) == 0
                                         })
@@ -904,6 +913,7 @@ mod native {
                                     pointer: halo.is_some(),
                                     keyboard: hooks.as_ref().is_some_and(Hooks::ready),
                                     mouse: hooks.as_ref().is_some_and(Hooks::ready),
+                                    banner: banner.is_some(),
                                 })
                             } else {
                                 gate.stop();
@@ -919,6 +929,7 @@ mod native {
                             hooks = None;
                             windows.clear();
                             halo = None;
+                            banner = None;
                             clicked = None;
                         }
                         let _ = next.reply.send(result);
@@ -934,6 +945,7 @@ mod native {
                         hooks = None;
                         windows.clear();
                         halo = None;
+                        banner = None;
                         clicked = None;
                         let reason = if message.message == WM_DISPLAYCHANGE {
                             "display_changed"
@@ -959,6 +971,7 @@ mod native {
                     let opacity = (222.0 + 27.0 * pulse) as u8;
                     let painted = hooks.as_ref().is_some_and(Hooks::ready)
                         && halo.as_mut().is_some_and(|h| h.follow(clicked))
+                        && banner.as_ref().is_some_and(|b| b.paint(255))
                         && windows.iter().all(|w| w.paint(opacity));
                     if !painted {
                         gate.stop();
@@ -971,6 +984,7 @@ mod native {
             HOOK_GATE.store(0, std::sync::atomic::Ordering::Release);
             HOOK_THREAD.store(0, std::sync::atomic::Ordering::Release);
             drop(halo);
+            drop(banner);
             windows.clear();
             UnregisterClassW(CLASS.as_ptr(), GetModuleHandleW(null()));
         }
@@ -1034,6 +1048,7 @@ mod native {
             ReleaseDC(backdrop.0, dc);
             windows_sys::Win32::Graphics::Dwm::DwmFlush();
             let mut windows = strips()?;
+            windows.push(Strip::banner()?);
             windows.push(Strip::halo()?);
             let mut result = Ok(windows.len());
             for strip in &windows {

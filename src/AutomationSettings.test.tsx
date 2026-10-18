@@ -24,6 +24,8 @@ it('makes bundled computer control available without pretending it has passed a 
   expect(computer.textContent).not.toContain('上次通过测试');
   expect(computer.textContent).not.toContain('修复安装');
   expect(computer.textContent).not.toContain('安装并测试');
+  expect(computer.textContent).toContain('SuperCode 正在控制电脑 · 按 Esc 取消');
+  expect(computer.textContent).toContain('普通鼠标、键盘操作和窗口切换不会取消控制');
   const browser = node.querySelector('[aria-label="浏览器自动化"]')!;
   expect(browser.textContent).toContain('测试浏览器');
   expect(browser.textContent).not.toContain('安装并测试');

@@ -55,7 +55,7 @@ export default function AutomationSettings({ busy }: { busy: boolean }) {
           <header><div className="automation-icon">{browser ? <Globe size={22}/> : <Monitor size={22}/>}</div><div className="automation-title"><h3>{browser ? '浏览器自动化' : '电脑自动化'}</h3><p>{browser ? 'SuperCode 内置 · 右侧实时浏览器' : 'SuperCode 内置 · 无需另行安装'}</p></div>
             {ready ? <label className="automation-enable"><span>{item.enabled ? '已启用' : '已停用'}</span><input className="settings-switch" role="switch" type="checkbox" aria-label={`启用${browser ? '浏览器' : '电脑'}自动化`} checked={item.enabled} disabled={locked || !desktop} onChange={e => void action('set_automation_enabled', item.kind, { enabled: e.target.checked })}/></label> : null}
           </header>
-          <p className="automation-description">{browser ? '在聊天右侧浏览网页，实时查看点击、输入和滚动。按 Esc 或直接操作网页即可接管。' : '识别窗口、截图、点击和输入。操作时显示淡蓝色屏幕边缘和独立 AI 指针；按 Esc、移动鼠标或敲键盘即可接管，需要确认时返回聊天。'}</p>
+          <p className="automation-description">{browser ? '在聊天右侧浏览网页，实时查看点击、输入和滚动。按 Esc 或直接操作网页即可接管。' : '识别窗口、截图、点击和输入。控制时显示“SuperCode 正在控制电脑 · 按 Esc 取消”提示条、淡蓝色屏幕边缘与 AI 指针；普通鼠标、键盘操作和窗口切换不会取消控制，需要确认时返回聊天。'}</p>
           <div className={`automation-result ${failed ? 'failed' : ''}`} role="status">
             {loading ? <span>正在检查工具状态…</span> : running ? <><RefreshCw size={14} className="automation-spin"/><span>{item.message}</span>{size ? <small>{size}</small> : null}</> : ready ? <><Check size={15}/><span>{item.installation!.testedAt > 0 ? '测试通过' : '软件自带 · 尚未测试'}</span><small>{item.installation!.tools} 个工具{browser ? ` · v${item.installation!.version}` : ''}</small></> : <span>{item.message}</span>}
           </div>

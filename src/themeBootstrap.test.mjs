@@ -5,13 +5,15 @@ import { describe, expect, it } from 'vitest';
 const bootstrap = readFileSync(new URL('../public/theme-init.js', import.meta.url), 'utf8');
 const html = readFileSync(new URL('../index.html', import.meta.url), 'utf8');
 const palettes = readFileSync(new URL('./themes.css', import.meta.url), 'utf8');
-function initialize(preferences, saved, dark = false, throws = false) {
-  const root = { dataset: {} };
+function initializeRoot(preferences, saved, dark = false, throws = false) {
+  const colors = {};
+  const root = { dataset: {}, colors, style: { setProperty: (key, value) => { colors[key] = value; } } };
   runInNewContext(bootstrap, { document: { documentElement: root }, window: { matchMedia: () => ({ matches: dark }) },
     localStorage: { getItem: (key) => { if (throws) throw new Error('Storage unavailable'); return key === 'supercode.preferences' ? preferences : saved; } },
   });
-  return root.dataset.theme;
+  return root;
 }
+const initialize = (...args) => initializeRoot(...args).dataset.theme;
 describe('theme before the first React frame', () => {
   it('restores explicit and legacy palettes before the app loads', () => {
     for (const theme of ['light', 'dark', 'graphite', 'sand']) {
@@ -30,9 +32,15 @@ describe('theme before the first React frame', () => {
   });
   it('uses the same early backing colors as the full stylesheet', () => {
     for (const [theme, color] of [['dark', '#181818'], ['graphite', '#20262f'], ['sand', '#fcfaf5']]) {
-      expect(html).toContain(`html[data-theme=${theme}] { background:${color};`);
+      expect(html).toContain(`html[data-theme=${theme}] { background:var(--bg,${color});`);
       const palette = palettes.split(`:root[data-theme=${theme}]`)[1]?.split('}')[0];
       expect(palette).toContain(`--bg:${color};`);
     }
+  });
+  it('restores validated custom colors for the effective palette before React paints', () => {
+    const saved = JSON.stringify({ theme:'system', themeColors:{ light:{ background:'#fff',foreground:'#123',accent:'#06c' }, dark:{ background:'#102030',foreground:'#eee',accent:'red; background:url(x)' } } });
+    expect(initializeRoot(saved, null, false).colors).toEqual({ '--bg':'#FFFFFF','--text':'#112233','--accent':'#0066CC' });
+    expect(initializeRoot(saved, null, true).colors).toEqual({ '--bg':'#102030','--text':'#EEEEEE' });
+    expect(initializeRoot('{"themeColors":{"light":{"background":42}}}', null).colors).toEqual({});
   });
 });

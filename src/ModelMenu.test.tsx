@@ -2,6 +2,19 @@ import { expect, it } from 'vitest';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { ModelMenu } from './ModelMenu';
 
+it.each([['high', '高'], ['max', '最高'], ['xhigh', '极高'], ['', '中']])('shows reasoning effort %s beside the selected model', (effort, label) => {
+  const profile = { id:'api', agent:'claude', name:'API', model:'claude-opus-5-5', current:true, hasCredential:true };
+  const html = renderToStaticMarkup(<ModelMenu value={profile.model} models={[{id:profile.model,model:profile.model,displayName:profile.model,isDefault:true,defaultReasoningEffort:'medium'}]} profiles={[profile]} activeProfile={profile} connectionId="api" agent="claude" busy={false} loading={false} choose={async()=>{}} reload={()=>{}} manage={()=>{}} effort={effort} setEffort={()=>{}} hasConversation/>);
+  expect(html).toContain(`class="model-chip-effort" title="推理强度：${label}">${label}</span>`);
+  expect(html).toContain(`推理强度：${label}${effort ? '' : '（默认）'}`);
+});
+
+it('does not show a reasoning badge for a model without reasoning controls', () => {
+  const profile = { id:'api', agent:'pi', name:'API', model:'basic-model', current:true, hasCredential:true };
+  const html = renderToStaticMarkup(<ModelMenu value={profile.model} models={[{id:profile.model,model:profile.model,displayName:profile.model,isDefault:true}]} profiles={[profile]} activeProfile={profile} connectionId="api" agent="pi" busy={false} loading={false} choose={async()=>{}} reload={()=>{}} manage={()=>{}} effort="" setEffort={()=>{}} hasConversation/>);
+  expect(html).not.toContain('model-chip-effort');
+});
+
 it('keeps the official icon and selected display name on a historical imported conversation', () => {
   const official = { id: 'imported', agent: 'codex', name: 'OpenAI Official', officialAccount: true, model: 'official-model', models: ['official-model'], current: false, hasCredential: false };
   const html = renderToStaticMarkup(<ModelMenu value="official-model" models={[{ id: 'official-model', model: 'official-model', displayName: 'Selected Official Model', isDefault: true }]} source={{providerId:'openai',providerName:'OpenAI',mark:'O',available:true}} profiles={[official]} activeProfile={official} connectionId="imported" order={{ codex: ['@official'] }} agent="codex" busy={false} loading={false} choose={async () => {}} reload={() => {}} manage={() => {}} effort="" setEffort={() => {}} hasConversation />);

@@ -453,7 +453,13 @@ async fn verify_builtin(app: &AppHandle) -> Result<Value, String> {
         }
         let input_counts = crate::desktop_glow::input_counts();
         let stopped_at = std::time::Instant::now();
-        native_fixture.user_input(agent == "claude", true)?;
+        native_fixture.user_input(true, false)?;
+        native_fixture.user_input(false, false)?;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        if !desktop_control::cue_ready(app) {
+            return Err("Ordinary mouse/keyboard input revoked desktop control".into());
+        }
+        native_fixture.user_input(false, true)?;
         let cancelled = pipe.receive_with_timeout(Duration::from_secs(3)).await?;
         let takeover: Value = serde_json::from_str(
             cancelled["result"]["content"][0]["text"]
@@ -765,7 +771,15 @@ async fn verify(app: &AppHandle) -> Result<Value, String> {
         }
         let stopped_at = std::time::Instant::now();
         #[cfg(windows)]
-        native_fixture.user_input(agent == "claude", true)?;
+        {
+            native_fixture.user_input(true, false)?;
+            native_fixture.user_input(false, false)?;
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            if !desktop_control::cue_ready(app) {
+                return Err("Ordinary mouse/keyboard input revoked desktop control".into());
+            }
+            native_fixture.user_input(false, true)?;
+        }
         #[cfg(not(windows))]
         desktop_control::takeover_reason(app, true, "fixture_escape");
         let status = tokio::time::timeout(Duration::from_secs(3), fixture.child.wait())
@@ -783,15 +797,11 @@ async fn verify(app: &AppHandle) -> Result<Value, String> {
             done.await.map_err(|e| e.to_string())?;
         }
         settle().await;
-        let manual_input = agent == "claude";
         if status.success()
             || desktop_control::active(app)
-            || (!manual_input && main.is_minimized().map_err(|e| e.to_string())?)
+            || main.is_minimized().map_err(|e| e.to_string())?
         {
             return Err("停止操作没有退出工具、移除光效和恢复聊天".into());
-        }
-        if manual_input && !main.is_minimized().map_err(|e| e.to_string())? {
-            return Err("Mouse/keyboard takeover stole focus back to chat".into());
         }
         #[cfg(windows)]
         unsafe {
@@ -826,7 +836,7 @@ async fn verify(app: &AppHandle) -> Result<Value, String> {
         if rejected["result"]["isError"] != true
             || desktop_control::active(app)
             || desktop_control::cue_ready(app)
-            || (!manual_input && main.is_minimized().map_err(|e| e.to_string())?)
+            || main.is_minimized().map_err(|e| e.to_string())?
         {
             return Err("Late call reclaimed control after takeover".into());
         }
@@ -835,7 +845,7 @@ async fn verify(app: &AppHandle) -> Result<Value, String> {
             app,
             json!({"method":"turn/completed","params":{"threadId":native,"turn":{"id":"fixture-turn","status":"interrupted"}}}),
         );
-        reports.push(json!({"agent":agent,"initializationQuiet":true,"handoffBeforeCall":true,"questionsPassedThrough":true,"attentionRestoresChat":true,"hungToolStopped":true,"nativeCueReady":true,"stopInput":if agent=="claude" {"mouseMove"} else {"Esc"},"stopMilliseconds":stop_ms,"lateCallsBlocked":true,"uiBusyStop":agent=="codex"}));
+        reports.push(json!({"agent":agent,"initializationQuiet":true,"handoffBeforeCall":true,"questionsPassedThrough":true,"attentionRestoresChat":true,"hungToolStopped":true,"nativeCueReady":true,"stopInput":"Esc","ordinaryInputIgnored":true,"stopMilliseconds":stop_ms,"lateCallsBlocked":true,"uiBusyStop":agent=="codex"}));
     }
     Ok(json!({"fixtureOnly":true,"agents":reports}))
 }

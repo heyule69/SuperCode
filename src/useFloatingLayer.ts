@@ -6,7 +6,7 @@ export function useFloatingLayer<T extends HTMLElement = HTMLDivElement>(open: b
   const latestClose = useRef(close); latestClose.current = close;
   const dismiss = (restoreFocus = false) => {
     latestClose.current();
-    if (restoreFocus) root.current?.querySelector<HTMLButtonElement>(':scope > button')?.focus();
+    if (restoreFocus) root.current?.querySelector<HTMLButtonElement>(':scope > button')?.focus({ preventScroll: true });
   };
   useEffect(() => {
     if (!open) return;
@@ -16,7 +16,7 @@ export function useFloatingLayer<T extends HTMLElement = HTMLDivElement>(open: b
     const escape = (event: globalThis.KeyboardEvent) => { if (event.key === 'Escape') { event.preventDefault(); event.stopImmediatePropagation(); dismiss(true); } };
     document.addEventListener('pointerdown', outside); document.addEventListener('focusin', outside);
     document.addEventListener('supercode:layer-open', another); document.addEventListener('keydown', escape, true);
-    if (focusFirst) root.current?.querySelector<HTMLElement>('[role^="menuitem"]')?.focus();
+    if (focusFirst) root.current?.querySelector<HTMLElement>('[role^="menuitem"]')?.focus({ preventScroll: true });
     return () => {
       document.removeEventListener('pointerdown', outside); document.removeEventListener('focusin', outside);
       document.removeEventListener('supercode:layer-open', another); document.removeEventListener('keydown', escape, true);
@@ -52,5 +52,5 @@ export function useFloatingLayer<T extends HTMLElement = HTMLDivElement>(open: b
     const next = event.key === 'Home' ? 0 : event.key === 'End' ? items.length - 1 : event.key === 'ArrowDown' ? (current + 1) % items.length : (current <= 0 ? items.length : current) - 1;
     items[next].focus();
   }
-  return { root, id, dismiss, navigate, restoreFocus: () => root.current?.querySelector<HTMLButtonElement>(':scope > button')?.focus() };
+  return { root, id, dismiss, navigate, restoreFocus: () => root.current?.querySelector<HTMLButtonElement>(':scope > button')?.focus({ preventScroll: true }) };
 }

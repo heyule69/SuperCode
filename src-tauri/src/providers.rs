@@ -893,13 +893,31 @@ fn protocol_headers(
     }
 }
 
-async fn fetch_models(s: &Settings, secret: Option<&str>) -> Result<(Vec<String>, Value), String> {
+fn model_listing_endpoint(s: &Settings) -> Result<(String, &str), String> {
     let base = api_base(&s.base_url, &s.protocol)?;
+    let mut parsed = reqwest::Url::parse(&base).map_err(|_| "API 地址无效")?;
+    // DeepSeek's Anthropic prefix serves Messages, while its model catalog is
+    // the same-origin OpenAI-compatible /models endpoint with Bearer auth.
+    // Match the official HTTPS origin and prefix, including imported custom profiles.
+    if s.protocol == "anthropic"
+        && parsed.scheme() == "https"
+        && parsed.host_str() == Some("api.deepseek.com")
+        && parsed.port_or_known_default() == Some(443)
+        && matches!(parsed.path(), "/anthropic" | "/anthropic/v1")
+    {
+        parsed.set_path("/models");
+        return Ok((parsed.to_string(), "chat"));
+    }
     let url = if s.protocol == "anthropic" && !base.ends_with("/v1") {
         format!("{base}/v1/models")
     } else {
         format!("{base}/models")
     };
+    Ok((url, &s.protocol))
+}
+
+async fn fetch_models(s: &Settings, secret: Option<&str>) -> Result<(Vec<String>, Value), String> {
+    let (url, listing_protocol) = model_listing_endpoint(s)?;
     let client = client()?;
     let mut models = std::collections::BTreeSet::new();
     let mut metadata = json!({});
@@ -916,7 +934,7 @@ async fn fetch_models(s: &Settings, secret: Option<&str>) -> Result<(Vec<String>
             }
         }
         let value = provider_json(
-            protocol_headers(request, &s.protocol, secret)
+            protocol_headers(request, listing_protocol, secret)
                 .send()
                 .await
                 .map_err(|_| "连接失败或超时，可手动填写模型 ID")?,
@@ -1299,6 +1317,42 @@ mod tests {
     }
     fn draft_settings(agent: &str, protocol: &str, base: &str) -> Settings {
         serde_json::from_value(json!({"name":"","agent":agent,"providerId":"custom","plan":"standard","protocol":protocol,"baseUrl":base,"model":"","models":[]})).unwrap()
+    }
+    #[test]
+    fn deepseek_anthropic_models_use_official_catalog_and_bearer_auth() {
+        for base in [
+            "https://api.deepseek.com/anthropic",
+            "https://api.deepseek.com/anthropic/",
+            "https://api.deepseek.com/anthropic/v1",
+            "https://API.DEEPSEEK.COM:443/anthropic",
+        ] {
+            let settings = draft_settings("claude", "anthropic", base);
+            let (url, protocol) = model_listing_endpoint(&settings).unwrap();
+            assert_eq!(url, "https://api.deepseek.com/models");
+            let request = protocol_headers(client().unwrap().get(url), protocol, Some("fixture-secret"))
+                .build().unwrap();
+            assert_eq!(request.headers()["authorization"], "Bearer fixture-secret");
+            assert!(!request.headers().contains_key("x-api-key"));
+            assert!(!request.headers().contains_key("anthropic-version"));
+            // Model discovery must not rewrite the saved Messages route.
+            assert_eq!(settings.base_url, base);
+            assert_eq!(settings.protocol, "anthropic");
+        }
+    }
+    #[test]
+    fn deepseek_catalog_override_does_not_rewrite_other_origins_or_protocols() {
+        for (base, protocol, expected) in [
+            ("https://api.anthropic.com", "anthropic", "https://api.anthropic.com/v1/models"),
+            ("https://gateway.example/anthropic", "anthropic", "https://gateway.example/anthropic/v1/models"),
+            ("https://api.deepseek.com.attacker.example/anthropic", "anthropic", "https://api.deepseek.com.attacker.example/anthropic/v1/models"),
+            ("https://api.deepseek.com:8443/anthropic", "anthropic", "https://api.deepseek.com:8443/anthropic/v1/models"),
+            ("https://api.deepseek.com/proxy/anthropic", "anthropic", "https://api.deepseek.com/proxy/anthropic/v1/models"),
+            ("https://api.deepseek.com/v1", "chat", "https://api.deepseek.com/v1/models"),
+            ("https://api.deepseek.com", "responses", "https://api.deepseek.com/models"),
+        ] {
+            let settings = draft_settings("pi", protocol, base);
+            assert_eq!(model_listing_endpoint(&settings).unwrap(), (expected.to_owned(), protocol));
+        }
     }
     #[tokio::test]
     async fn unsaved_gemini_lists_use_native_headers_normalize_names_and_follow_pages() {

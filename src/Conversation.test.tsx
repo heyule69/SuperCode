@@ -17,11 +17,12 @@ function render(items = messages, autoExpand = false) {
 }
 
 describe('task replies and execution history', () => {
-  it('shows tool screenshots with collapsed details and allows a media-only assistant reply', () => {
+  it('keeps process screenshots behind a disclosure and allows a media-only final reply', () => {
     const media = [{ kind: 'image', path: 'D:/cache/截图.png', name: '截图' }];
     const html = render([messages[0], message('shot', 'tool', '', 'mcpToolCall', { tool: 'screenshot', status: 'completed', media })]);
     expect(html).not.toContain('class="activity-row"');
-    expect(html).toContain('data-media-source="D:/cache/截图.png"');
+    expect(html).toContain('已查看 1 张图像');
+    expect(html).not.toContain('data-media-source="D:/cache/截图.png"');
     const assistant = render([messages[0], message('picture', 'assistant', '', 'agentMessage', { media })]);
     expect(assistant).toContain('data-media-source="D:/cache/截图.png"');
   });

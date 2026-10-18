@@ -1,6 +1,6 @@
 [package]
 name = "supercode"
-version = "0.2.7"
+version = "0.2.8"
 description = "A lightweight desktop workspace for coding agents"
 edition = "2021"
 
@@ -34,7 +34,7 @@ base64 = "0.22"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 similar = "2"
 sha2 = "0.10"
-zip = { version = "2", default-features = false, features = ["deflate"] }
+zip = { version = "9", default-features = false, features = ["deflate"] }
 minisign-verify = "0.3"
 
 [dev-dependencies]

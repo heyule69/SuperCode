@@ -40,6 +40,16 @@ pre, code, .settings-modal input.code-input { font-family:var(--code-font); }
 .theme-preview i:nth-child(2) { width:55%; }
 .theme-preview b { display:block; height:14px; margin-top:13px; border:1px solid currentColor; border-radius:4px; opacity:.18; }
 .theme-option.selected .theme-preview { border-color:var(--accent); box-shadow:0 0 0 1px var(--accent); }
+.theme-color-control { display:flex; align-items:center; gap:6px; }
+.theme-color-field { display:flex; align-items:center; gap:8px; width:144px; height:34px; padding:4px 10px; border:1px solid var(--line); border-radius:18px; background:var(--surface); }
+.theme-color-field:focus-within { border-color:var(--accent); box-shadow:0 0 0 1px var(--accent); }
+.theme-color-field:has([aria-invalid=true]) { border-color:var(--danger); }
+.settings-modal .theme-color-field input[type=color] { flex:none; width:22px; height:22px; min-height:22px; border:0; padding:0; border-radius:50%; overflow:hidden; background:transparent; cursor:pointer; }
+.theme-color-field input[type=color]::-webkit-color-swatch-wrapper { padding:0; }
+.theme-color-field input[type=color]::-webkit-color-swatch { border:1px solid #8883; border-radius:50%; }
+.settings-modal .theme-color-field input[type=text] { min-width:0; flex:1; width:86px; height:24px; min-height:24px; padding:0; border:0; border-radius:0; background:transparent; font-family:var(--code-font); font-size:12px; }
+.settings-modal .theme-color-field input:focus { outline:0; box-shadow:none; }
+.theme-color-control > .icon-button { width:26px; height:26px; }
 .font-preview { padding:10px 14px; margin-top:14px; background:var(--surface2); border:1px solid var(--line); border-radius:6px; }
 .font-preview p { font-size:var(--chat-size); margin:0 0 8px; }.font-preview code { font-size:var(--ui-size); color:var(--accent); }
 .settings-modal .preference-toggle { display:flex; align-items:center; justify-content:space-between; gap:14px; margin:0!important; padding:14px 0; min-height:46px; border-bottom:1px solid var(--line); cursor:pointer; }
