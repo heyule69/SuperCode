@@ -554,7 +554,7 @@ fn extract_zip(archive: &Path, target: &Path) -> Result<(), String> {
     for n in 0..archive.len() {
         let mut entry = archive.by_index(n).map_err(|e| e.to_string())?;
         let name = entry.enclosed_name().ok_or("压缩包路径无效")?;
-        if entry.name().contains('\\')
+        if entry.name().map_err(|_| "压缩包文件名无效")?.contains('\\')
             || entry.unix_mode().is_some_and(|m| m & 0o170000 == 0o120000)
         {
             return Err("不支持的压缩包路径或链接".into());
@@ -1458,6 +1458,29 @@ mod tests {
         assert!(!root.join("escaped.txt").exists());
         std::fs::remove_file(zip).unwrap();
         std::fs::remove_dir(root).unwrap();
+    }
+    #[test]
+    fn zip_reads_utf8_names_and_rejects_windows_separators() {
+        use std::io::Write;
+        let root = std::env::temp_dir().join(format!("sc-zip-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let archive = root.join("names.zip");
+        for (name, valid) in [("目录/文本.txt", true), ("目录\\文本.txt", false)] {
+            let mut writer = zip::ZipWriter::new(std::fs::File::create(&archive).unwrap());
+            writer.start_file(name, zip::write::SimpleFileOptions::default()).unwrap();
+            writer.write_all("中文内容".as_bytes()).unwrap();
+            writer.finish().unwrap();
+            let target=root.join(if valid {"valid"} else {"invalid"});
+            let result=extract_zip(&archive,&target);
+            if valid {
+                result.unwrap();
+                assert_eq!(std::fs::read(target.join("目录/文本.txt")).unwrap(),"中文内容".as_bytes());
+            } else {
+                assert!(result.is_err());
+                assert!(!target.exists());
+            }
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
     #[tokio::test]
     async fn output_capture_is_bounded_and_cancellation_wakes() {
