@@ -76,7 +76,7 @@ pub(crate) fn configure(
 ) -> Result<(), String> {
     configure_in(command, &app.state::<AppState>().data_dir, agent, config)
 }
-fn configure_in(
+pub(crate) fn configure_in(
     command: &mut tokio::process::Command,
     base: &Path,
     agent: &str,

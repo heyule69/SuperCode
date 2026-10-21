@@ -1189,6 +1189,23 @@ it('switches one composer button between stopping an empty running chat and queu
   expect(call).not.toHaveBeenCalledWith('send_chat_message',expect.anything());
 });
 
+it('preserves the composer draft when an archived-session enqueue is rejected', async () => {
+  localStorage.setItem('supercode.session','running');
+  data.sessions = [{id:'running',projectId:'existing',title:'正在工作',agent:'claude',connectionId:'api:claude',model:'test-model',status:'running',nativeId:'native',turnId:'turn',updatedAt:1}];
+  const original = vi.mocked(call).getMockImplementation()!;
+  vi.mocked(call).mockImplementation(async (command,args={}) => {
+    if (command==='enqueue_followup') throw new Error('会话已归档或删除，消息未加入队列');
+    return original(command,args);
+  });
+  await render();
+  await type('这条消息必须保留');
+  await send();
+  expect(call).toHaveBeenCalledWith('enqueue_followup',expect.objectContaining({sessionId:'running'}));
+  expect(container.querySelector<HTMLTextAreaElement>('.composer textarea')?.value).toBe('这条消息必须保留');
+  expect(container.querySelector('.error-banner')?.textContent).toContain('未加入队列');
+  expect(call).not.toHaveBeenCalledWith('send_chat_message',expect.anything());
+});
+
 it('keeps empty idle and starting chats in disabled send mode until a turn exists', async () => {
   localStorage.setItem('supercode.session','idle');
   data.sessions = [

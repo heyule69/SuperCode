@@ -4,7 +4,7 @@
 
 一个轻量、本地优先的多 Agent 编程桌面工作台。把 **Codex、Claude Code、OpenCode、Pi 和 Gemini CLI** 放进同一个界面，管理项目、模型连接与工具，用对话完成开发任务。
 
-当前版本 **0.2.8**，主要支持 **Windows**。桌面核心采用 Rust + Tauri 2，前端采用 React + TypeScript，聊天与配置保存在本机 SQLite 数据库中。
+当前版本 **0.2.9**，主要支持 **Windows**。桌面核心采用 Rust + Tauri 2，前端采用 React + TypeScript，聊天与配置保存在本机 SQLite 数据库中。
 
 [下载 Windows 安装包](https://github.com/heyule69/SuperCode/releases/latest) · [版本记录](https://github.com/heyule69/SuperCode/releases) · [反馈问题](https://github.com/heyule69/SuperCode/issues)
 
@@ -46,6 +46,7 @@ Gemini CLI 要求 **0.63.0 或以上版本**。0.2.5 已通过官方 CLI 0.63.0 
 - 查看原生计划文档，选择执行或继续修改；Codex 支持设置持续推进的目标，并可指定 Token 预算。
 - 子代理有独立图标、任务摘要和详情面板，工具输出按需展开；可使用侧边聊天继续提问。
 - 每个聊天独立保存草稿，支持重启恢复与跨窗口同步；`/` 菜单提供界面操作及当前引擎可用的原生命令。
+- 普通文件附件只传原文件路径，由 Agent 按需读取；文本、文档、大文件与未知格式都不在应用内解码，不因编码或大小阻止发送。
 
 ### 项目、文件与代码改动
 

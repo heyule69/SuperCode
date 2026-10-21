@@ -112,7 +112,10 @@ impl Store {
             return Err("排队消息过多，请先发送或移除一些消息".into());
         }
         let id = uuid::Uuid::new_v4().to_string();
-        conn.execute("INSERT INTO followups(id,session_id,payload,status) SELECT ?1,?2,?3,'queued' WHERE EXISTS(SELECT 1 FROM sessions WHERE id=?2 AND archived=0)",params![id,session,serde_json::to_string(payload).map_err(|e|e.to_string())?]).map_err(|e|e.to_string())?;
+        let inserted = conn.execute("INSERT INTO followups(id,session_id,payload,status) SELECT ?1,?2,?3,'queued' WHERE EXISTS(SELECT 1 FROM sessions WHERE id=?2 AND archived=0)",params![id,session,serde_json::to_string(payload).map_err(|e|e.to_string())?]).map_err(|e|e.to_string())?;
+        if inserted != 1 {
+            return Err("会话已归档或删除，消息未加入队列，请保留输入并切换到可用会话".into());
+        }
         Ok(id)
     }
     fn update_followup(&self, id: &str, status: &str, error: Option<&str>) -> Result<(), String> {
@@ -439,6 +442,21 @@ mod tests {
         assert!(store.next_followup().unwrap().is_none());
         store.erase_followup(&a).unwrap();
         assert_eq!(store.next_followup().unwrap(), Some(b));
+    }
+    #[test]
+    fn archived_or_deleted_sessions_cannot_report_a_successful_enqueue() {
+        let (store, s) = fixture();
+        store.archive(&s.id).unwrap();
+        assert!(store.put_followup(&s.id, &payload("仍在输入框")).unwrap_err().contains("未加入队列"));
+        assert!(store.followups(Some(&s.id)).unwrap().is_empty());
+        store.0.lock().unwrap().execute("DELETE FROM sessions WHERE id=?1", [&s.id]).unwrap();
+        assert!(store.put_followup(&s.id, &payload("已删除")).is_err());
+        assert!(store.followups(None).unwrap().is_empty());
+        let active = store.create_session(&s.project_id, None).unwrap();
+        let id = store.put_followup(&active.id, &payload("正常保存")).unwrap();
+        let saved = store.followup(&id).unwrap();
+        assert_eq!(saved.session_id, active.id);
+        assert_eq!(saved.payload.text, "正常保存");
     }
     #[test]
     fn active_session_cannot_dispatch_and_queue_is_bounded() {

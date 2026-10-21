@@ -374,6 +374,7 @@ it.each(['check_chat_connection','create_session','enqueue_followup'])('clears t
   await render({key:'draft',text:'侧边发送',connectionId:'chosen:pi'},{pendingConnectionChanged});await send();
   expect(pendingConnectionChanged.mock.calls).toEqual([[{agent:'pi',id:'chosen:pi'}],[null]]);
   expect(container.querySelector('[role="alert"]')?.textContent).toContain('提交失败');
+  expect(container.querySelector<HTMLTextAreaElement>('textarea')?.value).toBe('侧边发送');
 });
 
 it('clears a missing-provider pending route while preserving the side draft',async()=>{

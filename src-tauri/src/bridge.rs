@@ -61,11 +61,7 @@ impl Bridge {
             cancel: rx,
             stream_usage: Arc::new(AtomicBool::new(true)),
         });
-        let router = Router::new()
-            .route("/v1/messages", post(messages))
-            .route("/v1/messages/count_tokens", post(count_tokens))
-            .layer(DefaultBodyLimit::max(16 * 1024 * 1024))
-            .with_state(state);
+        let router = router(state);
         let task = tokio::spawn(async move {
             let _ = axum::serve(listener, router).await;
         });
@@ -76,6 +72,13 @@ impl Bridge {
             cancel,
         })
     }
+}
+fn router(state: Arc<Connection>) -> Router {
+    Router::new()
+        .route("/v1/messages", post(messages))
+        .route("/v1/messages/count_tokens", post(count_tokens))
+        .layer(DefaultBodyLimit::max(crate::input_limits::BRIDGE_REQUEST_LIMIT))
+        .with_state(state)
 }
 fn authorized(headers: &HeaderMap, state: &Connection) -> bool {
     headers.get("x-api-key").and_then(|v| v.to_str().ok()) == Some(&state.token)
@@ -542,6 +545,55 @@ async fn read_option_error(response: reqwest::Response) -> Result<Value, ()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn full_allowed_image_budget_reaches_the_local_handler() {
+        use crate::client_features::{prepare_input, Attachment};
+        let root = std::env::temp_dir().join(format!("supercode-bridge-images-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let image = root.join("image.png");
+        let mut png = include_bytes!("../icons/32x32.png").to_vec();
+        png.resize(crate::input_limits::IMAGE_LIMIT as usize, 0);
+        std::fs::write(&image, &png).unwrap();
+        drop(png);
+        let attachment = Attachment { kind: "image".into(), path: image.to_string_lossy().into(), name: "image.png".into() };
+        let prepared = prepare_input("检查两张图片", &[attachment.clone(), attachment]).unwrap();
+        let body = serde_json::to_vec(&json!({"model":"fixture","system":"context ".repeat(128*1024),"messages":[{"role":"user","content":prepared.claude}]})).unwrap();
+        drop(prepared);
+        std::fs::remove_dir_all(root).unwrap();
+        assert!(body.len() > 16 * 1024 * 1024);
+        assert!(body.len() < crate::input_limits::BRIDGE_REQUEST_LIMIT);
+        let bridge = Bridge::start(json!({"protocol":"chat","baseUrl":"https://fixture.invalid/v1"})).await.unwrap();
+        // This endpoint is entirely local and never calls a supplier or model.
+        let response = reqwest::Client::builder().no_proxy().timeout(std::time::Duration::from_secs(15)).build().unwrap()
+            .post(format!("{}/v1/messages/count_tokens", bridge.base_url))
+            .header("x-api-key", &bridge.token)
+            .header("content-type", "application/json")
+            .body(body).send().await.unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
+        assert!(response.text().await.unwrap().contains("does not expose Anthropic token counting"));
+    }
+
+    #[tokio::test]
+    async fn oversized_requests_still_have_a_finite_body_limit() {
+        let (_cancel, rx) = watch::channel(false);
+        let state = Arc::new(Connection {
+            config: json!({}), token: "fixture".into(), http: reqwest::Client::new(),
+            cancel: rx, stream_usage: Arc::new(AtomicBool::new(true)),
+        });
+        // Stream reused 64 KiB chunks so the test does not allocate a second huge body.
+        const CHUNK: &[u8] = &[b' '; 64 * 1024];
+        let count = crate::input_limits::BRIDGE_REQUEST_LIMIT / CHUNK.len() + 1;
+        let body = axum::body::Body::from_stream(futures_util::stream::iter(
+            (0..count).map(|_| Ok::<_, Infallible>(axum::body::Bytes::from_static(CHUNK)))
+        ));
+        let request = axum::http::Request::builder().method("POST")
+            .uri("/v1/messages/count_tokens").header("x-api-key", "fixture")
+            .header("content-type", "application/json").body(body).unwrap();
+        let response = router(state).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
     #[test]
     fn translates_tool_history_and_keeps_real_model_id() {
         let input = json!({"model":"kimi-k2.5","max_tokens":1024,"stream":true,"system":[{"type":"text","text":"system"}],"tools":[{"name":"Read","input_schema":{"type":"object"}}],"messages":[{"role":"assistant","content":[{"type":"thinking","thinking":"summary"},{"type":"tool_use","id":"t1","name":"Read","input":{"file_path":"README.md"}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"file text"},{"type":"text","text":"continue"}]}]});

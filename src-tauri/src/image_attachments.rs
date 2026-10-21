@@ -9,8 +9,7 @@ use std::{
 };
 use tauri::{AppHandle, Manager};
 
-pub const IMAGE_LIMIT: u64 = 10 * 1024 * 1024;
-pub const TOTAL_IMAGE_LIMIT: u64 = 20 * 1024 * 1024;
+pub use crate::input_limits::{IMAGE_LIMIT, TOTAL_IMAGE_LIMIT};
 // Decode one image at a time, off the UI thread. Conversation thumbnails never
 // transfer the original image through IPC.
 static IMAGE_WORK: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);

@@ -5,6 +5,7 @@ use serde_json::{json, Value};
 use std::{
     collections::HashSet,
     hash::{Hash, Hasher},
+    io::Read,
     path::{Path, PathBuf},
 };
 use tauri::{AppHandle, Manager};
@@ -195,7 +196,7 @@ pub struct PreparedInput {
     pub metadata: Value,
 }
 pub fn prepare_input(text: &str, attachments: &[Attachment]) -> Result<PreparedInput, String> {
-    if attachments.len() > 12 {
+    if attachments.len() > crate::input_limits::MAX_ATTACHMENTS {
         return Err("最多添加 12 个附件".into());
     }
     let mut codex = vec![json!({"type":"text","text":text})];
@@ -221,7 +222,7 @@ pub fn prepare_input(text: &str, attachments: &[Attachment]) -> Result<PreparedI
                 )?;
                 let size = bytes.len() as u64;
                 image_bytes += size;
-                if image_bytes > 20 * 1024 * 1024 {
+                if image_bytes > crate::input_limits::TOTAL_IMAGE_LIMIT {
                     return Err("图片总量不能超过 20 MB".into());
                 }
                 let (_, mime, _) = crate::image_attachments::image_format(&bytes)?;
@@ -238,8 +239,7 @@ pub fn prepare_input(text: &str, attachments: &[Attachment]) -> Result<PreparedI
                 claude.push(json!({"type":"text","text":format!("用户选择的技能：{}\n路径：{}\n{}",a.name,p,content)}));
             }
             "file" => {
-                let content = read_utf8(&path, 256 * 1024)?;
-                let extra = format!("\n\n用户附加的文件（路径：{}）：\n{}", p, content);
+                let extra = crate::file_attachments::prepare(&path)?;
                 expanded.push_str(&extra);
                 codex.push(json!({"type":"text","text":extra}));
                 claude.push(json!({"type":"text","text":extra}));
@@ -259,14 +259,14 @@ pub fn prepare_input(text: &str, attachments: &[Attachment]) -> Result<PreparedI
             json!({"kind":a.kind,"path":p,"name":if a.kind == "image" { &a.name } else { &name }}),
         );
     }
-    if expanded.len() > 1024 * 1024 {
+    if expanded.len() > crate::input_limits::TEXT_LIMIT {
         return Err("附件文本总量不能超过 1 MB".into());
     }
     let bytes = claude
         .iter()
         .map(|v| v["source"]["data"].as_str().map(str::len).unwrap_or(0))
         .sum::<usize>();
-    if bytes > 28 * 1024 * 1024 {
+    if bytes > crate::input_limits::ENCODED_IMAGE_LIMIT {
         return Err("图片总量不能超过 20 MB".into());
     }
     Ok(PreparedInput {
@@ -276,17 +276,23 @@ pub fn prepare_input(text: &str, attachments: &[Attachment]) -> Result<PreparedI
     })
 }
 pub fn read_utf8(path: &Path, limit: u64) -> Result<String, String> {
-    if std::fs::metadata(path).map_err(|e| e.to_string())?.len() > limit {
+    let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+    let metadata = file.metadata().map_err(|e| e.to_string())?;
+    if !metadata.is_file() {
+        return Err(format!("附件不是文件：{}", path.display()));
+    }
+    if metadata.len() > limit {
         return Err("文件过大".into());
     }
-    let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
+    let mut bytes = Vec::new();
+    file.take(limit.saturating_add(1)).read_to_end(&mut bytes).map_err(|e| e.to_string())?;
     if bytes.len() as u64 > limit {
         return Err("文件过大".into());
     }
     if bytes.starts_with(&[239, 187, 191]) {
-        return Err("文件带 UTF-8 BOM，未更改编码".into());
+        return Err(format!("文件带 UTF-8 BOM，未更改编码：{}", path.display()));
     }
-    String::from_utf8(bytes).map_err(|_| "文件不是 UTF-8，未更改编码".into())
+    String::from_utf8(bytes).map_err(|_| format!("文件不是 UTF-8，未更改编码：{}", path.display()))
 }
 pub fn resolve_codex_skills(prepared: &PreparedInput, catalog: &Value) -> Vec<Value> {
     let known = catalog["data"]
@@ -868,20 +874,23 @@ mod tests {
         assert!(claude_native_permission("invalid").is_err());
     }
     #[test]
-    fn attachments_reject_bad_types_and_bom() {
-        let path = std::env::temp_dir().join(format!("supercode-{}.txt", uuid::Uuid::new_v4()));
+    fn skill_attachments_reject_bom_without_rewriting() {
+        let root = std::env::temp_dir().join(format!("supercode-skill-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let path = root.join("SKILL.md");
         std::fs::write(&path, [239, 187, 191, 65]).unwrap();
         assert!(prepare_input(
             "x",
             &[Attachment {
-                kind: "file".into(),
+                kind: "skill".into(),
                 name: "test".into(),
                 path: path.to_string_lossy().into()
             }]
         )
         .unwrap_err()
         .contains("BOM"));
-        std::fs::remove_file(path).unwrap();
+        assert_eq!(std::fs::read(path).unwrap(), [239, 187, 191, 65]);
+        std::fs::remove_dir_all(root).unwrap();
     }
     #[test]
     fn mcp_config_rejects_duplicate_names_and_remote_http() {
@@ -903,7 +912,7 @@ mod tests {
         .is_err());
     }
     #[test]
-    fn attachment_content_and_images_reach_native_inputs() {
+    fn attachment_paths_skills_and_images_reach_native_inputs() {
         let root = std::env::temp_dir().join(format!("supercode-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
         let file = root.join("中文.txt");
@@ -933,10 +942,10 @@ mod tests {
             ],
         )
         .unwrap();
-        assert!(inputs.codex[1]["text"]
-            .as_str()
-            .unwrap()
-            .contains("$(echo unchanged)"));
+        let reference = inputs.codex[1]["text"].as_str().unwrap();
+        assert!(reference.contains("中文.txt"));
+        assert!(reference.contains("原文件引用"));
+        assert!(!reference.contains("$(echo unchanged)"));
         assert_eq!(inputs.codex[2]["type"], "localImage");
         assert_eq!(inputs.codex[3]["type"], "skill");
         assert_eq!(inputs.claude[2]["source"]["media_type"], "image/png");

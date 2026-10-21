@@ -1839,7 +1839,9 @@ pub async fn summary(
         )
         .await?
     };
-    let result=tokio::time::timeout(Duration::from_secs(120),async {
+    let wait = crate::handoff::wait::SummaryWait::new();
+    let progress = wait.progress();
+    let result=wait.run(async {
         let native=if session.agent=="pi" {
             summary_request(&client,&mut rx,"get_state",json!({})).await?["sessionId"].as_str().ok_or("Pi 未返回会话 ID")?.to_owned()
         } else {
@@ -1859,10 +1861,17 @@ pub async fn summary(
         let prompt=prompt_content(&session.agent,&[json!({"type":"text","text":input})],"");
         let method=if session.agent=="pi"{"prompt"}else{"session/prompt"};
         let params=if session.agent=="pi"{prompt}else{json!({"sessionId":t.native,"prompt":prompt})};
-        let request=client.request(method,params,120);tokio::pin!(request);let mut acknowledged=false;
+        progress.touch();
+        // The progress watchdog owns generation timeouts. The RPC transport
+        // must not impose its old two-minute deadline underneath it.
+        let request=client.request(method,params,crate::handoff::wait::MAX_SECONDS);tokio::pin!(request);let mut acknowledged=false;
         loop { tokio::select! {
             value=rx.recv()=> {let value=value.ok_or("压缩连接已关闭")?;summary_notification(&value)?;
-                for e in mapper.map(&t,&value) {let item=&e["params"]["item"];if item["type"]=="claudeToolCall" { return Err("压缩尝试调用工具，切换已取消".into()); }if item["type"]=="agentMessage" {if let (Some(id),Some(text))=(item["id"].as_str(),item["text"].as_str()){texts.insert(id.to_owned(),protocol::bounded(text,24*1024));}} }
+                for e in mapper.map(&t,&value) {
+                    if crate::handoff::is_model_progress(&e) { progress.touch(); }
+                    let item = &e["params"]["item"];
+                    collect_summary_item(&mut texts, item)?;
+                }
                 if value["type"]=="agent_settled" {break;}
             },
             value=&mut request,if !acknowledged=>{let value=value?;if session.agent=="gemini"{mapper.observe_gemini_completion(&value);}if is_acp(&session.agent){break;}acknowledged=true;}
@@ -1872,9 +1881,9 @@ pub async fn summary(
         if mapper.failed {return Err(mapper.failure.unwrap_or("模型未完成压缩".into()));}
         if mapper.usage.is_object(){let mut usage=mapper.usage;usage["purpose"]="handoff".into();app.state::<AppState>().store.record_usage(session,&t.turn,usage)?;}
         Ok(texts.into_values().collect::<Vec<_>>().join("\n"))
-    }).await.map_err(|_|"上下文压缩超时".to_owned());
+    }).await;
     client.close().await;
-    result?
+    result
 }
 fn collect_summary_item(
     texts: &mut std::collections::BTreeMap<String, String>,
@@ -1965,6 +1974,23 @@ fn prompt_content(agent: &str, content: &[Value], instructions: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn file_references_survive_each_native_agent_prompt_protocol() {
+        let path = std::env::temp_dir().join(format!("supercode-reference-{}.unknown", uuid::Uuid::new_v4()));
+        let original = [0xff, 0xfe, 0, 0x81];
+        std::fs::write(&path, original).unwrap();
+        let prepared = crate::client_features::prepare_input("检查附件", &[crate::client_features::Attachment {
+            kind: "file".into(), path: path.to_string_lossy().into(), name: "未知格式".into(),
+        }]).unwrap();
+        let reference = prepared.claude[1]["text"].as_str().unwrap();
+        for agent in ["gemini", "opencode", "pi"] {
+            let prompt = prompt_content(agent, &prepared.claude, "fixture instructions");
+            let text = if agent == "pi" { &prompt["message"] } else { &prompt[0]["text"] };
+            assert!(text.as_str().unwrap().contains(reference), "{agent}");
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        std::fs::remove_file(path).unwrap();
+    }
     #[test]
     fn gemini_probe_returns_the_first_http_failure_without_blaming_credentials_for_503() {
         let error = probe_notification(&json!({"type":"supercode_gemini_probe_failure","status":503,

@@ -1,6 +1,6 @@
 [package]
 name = "supercode"
-version = "0.2.8"
+version = "0.2.9"
 description = "A lightweight desktop workspace for coding agents"
 edition = "2021"
 
@@ -39,6 +39,7 @@ minisign-verify = "0.3"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }
+tower = { version = "0.5", features = ["util"] }
 
 [target.'cfg(windows)'.dependencies]
 tauri-winrt-notification = "0.8.1"

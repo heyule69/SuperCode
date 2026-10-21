@@ -601,38 +601,14 @@ pub async fn send(
     );
     // Use only connection/model data from settings. Permissions remain under the UI's control.
     command.args(["--setting-sources", ""]);
-    if route.id != crate::session_config::LOCAL {
-        for key in [
-            "ANTHROPIC_API_KEY",
-            "ANTHROPIC_AUTH_TOKEN",
-            "ANTHROPIC_BASE_URL",
-            "ANTHROPIC_MODEL",
-            "ANTHROPIC_REASONING_MODEL",
-            "ANTHROPIC_DEFAULT_FABLE_MODEL",
-            "ANTHROPIC_DEFAULT_OPUS_MODEL",
-            "ANTHROPIC_DEFAULT_SONNET_MODEL",
-            "ANTHROPIC_DEFAULT_HAIKU_MODEL",
-            "ANTHROPIC_SMALL_FAST_MODEL",
-            "CLAUDE_CODE_SUBAGENT_MODEL",
-            "CLAUDE_CODE_OAUTH_TOKEN",
-            "CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR",
-            "CLAUDE_CODE_USE_BEDROCK",
-            "CLAUDE_CODE_USE_VERTEX",
-            "CLAUDE_CODE_USE_FOUNDRY",
-        ] {
-            command.env_remove(key);
-        }
-    }
-    if let Some(env) = config["env"].as_object() {
-        for (key, value) in env {
-            if let Some(value) = value.as_str() {
-                command.env(key, value);
-            }
-        }
-    }
+    crate::claude_connection::configure(
+        &mut command,
+        &app.state::<AppState>().data_dir,
+        &route.id,
+        &config,
+    )?;
     let claude_context=crate::model_context::configure_claude(&mut command,&config,model.as_deref());
     if let Some(launch_model)=&claude_context.launch_model { command.arg(format!("--model={launch_model}")); }
-    crate::official_accounts::configure(&mut command, app, "claude", &config)?;
     command.env("SUPERCODE_SESSION_ID", &session.id);
     command.env("CLAUDE_CODE_SDK_READS_SESSION_STATE", "1");
     let mut child = command
