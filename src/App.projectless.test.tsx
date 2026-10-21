@@ -123,6 +123,85 @@ it('renders the first settings page immediately and keeps the hidden chat geomet
   expect(textarea.style.height).toBe('48px');
 });
 
+async function useManagedMagpie(wait?: Promise<void>) {
+  const base=vi.mocked(call).getMockImplementation()!;
+  vi.mocked(call).mockImplementation(async(command,args={})=>{
+    if(command==='use_magpie') {
+      if(wait) await wait;
+      data.profiles=data.profiles.map(p=>({...p,current:false}));
+      for(const agent of ['claude','codex','opencode','pi','gemini']) {
+        data.profiles.push({id:`magpie:${agent}`,agent,name:'Magpie',model:'vendor/available',models:['vendor/available'],providerId:'magpie',source:'magpie',current:true,hasCredential:true});
+        (data.connectionOrder??={})[agent]=[`magpie:${agent}`,...(data.connectionOrder?.[agent]??[])];
+      }
+      return {models:1,added:5};
+    }
+    return base(command,args);
+  });
+  await act(async()=>container.querySelector<HTMLButtonElement>('button[aria-label="设置"]')!.click());
+  await act(async()=>[...container.querySelectorAll<HTMLButtonElement>('button')].find(b=>b.textContent==='模型供应商')!.click());
+  await act(async()=>{await vi.dynamicImportSettled()});
+  await act(async()=>container.querySelector<HTMLButtonElement>('button[aria-label="Magpie"]')!.click());
+  await act(async()=>[...document.querySelectorAll<HTMLButtonElement>('[aria-label="Magpie 操作"] button')].find(b=>b.querySelector('strong')?.textContent==='使用 Magpie')!.click());
+  await act(async()=>container.querySelector<HTMLButtonElement>('button[aria-label="聊天"]')!.click());
+}
+it('explicit Magpie use selects its managed connection for a draft and remembers every Agent without losing text',async()=>{
+  saveModelSelection('claude',{connectionId:'api:claude',model:'test-model',effort:'high'});
+  await render();await type('保持这份草稿。'.repeat(80));await useManagedMagpie();
+  expect(container.querySelector('.model-chip-name')?.textContent).toBe('vendor/available');
+  expect(container.querySelector<HTMLTextAreaElement>('.composer textarea')!.value).toBe('保持这份草稿。'.repeat(80));
+  for(const agent of ['claude','codex','opencode','pi','gemini'])expect(loadModelSelection(agent,data.profiles,[])).toEqual({connectionId:`magpie:${agent}`,model:'vendor/available',effort:''});
+  expect(vi.mocked(call).mock.calls.some(([c])=>c==='switch_session_model')).toBe(false);
+});
+it('adding Magpie leaves an existing chat on its original model and connection',async()=>{
+  localStorage.setItem('supercode.session','keep-chat');
+  data.sessions=[{id:'keep-chat',projectId:'existing',title:'原会话',agent:'claude',model:'test-model',connectionId:'api:claude',nativeId:'native-before',status:'idle',turnId:null,updatedAt:1}];
+  await render();await useManagedMagpie();
+  expect(container.querySelector('.model-chip-name')?.textContent).toBe('test-model');
+  expect(data.sessions[0].connectionId).toBe('api:claude');expect(data.sessions[0].nativeId).toBe('native-before');
+  expect(vi.mocked(call).mock.calls.some(([c])=>c==='switch_session_model')).toBe(false);
+});
+it('a late Magpie add cannot switch a newly chosen Agent back to the requesting Agent route',async()=>{
+  data.agents=[{id:'claude',name:'Claude Code',installed:true,connected:true,path:null},{id:'pi',name:'Pi',installed:true,connected:true,path:null}];
+  data.profiles.push({id:'api:pi',agent:'pi',name:'Pi API',model:'pi-model',hasCredential:true,current:true});
+  let finish!:()=>void;const wait=new Promise<void>(resolve=>finish=resolve);
+  await render();await useManagedMagpie(wait);
+  await act(async()=>container.querySelector<HTMLButtonElement>('[aria-label="Agent"]')!.click());
+  await act(async()=>[...container.querySelectorAll<HTMLButtonElement>('[aria-label="选择 Agent"] button')].find(b=>b.querySelector('strong')?.textContent==='Pi')!.click());
+  await act(async()=>container.querySelector<HTMLButtonElement>('.model-chip')!.click());
+  await act(async()=>[...container.querySelectorAll<HTMLButtonElement>('.model-option')].find(b=>b.textContent?.includes('pi-model'))!.click());
+  expect(container.querySelector('.model-chip-name')?.textContent).toBe('pi-model');
+  await act(async()=>finish());
+  expect(container.querySelector('.agent-chip')?.textContent).toContain('Pi');
+  expect(container.querySelector('.model-chip-name')?.textContent).not.toBe('vendor/available');
+  await type('继续使用 Pi');await send();
+  expect(call).toHaveBeenCalledWith('create_session',expect.objectContaining({agent:'pi',connectionId:'api:pi'}));
+});
+it('a late Magpie add preserves a newer explicit model choice in the same Agent',async()=>{
+  let finish!:()=>void;const wait=new Promise<void>(resolve=>finish=resolve);
+  await render();await useManagedMagpie(wait);
+  await act(async()=>container.querySelector<HTMLButtonElement>('.model-chip')!.click());
+  await act(async()=>[...container.querySelectorAll<HTMLButtonElement>('.model-option')].find(b=>b.textContent?.includes('test-model'))!.click());
+  await act(async()=>finish());
+  expect(container.querySelector('.model-chip-name')?.textContent).toBe('test-model');
+  expect(loadModelSelection('claude',data.profiles,[])?.connectionId).toBe('api:claude');
+  await type('保留刚才选择');await send();
+  expect(call).toHaveBeenCalledWith('create_session',expect.objectContaining({agent:'claude',connectionId:'api:claude'}));
+});
+it('removing Magpie restores the remaining draft connection without losing its text',async()=>{
+  await render();await type('移除后保留');await useManagedMagpie();
+  const base=vi.mocked(call).getMockImplementation()!;
+  vi.mocked(call).mockImplementation(async(command,args={})=>{
+    if(command==='remove_magpie') {data.profiles=data.profiles.filter(p=>p.source!=='magpie').map(p=>({...p,current:true}));data.connectionOrder={claude:['api:claude']};return null;}
+    return base(command,args);
+  });
+  await act(async()=>container.querySelector<HTMLButtonElement>('button[aria-label="设置"]')!.click());
+  await act(async()=>[...container.querySelectorAll<HTMLButtonElement>('button')].find(b=>b.textContent==='模型供应商')!.click());
+  await act(async()=>container.querySelector<HTMLButtonElement>('[aria-label="移除 Magpie"]')!.click());
+  await act(async()=>container.querySelector<HTMLButtonElement>('button[aria-label="聊天"]')!.click());
+  expect(container.querySelector('.model-chip-name')?.textContent).toBe('test-model');
+  expect(container.querySelector<HTMLTextAreaElement>('.composer textarea')!.value).toBe('移除后保留');
+});
+
 it('remembers an explicit model and reasoning choice immediately and restores it in a fresh window', async () => {
   data.profiles[0].models = ['test-model', 'last-picked'];
   const base = vi.mocked(call).getMockImplementation()!;

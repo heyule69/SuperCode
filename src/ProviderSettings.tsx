@@ -9,6 +9,7 @@ import { connectionIds, mergeVisibleOrder, moveConnection, nativeConnectionSourc
 import { agentProtocols, officialProvider, protocolLabels, providersForAgent } from './providerCapabilities';
 import OfficialAccounts from './OfficialAccounts';
 import { ModelPagination, pageModels } from './ModelPagination';
+import { MagpieMenu } from './MagpieMenu';
 const providers = catalog as Provider[];
 const CCSwitchSettings = lazy(() => import('./CCSwitchSettings'));
 const blank: Config = { id: null, name: '', agent: 'claude', providerId: 'custom', plan: 'anthropic', protocol: 'anthropic', baseUrl: '', model: '', models: [], hasCredential: false };
@@ -18,7 +19,7 @@ function SelectControl({ children, ...props }: SelectHTMLAttributes<HTMLSelectEl
   return <div className="select-control"><select {...props}>{children}</select><ChevronDown size={14} aria-hidden="true" /></div>;
 }
 
-export default function ProviderSettings({ profiles, officialAgents, order, runningConnections = {}, updated, initialAgent = 'claude' }: { profiles: AgentProfile[]; officialAgents: string[]; order?: ConnectionOrder; runningConnections?: Record<string, string[]>; updated: (resetAgent?: string) => Promise<void>; initialAgent?: string }) {
+export default function ProviderSettings({ profiles, officialAgents, order, runningConnections = {}, updated, initialAgent = 'claude' }: { profiles: AgentProfile[]; officialAgents: string[]; order?: ConnectionOrder; runningConnections?: Record<string, string[]>; updated: (resetAgent?: string, preferMagpie?: boolean) => Promise<void>; initialAgent?: string }) {
   const [adding, setAdding] = useState(false);
   const [managingAccounts, setManagingAccounts] = useState(false);
   const [importing, setImporting] = useState(false);
@@ -77,7 +78,11 @@ export default function ProviderSettings({ profiles, officialAgents, order, runn
     const subtitle = p?.officialAccount ? p.accountId ? '官方账号 · 独立登录' : '使用本机官方登录' : p ? `${p.model ?? '沿用 CLI 模型'}${p.source === 'ccswitch' ? ' · CC Switch 导入' : ''}` : id === '@official' ? '使用本机官方登录' : '沿用本机模型与供应商';
     return { id, index, p, native, name, subtitle, isDefault: completeIds[0] === id };
   }).filter(c => `${c.name} ${c.subtitle} ${c.p?.modelSource?.providerName ?? ''}`.toLowerCase().includes(connectionSearch.trim().toLowerCase()));
-  const canDelete = (id: string) => profiles.some(p => p.id === id && p.agent === agentTab && !p.officialAccount) && !runningConnections[agentTab]?.includes(id);
+  const managedMagpie = profiles.filter(p => p.providerId === 'magpie' && p.source === 'magpie');
+  const magpieAdded = providerAgents.every(agent => managedMagpie.some(p => p.agent === agent.id));
+  const magpieCount = managedMagpie.find(p => p.agent === agentTab)?.models?.length ?? managedMagpie[0]?.models?.length ?? 0;
+  const magpieBusy = managedMagpie.some(p => runningConnections[p.agent]?.includes(p.id));
+  const canDelete = (id: string) => profiles.some(p => p.id === id && p.agent === agentTab && !p.officialAccount && p.providerId !== 'magpie') && !runningConnections[agentTab]?.includes(id);
   const deletableVisibleIds = visibleConnections.filter(c => canDelete(c.id)).map(c => c.id);
   const selected = selectedIds.filter(canDelete);
   const selectedVisible = deletableVisibleIds.filter(id => selected.includes(id));
@@ -86,13 +91,13 @@ export default function ProviderSettings({ profiles, officialAgents, order, runn
   useEffect(() => { if (selectAll.current) selectAll.current.indeterminate = selectedVisible.length > 0 && !allSelected; });
   useEffect(() => {
     setSelectedIds(previous => {
-      const next = previous.filter(id => profiles.some(p => p.id === id && p.agent === agentTab && !p.officialAccount) && !runningConnections[agentTab]?.includes(id));
+      const next = previous.filter(id => profiles.some(p => p.id === id && p.agent === agentTab && !p.officialAccount && p.providerId !== 'magpie') && !runningConnections[agentTab]?.includes(id));
       return next.length === previous.length ? previous : next;
     });
   }, [agentTab, profiles, runningConnections]);
   const sortingDisabled = !desktop || working || !!connectionSearch.trim();
   const official = officialProvider(agentTab);
-  const pickerProviders = providersForAgent(providers, agentTab).map(p => {
+  const pickerProviders = providersForAgent(providers, agentTab).filter(p => p.id !== 'magpie').map(p => {
     const name = p.id === 'openai' ? 'OpenAI API' : p.id === 'anthropic' ? 'Anthropic API' : p.name;
     const plans = p.presets.map(preset => preset.name).join(' ');
     const access = p.category === '自定义' ? '兼容 API' : p.category === '本地' ? p.presets.some(preset => preset.id.startsWith('cloud')) ? '本地 / 云端 API' : '本地 API' : /M Plan/.test(plans) ? 'M Plan / API' : /Token Plan/.test(plans) ? 'Token Plan / API' : /Coding Plan/.test(plans) ? 'Coding Plan / API' : /Beta/.test(plans) ? 'API · Beta' : '标准 API';
@@ -175,8 +180,20 @@ export default function ProviderSettings({ profiles, officialAgents, order, runn
     if (config?.id && ids.includes(config.id)) setConfig(null);
     await updated(); setMessage(`已删除 ${ids.length} 个连接`);
   }
+  async function useMagpie() {
+    const result = await call<{ models: number; added: number }>('use_magpie');
+    setAdding(false); setManagingAccounts(false); setImporting(false); setConfig(null); setNativeId(null); setConnectionSearch(''); setSelectedIds([]); setDeleteIds([]);
+    await updated(agentTab, true);
+    setMessage(`已添加 Magpie，${result.models} 个模型已出现在模型选择中。`);
+  }
+  async function removeMagpie(profile: AgentProfile) {
+    if (profile.source === 'magpie') await call('remove_magpie');
+    else await call('delete_provider_profiles', { agent: profile.agent, ids: [profile.id] });
+    await updated();
+    setMessage('已移除 Magpie 连接；Magpie 本身继续运行，聊天记录保留。');
+  }
   return <div className="provider-settings">
-    <div className="settings-page-heading"><h2>模型供应商</h2><div>{!desktop ? <span className="preview-label" title="预览模式不保存密钥，不调用模型">预览</span> : null}<button className="quiet-button" disabled={!desktop || working || accountsChecking} onClick={() => void run(async () => { await refreshAccounts(); await updated(); })}><RefreshCw size={15} className={accountsChecking ? 'spin' : ''}/>{accountsChecking ? '检查中…' : '刷新连接'}</button><button className="quiet-button" disabled={working} onClick={() => { setImporting(true); setManagingAccounts(false); setConfig(null); setNativeId(null); setAdding(false); setError(''); setMessage(''); }}><Download size={15} />CC Switch 导入</button><button className="primary-button" disabled={working} onClick={() => { setAdding(true); setManagingAccounts(false); setImporting(false); setConfig(null); setNativeId(null); setSearch(''); setError(''); setMessage(''); }}><Plus size={15} />添加</button></div></div>
+    <div className="settings-page-heading"><h2>模型供应商</h2><div>{!desktop ? <span className="preview-label" title="预览模式不保存密钥，不调用模型">预览</span> : null}<button className="quiet-button" disabled={!desktop || working || accountsChecking} onClick={() => void run(async () => { await refreshAccounts(); await updated(); })}><RefreshCw size={15} className={accountsChecking ? 'spin' : ''}/>{accountsChecking ? '检查中…' : '刷新连接'}</button><button className="quiet-button" disabled={working} onClick={() => { setImporting(true); setManagingAccounts(false); setConfig(null); setNativeId(null); setAdding(false); setError(''); setMessage(''); }}><Download size={15} />CC Switch 导入</button><MagpieMenu added={magpieAdded} count={magpieCount} busy={working} run={run} use={useMagpie}/><button className="primary-button" disabled={working} onClick={() => { setAdding(true); setManagingAccounts(false); setImporting(false); setConfig(null); setNativeId(null); setSearch(''); setError(''); setMessage(''); }}><Plus size={15} />添加</button></div></div>
     <div className="provider-tabs" role="tablist" aria-label="按 Agent 分类">{providerAgents.map(a => <button key={a.id} role="tab" id={`providers-${a.id}-tab`} aria-controls="provider-connections" aria-selected={agentTab === a.id} className={agentTab === a.id ? 'selected' : ''} disabled={working || managingAccounts} onClick={() => { setAgentTab(a.id); setConfig(null); setNativeId(null); setConnectionSearch(''); setSearch(''); setMessage(''); setSelectedIds([]); setDeleteIds([]); clearDrag(); }}><AgentIcon agent={a.id}/>{a.name}<span>{visibleProviderIds(a.id, profiles, loggedInAgents, order).length}</span></button>)}</div>
     {error ? <p className="cc-error" role="alert">{error}</p> : null}
     {message ? <p className="provider-feedback" role="status"><Check size={15} />{message}</p> : null}
@@ -220,11 +237,18 @@ export default function ProviderSettings({ profiles, officialAgents, order, runn
       <div className="provider-save-actions">{working ? <LoaderCircle size={15} className="spin" /> : null}<button className="quiet-button" disabled={!desktop || working || connectionBusy || !config.model.trim() || (!config.official && !config.baseUrl.trim())} title="先保存，再发送测试请求；按供应商规则计费" onClick={() => void run(async () => { const id = await save(); if (!id) return; const result = await call<{ model: string }>('test_provider_connection', { id }); setMessage(config.official ? '官方账号可用' : `连接成功 · ${result.model}`); })}>{config.official ? '检查账号' : '测试'}</button><button className="quiet-button" disabled={!desktop || working || connectionBusy || !config.model.trim()} onClick={() => void run(async () => { await save(); })}>保存</button><button className="primary-button" disabled={!desktop || working || connectionBusy || !config.model.trim()} onClick={() => void run(async () => { await save(true); })}>保存为默认</button></div></div>
     </div> : <div className="provider-overview">
       <div className="search-field"><Search size={15} /><input aria-label="搜索模型连接" placeholder="搜索连接或模型" value={connectionSearch} onChange={e => { setConnectionSearch(e.target.value); clearDrag(); }} /></div>
-      <p className="provider-order-hint">{connectionSearch.trim() ? '清空搜索后可调整顺序' : !ids.length ? accountsChecking && ['codex', 'claude'].includes(agentTab) ? '正在检查本机官方登录…' : '添加连接或从 CC Switch 导入' : `拖动调整顺序并设置 ${providerAgents.find(a => a.id === agentTab)?.name} 新聊天默认`}</p>
-      {visibleConnections.length ? <div className="provider-selection-controls"><label><input ref={selectAll} type="checkbox" aria-label="全选当前可删除连接" checked={allSelected} disabled={!desktop || working || !deletableVisibleIds.length} onChange={e => setSelectedIds(previous => e.target.checked ? [...new Set([...previous.filter(canDelete), ...deletableVisibleIds])] : previous.filter(id => !deletableVisibleIds.includes(id)))}/>全选可删除连接</label><span>{selected.length ? `已选择 ${selected.length} 个` : '可多选删除'}</span><button className="quiet-button" disabled={!desktop || working || !selected.length} onClick={() => setDeleteIds(selected)}><Trash2 size={14}/>删除所选{selected.length ? ` (${selected.length})` : ''}</button></div> : null}
+      <p className="provider-order-hint">{connectionSearch.trim() ? '清空搜索后可调整顺序' : !ids.length ? accountsChecking && ['codex', 'claude'].includes(agentTab) ? '正在检查本机官方登录…' : '添加连接或从 CC Switch 导入' : visibleConnections.every(c => c.p?.providerId === 'magpie') ? 'Magpie 连接由其应用管理，使用时保持运行' : `拖动调整顺序并设置 ${providerAgents.find(a => a.id === agentTab)?.name} 新聊天默认`}</p>
+      {visibleConnections.some(c => c.p?.providerId !== 'magpie') ? <div className="provider-selection-controls"><label><input ref={selectAll} type="checkbox" aria-label="全选当前可删除连接" checked={allSelected} disabled={!desktop || working || !deletableVisibleIds.length} onChange={e => setSelectedIds(previous => e.target.checked ? [...new Set([...previous.filter(canDelete), ...deletableVisibleIds])] : previous.filter(id => !deletableVisibleIds.includes(id)))}/>全选可删除连接</label><span>{selected.length ? `已选择 ${selected.length} 个` : '可多选删除'}</span><button className="quiet-button" disabled={!desktop || working || !selected.length} onClick={() => setDeleteIds(selected)}><Trash2 size={14}/>删除所选{selected.length ? ` (${selected.length})` : ''}</button></div> : null}
       {deleteIds.length ? <div className="provider-delete-confirm" role="group" aria-label="确认删除连接"><p>删除 {deleteIds.length} 个连接：{deleteIds.map(id => profiles.find(p => p.id === id)?.name ?? id).join('、')}？</p><p>这些连接及已保存的 API Key 将被移除，已有聊天记录保留。</p>{deletionBlocked ? <p role="status">所选连接正在使用或已变更，请取消后重新选择。</p> : null}<div><button className="quiet-button" disabled={working} onClick={() => setDeleteIds([])}>取消</button><button className="danger-button" disabled={!desktop || working || deletionBlocked} onClick={() => void run(async () => { await deleteConnections(deleteIds); })}>确认删除 {deleteIds.length} 个连接</button></div></div> : null}
       <div ref={providerList} className="provider-scroll" id="provider-connections" role="tabpanel" aria-labelledby={`providers-${agentTab}-tab`}>
         <div className="saved-provider-list">{visibleConnections.map(({ id, index, p, native, name, subtitle, isDefault }) => {
+          if (p?.providerId === 'magpie') {
+            const inUse = p.source === 'magpie' ? magpieBusy : !!runningConnections[p.agent]?.includes(id);
+            return <div className="provider-sort-row magpie-managed-row" key={`${agentTab}:${id}`} data-connection-id={id} data-managed="magpie">
+              <div className="saved-provider"><span className="provider-mark mark-magpie"><ProviderIcon provider="magpie"/></span><span><strong>{name}<span className="magpie-managed-badge">Magpie 管理</span></strong><small>{p.models?.length ?? 0} 个模型 · 供应商与模型由 Magpie 管理</small></span>{isDefault ? <span className="connection-state enabled">新聊天默认</span> : null}{inUse ? <span className="connection-state">任务使用中</span> : null}</div>
+              <button className="quiet-button magpie-remove" disabled={!desktop || working || inUse} title={inUse ? 'Magpie 连接正被任务使用，完成或停止后可移除' : '只移除 SuperCode 中的连接，保留 Magpie 与聊天记录'} aria-label={`移除 ${name}`} onClick={() => void run(() => removeMagpie(p))}>移除</button>
+            </div>;
+          }
           const dropping = dropTarget?.id === id ? `drop-${dropTarget.edge}` : '';
           return <div className={`provider-sort-row ${dragId === id ? 'is-dragging' : ''} ${dropping}`} key={`${agentTab}:${id}`} data-connection-id={id}>
             {p && !p.officialAccount ? <input className="provider-row-select" type="checkbox" aria-label={`选择 ${name}`} checked={selected.includes(id)} disabled={!desktop || working || !canDelete(id)} onChange={e => setSelectedIds(previous => e.target.checked ? [...new Set([...previous, id])] : previous.filter(value => value !== id))}/> : <span className="provider-row-select-placeholder" aria-hidden="true"/>}

@@ -111,7 +111,7 @@ pub(crate) fn order(conn: &Connection, agent: &str) -> Result<Vec<String>> {
     Ok(result)
 }
 
-fn write_order(conn: &Connection, agent: &str, ids: &[String]) -> Result<()> {
+pub(crate) fn write_order(conn: &Connection, agent: &str, ids: &[String]) -> Result<()> {
     let first = ids.first().ok_or("至少需要保留一个连接")?;
     conn.execute("INSERT INTO settings(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
         params![format!("connection_order_{agent}"), serde_json::to_string(ids).map_err(|e| e.to_string())?]).map_err(|e| e.to_string())?;

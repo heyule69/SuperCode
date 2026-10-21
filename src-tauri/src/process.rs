@@ -4,7 +4,7 @@ use tokio::process::{Child, Command};
 // These belong to the hosting Codex task, not an independently launched CLI.
 // Keep user configuration (including CODEX_HOME) and let each agent's explicit
 // launch/turn settings select its permissions and runtime.
-const HOST_TASK_ENV: &[&str] = &[
+pub(crate) const HOST_TASK_ENV: &[&str] = &[
     "CODEX_APP_TOOLS_PIPE_PATH", "CODEX_CLI_PATH", "CODEX_THREAD_ID", "CODEX_SESSION_ID",
     "CODEX_INTERNAL_ORIGINATOR_OVERRIDE", "CODEX_PERMISSION_PROFILE",
     "CODEX_WINDOWS_SANDBOX_PACKAGE_FAMILY", "CODEX_TASK_WORKSPACE_VERIFYING_IDENTITY",

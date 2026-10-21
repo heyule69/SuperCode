@@ -64,7 +64,7 @@ fn connection_in_use(conn: &Connection, id: &str) -> Result<bool> {
     crate::connection_usage::in_use(conn, id)
 }
 
-fn ensure_connection_idle(conn: &Connection, id: &str) -> Result<()> {
+pub(crate) fn ensure_connection_idle(conn: &Connection, id: &str) -> Result<()> {
     if connection_in_use(conn, id)? {
         return Err("此连接正被运行中的任务使用，请等待任务完成或停止后再修改".into());
     }

@@ -195,40 +195,6 @@ it.each(['opencode', 'pi'].flatMap(agent => [false, true].map(hasCredential => (
   expect(mocks.call).toHaveBeenCalledWith('save_provider_profile', { settings: expect.objectContaining({ id: 'api', protocol: 'gemini', plan: 'gemini', hasCredential, apiKey: null }), activate: false });
 });
 
-it.each(['claude', 'codex', 'opencode', 'pi', 'gemini'])('connects %s to Magpie and saves gateway model IDs without importing accounts', async agent => {
-  const original = mocks.call.getMockImplementation()!;
-  mocks.call.mockImplementation(async (command: string, args: any) => command === 'fetch_provider_models_for_settings' ? ['fixture/test-reasoner', 'group/daily'] : command === 'save_provider_profile' ? { id: 'magpie', agent, hasCredential: true, current: false } : original(command, args));
-  await render(); await act(async () => tab(agent).click()); await act(async () => button('添加').click()); await act(async () => providerCard('Magpie').click());
-  expect(node.textContent).toContain('使用期间须保持网关运行');
-  expect(button('获取模型').disabled).toBe(false);
-  await act(async () => button('获取模型').click());
-  expect(mocks.call).toHaveBeenCalledWith('fetch_provider_models_for_settings', { settings: expect.objectContaining({ agent, providerId: 'magpie', model: '', apiKey: null }) });
-  expect(node.querySelector<HTMLInputElement>('#provider-default-model')!.value).toBe('fixture/test-reasoner');
-  await act(async () => button('保存').click());
-  expect(mocks.call).toHaveBeenCalledWith('save_provider_profile', { settings: expect.objectContaining({ agent, providerId: 'magpie', model: 'fixture/test-reasoner', models: ['fixture/test-reasoner', 'group/daily'] }), activate: false });
-  expect(mocks.call.mock.calls.some(([command]) => command === 'scan_ccswitch' || command === 'import_ccswitch')).toBe(false);
-});
-
-it('keeps a 5000-model Magpie directory when searching for and saving a late model with bounded DOM rows', async () => {
-  const models = Array.from({ length: 5000 }, (_, i) => `vendor/model-${String(i).padStart(4, '0')}`);
-  const original = mocks.call.getMockImplementation()!;
-  mocks.call.mockImplementation(async (command: string, args: any) => command === 'fetch_provider_models_for_settings' ? models : command === 'save_provider_profile' ? { id: 'magpie', agent: 'codex', hasCredential: true, current: false } : original(command, args));
-  await render(); await act(async () => tab('codex').click()); await act(async () => button('添加').click()); await act(async () => providerCard('Magpie').click());
-  await act(async () => button('获取模型').click());
-  expect(node.querySelector('.model-count')!.textContent).toContain('5000');
-  expect(node.querySelectorAll('.provider-model-row')).toHaveLength(50);
-  const search = node.querySelector<HTMLInputElement>('[aria-label="搜索已添加模型"]')!;
-  await act(async () => { Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')!.set!.call(search, 'model-4999'); search.dispatchEvent(new Event('input', { bubbles: true })); });
-  expect(node.querySelectorAll('.provider-model-row')).toHaveLength(1);
-  await act(async () => node.querySelector<HTMLButtonElement>('[aria-label="默认模型 vendor/model-4999"]')!.click());
-  await act(async () => button('保存').click());
-  const saved = mocks.call.mock.calls.find(([command]) => command === 'save_provider_profile')![1].settings;
-  expect(saved.model).toBe('vendor/model-4999');
-  expect(saved.models).toHaveLength(5000);
-  expect(saved.models).toContain('vendor/model-0000');
-  expect(saved.models).toContain('vendor/model-4999');
-});
-
 it('fetches models from an unsaved draft without a default model and retains its entered key and name', async () => {
   const original = mocks.call.getMockImplementation()!;
   mocks.call.mockImplementation(async (command: string, args: any) => command === 'fetch_provider_models_for_settings' ? ['returned-model', 'second-model'] : command === 'save_provider_profile' ? { id: 'new', agent: 'opencode', hasCredential: true, current: false } : original(command, args));

@@ -65,6 +65,7 @@ mod process;
 mod protocol;
 mod subagents;
 mod providers;
+mod magpie;
 mod runtime;
 mod runtime_diagnostics;
 mod session_config;
@@ -441,6 +442,9 @@ pub fn run() {
             providers::save_provider_profile,
             providers::delete_provider_profile,
             providers::delete_provider_profiles,
+            magpie::open_magpie,
+            magpie::use_magpie,
+            magpie::remove_magpie,
             connection_order::reorder_provider_connections,
             providers::fetch_provider_models,
             providers::fetch_provider_models_for_settings,

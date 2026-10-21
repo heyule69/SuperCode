@@ -593,10 +593,19 @@ fn find(app: &AppHandle, id: &str) -> Result<Profile, String> {
 }
 #[tauri::command]
 pub fn get_provider_profile(id: String, app: AppHandle) -> Result<Settings, String> {
-    Ok(settings(&find(&app, &id)?))
+    let profile = find(&app, &id)?;
+    ensure_editable(&profile)?;
+    Ok(settings(&profile))
 }
 
-fn make_profile(mut s: Settings, previous: Option<&Profile>) -> Result<Profile, String> {
+pub(crate) fn ensure_editable(profile: &Profile) -> Result<(), String> {
+    if profile.config["providerId"] == "magpie" || crate::magpie::managed(profile) {
+        return Err("Magpie 连接由 Magpie 管理，只支持添加或移除，请在 Magpie 中调整供应商和模型。".into());
+    }
+    Ok(())
+}
+
+pub(crate) fn make_profile(mut s: Settings, previous: Option<&Profile>) -> Result<Profile, String> {
     s.name = s.name.trim().into();
     s.model = s.model.trim().into();
     if s.name.is_empty() || s.name.len() > 100 {
@@ -786,6 +795,10 @@ pub async fn save_provider_profile(
         .as_deref()
         .map(|id| find(&app, id))
         .transpose()?;
+    if settings.provider_id == "magpie" {
+        return Err("请使用顶部 Magpie 菜单直接添加，无需填写 API 配置。".into());
+    }
+    if let Some(profile) = &previous { ensure_editable(profile)?; }
     if previous.as_ref().is_some_and(|p| p.agent != settings.agent) {
         return Err("更换连接的 Agent 请添加新连接，已有聊天的引擎不能被修改".into());
     }
@@ -950,7 +963,7 @@ fn model_listing_endpoint(s: &Settings) -> Result<(String, &str), String> {
     Ok((url, &s.protocol))
 }
 
-async fn fetch_models(s: &Settings, secret: Option<&str>) -> Result<(Vec<String>, Value), String> {
+pub(crate) async fn fetch_models(s: &Settings, secret: Option<&str>) -> Result<(Vec<String>, Value), String> {
     let (url, listing_protocol) = model_listing_endpoint(s)?;
     let client = if s.provider_id == "magpie" {
         client_builder().timeout(std::time::Duration::from_secs(10)).build()
@@ -974,7 +987,7 @@ async fn fetch_models(s: &Settings, secret: Option<&str>) -> Result<(Vec<String>
         let response = protocol_headers(request, listing_protocol, secret)
                 .send()
                 .await
-                .map_err(|_| "连接失败或超时，可手动填写模型 ID")?;
+                .map_err(|_| if s.provider_id == "magpie" { "无法连接 Magpie 本机网关，请打开 Magpie 检查运行状态" } else { "连接失败或超时，可手动填写模型 ID" })?;
         let value = if s.provider_id == "magpie" && response.status().is_success() {
             read_json_bounded(response, MAGPIE_CATALOG_BYTES).await?
         } else { provider_json(response, secret).await? };
@@ -1054,7 +1067,7 @@ async fn fetch_models(s: &Settings, secret: Option<&str>) -> Result<(Vec<String>
         page_token = Some(token.to_owned());
     }
     if models.is_empty() {
-        return Err("供应商没有返回模型列表，请手动添加模型 ID".into());
+        return Err(if s.provider_id == "magpie" { "Magpie 尚未提供可用模型，请在 Magpie 中添加或启用供应商后重试。" } else { "供应商没有返回模型列表，请手动添加模型 ID" }.into());
     }
     Ok((models.into_iter().collect(), metadata))
 }

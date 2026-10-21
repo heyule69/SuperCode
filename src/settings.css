@@ -152,6 +152,29 @@
 .provider-native-editor { display: flex; flex-direction: column; align-items: flex-start; gap: 20px; padding: 4px 0 24px; }
 .provider-native-heading { display: flex; gap: 12px; align-items: center; margin-top: 12px; flex-wrap: wrap; }
 .provider-account-controls { padding: 10px 0; }
+.magpie-trigger .provider-logo { width: 17px; height: 17px; border-radius: 3px; }
+.magpie-status-dot { width: 5px; height: 5px; border-radius: 50%; background: var(--muted); visibility: hidden; flex: 0 0 5px; }
+.magpie-status-dot.is-added { visibility: visible; background: #398363; }
+.magpie-popover { position: fixed; z-index: 110; width: 314px; padding: 8px; overflow: auto; overscroll-behavior: contain; border: 1px solid var(--line); border-radius: 11px; background: var(--surface); color: var(--text); box-shadow: 0 10px 32px #0002, 0 2px 5px #0001; }
+.magpie-menu-heading { display: flex; align-items: center; gap: 10px; padding: 10px 10px 13px; margin-bottom: 5px; border-bottom: 1px solid var(--line); }
+.magpie-menu-heading .provider-mark { width: 34px; height: 34px; border-radius: 8px; display: flex; align-items: center; justify-content: center; background: var(--surface2); }
+.magpie-menu-heading .provider-logo { width: 26px; height: 26px; border-radius: 4px; }
+.magpie-menu-heading strong { display: block; font-size: 13px; }
+.magpie-popover small { display: block; margin-top: 5px; color: var(--muted); font-size: 11px; font-weight: 400; line-height: 1.6; }
+.magpie-popover > button, .magpie-popover > a { display: flex; align-items: center; width: 100%; gap: 12px; padding: 12px 10px; min-height: 60px; border: 0; border-radius: 7px; color: var(--text); background: transparent; text-align: left; text-decoration: none; }
+.magpie-popover > button:hover:not(:disabled), .magpie-popover > a:hover { background: var(--hover); }
+.magpie-popover > button > span, .magpie-popover > a > span { flex: 1; min-width: 0; }
+.magpie-popover > button > svg, .magpie-popover > a > svg { flex-shrink: 0; color: var(--muted); }
+.magpie-popover > button strong, .magpie-popover > a strong { font-size: 12px; font-weight: 550; }
+.magpie-popover .magpie-use { background: var(--surface2); margin-top: 4px; }
+.magpie-popover .magpie-use:disabled { opacity: 1; cursor: default; }
+.magpie-menu-note { display: flex; align-items: center; gap: 6px; margin: 0; padding: 13px 10px 5px; font-size: 10px; line-height: 1.6; color: var(--muted); }
+.magpie-menu-note svg { flex-shrink: 0; }
+.provider-settings .magpie-managed-row .saved-provider { display: flex; align-items: center; gap: 12px; padding: 16px 8px 16px 56px; }
+.magpie-managed-row .saved-provider > span:nth-child(2) { flex: 1; min-width: 0; }
+.magpie-managed-row .saved-provider strong { display: flex; align-items: center; flex-wrap: wrap; gap: 7px; }
+.magpie-managed-badge { display: inline-block; font-size: 10px; font-weight: 400; padding: 2px 6px; color: var(--muted); border: 1px solid var(--line); border-radius: 4px; line-height: 1.4; }
+.magpie-remove { flex-shrink: 0; margin: 0 8px; }
 .provider-account-controls p { font-size: 12px; line-height: 1.7; margin: 0 0 12px; }
 @media (max-width: 760px) {
   .provider-sort-row .saved-provider { gap: 9px; flex-wrap: wrap; }

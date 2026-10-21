@@ -116,6 +116,9 @@ export default function App() {
   const [connectionOrder, setConnectionOrder] = useState<NonNullable<Bootstrap['connectionOrder']>>({});
   const [agentId, setAgentId] = useState(() => localStorage.getItem('supercode.agent') ?? prefs.defaultAgent);
   const agentRef = useRef(agentId); agentRef.current = agentId;
+  const modelChoiceRevision = useRef(0);
+  // Async settings actions retain the render in which they were requested.
+  const requestedModelChoiceRevision = modelChoiceRevision.current;
   const [codexPath, setCodexPath] = useState('');
   const [configuring, updateConfiguring] = useState(false);
   const configuringLock = useRef(false);
@@ -775,12 +778,24 @@ export default function App() {
       await refresh();
     } catch (e) { report(e); } finally { flight.finish(); }
   }
-  async function connectionUpdated(_resetAgent?: string) {
+  const connectionUpdateDraft = draftKey.current;
+  async function connectionUpdated(_resetAgent?: string, preferMagpie = false) {
+    const requestingDraft = connectionUpdateDraft;
     const data = await refresh();
     setConnectionRevision(value => value + 1);
     const defaultFor = (agent: string) => data.profiles.find(p => p.agent === agent && p.current)?.id ?? (data.officialAgents.includes(agent) ? '@official' : '@local');
     const nextDefault = defaultFor(agentId);
-    if (!sessionId && !sending && nextDefault !== connectionId && (!draftConnectionId || draftConnectionId === '@local' || _resetAgent === agentId && providerRequiredAgent === agentId)) {
+    const removedDraft = !!draftConnectionId && !draftConnectionId.startsWith('@') && !data.profiles.some(p => p.agent === agentId && p.id === draftConnectionId);
+    const canPreferMagpie = preferMagpie && agentRef.current === agentId && requestedModelChoiceRevision === modelChoiceRevision.current;
+    if (canPreferMagpie) {
+      try { for (const p of data.profiles) if (p.providerId === 'magpie' && p.source === 'magpie' && p.model) saveModelSelection(p.agent, { connectionId: p.id, model: p.model, effort: '' }); }
+      catch { report('模型偏好暂未保存，请检查可用磁盘空间。'); }
+    }
+    const magpie = canPreferMagpie && !sessionId && !current.current.sessionId && !sending && requestingDraft === draftKey.current ? data.profiles.find(p => p.agent === agentId && p.providerId === 'magpie' && p.source === 'magpie') : undefined;
+    if (magpie?.model) {
+      modelRequest.current++; setDraftConnectionId(magpie.id); setModels([]); setModelCatalogRevision(''); setModelSource(magpie.modelSource); setModel(magpie.model); setEffort(''); setUsage(undefined);
+      rememberModel(magpie.id, magpie.model, '');
+    } else if (agentRef.current === agentId && requestedModelChoiceRevision === modelChoiceRevision.current && !sessionId && !current.current.sessionId && requestingDraft === draftKey.current && !sending && (removedDraft || nextDefault !== connectionId && (!draftConnectionId || draftConnectionId === '@local' || _resetAgent === agentId && providerRequiredAgent === agentId))) {
       setDraftConnectionId(undefined); draftModels.current.delete(draftKey.current);
       modelRequest.current++; setModels([]); setModelCatalogRevision(''); setModelSource(undefined); setModel('');
     }
@@ -794,6 +809,7 @@ export default function App() {
     });
   }
   function rememberModel(connectionId: string, model: string, effort: string) {
+    modelChoiceRevision.current++;
     const selection = { connectionId, model, effort };
     draftModels.current.set(draftKey.current, selection);
     try { saveModelSelection(agentId, selection); } catch { report('模型偏好暂未保存，请检查可用磁盘空间。'); }
@@ -804,7 +820,7 @@ export default function App() {
   }
   async function chooseModel(option: ModelOption) {
     if (busy || configuringLock.current) return;
-    if (option.connectionId === connectionId && option.model === model) { rememberModel(connectionId, model, effort); return; }
+    if (option.connectionId === connectionId && option.model === model) { if (!sessionId) setDraftConnectionId(connectionId); rememberModel(connectionId, model, effort); return; }
     setConfiguring(true);
     setHandoffTarget(option.source.providerName || option.displayName);
     modelRequest.current++;
