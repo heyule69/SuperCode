@@ -41,14 +41,19 @@ impl Configuration {
         let percent = model
             .and_then(|model| crate::model_context::effective_percent(&route.config, model))
             .unwrap_or(95);
-        let mut ids = crate::providers::model_ids(&route.config);
-        ids.extend(
-            route.config["modelMetadata"]
-                .as_object()
-                .into_iter()
-                .flat_map(|metadata| metadata.keys().cloned()),
-        );
-        ids.truncate(200);
+        let mut ids = if route.config["providerId"] == "magpie" {
+            model.or_else(|| route.config["model"].as_str()).map(str::to_owned).into_iter().collect()
+        } else {
+            let mut ids = crate::providers::model_ids(&route.config);
+            ids.extend(
+                route.config["modelMetadata"]
+                    .as_object()
+                    .into_iter()
+                    .flat_map(|metadata| metadata.keys().cloned()),
+            );
+            ids.truncate(200);
+            ids
+        };
         if let Some(model) = model {
             ids.push(model.to_owned());
         }
@@ -238,6 +243,16 @@ mod tests {
             .unwrap()
             .iter()
             .all(|row| row["slug"] != "unknown"));
+    }
+    #[test]
+    fn magpie_large_directory_projects_only_the_selected_model_into_codex() {
+        let models: Vec<_> = (0..5000).map(|i| format!("v/m{i}")).collect();
+        let route = route(json!({"providerId":"magpie","models":models,"model":"v/m0",
+            "modelMetadata":{"v/m4999":{"contextWindow":262144}}}));
+        let selected = Configuration::for_route(&route, Some("v/m4999"));
+        assert_eq!(selected.mapped.len(), 1);
+        assert_eq!(selected.mapped[0].model, "v/m4999");
+        assert_eq!(selected.mapped[0].window, 262144);
     }
     #[test]
     fn known_native_metadata_is_retained_for_api_models_and_never_applied_to_accounts_or_local_routes(

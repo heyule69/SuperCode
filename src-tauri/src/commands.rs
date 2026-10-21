@@ -229,6 +229,18 @@ pub async fn list_models(
     let Some(route) = route else {
         return Ok(json!({"data":[],"source":source}));
     };
+    if let Some(profile) = route.profile.as_ref().filter(|p| p.config["providerId"] == "magpie") {
+        let (mut catalog, metadata) = crate::providers::magpie_catalog(profile).await;
+        if let Some((models, metadata)) = metadata {
+            // Existing guards reject a late response for an active task,
+            // deleted connection or newer settings.
+            if let Err(error) = app.state::<AppState>().store.save_model_catalog(profile, &metadata, Some(&models)) {
+                catalog["warning"] = json!(format!("Magpie 模型已获取，但目录信息未保存：{error}"));
+            }
+        }
+        catalog["source"] = source;
+        return Ok(catalog);
+    }
     if matches!(agent, "opencode" | "pi" | "gemini") {
         let mut catalog = crate::providers::catalog_models(&route.config);
         catalog["source"] = source;

@@ -267,6 +267,14 @@ impl Store {
         expected: &crate::ccswitch::Profile,
         metadata: &Value,
     ) -> Result<bool> {
+        self.save_model_catalog(expected, metadata, None)
+    }
+    pub(crate) fn save_model_catalog(
+        &self,
+        expected: &crate::ccswitch::Profile,
+        metadata: &Value,
+        models: Option<&[String]>,
+    ) -> Result<bool> {
         let conn = self.0.lock().map_err(|e| e.to_string())?;
         // Catalog reads may finish during a turn. Preserve the live runtime's
         // configuration fingerprint and let a later refresh save the metadata.
@@ -292,6 +300,9 @@ impl Store {
             return Ok(false);
         }
         config["modelMetadata"] = metadata.clone();
+        if let Some(models) = models {
+            config["models"] = serde_json::json!(models);
+        }
         let sealed = crate::credentials::seal(&config.to_string())?;
         conn.execute(
             "UPDATE agent_profiles SET config=?1 WHERE id=?2 AND agent=?3",
@@ -1669,15 +1680,22 @@ mod tests {
         assert!(store.save_model_metadata(&original, &metadata).unwrap());
         let mut newer = store.profile("pi", "models").unwrap().unwrap();
         assert_eq!(newer.config["modelMetadata"], metadata);
+        let models = vec!["gateway/new-model".to_owned()];
+        assert!(store.save_model_catalog(&newer, &metadata, Some(&models)).unwrap());
+        newer = store.profile("pi", "models").unwrap().unwrap();
+        assert_eq!(newer.config["models"], serde_json::json!(models));
+        assert_eq!(newer.config["model"], "glm-5.3");
         newer.config["apiKey"] = "new-key".into();
         newer.name = "New name".into();
         store.import_profiles(&[newer.clone()]).unwrap();
         assert!(!store.save_model_metadata(&original, &metadata).unwrap());
+        assert!(!store.save_model_catalog(&original, &metadata, Some(&models)).unwrap());
         let saved = store.profile("pi", "models").unwrap().unwrap();
         assert_eq!(saved.config["apiKey"], "new-key");
         assert_eq!(saved.name, "New name");
         store.delete_profile("models").unwrap();
         assert!(!store.save_model_metadata(&newer, &metadata).unwrap());
+        assert!(!store.save_model_catalog(&newer, &metadata, Some(&models)).unwrap());
         assert!(store.profile("pi", "models").unwrap().is_none());
     }
     fn connection_fixture(id: &str, agent: &str) -> crate::ccswitch::Profile {
@@ -2051,6 +2069,7 @@ mod tests {
         for status in ["starting", "running", "waiting"] {
             store.set_status(&chat.id, status, None).unwrap();
             assert!(!store.save_model_metadata(&profile, &metadata).unwrap());
+            assert!(!store.save_model_catalog(&profile, &metadata, Some(&["gateway/new-model".into()])).unwrap());
             assert_eq!(
                 store.route("codex", Some(&chat.id)).unwrap().fingerprint(),
                 before

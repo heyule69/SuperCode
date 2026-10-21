@@ -5,6 +5,16 @@ import type { Provider } from './types';
 
 const providers = catalog as Provider[];
 
+it('offers the Magpie gateway in every engine with its native protocol and no invented models', () => {
+  for (const [agent, protocol] of [['claude', 'anthropic'], ['codex', 'responses'], ['opencode', 'anthropic'], ['pi', 'anthropic'], ['gemini', 'gemini']]) {
+    const gateway = providersForAgent(providers, agent).find(provider => provider.id === 'magpie')!;
+    expect(gateway.presets[0].protocol).toBe(protocol);
+    expect(gateway.presets.every(preset => preset.models.length === 0)).toBe(true);
+    expect(gateway.presets[0].note).toContain('保持网关运行');
+    expect(gateway.presets[0].baseUrl).toBe(`http://127.0.0.1:3425${protocol === 'responses' ? '/v1' : ''}`);
+  }
+});
+
 it('offers documented Codex Responses vendors without treating chat-only APIs as compatible', () => {
   const codex = providersForAgent(providers, 'codex');
   expect(codex.map(p => p.id)).toEqual(expect.arrayContaining([

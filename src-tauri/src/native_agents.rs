@@ -627,7 +627,7 @@ fn opencode_config(config: &Value, permission: &str) -> Value {
             _ => "@ai-sdk/openai-compatible",
         };
         let native = &config["opencodeProvider"];
-        let models = crate::providers::model_ids(config)
+        let models = runtime_model_ids(config)
             .into_iter()
             .map(|m| {
                 let mut definition = native["models"]
@@ -693,7 +693,7 @@ fn sdk_base(config: &Value) -> String {
 }
 fn wire_model(config: &Value, id: &str) -> String {
     // Native declarations use literal model IDs, including any suffix.
-    if config["opencodeProvider"].is_object() || config["piProvider"].is_object() {
+    if config["providerId"] == "magpie" || config["opencodeProvider"].is_object() || config["piProvider"].is_object() {
         return id.to_owned();
     }
     if config["protocol"] == "anthropic" {
@@ -705,12 +705,33 @@ fn wire_model(config: &Value, id: &str) -> String {
     }
     id.to_owned()
 }
+fn gateway_startup_model(mut config: Value, selected: Option<&str>) -> Value {
+    // A live gateway catalog can expose a model added while a task was active,
+    // when the persistence guard deliberately deferred saving that directory.
+    if config["providerId"] == "magpie" {
+        if let Some(selected) = selected {
+            let metadata = config["modelMetadata"].get(selected).cloned();
+            config["model"] = json!(selected);
+            config["models"] = json!([selected]);
+            config["modelMetadata"] = metadata.map(|metadata| json!({selected:metadata})).unwrap_or_else(|| json!({}));
+        }
+    }
+    config
+}
+fn runtime_model_ids(config: &Value) -> Vec<String> {
+    // SuperCode owns the gateway picker. Avoid copying a large directory into
+    // every native process merely to run one selected model.
+    if config["providerId"] == "magpie" {
+        return crate::providers::real_claude_model(config, None).into_iter().collect();
+    }
+    crate::providers::model_ids(config)
+}
 fn pi_provider_config(config: &Value) -> Option<Value> {
     let base = config["baseUrl"].as_str()?;
     let native = &config["piProvider"];
     let mut provider = native.as_object().cloned().unwrap_or_default();
     let mut seen = std::collections::HashSet::new();
-    let models = crate::providers::model_ids(config)
+    let models = runtime_model_ids(config)
         .into_iter()
         .filter_map(|m| {
             let id = wire_model(config, &m);
@@ -849,6 +870,7 @@ async fn start_for(
         .store
         .route(agent, session.map(|s| s.id.as_str()))?
         .config;
+    config = gateway_startup_model(config, startup_model.or_else(|| session.and_then(|s| s.model.as_deref())));
     if agent == "gemini" {
         config = gemini::startup_model(
             config,
@@ -1823,7 +1845,7 @@ pub async fn summary(
             Path::new(&cwd),
             Some(&fresh),
             "summary",
-            route.config.clone(),
+            gateway_startup_model(route.config.clone(), fresh.model.as_deref()),
             &launch,
             false,
         )
@@ -2973,6 +2995,25 @@ write(v.type?{type:'response',command:method,id:v.id,success:true,data:{session:
             "https://api.example/v1"
         );
         assert_eq!(wire_model(&c, "k3[1M]"), "k3");
+        let gateway = json!({"providerId":"magpie","protocol":"anthropic","baseUrl":"http://127.0.0.1:3425",
+            "model":"fixture/reasoner[1m]","models":["fixture/reasoner[1m]"]});
+        assert_eq!(wire_model(&gateway, "fixture/reasoner[1m]"), "fixture/reasoner[1m]");
+        assert!(opencode_config(&gateway, "ask")["provider"]["supercode"]["models"].get("fixture/reasoner[1m]").is_some());
+        assert_eq!(pi_provider_config(&gateway).unwrap()["models"][0]["id"], "fixture/reasoner[1m]");
+        let selected = gateway_startup_model(gateway, Some("fixture/new-model"));
+        assert!(opencode_config(&selected, "ask")["provider"]["supercode"]["models"].get("fixture/new-model").is_some());
+        assert!(pi_provider_config(&selected).unwrap()["models"].as_array().unwrap().iter().any(|row| row["id"] == "fixture/new-model"));
+        assert_eq!(gateway_startup_model(c.clone(), Some("other")), c);
+        let models: Vec<_> = (0..5000).map(|i| format!("v/m{i}")).collect();
+        let large = gateway_startup_model(json!({"providerId":"magpie","protocol":"responses","baseUrl":"http://127.0.0.1:3425/v1",
+            "model":"v/m0","models":models}), Some("v/m4999"));
+        assert_eq!(large["models"].as_array().unwrap().len(), 1);
+        let open = opencode_config(&large, "ask");
+        assert_eq!(open["provider"]["supercode"]["models"].as_object().unwrap().len(), 1);
+        assert!(open["provider"]["supercode"]["models"].get("v/m4999").is_some());
+        let pi = pi_provider_config(&large).unwrap();
+        assert_eq!(pi["models"].as_array().unwrap().len(), 1);
+        assert_eq!(pi["models"][0]["id"], "v/m4999");
         assert_eq!(
             wire_model(&json!({"protocol":"chat"}), "literal[1M]"),
             "literal[1M]"

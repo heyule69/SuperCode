@@ -57,3 +57,7 @@
 .model-popover .model-context-note > button { font-size:calc(var(--ui-size) - 2px); }
 .model-popover .model-switch-note { position:absolute; right:0; bottom:calc(100% + 7px); z-index:2; width:min(228px,calc(100vw - 60px)); padding:12px; margin:0; background:var(--surface); border:1px solid var(--line); border-radius:10px; box-shadow:0 6px 20px #0003; color:var(--muted); font-size:calc(var(--ui-size) - 1px); line-height:1.6; }
 @media (max-width:540px) { .model-popover .model-provider-filters { padding-inline:12px; }.model-popover .model-group-heading > small { max-width:38%; }.model-popover .model-menu-heading { padding-inline:13px; } }
+.model-pagination { display:flex; align-items:center; justify-content:space-between; gap:8px; padding:6px; font-size:11px; color:var(--muted); flex:none; }
+.model-pagination button { border:1px solid var(--line); border-radius:5px; background:transparent; color:var(--text); padding:4px 7px; cursor:pointer; font:inherit; }
+.model-pagination button:disabled { opacity:.4; cursor:default; }
+.model-pagination span { font-variant-numeric:tabular-nums; }

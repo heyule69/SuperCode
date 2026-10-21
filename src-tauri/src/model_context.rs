@@ -1,4 +1,4 @@
-//! Model-specific capacity metadata; runtime usage remains authoritative.
+//! Bounded model catalog metadata; runtime usage remains authoritative for capacity.
 use serde_json::{json, Value};
 
 fn catalog() -> &'static Value {
@@ -36,6 +36,38 @@ pub fn metadata(row: &Value) -> Value {
     }
     if let Some(percent) = percent {
         result["effectiveContextWindowPercent"] = json!(percent);
+    }
+    if let Some(name) = ["displayName", "display_name", "name"].iter()
+        .find_map(|key| row[*key].as_str().filter(|name| {
+            !name.trim().is_empty() && name.len() <= 200 && !name.chars().any(char::is_control)
+        }))
+    {
+        result["displayName"] = json!(name);
+    }
+    let valid_effort = |value: &str| matches!(value, "none" | "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra");
+    let levels = ["supportedReasoningEfforts", "supported_reasoning_levels", "reasoning_levels"]
+        .iter().find_map(|key| row[*key].as_array());
+    if let Some(levels) = levels {
+        let mut efforts = Vec::new();
+        for level in levels.iter().take(16) {
+            if let Some(effort) = level["reasoningEffort"].as_str()
+                .or_else(|| level["effort"].as_str()).or_else(|| level.as_str())
+                .filter(|effort| valid_effort(effort))
+            {
+                let value = json!({"reasoningEffort":effort});
+                if !efforts.contains(&value) { efforts.push(value); }
+            }
+        }
+        result["supportedReasoningEfforts"] = json!(efforts);
+    } else if row["reasoning"] == false {
+        result["supportedReasoningEfforts"] = json!([]);
+    }
+    if let Some(effort) = ["defaultReasoningEffort", "default_reasoning_level", "default_reasoning_effort"]
+        .iter().find_map(|key| row[*key].as_str()).filter(|effort| valid_effort(effort))
+        .filter(|effort| row["reasoning"] != false && (levels.is_none() || result["supportedReasoningEfforts"].as_array()
+            .is_some_and(|values| values.iter().any(|value| value["reasoningEffort"] == *effort))))
+    {
+        result["defaultReasoningEffort"] = json!(effort);
     }
     result
 }
@@ -320,7 +352,7 @@ pub fn configure_claude(
 }
 
 pub fn catalog_row(config: &Value, model: &str) -> Value {
-    let mut row = json!({});
+    let mut row = metadata(&config["modelMetadata"][model]);
     if let Some(capacity) = for_model(config, model) {
         row["contextWindow"] = json!(capacity);
     }
@@ -331,8 +363,11 @@ pub fn catalog_row(config: &Value, model: &str) -> Value {
 }
 
 pub fn api_catalog(value: &Value) -> Value {
+    api_catalog_with_limit(value, 200)
+}
+pub(crate) fn api_catalog_with_limit(value: &Value, limit: usize) -> Value {
     let mut result = json!({});
-    for row in value["data"].as_array().into_iter().flatten().take(200) {
+    for row in value["data"].as_array().into_iter().flatten().take(limit) {
         if let Some(id) = row["id"]
             .as_str()
             .filter(|id| !id.is_empty() && id.len() <= 200 && !id.chars().any(char::is_control))
@@ -349,6 +384,23 @@ pub fn api_catalog(value: &Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn gateway_metadata_keeps_names_efforts_and_limits_without_private_fields() {
+        let row = json!({"id":"fixture/test-reasoner","display_name":"Magpie 测试模型","context_length":262144,
+            "reasoning":true,"supported_reasoning_levels":[{"effort":"low"},{"effort":"high"},{"effort":"high"},{"effort":"invalid"}],
+            "default_reasoning_level":"high","apiKey":"must-not-survive","headers":{"Authorization":"private"}});
+        let safe = api_catalog(&json!({"data":[row]}));
+        let saved = json!({"modelMetadata":safe});
+        let restored = catalog_row(&saved, "fixture/test-reasoner");
+        assert_eq!(restored, json!({"displayName":"Magpie 测试模型","contextWindow":262144,
+            "supportedReasoningEfforts":[{"reasoningEffort":"low"},{"reasoningEffort":"high"}],"defaultReasoningEffort":"high"}));
+        assert!(!safe.to_string().contains("private"));
+        assert!(!safe.to_string().contains("must-not-survive"));
+        assert_eq!(metadata(&json!({"reasoning_levels":["medium","high"],"default_reasoning_level":"low"})),
+            json!({"supportedReasoningEfforts":[{"reasoningEffort":"medium"},{"reasoningEffort":"high"}]}));
+        assert_eq!(metadata(&json!({"display_name":"bad\nname","reasoning":false,"default_reasoning_level":"high"})),
+            json!({"supportedReasoningEfforts":[]}));
+    }
     #[test]
     fn distinct_windows_and_explicit_kimi_variants_are_not_one_global_limit() {
         assert_eq!(published("glm-5.3-flash"), Some(1_000_000));

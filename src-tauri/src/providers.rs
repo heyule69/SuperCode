@@ -4,6 +4,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter, Manager};
 
+pub(crate) const MAGPIE_MODEL_LIMIT: usize = 10_000;
+const MAGPIE_CATALOG_BYTES: usize = 8 * 1024 * 1024;
+
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Settings {
@@ -337,8 +340,9 @@ pub fn real_claude_model(config: &Value, requested: Option<&str>) -> Option<Stri
 
 pub fn model_ids(config: &Value) -> Vec<String> {
     let mut models = Vec::new();
+    let mut seen = std::collections::HashSet::new();
     let mut add = |s: &str| {
-        if !s.is_empty() && !models.iter().any(|m| m == s) {
+        if !s.is_empty() && seen.insert(s.to_owned()) {
             models.push(s.to_owned());
         }
     };
@@ -368,7 +372,8 @@ pub fn catalog_models(config: &Value) -> Value {
     let default = real_claude_model(config, None);
     json!({"data":model_ids(config).into_iter().map(|id| {
         let mut row = crate::model_context::catalog_row(config, &id);
-        row.as_object_mut().unwrap().extend(json!({"id":id,"model":id,"displayName":id,"isDefault":Some(id.as_str())==default.as_deref()}).as_object().unwrap().clone());
+        if row["displayName"].is_null() { row["displayName"] = json!(id); }
+        row.as_object_mut().unwrap().extend(json!({"id":id,"model":id,"isDefault":Some(id.as_str())==default.as_deref()}).as_object().unwrap().clone());
         row
     }).collect::<Vec<_>>()})
 }
@@ -420,6 +425,9 @@ pub fn key(config: &Value) -> Option<&str> {
         .filter(|s| !s.is_empty())
 }
 pub async fn read_json(response: reqwest::Response) -> Result<Value, String> {
+    read_json_bounded(response, 2 * 1024 * 1024).await
+}
+async fn read_json_bounded(response: reqwest::Response, limit: usize) -> Result<Value, String> {
     use futures_util::StreamExt;
     let status = response.status();
     if !status.is_success() {
@@ -429,8 +437,8 @@ pub async fn read_json(response: reqwest::Response) -> Result<Value, String> {
     let mut bytes = Vec::new();
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|_| "读取 API 响应失败")?;
-        if bytes.len() + chunk.len() > 2 * 1024 * 1024 {
-            return Err("API 响应超过 2 MiB".into());
+        if bytes.len() + chunk.len() > limit {
+            return Err(format!("API 响应超过 {} MiB", limit / (1024 * 1024)));
         }
         bytes.extend_from_slice(&chunk);
     }
@@ -609,23 +617,29 @@ fn make_profile(mut s: Settings, previous: Option<&Profile>) -> Result<Profile, 
         .as_deref()
         .filter(|v| !v.trim().is_empty())
         .or_else(|| previous.and_then(|p| key(&p.config)))
+        .or_else(|| local_magpie_key(&s))
         .unwrap_or("")
         .trim();
     if secret.len() > 8192 || secret.chars().any(char::is_control) {
         return Err("API Key 格式无效".into());
     }
     let mut models = vec![s.model.clone()];
-    if s.models.len() > 200 {
-        return Err("单个连接最多保存 200 个模型".into());
+    let model_limit = if s.provider_id == "magpie" { MAGPIE_MODEL_LIMIT } else { 200 };
+    if s.models.len() > model_limit {
+        return Err(format!("单个连接最多保存 {model_limit} 个模型"));
     }
+    let mut seen = std::collections::HashSet::from([s.model.clone()]);
     for m in s.models {
         let m = m.trim();
         if m.len() > 200 || m.chars().any(char::is_control) {
             return Err("模型 ID 格式无效".into());
         }
-        if !m.is_empty() && !models.iter().any(|v| v == m) {
+        if !m.is_empty() && seen.insert(m.to_owned()) {
             models.push(m.to_owned());
         }
+    }
+    if s.provider_id == "magpie" && models.len() > model_limit {
+        return Err(format!("单个连接最多保存 {model_limit} 个模型"));
     }
     if let Some(previous) = previous.filter(|p| p.is_official()) {
         if !secret.is_empty() {
@@ -814,6 +828,16 @@ pub async fn delete_provider_profiles(
     Ok(())
 }
 
+// Magpie accepts a public placeholder on loopback. Native CLIs still need a
+// nonempty key to choose API authentication instead of their own sign-in.
+fn local_magpie_key(s: &Settings) -> Option<&'static str> {
+    (s.provider_id == "magpie"
+        && reqwest::Url::parse(&s.base_url).ok().is_some_and(|url| {
+            matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"))
+        }))
+    .then_some("magpie")
+}
+
 fn listing_secret<'a>(
     s: &'a Settings,
     previous: Option<&'a Profile>,
@@ -827,6 +851,7 @@ fn listing_secret<'a>(
         .as_deref()
         .filter(|key| !key.trim().is_empty())
         .or_else(|| previous.and_then(|profile| key(&profile.config)))
+        .or_else(|| local_magpie_key(s))
         .map(str::trim);
     if secret.is_some_and(|secret| secret.len() > 8192 || secret.chars().any(char::is_control)) {
         return Err("API Key 格式无效".into());
@@ -895,6 +920,15 @@ fn protocol_headers(
 
 fn model_listing_endpoint(s: &Settings) -> Result<(String, &str), String> {
     let base = api_base(&s.base_url, &s.protocol)?;
+    if s.provider_id == "magpie" {
+        // The OpenAI-shaped catalog also carries names, reasoning levels and
+        // context limits; Magpie's Gemini list omits those capabilities.
+        let root = ["/v1beta", "/v1alpha", "/v1"]
+            .into_iter()
+            .find_map(|suffix| base.strip_suffix(suffix))
+            .unwrap_or(&base);
+        return Ok((format!("{root}/v1/models"), "chat"));
+    }
     let mut parsed = reqwest::Url::parse(&base).map_err(|_| "API 地址无效")?;
     // DeepSeek's Anthropic prefix serves Messages, while its model catalog is
     // the same-origin OpenAI-compatible /models endpoint with Bearer auth.
@@ -918,30 +952,33 @@ fn model_listing_endpoint(s: &Settings) -> Result<(String, &str), String> {
 
 async fn fetch_models(s: &Settings, secret: Option<&str>) -> Result<(Vec<String>, Value), String> {
     let (url, listing_protocol) = model_listing_endpoint(s)?;
-    let client = client()?;
+    let client = if s.provider_id == "magpie" {
+        client_builder().timeout(std::time::Duration::from_secs(10)).build()
+            .map_err(|_| "无法初始化 Magpie 连接")?
+    } else { client()? };
     let mut models = std::collections::BTreeSet::new();
     let mut metadata = json!({});
     let mut page_token: Option<String> = None;
     let mut tokens = std::collections::HashSet::new();
-    // The editor stores at most 200 models. Bound both response size (read_json)
-    // and page count so a broken gateway cannot keep the preview alive forever.
+    let model_limit = if s.provider_id == "magpie" { MAGPIE_MODEL_LIMIT } else { 200 };
+    // Keep the full gateway directory within explicit byte/count bounds. A
+    // larger gateway fails visibly instead of silently losing its later models.
     for _ in 0..4 {
         let mut request = client.get(&url);
-        if s.protocol == "gemini" {
+        if listing_protocol == "gemini" {
             request = request.query(&[("pageSize", "200")]);
             if let Some(token) = &page_token {
                 request = request.query(&[("pageToken", token)]);
             }
         }
-        let value = provider_json(
-            protocol_headers(request, listing_protocol, secret)
+        let response = protocol_headers(request, listing_protocol, secret)
                 .send()
                 .await
-                .map_err(|_| "连接失败或超时，可手动填写模型 ID")?,
-            secret,
-        )
-        .await?;
-        let rows = if s.protocol == "gemini" {
+                .map_err(|_| "连接失败或超时，可手动填写模型 ID")?;
+        let value = if s.provider_id == "magpie" && response.status().is_success() {
+            read_json_bounded(response, MAGPIE_CATALOG_BYTES).await?
+        } else { provider_json(response, secret).await? };
+        let rows = if listing_protocol == "gemini" {
             value["models"]
                 .as_array()
                 .or_else(|| value["data"].as_array())
@@ -953,7 +990,7 @@ async fn fetch_models(s: &Settings, secret: Option<&str>) -> Result<(Vec<String>
             if !row.is_object() {
                 continue;
             }
-            if s.protocol == "gemini"
+            if listing_protocol == "gemini"
                 && row["supportedGenerationMethods"]
                     .as_array()
                     .is_some_and(|methods| {
@@ -965,7 +1002,7 @@ async fn fetch_models(s: &Settings, secret: Option<&str>) -> Result<(Vec<String>
             let raw = row["id"].as_str().or_else(|| row["name"].as_str());
             let Some(id) = raw
                 .map(|id| {
-                    if s.protocol == "gemini" {
+                    if listing_protocol == "gemini" {
                         id.strip_prefix("models/").unwrap_or(id)
                     } else {
                         id
@@ -977,7 +1014,10 @@ async fn fetch_models(s: &Settings, secret: Option<&str>) -> Result<(Vec<String>
             else {
                 continue;
             };
-            if models.len() >= 200 && !models.contains(id) {
+            if models.len() >= model_limit && !models.contains(id) {
+                if s.provider_id == "magpie" {
+                    return Err(format!("Magpie 目录超过 {model_limit} 个模型，未截取部分目录，请在 Magpie 中限制可见模型"));
+                }
                 continue;
             }
             models.insert(id.to_owned());
@@ -985,12 +1025,18 @@ async fn fetch_models(s: &Settings, secret: Option<&str>) -> Result<(Vec<String>
             normalized_row["id"] = json!(id);
             normalized.push(normalized_row);
         }
-        let safe = crate::model_context::api_catalog(&json!({"data": normalized}));
-        metadata
-            .as_object_mut()
-            .unwrap()
-            .extend(safe.as_object().unwrap().clone());
-        if s.protocol != "gemini" || models.len() >= 200 {
+        let normalized = json!({"data": normalized});
+        let safe = if s.provider_id == "magpie" {
+            crate::model_context::api_catalog_with_limit(&normalized, model_limit)
+        } else { crate::model_context::api_catalog(&normalized) };
+        // A later page can repeat a model with fewer fields. Keep previously
+        // discovered capabilities instead of replacing the whole entry.
+        for (id, fields) in safe.as_object().unwrap() {
+            let mut saved = metadata[id].as_object().cloned().unwrap_or_default();
+            saved.extend(fields.as_object().unwrap().clone());
+            metadata[id] = json!(saved);
+        }
+        if listing_protocol != "gemini" || models.len() >= model_limit {
             break;
         }
         let Some(token) = value["nextPageToken"]
@@ -1011,6 +1057,33 @@ async fn fetch_models(s: &Settings, secret: Option<&str>) -> Result<(Vec<String>
         return Err("供应商没有返回模型列表，请手动添加模型 ID".into());
     }
     Ok((models.into_iter().collect(), metadata))
+}
+
+/// Read the external gateway only when the model picker requests its catalog.
+/// No Magpie process, account configuration or upstream secret is managed here.
+pub(crate) async fn magpie_catalog(profile: &Profile) -> (Value, Option<(Vec<String>, Value)>) {
+    let mut catalog = catalog_models(&profile.config);
+    let settings = settings(profile);
+    match fetch_models(&settings, key(&profile.config).or_else(|| local_magpie_key(&settings))).await {
+        Ok((models, metadata)) => {
+            let mut config = profile.config.clone();
+            config["models"] = json!(models);
+            config["modelMetadata"] = metadata.clone();
+            catalog = catalog_models(&config);
+            if let Some(rows) = catalog["data"].as_array_mut() {
+                let visible: std::collections::HashSet<_> = models.iter().map(String::as_str).collect();
+                rows.retain(|row| row["model"].as_str().is_some_and(|id| visible.contains(id)));
+            }
+            if real_claude_model(&profile.config, None).is_some_and(|selected| !models.contains(&selected)) {
+                catalog["warning"] = json!("上次使用的模型已不在 Magpie 当前目录中，请重新选择模型。");
+            }
+            return (catalog, Some((models, metadata)));
+        }
+        Err(error) => {
+            catalog["warning"] = json!(format!("无法获取 Magpie 模型，请确认网关已运行且地址与网关 Key 正确。当前保留已保存的模型。{error}"));
+        }
+    }
+    (catalog, None)
 }
 #[tauri::command]
 pub async fn fetch_provider_models(id: String, app: AppHandle) -> Result<Vec<String>, String> {
@@ -1317,6 +1390,120 @@ mod tests {
     }
     fn draft_settings(agent: &str, protocol: &str, base: &str) -> Settings {
         serde_json::from_value(json!({"name":"","agent":agent,"providerId":"custom","plan":"standard","protocol":protocol,"baseUrl":base,"model":"","models":[]})).unwrap()
+    }
+    #[tokio::test]
+    async fn magpie_large_directory_keeps_models_and_metadata_beyond_old_limits() {
+        let rows: Vec<_> = (0..5000).map(|i| json!({"id":format!("vendor/model-{i:05}"),"display_name":format!("模型 {i}"),
+            "context_length":262144,"supported_reasoning_levels":[{"effort":"high"}],"unused": "x".repeat(400)})).collect();
+        let response = json!({"data":rows});
+        assert!(response.to_string().len() > 2 * 1024 * 1024);
+        let (base, peer) = model_peer(vec![response]).await;
+        let mut settings = draft_settings("pi", "responses", &format!("{base}/v1"));
+        settings.provider_id = "magpie".into();
+        settings.name = "Magpie".into();
+        let (models, metadata) = fetch_models(&settings, listing_secret(&settings, None).unwrap()).await.unwrap();
+        assert_eq!(models.len(), 5000);
+        assert_eq!(metadata.as_object().unwrap().len(), 5000);
+        settings.model = "vendor/model-04999".into();
+        settings.models = models;
+        let mut profile = make_profile(settings, None).unwrap();
+        merge_preview_metadata(&mut profile, &metadata);
+        let catalog = catalog_models(&profile.config);
+        assert_eq!(catalog["data"].as_array().unwrap().len(), 5000);
+        let last = catalog["data"].as_array().unwrap().iter().find(|row| row["model"] == "vendor/model-04999").unwrap();
+        assert_eq!(last["displayName"], "模型 4999");
+        assert_eq!(last["supportedReasoningEfforts"][0]["reasoningEffort"], "high");
+        assert!(metadata["vendor/model-04999"].get("unused").is_none());
+        peer.await.unwrap();
+    }
+    #[tokio::test]
+    async fn magpie_oversized_directory_fails_instead_of_silently_returning_a_partial_list() {
+        let rows: Vec<_> = (0..=MAGPIE_MODEL_LIMIT).map(|i| json!({"id":format!("v/m{i}")})).collect();
+        let (base, peer) = model_peer(vec![json!({"data":rows})]).await;
+        let mut settings = draft_settings("pi", "responses", &format!("{base}/v1"));
+        settings.provider_id = "magpie".into();
+        assert!(fetch_models(&settings, Some("magpie")).await.unwrap_err().contains("未截取部分目录"));
+        peer.await.unwrap();
+    }
+    #[tokio::test]
+    async fn magpie_models_use_enriched_catalog_and_keep_literal_ids_for_every_engine() {
+        for (agent, protocol, suffix) in [("claude","anthropic",""),("codex","responses","/v1"),
+            ("opencode","chat","/v1"),("pi","anthropic","/v1"),("gemini","gemini","/v1beta")] {
+            let response = json!({"data":[{"id":"fixture/test-reasoner","display_name":"Magpie 测试模型",
+                "context_length":262144,"reasoning":true,"supported_reasoning_levels":[{"effort":"low"},{"effort":"high"}]},
+                {"id":"models/literal[1m]","reasoning":false}]});
+            let (base, peer) = model_peer(vec![response.clone(),response]).await;
+            let mut settings = draft_settings(agent, protocol, &format!("{base}{suffix}"));
+            settings.provider_id = "magpie".into();
+            settings.name = "Magpie".into();
+            let secret = listing_secret(&settings, None).unwrap();
+            assert_eq!(secret, Some("magpie"));
+            let (models, metadata) = fetch_models(&settings, secret).await.unwrap();
+            assert_eq!(models, ["fixture/test-reasoner","models/literal[1m]"]);
+            settings.model = models[0].clone();
+            settings.models = models;
+            let mut profile = make_profile(settings, None).unwrap();
+            merge_preview_metadata(&mut profile, &metadata);
+            assert_eq!(key(&profile.config), Some("magpie"));
+            let (catalog, live_metadata) = magpie_catalog(&profile).await;
+            assert_eq!(live_metadata.as_ref().map(|(_, metadata)| metadata), Some(&metadata));
+            assert_eq!(catalog["data"][0]["model"], "fixture/test-reasoner");
+            assert_eq!(catalog["data"][0]["displayName"], "Magpie 测试模型");
+            assert_eq!(catalog["data"][0]["contextWindow"], 262144);
+            assert_eq!(catalog["data"][0]["supportedReasoningEfforts"], json!([{"reasoningEffort":"low"},{"reasoningEffort":"high"}]));
+            let requests = peer.await.unwrap();
+            assert!(requests.iter().all(|request| request.starts_with("GET /v1/models HTTP/1.1")
+                && request.to_ascii_lowercase().contains("authorization: bearer magpie")));
+        }
+    }
+    #[test]
+    fn magpie_placeholder_is_loopback_only_and_never_replaces_a_gateway_key() {
+        for base in ["https://gateway.example/v1", "https://127.0.0.1.attacker.example/v1"] {
+            let mut settings = draft_settings("codex", "responses", base);
+            settings.provider_id = "magpie".into();
+            assert_eq!(listing_secret(&settings, None).unwrap(), None);
+            settings.api_key = Some("gateway-key".into());
+            assert_eq!(listing_secret(&settings, None).unwrap(), Some("gateway-key"));
+        }
+        let mut settings = draft_settings("codex", "responses", "http://127.0.0.1:3425/v1");
+        assert_eq!(listing_secret(&settings, None).unwrap(), None);
+        settings.provider_id = "magpie".into();
+        settings.api_key = Some("my-gateway-key".into());
+        assert_eq!(listing_secret(&settings, None).unwrap(), Some("my-gateway-key"));
+    }
+    #[tokio::test]
+    async fn magpie_refresh_lists_new_models_without_reselecting_a_removed_default() {
+        let (base, peer) = model_peer(vec![json!({"data":[{"id":"fixture/new-model","display_name":"新模型"}]})]).await;
+        let mut settings = draft_settings("pi", "responses", &format!("{base}/v1"));
+        settings.provider_id = "magpie".into();
+        settings.name = "Magpie".into();
+        settings.model = "fixture/old-model".into();
+        let profile = make_profile(settings, None).unwrap();
+        let (catalog, refreshed) = magpie_catalog(&profile).await;
+        assert_eq!(catalog["data"].as_array().unwrap().len(), 1);
+        assert_eq!(catalog["data"][0]["model"], "fixture/new-model");
+        assert_eq!(catalog["data"][0]["isDefault"], false);
+        assert!(catalog["warning"].as_str().unwrap().contains("重新选择"));
+        assert_eq!(profile.config["model"], "fixture/old-model");
+        assert_eq!(refreshed.unwrap().0, ["fixture/new-model"]);
+        peer.await.unwrap();
+    }
+    #[tokio::test]
+    async fn magpie_offline_retains_saved_models_and_reports_reconnect_hint() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+        let mut settings = draft_settings("claude", "anthropic", &base);
+        settings.provider_id = "magpie".into();
+        settings.model = "fixture/saved".into();
+        settings.name = "Magpie".into();
+        let profile = make_profile(settings, None).unwrap();
+        let original = profile.config.clone();
+        let (catalog, metadata) = magpie_catalog(&profile).await;
+        assert_eq!(catalog["data"][0]["model"], "fixture/saved");
+        assert!(catalog["warning"].as_str().unwrap().contains("网关已运行"));
+        assert!(metadata.is_none());
+        assert_eq!(profile.config, original);
     }
     #[test]
     fn deepseek_anthropic_models_use_official_catalog_and_bearer_auth() {

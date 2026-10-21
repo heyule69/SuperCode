@@ -1,4 +1,4 @@
-import { lazy, Suspense, useEffect, useRef, useState, type PointerEvent, type SelectHTMLAttributes } from 'react';
+import { lazy, Suspense, useEffect, useMemo, useRef, useState, type PointerEvent, type SelectHTMLAttributes } from 'react';
 import { ArrowLeft, ArrowUp, ArrowDown, Check, ChevronDown, ChevronRight, Download, ExternalLink, GripVertical, LoaderCircle, Plus, RefreshCw, Search, Trash2, X } from 'lucide-react';
 import catalog from '../resources/providers.json';
 import { CredentialInput } from './CredentialInput';
@@ -8,6 +8,7 @@ import type { AgentProfile, Provider, ProviderSettings as Config } from './types
 import { connectionIds, mergeVisibleOrder, moveConnection, nativeConnectionSource, providerAgents, visibleProviderIds, type ConnectionOrder } from './providerOrder';
 import { agentProtocols, officialProvider, protocolLabels, providersForAgent } from './providerCapabilities';
 import OfficialAccounts from './OfficialAccounts';
+import { ModelPagination, pageModels } from './ModelPagination';
 const providers = catalog as Provider[];
 const CCSwitchSettings = lazy(() => import('./CCSwitchSettings'));
 const blank: Config = { id: null, name: '', agent: 'claude', providerId: 'custom', plan: 'anthropic', protocol: 'anthropic', baseUrl: '', model: '', models: [], hasCredential: false };
@@ -30,6 +31,7 @@ export default function ProviderSettings({ profiles, officialAgents, order, runn
   const [config, setConfig] = useState<Config | null>(null);
   const [search, setSearch] = useState('');
   const [modelSearch, setModelSearch] = useState('');
+  const [modelPageIndex, setModelPageIndex] = useState(0);
   const [connectionSearch, setConnectionSearch] = useState('');
   const [newModel, setNewModel] = useState('');
   const [working, setWorking] = useState(false);
@@ -60,6 +62,8 @@ export default function ProviderSettings({ profiles, officialAgents, order, runn
     } finally { setAccountsChecking(false); }
   }
   const connectionBusy = !!config?.id && !!runningConnections[config.agent]?.includes(config.id);
+  const filteredModels = useMemo(() => config?.models.filter(model => model.toLowerCase().includes(modelSearch.toLowerCase())) ?? [], [config?.models, modelSearch]);
+  const modelPage = pageModels(filteredModels, modelPageIndex);
   const active = config ? profiles.find(p => p.id === config.id)?.current : false;
   const provider = providersForAgent(providers, config?.agent ?? agentTab).find(p => p.id === config?.providerId);
   const selectedPreset = provider?.presets.find(p => p.id === config?.plan);
@@ -141,7 +145,18 @@ export default function ProviderSettings({ profiles, officialAgents, order, runn
   function choose(p: Provider, presetId = p.presets[0].id) {
     const preset = p.presets.find(p => p.id === presetId)!;
     setConfig({ ...blank, providerId: p.id, plan: preset.id, name: p.id === 'custom' ? '自定义连接' : `${p.name} · ${preset.name}`, protocol: preset.protocol, agent: agentTab, baseUrl: preset.baseUrl, model: preset.models[0] ?? '', models: preset.models });
-    setAdding(false); setNativeId(null); setModelSearch(''); setNewModel(''); setDeleteIds([]); setError(''); setMessage('');
+    setAdding(false); setNativeId(null); setModelSearch(''); setModelPageIndex(0); setNewModel(''); setDeleteIds([]); setError(''); setMessage('');
+  }
+  async function fetchModels() {
+    if (!config) return;
+    const models = await call<string[]>('fetch_provider_models_for_settings', { settings: { ...config, apiKey: config.apiKey?.trim() || null } });
+    setConfig(current => {
+      if (!current) return null;
+      const ids = [...new Set([...(current.model.trim() ? [current.model] : []), ...models])];
+      return { ...current, model: current.model.trim() || models[0] || '', models: current.providerId === 'magpie' ? ids : ids.slice(0, 200) };
+    });
+    setModelPageIndex(0);
+    setMessage(`已获取 ${models.length} 个模型，保存后生效`);
   }
   async function save(activate = false) {
     if (!config) return;
@@ -194,10 +209,11 @@ export default function ProviderSettings({ profiles, officialAgents, order, runn
       </div><div className="provider-model-manager">
         <div className="settings-section-heading"><h3>模型</h3><span className="model-count">{config.models.length} 个</span></div>
         <label htmlFor="provider-default-model">默认模型 ID</label><input id="provider-default-model" className="code-input" value={config.model} disabled={working || connectionBusy} onChange={e => setConfig({ ...config, model: e.target.value })} placeholder="模型 ID" spellCheck={false} autoComplete="off" />
-        {config.models.length ? <div className="search-field model-search"><Search size={15} /><input aria-label="搜索已添加模型" placeholder="搜索模型" value={modelSearch} onChange={e => setModelSearch(e.target.value)} /></div> : null}
-        <div className={`provider-model-list ${!config.models.length ? 'is-empty' : ''}`}>{config.models.filter(m => m.toLowerCase().includes(modelSearch.toLowerCase())).map(m => <div className="provider-model-row" key={m}><button disabled={working || connectionBusy} aria-pressed={config.model === m} aria-label={`默认模型 ${m}`} onClick={() => setConfig({ ...config, model: m })}><span className={`model-radio ${config.model === m ? 'selected' : ''}`} /><span title={m}>{m}</span>{config.model === m ? <small>默认</small> : null}</button><button className="icon-button" title={`移除模型 ${m}`} disabled={working || connectionBusy || m === config.model} onClick={() => setConfig({ ...config, models: config.models.filter(v => v !== m) })}><X size={14} /></button></div>)}{!config.models.length ? <p className="muted">暂无模型</p> : !config.models.some(m => m.toLowerCase().includes(modelSearch.toLowerCase())) ? <p className="muted">没有匹配的模型</p> : null}</div>
+        {config.models.length ? <div className="search-field model-search"><Search size={15} /><input aria-label="搜索已添加模型" placeholder="搜索模型" value={modelSearch} onChange={e => { setModelSearch(e.target.value); setModelPageIndex(0); }} /></div> : null}
+        <div className={`provider-model-list ${!config.models.length ? 'is-empty' : ''}`}>{modelPage.items.map(m => <div className="provider-model-row" key={m}><button disabled={working || connectionBusy} aria-pressed={config.model === m} aria-label={`默认模型 ${m}`} onClick={() => setConfig({ ...config, model: m })}><span className={`model-radio ${config.model === m ? 'selected' : ''}`} /><span title={m}>{m}</span>{config.model === m ? <small>默认</small> : null}</button><button className="icon-button" title={`移除模型 ${m}`} disabled={working || connectionBusy || m === config.model} onClick={() => setConfig({ ...config, models: config.models.filter(v => v !== m) })}><X size={14} /></button></div>)}{!config.models.length ? <p className="muted">暂无模型</p> : !filteredModels.length ? <p className="muted">没有匹配的模型</p> : null}</div>
+        <ModelPagination count={filteredModels.length} page={modelPage.page} change={setModelPageIndex} label="已添加模型" disabled={working}/>
         <form className="add-model-row" onSubmit={e => { e.preventDefault(); if (working || connectionBusy) return; const m = newModel.trim(); if (m && !config.models.includes(m)) setConfig({ ...config, models: [...config.models, m], model: config.model || m }); setNewModel(''); }}><input aria-label="新增模型 ID" className="code-input" value={newModel} onChange={e => setNewModel(e.target.value)} placeholder="添加模型 ID" spellCheck={false} autoComplete="off" disabled={working || connectionBusy} /><button className="quiet-button" disabled={!newModel.trim() || working || connectionBusy}><Plus size={15} />添加</button></form>
-        <button className="quiet-button" disabled={!desktop || working || connectionBusy || (!config.official && !config.baseUrl.trim())} title="使用当前地址、协议和密钥获取模型，无需先保存或填写模型 ID" onClick={() => void run(async () => { const models = await call<string[]>('fetch_provider_models_for_settings', { settings: { ...config, apiKey: config.apiKey?.trim() || null } }); setConfig(c => c ? { ...c, model: c.model.trim() || models[0] || '', models: [...new Set([...(c.model.trim() ? [c.model] : []), ...models])].slice(0, 200) } : null); setMessage(`已获取 ${models.length} 个模型，保存后生效`); })}><RefreshCw size={14} />获取模型</button>
+        <button className="quiet-button" disabled={!desktop || working || connectionBusy || (!config.official && !config.baseUrl.trim())} title="使用当前地址、协议和密钥获取模型，无需先保存或填写模型 ID" onClick={() => void run(fetchModels)}><RefreshCw size={14} />获取模型</button>
       </div></div>
       <div className="provider-editor-footer">
       {config.id && !config.official ? <div className="provider-delete">{deleteId === config.id ? <><span>删除“{config.name}”及已保存的 API Key？聊天记录保留。</span><button className="quiet-button" disabled={working} onClick={() => setDeleteId('')}>取消</button><button className="danger-button" disabled={!desktop || working || connectionBusy} onClick={() => void run(async () => { await deleteConnections([config.id!]); })}>删除</button></> : <button className="quiet-button" disabled={!desktop || working || connectionBusy} onClick={() => setDeleteId(config.id!)}><Trash2 size={14} />删除</button>}</div> : <span />}

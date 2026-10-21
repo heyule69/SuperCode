@@ -15,6 +15,7 @@
 
 | 平台 | 本地文件 | 官方页面 | 页面声明的资源 |
 | --- | --- | --- | --- |
+| magpie | `magpie.png` | https://github.com/yetone/magpie | https://raw.githubusercontent.com/yetone/magpie/main/site/public/img/icon-256.png |
 | kimi | `kimi.png` | https://www.kimi.com/ | https://www.kimi.com/favicon.ico |
 | glm | `glm.png` | https://bigmodel.cn/ | https://bigmodel.cn/static/images/favicon.png |
 | minimax | `minimax.png` | https://www.minimax.io/ | https://www.minimax.io/favicon.ico |
