@@ -585,8 +585,9 @@ pub async fn open_chat_window(
     }
     let url = tauri::WebviewUrl::App(format!("index.html?session={}", s.id).into());
     // WebView2 creation must run outside the synchronous IPC callback on Windows.
-    tauri::WebviewWindowBuilder::new(&app, &label, url)
+    let window = tauri::WebviewWindowBuilder::new(&app, &label, url)
         .title(format!("{} — SuperCode", s.title))
+        .visible(false)
         .decorations(false)
         .inner_size(1100.0, 800.0)
         .min_inner_size(760.0, 580.0)
@@ -597,6 +598,8 @@ pub async fn open_chat_window(
         }))
         .build()
         .map_err(|e| e.to_string())?;
+    crate::window_viewport::install(&window).map_err(|e| e.to_string())?;
+    window.show().map_err(|e| e.to_string())?;
     Ok(())
 }
 

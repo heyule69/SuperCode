@@ -80,6 +80,7 @@ mod ui_recovery;
 mod usage_tokens;
 mod window_state;
 mod window_theme;
+mod window_viewport;
 
 use tauri::Manager;
 
@@ -274,6 +275,9 @@ pub fn run() {
                 change_snapshots: std::sync::Mutex::new(file_changes::Tracker::default()),
             });
             runtime_diagnostics::record(app.handle(), None, "app_started", serde_json::json!({}));
+            if let Some(window) = app.get_webview_window("main") {
+                window_viewport::install(&window)?;
+            }
             media::install(app.handle());
             if let Err(error) = desktop_control::install(app.handle()) {
                 runtime_diagnostics::message(app.handle(),None,"desktop_control","warn","desktop_control_install_error",&error.to_string());

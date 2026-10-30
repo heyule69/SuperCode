@@ -27,6 +27,41 @@ describe('tray menu', () => {
     act(()=>element.querySelector('.tray-window-list')!.dispatchEvent(new MouseEvent('pointerover',{bubbles:true})));
     expect(element.querySelector('.tray-window-list')).not.toBeNull();
   });
+  it('does not dismiss when the pointer moves between menu items or expanded windows', () => {
+    const data = fixture(); data.windows.push({label:'other',title:'另一个窗口',project:'test',status:'idle',main:false});
+    const { element, perform } = mount(data);
+    const chats = element.querySelectorAll('.tray-chat');
+    act(() => {
+      chats[0].dispatchEvent(new MouseEvent('pointerover', { bubbles:true, relatedTarget:document.body }));
+      chats[0].dispatchEvent(new MouseEvent('pointerout', { bubbles:true, relatedTarget:chats[1] }));
+      chats[1].dispatchEvent(new MouseEvent('pointerover', { bubbles:true, relatedTarget:chats[0] }));
+    });
+    const toggle = element.querySelector('.tray-window-toggle')!;
+    act(() => {
+      chats[1].dispatchEvent(new MouseEvent('pointerout', { bubbles:true, relatedTarget:toggle }));
+      toggle.dispatchEvent(new MouseEvent('pointerover', { bubbles:true, relatedTarget:chats[1] }));
+    });
+    const windows = element.querySelectorAll('.tray-window-list button');
+    expect(windows).toHaveLength(2);
+    act(() => {
+      toggle.dispatchEvent(new MouseEvent('pointerout', { bubbles:true, relatedTarget:windows[0] }));
+      windows[0].dispatchEvent(new MouseEvent('pointerover', { bubbles:true, relatedTarget:toggle }));
+      windows[0].dispatchEvent(new MouseEvent('pointerout', { bubbles:true, relatedTarget:windows[1] }));
+      windows[1].dispatchEvent(new MouseEvent('pointerover', { bubbles:true, relatedTarget:windows[0] }));
+    });
+    expect(perform).not.toHaveBeenCalled();
+    expect(element.querySelector('.tray-window-list')).not.toBeNull();
+  });
+  it('dismisses once when the pointer leaves the entire menu', async () => {
+    const { element, perform } = mount(fixture());
+    const item = element.querySelector('.tray-chat')!;
+    act(() => item.dispatchEvent(new MouseEvent('pointerover', { bubbles:true, relatedTarget:document.body })));
+
+    await act(async () => item.dispatchEvent(new MouseEvent('pointerout', { bubbles:true, relatedTarget:document.body })));
+
+    expect(perform).toHaveBeenCalledTimes(1);
+    expect(perform).toHaveBeenCalledWith('dismiss', undefined);
+  });
   it('bounds the initial list, expands it and opens a chat with one click', async () => {
     const { element, perform } = mount(fixture());
     expect(element.querySelectorAll('.tray-chat')).toHaveLength(3);

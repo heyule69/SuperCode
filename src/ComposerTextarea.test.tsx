@@ -50,3 +50,42 @@ it('does not collapse a long draft while its chat is hidden behind settings', as
   await act(async () => observer([], {} as ResizeObserver));
   expect(textarea.style.height).toBe('180px');
 });
+
+it.each([48, 67, 134, 196])('preserves the conversation scroll position when typing keeps a %ipx input height', async height => {
+  const contentHeight = 1200;
+  const availableHeight = 600;
+  const exposedControlCounts: number[] = [];
+  // happy-dom does not lay out flex siblings. Model the browser's scroll clamp
+  // when a geometry read flushes layout, using the original control's height.
+  vi.spyOn(HTMLElement.prototype, 'scrollHeight', 'get').mockImplementation(function (this: HTMLElement) {
+    const textarea = container.querySelector<HTMLTextAreaElement>('textarea');
+    const history = container.querySelector<HTMLElement>('[data-history]');
+    if (textarea && history) {
+      const inputHeight = Math.min(196, Math.max(32, parseFloat(textarea.style.height) || 0));
+      const viewportHeight = availableHeight - inputHeight;
+      history.scrollTop = Math.min(history.scrollTop, contentHeight - viewportHeight);
+    }
+    exposedControlCounts.push([...container.querySelectorAll('textarea')].filter(control =>
+      !control.hidden && control.getAttribute('aria-hidden') !== 'true' && control.style.visibility !== 'hidden',
+    ).length);
+    return height;
+  });
+  const renderConversation = async (value: string) => {
+    await act(async () => root.render(<section>
+      <div data-history />
+      <ComposerTextarea aria-label="消息" value={value} minHeight={48} onChange={() => {}}/>
+    </section>));
+  };
+  await renderConversation('draft');
+  const textarea = container.querySelector('textarea')!;
+  const history = container.querySelector<HTMLElement>('[data-history]')!;
+  const bottom = contentHeight - (availableHeight - height);
+  history.scrollTop = bottom;
+
+  await renderConversation('draft!');
+
+  expect(textarea.style.height).toBe(`${height}px`);
+  expect(history.scrollTop).toBe(bottom);
+  expect(exposedControlCounts.every(count => count === 1)).toBe(true);
+  expect(container.querySelectorAll('textarea')).toHaveLength(1);
+});

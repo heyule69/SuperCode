@@ -57,6 +57,37 @@ async fn hover_fixture(app: &AppHandle) -> Result<(), String> {
 async fn settle() {
     tokio::time::sleep(Duration::from_millis(400)).await;
 }
+
+#[cfg(windows)]
+async fn verify_minimized_viewport(window: &tauri::WebviewWindow) -> Result<(), String> {
+    let webview: &tauri::Webview = window.as_ref();
+    let before = webview.size().map_err(|e| e.to_string())?;
+    let client = window.inner_size().map_err(|e| e.to_string())?;
+    if before != client {
+        return Err(format!("{} WebView 未填满窗口：页面 {before:?}，客户区 {client:?}", window.label()));
+    }
+    window.minimize().map_err(|e| e.to_string())?;
+    settle().await;
+    if !window.is_minimized().map_err(|e| e.to_string())? {
+        return Err(format!("{} 未进入最小化状态", window.label()));
+    }
+    let minimized = webview.size().map_err(|e| e.to_string())?;
+    window.unminimize().map_err(|e| e.to_string())?;
+    settle().await;
+    if minimized != before {
+        return Err(format!(
+            "{} 最小化改变了页面尺寸：{before:?} -> {minimized:?}",
+            window.label()
+        ));
+    }
+    if webview.size().map_err(|e| e.to_string())? != before
+        || window.inner_size().map_err(|e| e.to_string())? != before
+    {
+        return Err(format!("{} 恢复后页面尺寸未保持一致", window.label()));
+    }
+    Ok(())
+}
+
 async fn verify(app: &AppHandle) -> Result<serde_json::Value, String> {
     let main = app.get_webview_window("main").ok_or("主窗口不存在")?;
     if app.tray_by_id("supercode-tray").is_none() {
@@ -76,8 +107,13 @@ async fn verify(app: &AppHandle) -> Result<serde_json::Value, String> {
         "agentMessage",
         &json!({"status":"completed"}),
     )?;
+    settle().await;
+    #[cfg(windows)]
+    verify_minimized_viewport(&main).await?;
     main.maximize().map_err(|e| e.to_string())?;
     settle().await;
+    #[cfg(windows)]
+    verify_minimized_viewport(&main).await?;
     main.close().map_err(|e| e.to_string())?;
     settle().await;
     if main.is_visible().map_err(|e| e.to_string())? || app.get_webview_window("main").is_none() {
@@ -99,6 +135,8 @@ async fn verify(app: &AppHandle) -> Result<serde_json::Value, String> {
     main.set_size(tauri::LogicalSize::new(1000.0, 700.0))
         .map_err(|e| e.to_string())?;
     settle().await;
+    #[cfg(windows)]
+    verify_minimized_viewport(&main).await?;
     main.close().map_err(|e| e.to_string())?;
     settle().await;
     let saved: serde_json::Value = serde_json::from_slice(
@@ -111,6 +149,8 @@ async fn verify(app: &AppHandle) -> Result<serde_json::Value, String> {
     let label = desktop_lifecycle::new_workspace_window(app.clone()).await?;
     let second = app.get_webview_window(&label).ok_or("新窗口不存在")?;
     settle().await;
+    #[cfg(windows)]
+    verify_minimized_viewport(&second).await?;
     second.close().map_err(|e| e.to_string())?;
     settle().await;
     if second.is_visible().map_err(|e| e.to_string())? || app.webview_windows().len() != 2 {
@@ -120,6 +160,15 @@ async fn verify(app: &AppHandle) -> Result<serde_json::Value, String> {
     settle().await;
     if !second.is_visible().map_err(|e| e.to_string())? {
         return Err("无法单独恢复新窗口".into());
+    }
+    #[cfg(windows)]
+    {
+        crate::sidebar::open_chat_window(session.id.clone(), false, app.clone()).await?;
+        let chat = app.get_webview_window(&format!("chat-{}", session.id)).ok_or("独立聊天窗口不存在")?;
+        settle().await;
+        verify_minimized_viewport(&chat).await?;
+        chat.destroy().map_err(|e| e.to_string())?;
+        settle().await;
     }
     if app.get_webview_window(tray_popup::LABEL).is_some() {
         return Err("托盘菜单未按需创建".into());
@@ -161,6 +210,6 @@ async fn verify(app: &AppHandle) -> Result<serde_json::Value, String> {
     }
     state.store.set_status(&session.id, "idle", None)?;
     Ok(
-        json!({"nativeTray":true,"trayPopupOnDemand":true,"trayThemeFollowsPreferences":true,"trayIdleWebviewReleased":true,"staleTrayCallbackIgnored":true,"closePreservesWebviewsAndFixtureTask":true,"restoreKeepsMaximized":true,"geometryUpdatesAfterHide":true,"newWindowRestoresIndependently":true,"windows":app.webview_windows().len(),"dataDirectory":state.data_dir,"fixtureOnly":true}),
+        json!({"nativeTray":true,"trayPopupOnDemand":true,"trayThemeFollowsPreferences":true,"trayIdleWebviewReleased":true,"staleTrayCallbackIgnored":true,"closePreservesWebviewsAndFixtureTask":true,"restoreKeepsMaximized":true,"minimizePreservesViewport":cfg!(windows),"geometryUpdatesAfterHide":true,"newWindowRestoresIndependently":true,"windows":app.webview_windows().len(),"dataDirectory":state.data_dir,"fixtureOnly":true}),
     )
 }

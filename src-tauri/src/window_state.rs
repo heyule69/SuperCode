@@ -254,6 +254,7 @@ pub fn restore(app: &tauri::App, dir: &std::path::Path) -> tauri::Result<()> {
         window.center()?;
     }
     window.show()?;
+    crate::window_viewport::sync(window)?;
     Ok(())
 }
 

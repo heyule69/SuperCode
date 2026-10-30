@@ -47,7 +47,7 @@ export function TrayMenu({ data, error, perform, ready }: {
   function action(label: string, name: string, icon: ReactNode) {
     return <button role="menuitem" className="tray-action" disabled={working} onClick={() => void run(name)}>{icon}<span>{label}</span></button>;
   }
-  return <main className="tray-panel" ref={panel} role="menu" aria-label="SuperCode" onKeyDown={navigate}>
+  return <main className="tray-panel" ref={panel} role="menu" aria-label="SuperCode" onKeyDown={navigate} onPointerLeave={() => void run('dismiss')}>
     <div className="tray-heading">最近对话</div>
     {!data ? <p className="tray-empty">{error || '正在读取对话…'}</p> : <>
       {data.recent.length ? <div className="tray-recent-list">{data.recent.slice(0, expanded ? 30 : 3).map(chat =>

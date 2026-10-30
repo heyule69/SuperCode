@@ -4,8 +4,24 @@ function resize(textarea: HTMLTextAreaElement | null, minHeight: number) {
   // Settings keep the chat mounted but hidden; measuring there would collapse
   // a long draft to zero before the chat becomes visible again.
   if (!textarea || textarea.closest('[hidden]')) return;
-  textarea.style.height = '0px';
-  textarea.style.height = `${Math.max(minHeight, textarea.scrollHeight)}px`;
+  // Shrinking the live control expands the adjacent chat viewport and clamps
+  // its scroll position, even when the final input height stays unchanged.
+  const measure = textarea.cloneNode() as HTMLTextAreaElement;
+  measure.removeAttribute('id');
+  measure.removeAttribute('name');
+  measure.removeAttribute('autofocus');
+  measure.setAttribute('aria-hidden', 'true');
+  measure.tabIndex = -1;
+  measure.value = textarea.value;
+  Object.assign(measure.style, {
+    position: 'fixed', visibility: 'hidden', pointerEvents: 'none',
+    top: '0', left: '0', width: `${textarea.getBoundingClientRect().width}px`,
+    height: '0', minHeight: '0', maxHeight: 'none', overflow: 'hidden',
+  });
+  textarea.parentElement!.append(measure);
+  const height = Math.max(minHeight, measure.scrollHeight);
+  measure.remove();
+  textarea.style.height = `${height}px`;
 }
 
 /** Both chat surfaces grow with the draft, then scroll at their CSS height limit. */
