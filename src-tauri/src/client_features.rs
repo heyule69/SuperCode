@@ -116,7 +116,7 @@ For long-running tools, use their background or asynchronous operation and short
 These updates must be ordinary assistant text, separate from private reasoning and tool output. Summarize verified actions, useful findings, remaining uncertainty, and the next step without exposing private chain-of-thought. Do not invent progress, claim success early, repeat empty reassurance, or narrate every trivial tool call.\n\
 Answer simple requests directly. Respect an explicit request for silence, minimal output, or a strict output-only format; do not add progress messages that break the requested format.";
 
-const PROGRESS_REMINDER: &str = "[SuperCode communication preference]\nFor substantial work, send a brief ordinary assistant text update in the user's language before the first tool call and between batches of tool calls. A thinking/reasoning block does not count as a public update. Before a long wait, explain what is running; use background execution and short status checks when supported instead of multi-minute sleep/poll calls. Keep long jobs running and report only verified progress. Respect an explicit request for silence or a strict output-only format.\n[User request follows]";
+const PROGRESS_REMINDER: &str = "[SuperCode communication preference]\nFor substantial work, send a brief ordinary assistant text update in the user's language before the first tool call and between batches of tool calls. A thinking/reasoning block does not count as a public update. Before a long wait, explain what is running; use background execution and short status checks when supported instead of multi-minute sleep/poll calls. Keep long jobs running and report only verified progress. Respect an explicit request for silence or a strict output-only format.";
 
 pub(crate) fn progress_context(mut content: Vec<Value>) -> Vec<Value> {
     // Resumed native sessions can retain an older system-prompt snapshot.
@@ -132,7 +132,7 @@ pub(crate) fn progress_context(mut content: Vec<Value>) -> Vec<Value> {
     {
         return content;
     }
-    content.insert(0, json!({"type":"text","text":format!("{ARTIFACT_GUIDANCE}\n{PROGRESS_REMINDER}")}));
+    content.insert(0, json!({"type":"text","text":format!("{PROGRESS_REMINDER}\n{ARTIFACT_GUIDANCE}\n[User request follows]")}));
     content
 }
 
@@ -681,6 +681,10 @@ mod tests {
         assert_eq!(prepared.len(), content.len() + 1);
         assert_eq!(&prepared[1..], content.as_slice());
         assert_eq!(prepared[0]["type"], "text");
+        let reminder = prepared[0]["text"].as_str().unwrap();
+        assert!(reminder.starts_with("[SuperCode communication preference]"));
+        assert!(reminder.contains(ARTIFACT_GUIDANCE));
+        assert!(reminder.ends_with("[User request follows]"));
         assert!(prepared[0]["text"].as_str().unwrap().contains("Respect an explicit request for silence or a strict output-only format"));
     }
     #[test]
