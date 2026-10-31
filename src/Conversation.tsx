@@ -18,6 +18,8 @@ import { planText, type PlanDecision } from './planPresentation';
 import { collectSubagents, isSubagent } from './subagents';
 import { SubagentContext, SubagentRows } from './SubagentRow';
 import { shareConversationTurns } from './conversationCache';
+import { turnArtifactPaths } from './artifacts';
+import { TurnArtifacts } from './TurnArtifacts';
 const PlanCard = lazy(() => import('./PlanCard').then(module => ({ default: module.PlanCard })));
 const ProposedPlan = lazy(() => import('./ProposedPlan'));
 
@@ -198,12 +200,14 @@ const TurnView = memo(function TurnView({ turn, lifecycle, pendingLabel, agentNa
   const added = files.reduce((count, file) => count + file.added, 0);
   const removed = files.reduce((count, file) => count + file.removed, 0);
   const resultText = marker?.data?.status === 'interrupted' ? '已停止' : marker?.data?.status === 'failed' ? '运行失败' : '';
+  const artifactPathsKey = JSON.stringify(turnArtifactPaths(turn.items,presentation.final));
+  const artifactError = turn.items.filter(message=>message.kind==='turnArtifacts').map(message=>message.data?.error).find(error=>typeof error==='string') as string|undefined;
   const summary = <>{marker?.data?.durationMs != null ? <span>用时 {duration(Number(marker.data.durationMs))}</span> : <span>{resultText || '执行过程'}</span>}{resultText && marker?.data?.durationMs != null ? <span>· {resultText}</span> : null}</>;
   if (!turn.user && turn.items.length === 1 && turn.items[0].kind === 'modelSwitch') return <MessageView message={turn.items[0]} openFile={openFile} />;
   function renderItems(items: Message[], live = false) {
     const blocks: (Message | Message[])[] = [];
     for (const item of items) {
-      if (item.kind === 'turnDiff' || item.role === 'system' && !noticeIds.has(item.id) || item.kind === 'goalState' && !item.data?.goal || item.role === 'assistant' && !item.text && !messageMedia(item).length) continue;
+      if (['turnDiff','turnArtifacts'].includes(item.kind) || item.role === 'system' && !noticeIds.has(item.id) || item.kind === 'goalState' && !item.data?.goal || item.role === 'assistant' && !item.text && !messageMedia(item).length) continue;
       const previous = blocks[blocks.length - 1];
       if (isSubagent(item) && collectSubagents([item]).length) blocks.push(item);
       else if (isActivity(item)) { if (Array.isArray(previous)) previous.push(item); else blocks.push([item]); }
@@ -227,6 +231,7 @@ const TurnView = memo(function TurnView({ turn, lifecycle, pendingLabel, agentNa
       {presentation.completed && processOpen ? <div className="turn-process-content" id={`process-${turn.id}`} role="region" aria-label="执行过程详情">{renderItems(process)}</div> : null}
       {presentation.completed ? renderItems(presentation.notices) : null}
       <div className={presentation.completed ? 'turn-final-result' : 'turn-live-content'}>{renderItems(presentation.completed ? result : turn.items, generating)}</div>
+      {presentation.completed&&(artifactPathsKey!=='[]'||artifactError)?<TurnArtifacts pathsKey={artifactPathsKey} collectionError={artifactError}/>:null}
       {!generating && (reply || completed && !presentation.completed) ? <div className="turn-footer">{completed && !presentation.completed ? <div className={`turn-summary ${marker?.data?.status}`}>{summary}</div> : null}{reply ? <CopyButton className="turn-copy" text={reply} label="复制回复" iconOnly /> : null}</div> : null}
       {completed && files.length ? <section className="turn-changes" aria-label="本轮文件变更"><div className="turn-changes-heading"><span className="turn-changes-icon"><FileDiff size={22}/></span><div className="turn-changes-title"><strong>已编辑 {files.length} 个文件</strong><div className="turn-change-totals"><span className="added-count">+{added}</span><span className="removed-count">−{removed}</span></div></div><button className="view-changes" onClick={()=>showDiff('本轮变更',diff)}>查看变更</button></div><div className="turn-changes-files">{(allChanges ? files : files.slice(0, 3)).map(f => {
         const path = f.path.replace(/\\/g, '/');

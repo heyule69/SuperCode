@@ -8,6 +8,11 @@ import { PROVIDER_REQUIRED } from './chatConnection';
 import type { Session, RpcEvent } from './types';
 import type { ComponentProps } from 'react';
 import type { Followup } from './Followups';
+import type { Event as TauriEvent } from '@tauri-apps/api/event';
+import type { DragDropEvent } from '@tauri-apps/api/webview';
+
+const nativeDrops = vi.hoisted(() => new Set<(event: TauriEvent<DragDropEvent>) => void>());
+vi.mock('@tauri-apps/api/webview', () => ({ getCurrentWebview: () => ({ onDragDropEvent: async (handler: (event: TauriEvent<DragDropEvent>) => void) => { nativeDrops.add(handler); return () => { nativeDrops.delete(handler); }; } }) }));
 
 vi.mock('./api', () => ({ desktop:true, call:vi.fn(), subscribe:vi.fn(async()=>()=>{}) }));
 vi.mock('@tauri-apps/api/event', () => ({ listen:vi.fn(async()=>()=>{}) }));
@@ -17,7 +22,7 @@ let requests: RpcEvent[];
 const providerRequired = vi.fn();
 beforeEach(() => {
   (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
-  localStorage.clear();
+  localStorage.clear(); nativeDrops.clear();
   missing = true; sessions = []; requests = []; providerRequired.mockClear();
   vi.mocked(call).mockReset();
   vi.mocked(call).mockImplementation(async (command,args={}) => {
@@ -30,6 +35,7 @@ beforeEach(() => {
     if(command==='runtime_info') return {requests};
     if(command==='respond_request') { requests = requests.filter(r => r.id !== args.id); return null; }
     if(['list_messages','list_followups'].includes(command)) return [];
+    if(command==='resolve_artifact_references') return [];
     if(command==='followup_capabilities') return {steeringMode:'native'};
     return null;
   });
@@ -40,6 +46,24 @@ async function render(draft:SideDraft, options:Partial<ComponentProps<typeof Sid
   await act(async()=>root.render(<SideChat draft={draft} projectId="" agent="pi" connectionId={draft.connectionId??'@local'} defaults={defaults} close={()=>{}} opened={()=>{}} openFile={()=>{}} showDiff={()=>{}} providerRequired={providerRequired} {...options}/>));
 }
 async function send() {await act(async()=>{container.querySelector('form')!.dispatchEvent(new Event('submit',{bubbles:true,cancelable:true}));});}
+it('adds dropped Excel and unknown files to the side chat as path references', async () => {
+  missing=false;
+  const attachments = [{kind:'file',name:'数据.xls',path:'D:/中文目录/数据.xls'},{kind:'file',name:'自定义格式.xyz',path:'D:/中文目录/自定义格式.xyz'}];
+  const original = vi.mocked(call).getMockImplementation()!;
+  vi.mocked(call).mockImplementation(async(command,args={})=>command==='resolve_attachment_paths'?attachments:original(command,args));
+  await render({key:'draft',text:'分析这些文件'});
+  const input = container.querySelector<HTMLTextAreaElement>('[aria-label="侧边聊天消息"]')!;
+  vi.spyOn(document,'elementFromPoint').mockReturnValue(input);
+  try {
+    expect(nativeDrops.size).toBe(1);
+    await act(async()=>{for(const handler of nativeDrops) handler({payload:{type:'drop',paths:attachments.map(a=>a.path),position:{x:50,y:60}}} as TauriEvent<DragDropEvent>);});
+    expect(container.querySelector('.attachment-strip')?.textContent).toContain('数据.xls');
+    expect(container.querySelector('.attachment-strip')?.textContent).toContain('自定义格式.xyz');
+    await send();
+    expect(call).toHaveBeenCalledWith('enqueue_followup',expect.objectContaining({payload:expect.objectContaining({attachments})}));
+    expect(call).not.toHaveBeenCalledWith('import_image_attachment',expect.anything());
+  } finally { vi.mocked(document.elementFromPoint).mockRestore(); }
+});
 it('sends a Gemini side chat with its own name and approval mode while keeping other Agent permissions separate', async () => {
   missing = false;
   localStorage.setItem('supercode.execution-permissions.v1', JSON.stringify({ claude: 'full' }));

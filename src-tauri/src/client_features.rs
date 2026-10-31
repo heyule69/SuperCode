@@ -105,6 +105,8 @@ pub(crate) fn validate_steering_settings(
     Ok(())
 }
 
+const ARTIFACT_GUIDANCE: &str = "Final files in SuperCode: when the task produces files for the user, save newly generated deliverables under the workspace outputs/ directory and include Markdown links with their absolute paths in the final reply. Keep intermediate scripts, logs and preview renders outside outputs/. Link an existing file at its original path when appropriate. Only present files that actually exist; do not create a file or an empty outputs directory just for an ordinary chat response.";
+
 const PROGRESS_GUIDANCE: &str = "Progress communication in this interactive app:\n\
 For substantial or multi-step work, proactively send brief, user-visible assistant messages in the user's language. Do not leave the user with only reasoning events and tool records until the final answer.\n\
 Before the first tool call for substantial work, emit one short ordinary assistant text message. Do not go directly from a thinking block to a tool call. Thinking or reasoning content is not a public progress update, even if it contains a sentence addressed to the user.\n\
@@ -130,7 +132,7 @@ pub(crate) fn progress_context(mut content: Vec<Value>) -> Vec<Value> {
     {
         return content;
     }
-    content.insert(0, json!({"type":"text","text":PROGRESS_REMINDER}));
+    content.insert(0, json!({"type":"text","text":format!("{ARTIFACT_GUIDANCE}\n{PROGRESS_REMINDER}")}));
     content
 }
 
@@ -143,7 +145,7 @@ pub fn instructions(app: &AppHandle) -> String {
         .flatten()
         .unwrap_or_default();
     let tools = automation_instructions(&servers(app).unwrap_or_default());
-    format!("Read and write every project text file as UTF-8 without BOM. Tell the user before converting non-UTF-8 files.\nYou are running inside the SuperCode graphical desktop app. The conversation supports inline images, video and audio, not just terminal text. Tool image results are displayed automatically. To show a local media file, write ![descriptive caption](<absolute file path>); use an absolute path with spaces inside angle brackets. The same syntax supports video and audio files. Use ordinary Markdown links for files that should only be referenced. Do not open another application or copy screenshots to the desktop merely to make media visible in the conversation. Never claim a media file was shown unless you actually returned the media result or referenced an existing file.\n{PROGRESS_GUIDANCE}\n{tools}\n{text}")
+    format!("Read and write every project text file as UTF-8 without BOM. Tell the user before converting non-UTF-8 files.\nYou are running inside the SuperCode graphical desktop app. The conversation supports inline images, video and audio, not just terminal text. Tool image results are displayed automatically. To show a local media file, write ![descriptive caption](<absolute file path>); use an absolute path with spaces inside angle brackets. The same syntax supports video and audio files. Use ordinary Markdown links for files that should only be referenced. Do not open another application or copy screenshots to the desktop merely to make media visible in the conversation. Never claim a media file was shown unless you actually returned the media result or referenced an existing file.\n{ARTIFACT_GUIDANCE}\n{PROGRESS_GUIDANCE}\n{tools}\n{text}")
 }
 
 #[tauri::command]

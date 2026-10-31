@@ -70,6 +70,6 @@ export function presentTurn(turn: ConversationTurn, lifecycle: TurnLifecycle = {
       && ['goal', 'goal-create', 'goal-status'].includes(String(message.data?.command))
       && result && typeof result === 'object' && 'goal' in result && result.goal);
   });
-  const process = turn.items.filter(message => message.kind !== 'turnDiff' && message.role !== 'system' && !resultIds.has(message.id) && (message.role !== 'assistant' || visibleReply(message)));
+  const process = turn.items.filter(message => !['turnDiff','turnArtifacts'].includes(message.kind) && message.role !== 'system' && !resultIds.has(message.id) && (message.role !== 'assistant' || visibleReply(message)));
   return { completed, settled: !active && (terminal || completed), active, final, notices, process };
 }

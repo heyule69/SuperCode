@@ -21,6 +21,14 @@ beforeEach(() => {
 });
 afterEach(async () => { await act(async () => root.unmount()); container.remove(); vi.unstubAllGlobals(); });
 
+it('prepares a Windows preview image instead of rejecting its Markdown-encoded path', async () => {
+  const path='C:\\Users\\Administrator\\Documents\\Codex\\中文目录\\work\\beautify_data.png';
+  await act(async()=>root.render(<Markdown text={`![公司信息页预览](<${path}>)`}/>));
+  expect(container.textContent).not.toContain('无法显示此来源');
+  expect(call).toHaveBeenCalledWith('prepare_media',expect.objectContaining({path}));
+  expect(container.querySelector('.chat-image-button')).not.toBeNull();
+});
+
 it('loads process images only after a click and unmounts previews when folded again', async()=>{
   const media=[{path:'D:/cache/step.jpg',name:'过程截图',kind:'image' as const}];
   await act(async()=>root.render(<ProcessMedia media={media}/>));

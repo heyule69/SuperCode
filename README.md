@@ -4,7 +4,7 @@
 
 一个轻量、本地优先的多 Agent 编程桌面工作台。把 **Codex、Claude Code、OpenCode、Pi 和 Gemini CLI** 放进同一个界面，管理项目、模型连接与工具，用对话完成开发任务。
 
-当前版本 **0.2.12**，主要支持 **Windows**。桌面核心采用 Rust + Tauri 2，前端采用 React + TypeScript，聊天与配置保存在本机 SQLite 数据库中。
+当前版本 **0.2.13**，主要支持 **Windows**。桌面核心采用 Rust + Tauri 2，前端采用 React + TypeScript，聊天与配置保存在本机 SQLite 数据库中。
 
 [下载 Windows 安装包](https://github.com/heyule69/SuperCode/releases/latest) · [版本记录](https://github.com/heyule69/SuperCode/releases) · [反馈问题](https://github.com/heyule69/SuperCode/issues)
 

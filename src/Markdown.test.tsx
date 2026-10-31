@@ -16,3 +16,9 @@ it('adds resource icons to titled links while leaving ordinary inline code alone
   expect(html).toContain('lucide-globe');
   expect(html).toContain('<code>const a = 1</code>');
 });
+
+it('keeps a real Windows Excel output link actionable after Markdown encodes backslashes', () => {
+  const html = renderToStaticMarkup(<Markdown text={'[美化版.xlsx](<C:\\Users\\Administrator\\中文目录 with spaces\\美化版.xlsx>)'}/>);
+  expect(html).toContain('class="markdown-link ');
+  expect(html).toContain('title="C:\\Users\\Administrator\\中文目录 with spaces\\美化版.xlsx"');
+});

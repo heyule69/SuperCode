@@ -11,6 +11,7 @@ mod agent_versions;
 mod agent_recovery;
 mod agents;
 mod app_updates;
+mod artifacts;
 mod automation;
 mod backup;
 mod bridge;
@@ -92,6 +93,7 @@ pub struct AppState {
     pub native: native_agents::Runtime,
     pub activity: session_runtimes::Sessions<std::sync::Mutex<protocol::ActivityBuffer>>,
     pub change_snapshots: std::sync::Mutex<file_changes::Tracker>,
+    pub artifact_snapshots: std::sync::Mutex<artifacts::Tracker>,
 }
 
 pub fn run() {
@@ -273,6 +275,7 @@ pub fn run() {
                 native: native_agents::Runtime::default(),
                 activity: session_runtimes::Sessions::default(),
                 change_snapshots: std::sync::Mutex::new(file_changes::Tracker::default()),
+                artifact_snapshots: std::sync::Mutex::new(artifacts::Tracker::default()),
             });
             runtime_diagnostics::record(app.handle(), None, "app_started", serde_json::json!({}));
             if let Some(window) = app.get_webview_window("main") {
@@ -426,6 +429,9 @@ pub fn run() {
             outbox::steer_followup,
             image_attachments::import_image_attachment,
             image_attachments::read_image_attachment,
+            file_attachments::resolve_attachment_paths,
+            artifacts::resolve_artifact_references,
+            artifacts::save_artifact_copy,
             commands::interrupt_turn,
             commands::respond_request,
             commands::list_models,

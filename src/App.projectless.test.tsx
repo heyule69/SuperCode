@@ -13,6 +13,11 @@ import { PlatformUsageIndicator } from './PlatformUsageView';
 import { AppUpdateNotice } from './AppUpdate';
 import { readWorkspaceDraft } from './workspaceDrafts';
 import { loadModelSelection, saveModelSelection } from './modelSelection';
+import type { Event as TauriEvent } from '@tauri-apps/api/event';
+import type { DragDropEvent } from '@tauri-apps/api/webview';
+
+const nativeDrops = vi.hoisted(() => new Set<(event: TauriEvent<DragDropEvent>) => void>());
+vi.mock('@tauri-apps/api/webview', () => ({ getCurrentWebview: () => ({ onDragDropEvent: async (handler: (event: TauriEvent<DragDropEvent>) => void) => { nativeDrops.add(handler); return () => { nativeDrops.delete(handler); }; } }) }));
 
 vi.mock('./api', () => ({ desktop:true, call:vi.fn(), subscribe:vi.fn(async()=>()=>{}) }));
 vi.mock('@tauri-apps/api/event', () => ({ listen:vi.fn(async()=>()=>{}) }));
@@ -25,7 +30,7 @@ let pendingRequests: RpcEvent[];
 let notify: (event: RpcEvent) => void;
 beforeEach(() => {
   (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
-  localStorage.clear(); vi.mocked(call).mockClear(); messages = []; pendingRequests = []; providerMissing = false;
+  localStorage.clear(); nativeDrops.clear(); vi.mocked(call).mockClear(); messages = []; pendingRequests = []; providerMissing = false;
   vi.mocked(AppUpdateNotice).mockReset();
   vi.mocked(subscribe).mockImplementation(async handler => { notify = handler; return () => {}; });
   data = { projects:[{id:'existing',name:'已有项目',path:'D:/existing'}],sessions:[],agents:[],profiles:[{id:'api:claude',agent:'claude',name:'Test API',model:'test-model',hasCredential:true,current:true}],officialAgents:[],connectionOrder:{},sidebar:{ projects:{}, sessions:{}, sections:[] },codexPath:null,loadMcp:false } as Bootstrap;
@@ -45,6 +50,7 @@ beforeEach(() => {
     if (command==='list_extensions') return { plugins:[], mcp:[], warnings:[] };
     if (command==='followup_capabilities') return {};
     if (command==='list_followups') return [];
+    if (command==='resolve_artifact_references') return [];
     if (command==='workspace_changes') return { files:[],diff:'',branch:'',isGit:false };
     if (command==='browser_open') return { sessionId:String(args.sessionId),url:'https://example.com/',title:'Example',status:'idle',action:'' };
     if (command==='create_session') {
@@ -69,6 +75,22 @@ async function type(text: string) {
 async function send() {
   await act(async()=>{container.querySelector<HTMLFormElement>('.composer')!.dispatchEvent(new Event('submit',{bubbles:true,cancelable:true}));await new Promise(resolve=>setTimeout(resolve,30));});
 }
+
+it('adds a dropped Excel file as its original path and sends it without importing its contents', async () => {
+  const attachment = { kind:'file', name:'预算表.xlsx', path:'D:\\中文目录 with spaces\\预算表.xlsx' };
+  const original = vi.mocked(call).getMockImplementation()!;
+  vi.mocked(call).mockImplementation(async (command,args={}) => command === 'resolve_attachment_paths' ? [attachment] : original(command,args));
+  await render();
+  const input = container.querySelector<HTMLTextAreaElement>('[aria-label="消息"]')!;
+  vi.spyOn(document, 'elementFromPoint').mockReturnValue(input);
+  expect(nativeDrops.size).toBe(1);
+  await act(async () => { for (const handler of nativeDrops) handler({ payload:{type:'drop',paths:[attachment.path],position:{x:50,y:60}} } as TauriEvent<DragDropEvent>); });
+  expect(call).toHaveBeenCalledWith('resolve_attachment_paths', { paths:[attachment.path] });
+  expect(container.querySelector('.attachment-strip')?.textContent).toContain(attachment.name);
+  expect(call).not.toHaveBeenCalledWith('import_image_attachment', expect.anything());
+  await send();
+  expect(call).toHaveBeenCalledWith('send_chat_message', expect.objectContaining({ attachments:[attachment] }));
+});
 
 it('opens and closes the model picker without asking the browser to scroll the chat for focus', async () => {
   await render();

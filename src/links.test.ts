@@ -23,3 +23,9 @@ it('keeps Chinese and spaced project paths and code line references', () => {
   expect(describeLink('src/App.tsx')).toEqual({ kind: 'file', target: 'src/App.tsx', line: undefined });
   expect(describeLink('#heading').kind).toBe('anchor');
 });
+
+it('accepts Markdown-encoded Windows drive separators without accepting other URL schemes', () => {
+  expect(describeLink('C:%5CUsers%5CAdministrator%5C%E6%8A%A5%E5%91%8A.xlsx')).toEqual({kind:'file',target:'C:\\Users\\Administrator\\报告.xlsx',line:undefined});
+  expect(describeLink('D:%2Freports%2Fpreview.png').target).toBe('D:/reports/preview.png');
+  expect(describeLink('javascript:alert(1)').kind).toBe('unsupported');
+});

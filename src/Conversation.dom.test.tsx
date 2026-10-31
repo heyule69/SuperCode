@@ -7,8 +7,9 @@ import { mergeEvent, reconcileMessages } from './events';
 import type { Message } from './types';
 import type { TurnLifecycle } from './turnPresentation';
 import * as diffs from './diff';
+import { call } from './api';
 
-vi.mock('./api', () => ({ desktop: true, call: vi.fn(async () => ({ token: 'full', previewToken: 'small' })) }));
+vi.mock('./api', () => ({ desktop: true, call: vi.fn(async (command:string) => command==='resolve_artifact_references'?[]:{ token: 'full', previewToken: 'small' }) }));
 vi.mock('@tauri-apps/api/core', () => ({ convertFileSrc: (token: string) => `http://supercode-media.localhost/${token}` }));
 const message = (id: string, role: string, text: string, kind = 'agentMessage', data: Message['data'] = null): Message => ({ id, seq: 0, sessionId: 's', role, kind, text, data });
 const items = [message('u', 'user', '优化页面'), message('start', 'assistant', '我会先检查布局。', 'agentMessage', { phase:'commentary' }), message('tool', 'tool', '构建通过', 'commandExecution', { command: 'npm run build', status: 'completed' }), message('final', 'assistant', '已完成布局优化。')];
@@ -23,6 +24,25 @@ beforeEach(async () => {
   await act(async () => { await import('./Markdown'); });
 });
 afterEach(async () => { await act(async () => root.unmount()); node.remove(); vi.unstubAllGlobals(); });
+
+it('shows a discovered final spreadsheet even when the assistant forgot its link, and retains it after history reload',async()=>{
+  const file={path:'D:/outputs/报告.xlsx',name:'报告.xlsx',size:1234};
+  const original=vi.mocked(call).getMockImplementation()!;
+  vi.mocked(call).mockImplementation(async(command,args={})=>command==='resolve_artifact_references'?[file]:original(command,args));
+  try {
+    let messages=mergeEvent([message('u','user','生成表格')],{method:'turn/started',params:{turn:{id:'t'}}},'s');
+    messages=mergeEvent(messages,{method:'item/completed',params:{turnId:'t',item:{id:'final',type:'agentMessage',phase:'final_answer',text:'表格已生成。',status:'completed'}}},'s');
+    messages=mergeEvent(messages,{method:'turn/artifacts/updated',params:{turnId:'t',artifacts:[file]}},'s');
+    const props={agentName:'Codex',autoExpand:false,showDiff:()=>{},openFile:()=>{},sessionId:'s'};
+    await act(async()=>root.render(<Conversation {...props} messages={messages} sessionStatus="running" activeTurnId="t"/>));
+    expect(node.querySelector('.turn-artifacts')).toBeNull();
+    messages=mergeEvent(messages,{method:'turn/completed',params:{turn:{id:'t',status:'completed'}}},'s');
+    await act(async()=>root.render(<Conversation {...props} messages={JSON.parse(JSON.stringify(messages))} sessionStatus="idle"/>));
+    expect(node.querySelector('[aria-label="最终文件"]')?.textContent).toContain('报告.xlsx');
+    expect(node.querySelector('[aria-label="执行过程"]')).toBeNull();
+    expect(node.querySelector('.turn-changes')).toBeNull();
+  } finally {vi.mocked(call).mockImplementation(original);}
+});
 it('does not parse completed history diffs again when only the latest streamed answer changes', async () => {
   const showDiff = vi.fn(), openFile = vi.fn(), parse = vi.spyOn(diffs,'diffFiles');
   const messages = [message('old-user','user','旧任务'),message('old-answer','assistant','旧结果'),message('old-diff','activity','diff --git a/a b/a\n@@ -1 +1 @@\n-old\n+new\n','turnDiff'),run('completed','old-run'),message('new-user','user','新任务'),message('new-answer','assistant','正在输出','agentMessage',{turnId:'new-turn',status:'inProgress'}),message('new-run','activity','','runMarker',{turnId:'new-turn',status:'inProgress'})];

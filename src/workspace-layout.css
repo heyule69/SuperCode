@@ -7,7 +7,8 @@
 .desktop-workarea .pane-collapsed { opacity:0; visibility:hidden; pointer-events:none; transition:opacity 150ms ease,visibility 0s 240ms; }
 .desktop-workarea .sidebar.pane-collapsed { padding-left:0; padding-right:0; }
 .desktop-workarea .workspace-panel[hidden] { display:none; }
-.desktop-workarea .sidebar-navigation { display:flex; flex-direction:column; gap:24px; min-height:0; flex:1; overflow:auto; overscroll-behavior:contain; scrollbar-width:thin; padding-bottom:18px; }
+.desktop-workarea .sidebar-navigation { display:flex; flex-direction:column; gap:24px; min-height:0; flex:1; overflow:auto; overscroll-behavior:contain; scrollbar-width:none; padding-bottom:18px; }
+.desktop-workarea .sidebar-navigation::-webkit-scrollbar { display:none; }
 .sidebar-navigation > .sidebar-region { flex:none; min-height:auto; }
 .smooth-collapse { display:grid; grid-template-rows:0fr; opacity:0; transition:grid-template-rows 220ms cubic-bezier(.2,.7,.2,1),opacity 150ms ease; }
 .smooth-collapse.is-open { grid-template-rows:1fr; opacity:1; }

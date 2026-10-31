@@ -641,6 +641,7 @@ pub(crate) fn publish_event(app: &AppHandle, mut message: Value) {
         }
     }
     crate::media::normalize_event(app, &mut message);
+    if let Some(artifacts) = crate::artifacts::observe(app, &message) { publish_event(app, artifacts); }
     if matches!(message["method"].as_str(),Some("item/started"|"item/updated"|"item/completed")) {
         crate::file_changes::normalize_native(&mut message["params"]["item"]);
         if let Some(native)=message["params"]["threadId"].as_str() {
@@ -706,6 +707,14 @@ pub(crate) fn persist_event(app: &AppHandle, message: &Value) {
             .or(session.turn_id.as_deref())
             .unwrap_or("unknown");
         let _ = state.store.record_usage(&session, turn, usage);
+        return;
+    }
+    if method == "turn/artifacts/updated" {
+        if let Some(turn) = params["turnId"].as_str() {
+            if let Err(error) = state.store.save_message(&format!("artifacts-{turn}"), &session.id, "activity", "", "turnArtifacts", &json!({"turnId":turn,"status":"completed","artifacts":params["artifacts"],"error":params["error"]})) {
+                crate::runtime_diagnostics::message(app,Some(&session.id),"storage","error","artifact_save_error",&error);
+            }
+        }
         return;
     }
     if method == "turn/diff/updated" {

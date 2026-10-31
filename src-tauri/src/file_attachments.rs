@@ -1,6 +1,49 @@
 //! Ordinary attachments are paths, regardless of format, encoding or file size.
 use std::path::Path;
 
+#[tauri::command]
+pub fn resolve_attachment_paths(
+    paths: Vec<String>,
+) -> Result<Vec<crate::client_features::Attachment>, String> {
+    if paths.len() > crate::input_limits::MAX_ATTACHMENTS {
+        return Err("最多添加 12 个附件".into());
+    }
+    paths
+        .into_iter()
+        .map(|path| {
+            let source = Path::new(&path);
+            let metadata = std::fs::metadata(source)
+                .map_err(|error| format!("附件不可用 {}：{error}", source.display()))?;
+            let kind = if metadata.is_dir() {
+                "directory"
+            } else if metadata.is_file() {
+                match source
+                    .extension()
+                    .and_then(|value| value.to_str())
+                    .unwrap_or("")
+                    .to_ascii_lowercase()
+                    .as_str()
+                {
+                    "png" | "jpg" | "jpeg" | "gif" | "webp" => "image",
+                    _ => "file",
+                }
+            } else {
+                return Err(format!("附件不是文件或目录：{}", source.display()));
+            };
+            let name = source
+                .file_name()
+                .ok_or_else(|| format!("附件名称无效：{}", source.display()))?
+                .to_string_lossy()
+                .into_owned();
+            Ok(crate::client_features::Attachment {
+                kind: kind.into(),
+                path,
+                name,
+            })
+        })
+        .collect()
+}
+
 pub(crate) fn prepare(path: &Path) -> Result<String, String> {
     let metadata =
         std::fs::metadata(path).map_err(|e| format!("附件不可用 {}：{e}", path.display()))?;
@@ -19,6 +62,87 @@ mod tests {
     use super::*;
     use crate::client_features::{prepare_input, Attachment};
     use std::{fs::File, io::Write};
+
+    #[test]
+    fn dropped_files_keep_original_paths_for_every_format() {
+        let root = std::env::temp_dir().join(format!("supercode-drop-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("中文目录 with spaces")).unwrap();
+        for name in [
+            "预算表.xlsx",
+            "旧表.xls",
+            "文档.docx",
+            "演示.pptx",
+            "压缩包.7z",
+            "数据.unknown",
+            "无扩展名",
+            "矢量图.svg",
+        ] {
+            let path = root.join("中文目录 with spaces").join(name);
+            let bytes = [0xff, 0xfe, 0, 0x81];
+            std::fs::write(&path, bytes).unwrap();
+            let original = path.to_string_lossy().into_owned();
+            let resolved = resolve_attachment_paths(vec![original.clone()]).unwrap();
+            assert_eq!(resolved.len(), 1);
+            assert_eq!(resolved[0].kind, "file");
+            assert_eq!(resolved[0].name, name);
+            assert_eq!(resolved[0].path, original);
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+            let input = prepare_input("分析附件", &resolved).unwrap();
+            assert!(input.codex[1]["text"]
+                .as_str()
+                .unwrap()
+                .contains("原文件引用"));
+            assert_eq!(input.codex[1], input.claude[1]);
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn dropped_directories_and_supported_images_keep_their_attachment_types() {
+        let root = std::env::temp_dir().join(format!("supercode-drop-{}", uuid::Uuid::new_v4()));
+        let directory = root.join("文件夹.png");
+        std::fs::create_dir_all(&directory).unwrap();
+        let image = root.join("截图.PNG");
+        std::fs::write(&image, b"type classification only").unwrap();
+        let resolved = resolve_attachment_paths(vec![
+            directory.to_string_lossy().into(),
+            image.to_string_lossy().into(),
+        ])
+        .unwrap();
+        assert_eq!(resolved[0].kind, "directory");
+        assert_eq!(resolved[1].kind, "image");
+        assert_eq!(resolved[0].name, "文件夹.png");
+        assert_eq!(resolved[1].name, "截图.PNG");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn dropped_large_files_have_no_image_size_limit_and_missing_paths_are_reported() {
+        let root = std::env::temp_dir().join(format!("supercode-drop-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let path = root.join("大文件.xlsx");
+        File::create(&path)
+            .unwrap()
+            .set_len(32 * 1024 * 1024)
+            .unwrap();
+        assert_eq!(
+            resolve_attachment_paths(vec![path.to_string_lossy().into()]).unwrap()[0].kind,
+            "file"
+        );
+        assert!(
+            resolve_attachment_paths(vec![root.join("missing.xlsx").to_string_lossy().into()])
+                .err()
+                .unwrap()
+                .contains("附件不可用")
+        );
+        assert!(
+            resolve_attachment_paths(vec![path.to_string_lossy().into(); 13])
+                .err()
+                .unwrap()
+                .contains("12 个附件")
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn all_formats_are_referenced_without_decoding_or_rewriting() {

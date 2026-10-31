@@ -1,0 +1,8 @@
+.turn-artifacts { display:flex; flex-direction:column; gap:8px; margin:16px 0 4px; max-width:640px; }
+.artifact-file { display:flex; align-items:center; gap:5px; min-width:0; padding:10px; border:1px solid var(--line); border-radius:12px; background:var(--surface); }
+.artifact-open { display:flex; align-items:center; gap:12px; flex:1; min-width:0; padding:0; background:transparent; text-align:left; }
+.artifact-icon { display:grid; place-items:center; flex:none; width:44px; height:44px; border-radius:9px; background:var(--surface2); }
+.artifact-description { display:flex; flex-direction:column; gap:5px; min-width:0; }
+.artifact-description strong { font-size:13px; font-weight:550; overflow-wrap:anywhere; }
+.artifact-description small { color:var(--muted); font-size:11px; }
+.artifact-file > .icon-button { flex:none; width:32px; height:32px; }

@@ -3,7 +3,7 @@ import type { Message, RpcEvent } from './types';
 const limit = 128 * 1024;
 const activityKinds = new Set(['reasoning', 'executionPlan', 'runMarker']);
 const toolKinds = new Set(['commandExecution', 'fileChange', 'mcpToolCall', 'dynamicToolCall', 'claudeToolCall', 'webSearch', 'imageView', 'collabAgentToolCall', 'collabToolCall', 'contextCompaction', 'enteredReviewMode', 'exitedReviewMode']);
-export const isActivity = (m: Message) => m.kind !== 'runMarker' && (m.role === 'tool' || m.role === 'activity');
+export const isActivity = (m: Message) => !['runMarker','turnArtifacts'].includes(m.kind) && (m.role === 'tool' || m.role === 'activity');
 function cut(text: string, max: number) { const end = Math.min(text.length, max); return text.slice(0, end > 0 && /[\uD800-\uDBFF]/.test(text[end - 1]) ? end - 1 : end); }
 const bounded = (text: string) => cut(text, limit);
 const parts = (value: unknown) => Array.isArray(value) ? value.filter(v => typeof v === 'string').join('\n\n') : '';
@@ -43,7 +43,7 @@ function upsert(messages: Message[], message: Message): Message[] {
 }
 
 export function isDisplayEvent(event: RpcEvent) {
-  return event.id === undefined && (event.method.startsWith('item/') || ['turn/started', 'turn/completed', 'turn/plan/updated', 'turn/diff/updated'].includes(event.method));
+  return event.id === undefined && (event.method.startsWith('item/') || ['turn/started', 'turn/completed', 'turn/plan/updated', 'turn/diff/updated', 'turn/artifacts/updated'].includes(event.method));
 }
 
 // A storage read may race native startup. Keep unacknowledged messages in their
@@ -101,6 +101,7 @@ export function reconcileMessages(live: Message[], saved: Message[], pendingUser
 
 export function mergeEvent(messages: Message[], event: RpcEvent, sessionId: string): Message[] {
   const p = event.params;
+  if (event.method === 'turn/artifacts/updated') return upsert(messages, { seq:0,id:`artifacts-${p.turnId}`,sessionId,role:'activity',text:'',kind:'turnArtifacts',data:metadata({turnId:p.turnId,status:'completed',artifacts:p.artifacts,error:p.error}) });
   if (event.method === 'turn/diff/updated') return upsert(messages, { seq: 0, id: `diff-${p.turnId}`, sessionId, role: 'activity', text: bounded(String(p.diff ?? '')), kind: 'turnDiff', data: { turnId: p.turnId, status: 'completed' } });
   if (event.method === 'turn/started') {
     return upsert(messages, { seq: 0, id: `run-${p.turn.id}`, sessionId, role: 'activity', text: '', kind: 'runMarker', data: { status: 'inProgress', turnId: p.turn.id, startedAt: Date.now(), ...(p.turn.phase === 'awaitingResponse' ? { phase: 'awaitingResponse' } : {}) } });

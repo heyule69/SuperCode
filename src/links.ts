@@ -7,7 +7,7 @@ export function describeLink(href: string): { kind: 'external' | 'file' | 'ancho
   let path = href;
   if (/^file:/i.test(path)) {
     try { const url = new URL(path); path = `${url.hostname ? `//${url.hostname}` : ''}${url.pathname}${url.hash}`; if (/^\/[a-z]:\//i.test(path)) path = path.slice(1); } catch { return { kind: 'unsupported', target: href }; }
-  } else if (/^[a-z][\w+.-]*:/i.test(path) && !/^[a-z]:[\\/]/i.test(path)) return { kind: 'unsupported', target: href };
+  } else if (/^[a-z][\w+.-]*:/i.test(path) && !/^[a-z]:(?:[\\/]|%5c|%2f)/i.test(path)) return { kind: 'unsupported', target: href };
   const marker = /(?::(\d+)|#L?(\d+))$/i.exec(path);
   const line = marker ? Number(marker[1] ?? marker[2]) : undefined;
   try { return { kind: 'file', target: decodeURIComponent(marker ? path.slice(0, marker.index) : path), line: line && line > 0 ? line : undefined }; }

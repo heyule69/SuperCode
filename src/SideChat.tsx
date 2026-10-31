@@ -4,6 +4,7 @@ import { call, desktop } from './api';
 import { useSideChatRecovery } from './useSideChatRecovery';
 import { useStableCallback } from './useStableCallback';
 import { ComposerTextarea } from './ComposerTextarea';
+import { useComposerFileDrop } from './useComposerFileDrop';
 import { AddMenu, AttachmentStrip, ComposerSkills, ModelMenu, PermissionMenu } from './ComposerMenus';
 import { AgentIcon } from './AgentIcon';
 import { clipboardImages, imageBase64, imageBytes, MAX_ATTACHMENTS, MAX_TOTAL_IMAGE_BYTES, mergeAttachments, validateImageFile, type Attachment } from './attachments';
@@ -103,14 +104,15 @@ export default function SideChat({draft,projectId,agent,connectionId,defaults,cl
       setSelection(option.connectionId);updateOptions({...options.current,model:option.model,effort:option.defaultReasoningEffort??null});rememberModel(option.model,option.defaultReasoningEffort??'',option.connectionId);}
     catch(e){report(e);}finally{setConfiguring(false);}
   }
-  function addAttachments(items:(Attachment|File)[]){
+  function addAttachments(items:(Attachment|File)[],paths:string[]=[]){
     if(!desktop)return Promise.reject(new Error('请在桌面版中上传或粘贴图片'));
     pendingImports.current++;setImporting(true);
     const job=attachmentJobs.current.then(async()=>{
-      if(items.length+options.current.attachments.length>MAX_ATTACHMENTS)throw new Error('最多添加 12 个附件，请先移除一个附件');
-      for(const item of items)if(item instanceof File)validateImageFile(item);
+      if(items.length+paths.length+options.current.attachments.length>MAX_ATTACHMENTS)throw new Error('最多添加 12 个附件，请先移除一个附件');
+      const entries=paths.length?[...items,...await call<Attachment[]>('resolve_attachment_paths',{paths})]:items;
+      for(const item of entries)if(item instanceof File)validateImageFile(item);
       const imported:Attachment[]=[];
-      for(const item of items){
+      for(const item of entries){
         if(!(item instanceof File)&&item.kind!=='image'){imported.push(item);continue;}
         const remainingBytes=MAX_TOTAL_IMAGE_BYTES-imageBytes(mergeAttachments(options.current.attachments,imported));
         const args=item instanceof File?{data:await imageBase64(item),name:item.name,remainingBytes}:{path:item.path,name:item.name,remainingBytes};
@@ -167,6 +169,7 @@ export default function SideChat({draft,projectId,agent,connectionId,defaults,cl
       updateOptions({...options.current,attachments:options.current.attachments.filter(a=>!sent.attachments.some(s=>s.path===a.path))});if(inputRef.current===sent.text)setInput('');await followups.reload();await refresh();
     }catch(e){if(operation.active())report(e);}finally{const active=operation.active();operation.finish();sendLock.current=false;if(active)setSending(false);}
   }
+  const composerDrop=useComposerFileDrop(paths=>addAttachments([],paths),report,!hidden&&!sending&&!followupEditor.busy);
   return <PlanDisplayContext.Provider value={planDisplay}><aside className="side-chat" aria-label="侧边聊天" hidden={hidden} inert={hidden}>{resizeHandle}
     <header className="side-chat-header"><MessageSquare size={16}/><strong>侧边聊天</strong>
       {!embedded ? <button className="icon-button" aria-label="关闭侧边聊天" title="关闭侧边聊天" onClick={()=>{if(session)opened(session);close();}}><X size={16}/></button> : null}
@@ -182,7 +185,7 @@ export default function SideChat({draft,projectId,agent,connectionId,defaults,cl
       {questionPending?<Suspense fallback={<p>正在加载提问…</p>}><QuestionDock requests={requests} respond={respondRequest}/></Suspense>:null}
       <div className="plan-decision-dock" ref={setPlanDock}/>
       <FollowupQueue rows={followups.rows} agent={agent} turnId={session?.turnId} steeringMode={followups.steeringMode} change={change} steer={async id=>{try{await call('steer_followup',{id,expectedTurnId:session?.turnId});await followups.reload();}catch(e){report(e);}}} openSide={row=>void followupEditor.begin(row)} edit={followupEditor.begin} editingId={followupEditor.editingId}/>
-      <form className={'composer side-chat-composer'+(busy?' busy':'')} onSubmit={e=>{e.preventDefault();void send();}}>
+      <form ref={composerDrop} className={'composer side-chat-composer'+(busy?' busy':'')} onSubmit={e=>{e.preventDefault();void send();}}>
         {followupEditor.editingId?<div className="composer-editing"><span>编辑排队消息</span><button type="button" disabled={followupEditor.busy} onClick={()=>void withPendingConnection(()=>followupEditor.cancel())}>取消编辑</button></div>:null}
         <AttachmentStrip attachments={payload.attachments} loading={importing} remove={removeAttachment}/>
         <div className="composer-input"><ComposerSkills attachments={payload.attachments} remove={removeAttachment}/>

@@ -17,6 +17,7 @@ import { emptySidebar } from './sidebarState';
 import { commandMatches, parseCommand, slashCommands } from './slashCommands';
 import { AddMenu, AttachmentStrip, ComposerSkills, ModelMenu, PermissionMenu, type Attachment } from './ComposerMenus';
 import { ComposerTextarea } from './ComposerTextarea';
+import { useComposerFileDrop } from './useComposerFileDrop';
 import { PlanDisplayContext } from './PlanDisplayContext';
 import { documentTab, useRightPane, workspaceTab } from './rightPaneState';
 import RightPane from './RightPane';
@@ -960,18 +961,19 @@ export default function App() {
       else document.execCommand(command);
     } catch (e) { report(e); }
   }
-  function addAttachments(items: (Attachment | File)[]): Promise<void> {
+  function addAttachments(items: (Attachment | File)[], paths: string[] = []): Promise<void> {
     if (!desktop) return Promise.reject(new Error('请在桌面版中上传或粘贴图片'));
-    if (!items.length) return Promise.resolve();
+    if (!items.length && !paths.length) return Promise.resolve();
     const origin = draftKey.current;
     drafts.current.set(origin, inputRef.current);
     pendingAttachments.current++; setImportingImages(true);
     const job = attachmentJobs.current.then(async () => {
       const currentAttachments = () => draftKey.current === origin ? attachmentsRef.current : attachmentDrafts.current.get(origin) ?? [];
-      if (items.length + currentAttachments().length > MAX_ATTACHMENTS) throw new Error('最多添加 12 个附件，请先移除一个附件');
-      for (const item of items) if (item instanceof File) validateImageFile(item);
+      if (items.length + paths.length + currentAttachments().length > MAX_ATTACHMENTS) throw new Error('最多添加 12 个附件，请先移除一个附件');
+      const entries = paths.length ? [...items, ...await call<Attachment[]>('resolve_attachment_paths', { paths })] : items;
+      for (const item of entries) if (item instanceof File) validateImageFile(item);
       const imported: Attachment[] = [];
-      for (const item of items) {
+      for (const item of entries) {
         if (!(item instanceof File) && item.kind !== 'image') { imported.push(item); continue; }
         const remainingBytes = MAX_TOTAL_IMAGE_BYTES - imageBytes(mergeAttachments(currentAttachments(), imported));
         const args = item instanceof File ? { data: await imageBase64(item), name: item.name, remainingBytes } : { path: item.path, name: item.name, remainingBytes };
@@ -987,6 +989,7 @@ export default function App() {
     attachmentJobs.current = job.catch(() => {});
     return job;
   }
+  const composerDrop = useComposerFileDrop(paths => addAttachments([], paths), report, ready && !sending && !followupEditor.busy);
   function pasteImages(event: React.ClipboardEvent<HTMLTextAreaElement>) {
     const images = clipboardImages(event.clipboardData);
     if (!images.length) return;
@@ -1059,7 +1062,7 @@ export default function App() {
         <div className="plan-decision-dock" ref={setPlanDock}/>
         {busy && session?.turnId && messages.some(message => message.kind === 'turnDiff') ? <Suspense fallback={null}><TurnChangesDock key={sessionId} messages={messages} activeTurnId={session.turnId} showDiff={showDiff}/></Suspense> : null}
         <FollowupQueue rows={followups.rows.filter(row=>row.sessionId===sessionId)} agent={agentId} turnId={session?.turnId} steeringMode={followups.steeringMode} change={changeFollowup} steer={steerFollowup} openSide={row=>void openSide(row)} edit={followupEditor.begin} editingId={followupEditor.editingId}/>
-        <form className={`composer ${busy ? 'busy' : ''}`} onSubmit={e => { e.preventDefault(); void send(); }}>
+        <form ref={composerDrop} className={`composer ${busy ? 'busy' : ''}`} onSubmit={e => { e.preventDefault(); void send(); }}>
           {followupEditor.editingId?<div className="composer-editing"><span>编辑排队消息</span><button type="button" disabled={followupEditor.busy} onClick={()=>void followupEditor.cancel()}>取消编辑</button></div>:null}
           {slashOptions.length || composerFocused && skillQuery && !commandsDismissed && (skillsLoading || skillsError) ? <div className="slash-menu" id="agent-commands" role="listbox" aria-label="命令与技能" aria-busy={skillsLoading}>{slashOptions.map((c, index) => <button id={`agent-command-${index}`} className={index === slashIndex ? 'selected' : ''} type="button" role="option" aria-selected={index === slashIndex} key={c.name} onMouseDown={e => e.preventDefault()} onClick={() => selectCommand(index)}><span className="slash-option-name">{c.skill ? <Sparkles size={14}/> : <Terminal size={14}/>}<code>{c.name}</code></span><span className="slash-option-detail" title={c.detail}>{c.detail}{c.skill ? <small>{skillSource(c.skill)}</small> : null}</span>{c.skill ? <small className="slash-option-kind">技能</small> : null}</button>)}{skillsLoading ? <div className="slash-menu-status" role="status">读取技能…</div> : skillsError ? <div className="slash-menu-status error-text" role="alert">{skillsError}</div> : null}</div> : null}
           <AttachmentStrip attachments={attachments} loading={importingImages} remove={path => setAttachments(old => old.filter(a => a.path !== path))} />
