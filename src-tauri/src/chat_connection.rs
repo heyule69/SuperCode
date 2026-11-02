@@ -101,7 +101,7 @@ async fn check_with<F: Future<Output = Result<Value, String>>>(
     }
 }
 
-pub(crate) async fn check(
+async fn check_eligibility(
     app: &AppHandle,
     agent: &str,
     session_id: Option<&str>,
@@ -125,15 +125,23 @@ pub(crate) async fn check(
     .await
 }
 
-// Model discovery and allowance queries must use the same eligibility as send.
-// Missing suppliers are an empty state; unrelated failures remain visible.
+pub(crate) async fn check(
+    app: &AppHandle, agent: &str, session_id: Option<&str>, connection_id: Option<&str>,
+) -> Result<(), String> {
+    check_eligibility(app, agent, session_id, connection_id).await?;
+    let route = app.state::<AppState>().store.route_with_connection(agent, session_id, connection_id)?;
+    crate::magpie::require_gateway(&route.config).await
+}
+
+// Catalogs remain inspectable offline. Generation additionally checks Magpie
+// transport through check()/require_gateway(), without changing chat bindings.
 pub(crate) async fn available_route(
     app: &AppHandle,
     agent: &str,
     session_id: Option<&str>,
     connection_id: Option<&str>,
 ) -> Result<Option<crate::session_config::Route>, String> {
-    match check(app, agent, session_id, connection_id).await {
+    match check_eligibility(app, agent, session_id, connection_id).await {
         Ok(()) => {
             let state = app.state::<AppState>();
             let route = state

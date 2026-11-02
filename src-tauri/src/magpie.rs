@@ -16,6 +16,60 @@ const AGENTS: [&str; 5] = ["claude", "codex", "opencode", "pi", "gemini"];
 pub(crate) fn managed(profile: &Profile) -> bool {
     profile.config["providerId"] == "magpie" && profile.config["source"] == "magpie"
 }
+pub(crate) const UNAVAILABLE: &str = "Magpie 网关未连接。请先打开 Magpie（后台运行也可以）后再发送；已保存的模型目录不代表当前可调用。";
+
+pub(crate) fn is_magpie(config: &Value) -> bool { config["providerId"] == "magpie" }
+
+// A transport check only: no model inference, directory download, process
+// launch, GUI visibility check, or copy of the upstream credentials.
+fn gateway_endpoint(config: &Value) -> Result<(String, u16, bool)> {
+    let base = providers::configured_base_url(config).ok_or("Magpie 网关地址缺失，请重新添加连接")?;
+    let url = reqwest::Url::parse(&base).map_err(|_| "Magpie 网关地址无效，请重新添加连接")?;
+    if !matches!(url.scheme(), "http" | "https") || !url.username().is_empty() || url.password().is_some() {
+        return Err("Magpie 网关地址无效，请重新添加连接".into());
+    }
+    let host = url.host_str().ok_or("Magpie 网关地址缺少主机")?.trim_matches(['[', ']']);
+    let port = url.port_or_known_default().filter(|p| *p > 0).ok_or("Magpie 网关端口无效")?;
+    let local = host == "localhost" || host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback());
+    Ok((host.to_owned(), port, local))
+}
+
+pub(crate) async fn gateway_reachable(config: &Value) -> Result<bool> {
+    let (host, port, local) = gateway_endpoint(config)?;
+    let deadline = if local { Duration::from_millis(1200) } else { Duration::from_secs(15) };
+    Ok(tokio::time::timeout(deadline, tokio::net::TcpStream::connect((host.as_str(), port)))
+        .await.is_ok_and(|result| result.is_ok()))
+}
+
+pub(crate) async fn require_gateway(config: &Value) -> Result<()> {
+    // A remote gateway can remain available without this computer's Magpie.
+    // Its native HTTP client may also use a proxy, so a direct TCP preflight
+    // would incorrectly reject that existing supported route.
+    if is_magpie(config) && gateway_endpoint(config)?.2 && !gateway_reachable(config).await? { return Err(UNAVAILABLE.into()); }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn get_magpie_status(app: AppHandle, agent: Option<String>, connection_id: Option<String>) -> Result<Value> {
+    let state = app.state::<AppState>();
+    let profile = if let (Some(agent), Some(id)) = (agent.as_deref(), connection_id.as_deref()) {
+        state.store.profile(agent, id)?
+    } else {
+        let mut found = None;
+        for agent in AGENTS {
+            if let Some(profile) = state.store.profile(agent, &format!("magpie:{agent}"))? {
+                if managed(&profile) { found = Some(profile); break; }
+            }
+        }
+        found
+    };
+    let Some(profile) = profile.filter(|profile| is_magpie(&profile.config)) else {
+        return Ok(json!({"state":"unconfigured"}));
+    };
+    if !gateway_endpoint(&profile.config)?.2 { return Ok(json!({"state":"remote"})); }
+    let reachable = gateway_reachable(&profile.config).await?;
+    Ok(json!({"state":if reachable {"reachable"} else {"offline"},"checkedAt":chrono::Utc::now().timestamp_millis()}))
+}
 fn revision(conn: &Connection) -> Result<u64> {
     conn.query_row("SELECT value FROM settings WHERE key=?1", [REVISION], |r| {
         r.get::<_, String>(0)
@@ -377,6 +431,60 @@ fn launch(program: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn gateway_probe_uses_saved_endpoint_without_gui_or_model_requests() {
+        use tokio::io::AsyncReadExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let config = json!({"providerId":"magpie","baseUrl":format!("http://{address}/v1"),"apiKey":"private-upstream-key"});
+        let read = tokio::spawn(async move {
+            let (mut connection, _) = listener.accept().await.unwrap();
+            let mut bytes = Vec::new();
+            tokio::time::timeout(Duration::from_secs(2), connection.read_to_end(&mut bytes)).await.unwrap().unwrap();
+            assert!(bytes.is_empty(), "transport inspection must not send a model/API payload");
+        });
+        assert!(gateway_reachable(&config).await.unwrap());
+        read.await.unwrap();
+        assert!(!gateway_reachable(&config).await.unwrap());
+        assert_eq!(require_gateway(&config).await.unwrap_err(), UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn every_magpie_agent_is_checked_and_unrelated_connections_are_unchanged() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let mut configs = Vec::new();
+        for agent in AGENTS {
+            let profile = providers::make_profile(settings(agent, &base, &models()), None).unwrap();
+            assert!(is_magpie(&profile.config));
+            require_gateway(&profile.config).await.unwrap();
+            configs.push(profile.config);
+        }
+        drop(listener);
+        for config in configs { assert_eq!(require_gateway(&config).await.unwrap_err(), UNAVAILABLE); }
+        require_gateway(&json!({"providerId":"custom","baseUrl":"invalid"})).await.unwrap();
+        require_gateway(&json!({"official":true})).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn invalid_or_missing_magpie_endpoints_do_not_fall_back_to_a_default_gateway() {
+        for base in [None, Some(""), Some("file:///tmp/models"), Some("http://user:secret@127.0.0.1:3425"), Some("not-a-url")] {
+            let config = json!({"providerId":"magpie","baseUrl":base});
+            assert!(gateway_reachable(&config).await.is_err());
+            assert!(require_gateway(&config).await.is_err());
+        }
+    }
+    #[tokio::test]
+    async fn remote_magpie_connections_do_not_require_a_local_gui_or_bypass_the_native_proxy() {
+        let config = json!({"providerId":"magpie","baseUrl":"https://gateway.example.invalid/v1"});
+        assert!(!gateway_endpoint(&config).unwrap().2);
+        // No remote request is made: the generation client retains ownership
+        // of remote transport, proxy and authentication checks.
+        require_gateway(&config).await.unwrap();
+        for base in ["http://localhost:3425/v1", "http://127.0.0.1:3425", "http://[::1]:3425/v1beta"] {
+            assert!(gateway_endpoint(&json!({"baseUrl":base})).unwrap().2);
+        }
+    }
     fn store() -> Store {
         Store::from_connection(Connection::open_in_memory().unwrap()).unwrap()
     }

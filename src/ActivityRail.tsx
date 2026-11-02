@@ -1,4 +1,4 @@
-import { FolderOpen, Home, Search, Settings2, SquarePen } from 'lucide-react';
+import { FolderOpen, Home, Search, Settings, SquarePen } from 'lucide-react';
 
 export function ActivityRail({ settings, blocked, home, create, search, projects, preferences }: {
   settings: boolean; blocked: boolean; home: () => void; create: () => void;
@@ -10,6 +10,6 @@ export function ActivityRail({ settings, blocked, home, create, search, projects
     <button aria-label="搜索聊天" title="搜索聊天 (Ctrl+K)" onClick={search}><Search size={19}/></button>
     <button aria-label="显示项目" title="显示项目" onClick={projects}><FolderOpen size={19}/></button>
     <div className="activity-rail-spacer"/>
-    <button className={settings ? 'selected' : ''} aria-label="设置" title="设置 (Ctrl+,)" aria-current={settings ? 'page' : undefined} onClick={preferences}><Settings2 size={19}/></button>
+    <button className={settings ? 'selected' : ''} aria-label="设置" title="设置 (Ctrl+,)" aria-current={settings ? 'page' : undefined} onClick={preferences}><Settings size={19}/></button>
   </nav>;
 }

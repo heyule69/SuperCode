@@ -2,6 +2,8 @@ import { lazy, memo, Suspense, useEffect, useMemo, useRef, useState } from 'reac
 import { ArrowDown, Brain, Check, ChevronDown, ChevronRight, Circle, FileCode2, FileDiff, FileSearch, Globe, ListChecks, MessageCircleQuestion, Monitor, Network, Pencil, Shield, Square, SquareTerminal, Wrench, X } from 'lucide-react';
 import { conversationTurns, isActivity, type ConversationTurn } from './events';
 import { isActive, type Message } from './types';
+import { ReplyText } from './ReplyText';
+import { TurnConnection } from './TurnConnection';
 import { diffFiles } from './diff';
 import { CopyButton } from './CopyButton';
 import { activityStatus, concisePath, summarizeActivities } from './activityPresentation';
@@ -18,7 +20,8 @@ import { planText, type PlanDecision } from './planPresentation';
 import { collectSubagents, isSubagent } from './subagents';
 import { SubagentContext, SubagentRows } from './SubagentRow';
 import { shareConversationTurns } from './conversationCache';
-import { turnArtifactPaths } from './artifacts';
+import { turnArtifactPaths, turnKnownArtifacts } from './artifacts';
+import { turnArtifactLinks } from './artifactLinks';
 import { TurnArtifacts } from './TurnArtifacts';
 const PlanCard = lazy(() => import('./PlanCard').then(module => ({ default: module.PlanCard })));
 const ProposedPlan = lazy(() => import('./ProposedPlan'));
@@ -163,7 +166,7 @@ const MessageView = memo(function MessageView({ message: m, openFile }: { messag
     {hasBubble ? <div className="message-content">
       {m.role === 'system' ? <div className="system-message-label">{informational ? m.kind === 'goalState' ? '目标' : '命令结果' : '运行提示'}</div> : null}
       {inlineAttachments.length ? <div className="message-attachments">{inlineAttachments.map((a,i) => a.kind === 'image' && a.path ? <span className="message-image-attachment" key={a.path}><AttachmentImage attachment={{ name:a.name, path:a.path }}/></span> : <span key={i}><FileCode2 size={12}/>{a.name}</span>)}</div> : null}
-      {user ? m.text ? <div className="message-text">{m.text}</div> : null : <Suspense fallback={<div className="message-text">{m.text}</div>}><Markdown text={m.text} openFile={openFile} streaming={m.role === 'assistant' && pending(m.data?.status)} /></Suspense>}
+      {user ? m.text ? <div className="message-text">{m.text}</div> : null : m.role === 'assistant' ? <ReplyText text={m.text} openFile={openFile} streaming={pending(m.data?.status)} /> : <Suspense fallback={<div className="message-text">{m.text}</div>}><Markdown text={m.text} openFile={openFile} /></Suspense>}
       {user ? null : <MediaList media={media}/>}
     </div> : null}
     {user && m.text ? <CopyButton className="copy-message user-copy" text={m.text} label="复制消息" iconOnly /> : null}
@@ -201,6 +204,8 @@ const TurnView = memo(function TurnView({ turn, lifecycle, pendingLabel, agentNa
   const removed = files.reduce((count, file) => count + file.removed, 0);
   const resultText = marker?.data?.status === 'interrupted' ? '已停止' : marker?.data?.status === 'failed' ? '运行失败' : '';
   const artifactPathsKey = JSON.stringify(turnArtifactPaths(turn.items,presentation.final));
+  const artifactLinksKey = useMemo(()=>JSON.stringify(turnArtifactLinks(presentation.final)),[turn.items,presentation.completed]);
+  const artifactKnownKey = useMemo(()=>JSON.stringify(turnKnownArtifacts(turn.items)),[turn.items]);
   const artifactError = turn.items.filter(message=>message.kind==='turnArtifacts').map(message=>message.data?.error).find(error=>typeof error==='string') as string|undefined;
   const summary = <>{marker?.data?.durationMs != null ? <span>用时 {duration(Number(marker.data.durationMs))}</span> : <span>{resultText || '执行过程'}</span>}{resultText && marker?.data?.durationMs != null ? <span>· {resultText}</span> : null}</>;
   if (!turn.user && turn.items.length === 1 && turn.items[0].kind === 'modelSwitch') return <MessageView message={turn.items[0]} openFile={openFile} />;
@@ -214,11 +219,11 @@ const TurnView = memo(function TurnView({ turn, lifecycle, pendingLabel, agentNa
       else blocks.push(item);
     }
     const waiting = live && lifecycle.sessionStatus === 'waiting';
-    const content = blocks.map((block, index) => Array.isArray(block) ? <ActivityGroup key={block[0].id} messages={block} autoExpand={autoExpand} processDisplay={processDisplay} showDiff={showDiff} live={live && !waiting && index === blocks.length - 1} /> : isSubagent(block) && collectSubagents([block]).length ? <SubagentRows key={block.id} messageId={block.id} /> : block.kind === 'plan' ? <Suspense key={block.id} fallback={<span className="pending-text">正在加载计划文档…</span>}><ProposedPlan text={block.text} streaming={!!generating && pending(block.data?.status)} openFile={openFile} respond={presentation.completed && lifecycle.latest && block.id === latestPlan?.id && onPlanAction ? (decision,feedback)=>onPlanAction(block,decision,feedback) : undefined}/></Suspense> : <MessageView key={block.id} message={block} openFile={openFile} />);
+    const content = blocks.map((block, index) => Array.isArray(block) ? <ActivityGroup key={block[0].id} messages={block} autoExpand={autoExpand} processDisplay={processDisplay} showDiff={showDiff} live={live && !waiting && index === blocks.length - 1} /> : isSubagent(block) && collectSubagents([block]).length ? <SubagentRows key={block.id} messageId={block.id} /> : block.kind === 'plan' ? <Suspense key={block.id} fallback={<span className="pending-text">正在加载计划文档…</span>}><ReplyText text={block.text} streaming={!!generating && pending(block.data?.status)} renderText={displayed => <ProposedPlan text={displayed} streaming={!!generating && pending(block.data?.status)} openFile={openFile} respond={presentation.completed && lifecycle.latest && block.id === latestPlan?.id && onPlanAction ? (decision,feedback)=>onPlanAction(block,decision,feedback) : undefined}/>}/></Suspense> : <MessageView key={block.id} message={block} openFile={openFile} />);
     if (waiting) content.push(<TurnProgress key="turn-progress" label={pendingLabel} />);
-    else if (live && !Array.isArray(blocks.at(-1))) {
+    else if (live) {
       const activities = items.filter(item => !isSubagent(item));
-      content.push(<TurnProgress key="turn-progress" label={activities.length ? summarizeActivities(activities, true).label : responsePendingLabel} />);
+      content.push(<TurnConnection key={processKey} active connection={marker?.data?.connection} lastProgressAt={Number(marker?.data?.lastProgressAt ?? marker?.data?.startedAt)} waitingForTool={items.some(m => m.role === 'tool' && pending(m.data?.status))} starting={lifecycle.sessionStatus === 'starting'} normalLabel={!Array.isArray(blocks.at(-1)) ? activities.length ? summarizeActivities(activities, true).label : responsePendingLabel : undefined} />);
     }
     return content;
   }
@@ -231,7 +236,8 @@ const TurnView = memo(function TurnView({ turn, lifecycle, pendingLabel, agentNa
       {presentation.completed && processOpen ? <div className="turn-process-content" id={`process-${turn.id}`} role="region" aria-label="执行过程详情">{renderItems(process)}</div> : null}
       {presentation.completed ? renderItems(presentation.notices) : null}
       <div className={presentation.completed ? 'turn-final-result' : 'turn-live-content'}>{renderItems(presentation.completed ? result : turn.items, generating)}</div>
-      {presentation.completed&&(artifactPathsKey!=='[]'||artifactError)?<TurnArtifacts pathsKey={artifactPathsKey} collectionError={artifactError}/>:null}
+      {!generating ? <TurnConnection active={false} connection={marker?.data?.connection} /> : null}
+      {presentation.completed&&(artifactPathsKey!=='[]'||artifactLinksKey!=='[]'||artifactError)?<TurnArtifacts pathsKey={artifactPathsKey} linksKey={artifactLinksKey} knownKey={artifactKnownKey} collectionError={artifactError}/>:null}
       {!generating && (reply || completed && !presentation.completed) ? <div className="turn-footer">{completed && !presentation.completed ? <div className={`turn-summary ${marker?.data?.status}`}>{summary}</div> : null}{reply ? <CopyButton className="turn-copy" text={reply} label="复制回复" iconOnly /> : null}</div> : null}
       {completed && files.length ? <section className="turn-changes" aria-label="本轮文件变更"><div className="turn-changes-heading"><span className="turn-changes-icon"><FileDiff size={22}/></span><div className="turn-changes-title"><strong>已编辑 {files.length} 个文件</strong><div className="turn-change-totals"><span className="added-count">+{added}</span><span className="removed-count">−{removed}</span></div></div><button className="view-changes" onClick={()=>showDiff('本轮变更',diff)}>查看变更</button></div><div className="turn-changes-files">{(allChanges ? files : files.slice(0, 3)).map(f => {
         const path = f.path.replace(/\\/g, '/');
@@ -251,7 +257,7 @@ export const Conversation = memo(function Conversation({ messages, agentName, au
   }, [messages]);
   const mediaContext = useMemo(() => ({ projectId, sessionId, openFile }), [projectId, sessionId, openFile]);
   const subagents = useMemo(() => ({ agents:collectSubagents(messages), open:openSubagent }), [messages, openSubagent]);
-  return <SubagentContext.Provider value={subagents}><MediaContext.Provider value={mediaContext}><ResourceMenu openFile={openFile} openPath={openPath}><ConversationIndex turns={turns}/>{turns.map((turn, index) => <TurnView key={turn.id} turn={turn} lifecycle={{ sessionStatus, activeTurnId, latest: index === turns.length - 1 }} pendingLabel={pendingLabel} agentName={agentName} autoExpand={autoExpand} processDisplay={processDisplay} showDiff={showDiff} openFile={openFile} onPlanAction={onPlanAction} />)}{!turns.length && isActive(sessionStatus) ? <TurnProgress label={pendingLabel} /> : null}</ResourceMenu></MediaContext.Provider></SubagentContext.Provider>;
+  return <SubagentContext.Provider value={subagents}><MediaContext.Provider value={mediaContext}><ResourceMenu openFile={openFile} openPath={openPath}><ConversationIndex turns={turns}/>{turns.map((turn, index) => <TurnView key={turn.id} turn={turn} lifecycle={{ sessionStatus, activeTurnId, latest: index === turns.length - 1 }} pendingLabel={pendingLabel} agentName={agentName} autoExpand={autoExpand} processDisplay={processDisplay} showDiff={showDiff} openFile={openFile} onPlanAction={onPlanAction} />)}{!turns.length && isActive(sessionStatus) ? <TurnConnection key={sessionId} active={sessionStatus !== 'waiting'} starting={sessionStatus === 'starting'} normalLabel={pendingLabel} /> : null}</ResourceMenu></MediaContext.Provider></SubagentContext.Provider>;
 });
 
 export function JumpToLatest({ onClick }: { onClick: () => void }) { return <button className="jump-to-latest" onClick={onClick}><ArrowDown size={14} />回到最新消息</button>; }

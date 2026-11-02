@@ -1,0 +1,15 @@
+.turn-connection { display:flex; align-items:flex-start; gap:10px; padding:12px 14px; margin:12px 0; border:1px solid var(--line); border-radius:10px; background:var(--surface); color:var(--muted); font-size:12px; line-height:1.6; }
+.turn-connection > svg { flex-shrink:0; margin-top:3px; }
+.connection-content { min-width:0; }
+.connection-heading { display:flex; flex-wrap:wrap; align-items:center; gap:6px 12px; }
+.connection-heading strong { font-weight:550; font-size:13px; color:var(--text); }
+.connection-attempt { font-variant-numeric:tabular-nums; white-space:nowrap; }
+.turn-connection p { margin:3px 0 0; overflow-wrap:anywhere; }
+.turn-connection.retrying { border-color:color-mix(in srgb,#b78028 34%,var(--line)); background:color-mix(in srgb,#b78028 7%,var(--bg)); }
+.turn-connection.retrying > svg,.turn-connection.failed > svg { color:#b78028; }
+.turn-connection.restored { border-color:color-mix(in srgb,#3b8c66 34%,var(--line)); }
+.turn-connection.restored > svg { color:#3b8c66; }
+.connection-spinner { animation:connection-spin 1.5s linear infinite; }
+@keyframes connection-spin { to { transform:rotate(360deg); } }
+[data-motion="off"] .connection-spinner { animation:none; }
+@media(prefers-reduced-motion:reduce) { .connection-spinner { animation:none; } }

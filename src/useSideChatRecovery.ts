@@ -63,7 +63,7 @@ export function useSideChatRecovery(current: RefObject<Session | undefined>, set
       const ownedRequest = owner === session.id && (event.id !== undefined || event.method === 'serverRequest/resolved');
       if (native !== session.nativeId && !bind && !ownedRequest) return;
       requestEvent(event); eventRevision.current++;
-      if (event.method === 'error') callbacks.current.report(event.params.error?.message ?? 'Agent 运行失败');
+      if (event.method === 'error' && event.params.willRetry !== true) callbacks.current.report(event.params.error?.message ?? 'Agent 运行失败');
       if (bind || event.id !== undefined || event.method === 'serverRequest/resolved' || event.method === 'turn/started' || event.method === 'turn/completed') {
         const next = { ...session, ...(bind ? { nativeId: native } : {}), ...(event.method === 'turn/started' ? { status: 'running', turnId: event.params.turn.id } : event.method === 'turn/completed' ? { status: event.params.turn.status === 'completed' ? 'idle' : event.params.turn.status, turnId: null } : event.id !== undefined ? { status: 'waiting' } : event.method === 'serverRequest/resolved' && session.status === 'waiting' ? { status: 'running' } : {}) };
         current.current = next; callbacks.current.setSession(next);

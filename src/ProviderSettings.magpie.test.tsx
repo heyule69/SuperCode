@@ -16,6 +16,16 @@ const trigger=()=>node.querySelector<HTMLButtonElement>('button[aria-label="Magp
 async function render(profiles:AgentProfile[]=[existing],updated: (agent?:string,prefer?:boolean)=>Promise<void>=async()=>{},runningConnections:Record<string,string[]>={}){await act(async()=>root.render(<ProviderSettings profiles={profiles} officialAgents={[]} runningConnections={runningConnections} updated={updated}/>))}
 beforeEach(()=>{(globalThis as any).IS_REACT_ACT_ENVIRONMENT=true;node=document.createElement('div');document.body.append(node);root=createRoot(node);mocks.call.mockReset();mocks.call.mockImplementation(async(command:string)=>command==='list_provider_accounts'?[]:undefined)});
 afterEach(async()=>{await act(async()=>root.unmount());node.remove()});
+it('distinguishes saved model counts from the current gateway state without auto-launching it', async () => {
+ let gateway='offline';mocks.call.mockImplementation(async(command:string)=>command==='list_provider_accounts'?[]:command==='get_magpie_status'?{state:gateway}:undefined);
+ await render(managed());await act(async()=>trigger().click());
+ expect(menu().textContent).toContain('已保存 5000 个模型');expect(menu().textContent).not.toContain('5000 个模型可用');
+ expect(menu().querySelector('[data-state="offline"]')?.textContent).toContain('网关未连接');
+ expect(mocks.call.mock.calls.some(([command])=>['open_magpie','use_magpie','list_models'].includes(command))).toBe(false);
+ await act(async()=>trigger().click());gateway='reachable';await act(async()=>trigger().click());
+ expect(menu().querySelector('[data-state="reachable"]')?.textContent).toContain('后台运行');
+ expect(mocks.call.mock.calls.filter(([command])=>command==='get_magpie_status')).toHaveLength(2);
+});
 it('places Magpie in the toolbar and removes its API preset from every Agent picker',async()=>{
  await render();expect(trigger()).toBeTruthy();
  for(const agent of ['claude','codex','opencode','pi','gemini']){

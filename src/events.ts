@@ -1,4 +1,5 @@
 import type { Message, RpcEvent } from './types';
+import { readRunConnection, updateRunConnection } from './runConnection';
 
 const limit = 128 * 1024;
 const activityKinds = new Set(['reasoning', 'executionPlan', 'runMarker']);
@@ -43,7 +44,7 @@ function upsert(messages: Message[], message: Message): Message[] {
 }
 
 export function isDisplayEvent(event: RpcEvent) {
-  return event.id === undefined && (event.method.startsWith('item/') || ['turn/started', 'turn/completed', 'turn/plan/updated', 'turn/diff/updated', 'turn/artifacts/updated'].includes(event.method));
+  return event.id === undefined && (event.method.startsWith('item/') || ['error', 'turn/connection/updated', 'turn/started', 'turn/completed', 'turn/plan/updated', 'turn/diff/updated', 'turn/artifacts/updated'].includes(event.method));
 }
 
 // A storage read may race native startup. Keep unacknowledged messages in their
@@ -91,6 +92,12 @@ export function reconcileMessages(live: Message[], saved: Message[], pendingUser
       result.push({ ...previous, seq: message.seq });
       return;
     }
+    if (previous?.kind === 'runMarker' && message.kind === 'runMarker' && previous.data?.turnId === message.data?.turnId
+      && ['inProgress', 'running', 'preparing'].includes(String(previous.data?.status)) && ['inProgress', 'running', 'preparing'].includes(String(message.data?.status))) {
+      const observedAt = Math.max(readRunConnection(previous.data?.connection)?.at ?? 0, Number(previous.data?.lastProgressAt) || 0);
+      const savedAt = Math.max(readRunConnection(message.data?.connection)?.at ?? 0, Number(message.data?.lastProgressAt) || 0);
+      if (observedAt > savedAt) { result.push({ ...message, data:{ ...message.data, ...previous.data } }); return; }
+    }
     result.push(previous && previous.text.length > message.text.length
       && ['inProgress', 'preparing'].includes(String(previous.data?.status))
       && ['inProgress', 'preparing'].includes(String(message.data?.status)) ? { ...previous, seq: message.seq } : message);
@@ -100,6 +107,7 @@ export function reconcileMessages(live: Message[], saved: Message[], pendingUser
 }
 
 export function mergeEvent(messages: Message[], event: RpcEvent, sessionId: string): Message[] {
+  messages = updateRunConnection(messages, event, sessionId);
   const p = event.params;
   if (event.method === 'turn/artifacts/updated') return upsert(messages, { seq:0,id:`artifacts-${p.turnId}`,sessionId,role:'activity',text:'',kind:'turnArtifacts',data:metadata({turnId:p.turnId,status:'completed',artifacts:p.artifacts,error:p.error}) });
   if (event.method === 'turn/diff/updated') return upsert(messages, { seq: 0, id: `diff-${p.turnId}`, sessionId, role: 'activity', text: bounded(String(p.diff ?? '')), kind: 'turnDiff', data: { turnId: p.turnId, status: 'completed' } });
@@ -121,7 +129,10 @@ export function mergeEvent(messages: Message[], event: RpcEvent, sessionId: stri
     });
     // Restored/paginated history may not contain the start event. Record the
     // actual completion beside its own items, not at the end of a newer turn.
-    if (!marker && last >= 0) finished.splice(last + 1, 0, { seq: 0, id: `run-${turnId}`, sessionId, role: 'activity', text: '', kind: 'runMarker', data: { turnId, status } });
+    if (!marker && last >= 0) {
+      const context = messages.find(m => m.historyRun?.data?.turnId === turnId)?.historyRun?.data;
+      finished.splice(last + 1, 0, { seq: 0, id: `run-${turnId}`, sessionId, role: 'activity', text: '', kind: 'runMarker', data: { ...context, turnId, status } });
+    }
     return finished;
   }
   if (event.method === 'turn/plan/updated') {

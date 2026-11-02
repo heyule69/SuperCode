@@ -64,6 +64,8 @@ mod outbox;
 mod platform_usage;
 mod process;
 mod protocol;
+mod run_connection;
+mod reply_translation;
 mod subagents;
 mod providers;
 mod magpie;
@@ -213,6 +215,7 @@ pub fn run() {
     builder
         .manage(outbox::Outbox::default())
         .manage(media::Media::default())
+        .manage(reply_translation::Translations::default())
         .register_asynchronous_uri_scheme_protocol(
             "supercode-media",
             |context, request, responder| {
@@ -343,6 +346,7 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(browser::guard(tauri::generate_handler![
+            reply_translation::translate_reply,
             browser::browser_open,
             browser::browser_layout,
             browser::browser_manual,
@@ -416,6 +420,7 @@ pub fn run() {
             commands::add_project,
             commands::create_session,
             chat_connection::check_chat_connection,
+            magpie::get_magpie_status,
             commands::list_messages,
             subagents::get_subagent_messages,
             commands::send_message,

@@ -5,6 +5,11 @@ function stored(value: object) {
   vi.stubGlobal('localStorage', { getItem: (key: string) => key === 'supercode.preferences' ? JSON.stringify(value) : null });
 }
 afterEach(() => vi.unstubAllGlobals());
+it('defaults to automatic Chinese translation and persists an explicit opt out', () => {
+  stored({}); expect(loadPreferences().autoTranslateReplies).toBe(true);
+  stored({ autoTranslateReplies:false }); expect(loadPreferences().autoTranslateReplies).toBe(false);
+  stored({ autoTranslateReplies:'false' }); expect(loadPreferences().autoTranslateReplies).toBe(true);
+});
 describe('typography preference migration', () => {
   it('upgrades the previous system defaults while retaining theme and behavior', () => {
     stored({ typographyVersion: 1, uiFont: 'system', uiSize: 14, chatSize: 16, theme: 'dark', animations: false });

@@ -1,6 +1,7 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { Check, ChevronDown, LoaderCircle, MessageSquare, Plus, RefreshCw, Search, SlidersHorizontal, X } from 'lucide-react';
 import { call, desktop } from './api';
+import { magpieGatewayText, useMagpieGateway } from './useMagpieGateway';
 import { filterModelGroups, isKimiSource, modelGroups, sourceLabel, type ModelOption } from './modelPicker';
 import type { AgentProfile, Model, ModelSource } from './types';
 import { useFloatingLayer } from './useFloatingLayer';
@@ -82,6 +83,8 @@ export function ModelMenu({ value, models, catalogLoaded, catalogWarning, profil
   const note = useRef<HTMLDivElement>(null);
   const groups = useMemo(() => modelGroups({ value, models, catalogLoaded, profiles, activeProfile, source, agent, connectionId, order, loggedInAgents }), [value, models, catalogLoaded, profiles, activeProfile, source, agent, connectionId, order, loggedInAgents]);
   const currentId = connectionId ?? activeProfile?.id ?? '';
+  const magpieCurrent = profiles.find(profile => profile.agent === agent && profile.id === currentId && (profile.providerId === 'magpie' || profile.modelSource?.providerId === 'magpie' || source?.providerId === 'magpie'));
+  const magpieGateway = useMagpieGateway(open && !!magpieCurrent, agent, magpieCurrent?.id);
   const currentGroup = groups.find(g => g.id === currentId || g.options.some(option => option.connectionId === currentId));
   const officialCodex = agent === 'codex' && (activeProfile?.officialAccount || currentId === '@official' || currentGroup?.id === '@official');
   const selected = currentGroup?.options.find(m => m.selected);
@@ -196,7 +199,7 @@ export function ModelMenu({ value, models, catalogLoaded, catalogWarning, profil
       </div> : null}
       <div ref={list} className="model-menu-scroll" style={{ maxHeight: listHeight }} role="menu" aria-label="可用模型">
         {visible.filter(group => group.options.some(option => pageKeys.has(option.key))).map(group => <div className="model-source-group" key={group.id}>
-          <div className="model-group-heading" title={sourceLabel(group.source)}><span><span className="model-group-mark" aria-hidden="true"><ProviderIcon provider={group.source.providerId} name={connectionLabel(group.source)} mark={group.source.mark}/></span><span>{connectionLabel(group.source)}</span></span><small>{group.source.planName}</small></div>
+          <div className="model-group-heading" title={sourceLabel(group.source)}><span><span className="model-group-mark" aria-hidden="true"><ProviderIcon provider={group.source.providerId} name={connectionLabel(group.source)} mark={group.source.mark}/></span><span>{connectionLabel(group.source)}</span></span><small>{group.source.providerId === 'magpie' ? '已保存目录' : group.source.planName}</small></div>
           {group.options.filter(option => pageKeys.has(option.key)).map(option => <button type="button" key={option.key} data-model-key={option.key} className={`model-option ${option.selected ? 'selected' : ''}`} role="menuitemradio" aria-checked={option.selected} disabled={busy}
             title={`模型 ID：${option.rawIds.join(' / ')}${option.context === '1M' ? '\n已配置 Claude Code 1M 上下文参数' : ''}`}
             onClick={() => void select(option)}>
@@ -208,6 +211,7 @@ export function ModelMenu({ value, models, catalogLoaded, catalogWarning, profil
       </div>
       <ModelPagination count={options.length} page={currentPage.page} change={setPage} disabled={busy}/>
       <div className="model-menu-footer">
+        {visible.some(group => group.source.providerId === 'magpie') ? <p className="model-catalog-warning magpie-gateway-status" role="status" data-state={magpieGateway}>{magpieGatewayText(magpieGateway)}</p> : null}
         {catalogWarning ? <p className="model-catalog-warning" role="status">{catalogWarning}</p> : null}
         {selected && contextVariants.length > 1 ? <ModelSetting label="上下文" value={selected.model} options={contextVariants.map(id => ({ value: id, label: /\[1m\]$/i.test(id) ? '1M' : '默认' }))} choose={model => void choose({ ...selected, model, defaultReasoningEffort: effort })}/> : null}
         {efforts.length ? <ModelSetting label="推理强度" value={effort} options={[{ value: '', label: '默认' }, ...efforts.map(value => ({ value, label: effortLabels[value] ?? value }))]} choose={setEffort}/> : null}

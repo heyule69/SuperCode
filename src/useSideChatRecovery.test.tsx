@@ -27,6 +27,22 @@ beforeEach(async () => {
 });
 afterEach(async () => { await act(async () => root.unmount()); node.remove(); vi.useRealTimers(); });
 const delta = (text: string): RpcEvent => ({ method: 'item/agentMessage/delta', params: { threadId: 'native', turnId: 'turn', itemId: 'answer', delta: text } });
+it('keeps recoverable retries inline, ignores other owners and reports only definitive errors', async () => {
+  await act(async () => {
+    notify({ method:'turn/started', params:{ threadId:'native', turn:{ id:'turn' } } });
+    notify({ method:'error', params:{ threadId:'native', turnId:'turn', willRetry:true, error:{ message:'reconnecting' } } });
+    vi.advanceTimersByTime(50);
+  });
+  expect(report).not.toHaveBeenCalled();
+  expect(api.messages.find(m => m.kind === 'runMarker')?.data?.connection).toMatchObject({ status:'retrying' });
+  await act(async () => {
+    notify({ method:'turn/connection/updated', params:{ appSessionId:'other', threadId:'native', turnId:'turn', connection:{ status:'failed', at:Date.now() } } });
+    notify(delta('已收到新的响应')); vi.advanceTimersByTime(50);
+  });
+  expect(api.messages.find(m => m.kind === 'runMarker')?.data?.connection).toMatchObject({ status:'restored' });
+  await act(async () => notify({ method:'error', params:{ threadId:'native', turnId:'turn', willRetry:false, error:{ message:'最终错误' } } }));
+  expect(report).toHaveBeenCalledWith('最终错误');
+});
 it('preserves streamed text received during a delayed snapshot without duplicating persisted deltas', async () => {
   await act(async () => { notify(delta('A')); vi.advanceTimersByTime(50); });
   const base = vi.mocked(call).getMockImplementation()!; let finish!: (rows: Message[]) => void;

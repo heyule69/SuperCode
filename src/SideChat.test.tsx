@@ -46,6 +46,31 @@ async function render(draft:SideDraft, options:Partial<ComponentProps<typeof Sid
   await act(async()=>root.render(<SideChat draft={draft} projectId="" agent="pi" connectionId={draft.connectionId??'@local'} defaults={defaults} close={()=>{}} opened={()=>{}} openFile={()=>{}} showDiff={()=>{}} providerRequired={providerRequired} {...options}/>));
 }
 async function send() {await act(async()=>{container.querySelector('form')!.dispatchEvent(new Event('submit',{bubbles:true,cancelable:true}));});}
+it('preserves an offline Magpie draft, opens the app on click and only submits on a later send', async () => {
+  missing = false;
+  let offline = true;
+  const base = vi.mocked(call).getMockImplementation()!;
+  vi.mocked(call).mockImplementation(async (command, args = {}) => {
+    if (command === 'check_chat_connection' && offline) throw 'Magpie 网关未连接。请先打开 Magpie后再发送。';
+    return base(command, args);
+  });
+  const attachments = [{ kind:'file' as const, name:'任务.txt', path:'D:/任务.txt' }];
+  await render({ key:'magpie-draft', text:'保留侧边任务', connectionId:'magpie:pi', payload:{...defaults, text:'保留侧边任务', attachments} });
+  await send();
+  expect(container.querySelector<HTMLTextAreaElement>('[aria-label="侧边聊天消息"]')!.value).toBe('保留侧边任务');
+  expect(container.querySelector('.attachment-strip')?.textContent).toContain('任务.txt');
+  expect(call).not.toHaveBeenCalledWith('create_session', expect.anything());
+  expect(call).not.toHaveBeenCalledWith('enqueue_followup', expect.anything());
+  expect(vi.mocked(call).mock.calls.some(([command]) => command === 'open_magpie')).toBe(false);
+  await act(async () => [...container.querySelectorAll<HTMLButtonElement>('.error-banner button')].find(button => button.textContent === '打开 Magpie')!.click());
+  expect(call).toHaveBeenCalledWith('open_magpie');
+  expect(container.querySelector('.error-banner')?.textContent).toContain('已请求打开');
+  expect(call).not.toHaveBeenCalledWith('enqueue_followup', expect.anything());
+  offline = false;
+  await send();
+  expect(call).toHaveBeenCalledWith('enqueue_followup', expect.objectContaining({ payload:expect.objectContaining({ text:'保留侧边任务', attachments }) }));
+  expect(container.querySelector('.error-banner')).toBeNull();
+});
 it('adds dropped Excel and unknown files to the side chat as path references', async () => {
   missing=false;
   const attachments = [{kind:'file',name:'数据.xls',path:'D:/中文目录/数据.xls'},{kind:'file',name:'自定义格式.xyz',path:'D:/中文目录/自定义格式.xyz'}];

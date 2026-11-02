@@ -1,3 +1,5 @@
+import { latestChatUsage } from './usage';
+import { ReplyTranslationContext } from './ReplyText';
 import { lazy, Suspense, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { Sparkles, ArrowUp, Folder, Globe, MessageSquare, MessagesSquare, MoreHorizontal, PanelLeftOpen, PanelRightClose, PanelRightOpen, RefreshCw, Search, Square, SquarePen, Terminal, X } from 'lucide-react';
 import { call, desktop, subscribe } from './api';
@@ -49,6 +51,7 @@ import { SettingsPage, GeneralSettings, type SettingsTab } from './SettingsPage'
 import { createChatSession } from './chatSession';
 import { inUseProviderConnections, type ProviderConnection } from './providerActivity';
 import { isProviderRequired, requireChatConnection } from './chatConnection';
+import { ChatErrorBanner } from './ChatErrorBanner';
 import { FollowupQueue, useFollowups, type Followup, type FollowupPayload } from './Followups';
 import { useFollowupEditor } from './useFollowupEditor';
 import { SelectionActions } from './SelectionActions';
@@ -215,6 +218,8 @@ export default function App() {
   const scrollArea = useRef<HTMLDivElement>(null);
   const stickToBottom = useRef(true);
   const prependScroll = useRef<{ height: number; top: number } | null>(null);
+  const historyScrollTop = useRef(0);
+  const olderHistoryRequest = useRef<{ sessionId: string; before: number } | null>(null);
   const inputRef = useRef(input); inputRef.current = input;
   const changesRevision = useRef(0);
   const fileReadRevision = useRef(0);
@@ -226,6 +231,21 @@ export default function App() {
   const textarea = useRef<HTMLTextAreaElement>(null);
   const selectionModalElement = useRef<HTMLElement>(null);
   const { messages, setMessages, messagesLoading, setMessagesLoading, hasMore, setHasMore, loadMessages, flush, enqueue: enqueueDisplayEvent, discard: discardDisplayEvents } = useChatHistory(current, pendingUsers, pendingMessages, scrollArea, prependScroll);
+  const loadEarlierMessages = useStableCallback(() => {
+    const area = scrollArea.current;
+    const before = messages.find(message => message.seq > 0)?.seq;
+    if (!sessionId || current.current.sessionId !== sessionId || settingsOpenRef.current || !hasMore || messagesLoading
+      || !area || area.scrollTop > 120 || !before || olderHistoryRequest.current?.sessionId === sessionId) return;
+    // A wheel and its resulting scroll can arrive before React commits loading.
+    const request = { sessionId, before };
+    olderHistoryRequest.current = request;
+    stickToBottom.current = false;
+    void loadMessages(sessionId, before).catch(error => {
+      if (current.current.sessionId === sessionId) report(error);
+    }).finally(() => {
+      if (olderHistoryRequest.current === request) olderHistoryRequest.current = null;
+    });
+  });
   const project = projects.find(p => p.id === projectId);
   const session = sessions.find(s => s.id === sessionId);
   const workspacePath = project?.path ?? session?.workspacePath ?? undefined;
@@ -396,7 +416,7 @@ export default function App() {
   const refreshUsage = useCallback(async (id: string) => {
     const revision = usageRevision.current;
     const result=await call<{records:UsageRecord[]}>('get_usage',{sessionId:id});
-    if(current.current.sessionId===id && revision===usageRevision.current)setUsage(result.records[0]?.data);
+    if(current.current.sessionId===id && revision===usageRevision.current)setUsage(latestChatUsage(result.records));
   }, [setUsage]);
   const refreshChanges = useCallback(async (id: string) => {
     if (!id && !current.current.sessionId) return;
@@ -467,7 +487,7 @@ export default function App() {
       if (matches && isDisplayEvent(event)) {
         enqueueDisplayEvent(event);
       }
-      if (event.method === 'error' && matches) setError(p.error?.message ?? 'Agent 运行失败');
+      if (event.method === 'error' && matches && p.willRetry !== true) setError(p.error?.message ?? 'Agent 运行失败');
       if (event.method === 'turn/completed') {
         if (matches) { flush(); void loadMessages(current.current.sessionId).catch(report); void refreshUsage(current.current.sessionId).catch(report); void refreshChanges(current.current.projectId); }
         clearRequestTurn(p.turn.id);
@@ -529,7 +549,7 @@ export default function App() {
   useEffect(() => {
     if (settingsOpen && settingsTab === 'resources' && desktop) void inspectRuntime();
   }, [settingsOpen, settingsTab]);
-  useEffect(() => { setUsage(undefined); if (!desktop || !sessionId) return; let disposed=false; const revision=usageRevision.current; void call<{records:UsageRecord[]}>('get_usage',{sessionId}).then(r=>{if(!disposed && revision===usageRevision.current)setUsage(r.records[0]?.data);}).catch(report); return ()=>{disposed=true;}; }, [sessionId, setUsage]);
+  useEffect(() => { setUsage(undefined); if (!desktop || !sessionId) return; let disposed=false; const revision=usageRevision.current; void call<{records:UsageRecord[]}>('get_usage',{sessionId}).then(r=>{if(!disposed && revision===usageRevision.current)setUsage(latestChatUsage(r.records));}).catch(report); return ()=>{disposed=true;}; }, [sessionId, setUsage]);
   useEffect(() => { localStorage.setItem('supercode.agent', agentId); }, [agentId]);
   useEffect(() => { if (ready && !detached) { localStorage.setItem('supercode.session', sessionId); localStorage.setItem('supercode.project', projectId); } }, [ready, sessionId, projectId, detached]);
   useDraftPersistence(draftStore, { ready, key: draftKey.current, text: input, attachments, selection: model ? { connectionId, model, effort } : undefined }, { text: inputRef, attachments: attachmentsRef });
@@ -548,13 +568,15 @@ export default function App() {
   }, []);
   useLayoutEffect(() => {
     if (settingsOpen) document.querySelector<HTMLInputElement>('.settings-search input')?.focus({ preventScroll: true });
-    else if (scrollArea.current) { scrollArea.current.scrollTop = settingsScroll.current; }
+    else if (scrollArea.current) { scrollArea.current.scrollTop = settingsScroll.current; historyScrollTop.current = scrollArea.current.scrollTop; }
   }, [settingsOpen]);
   useEffect(() => { localStorage.setItem('supercode.sidebar', String(sidebar)); localStorage.setItem('supercode.context', String(context)); localStorage.setItem('supercode.expandActivity.compact', String(autoExpand)); localStorage.setItem('supercode.collapsedProjects', JSON.stringify([...collapsedProjects])); }, [sidebar, context, autoExpand, collapsedProjects]);
   useLayoutEffect(() => {
     const el = scrollArea.current;
     if (prependScroll.current && el) { el.scrollTop = prependScroll.current.top + el.scrollHeight - prependScroll.current.height; prependScroll.current = null; }
     else if (stickToBottom.current) scrollToLatest(el);
+    // Restoring a reading position is not another upward gesture.
+    historyScrollTop.current = el?.scrollTop ?? 0;
   }, [messages, currentRequests.length]);
   useLayoutEffect(() => {
     const area = scrollArea.current;
@@ -1032,7 +1054,7 @@ export default function App() {
     ] },
   ];
 
-  return <PlanDisplayContext.Provider value={planDisplay}><div className="desktop-shell" inert={updateDialog}><DesktopTitleBar menus={desktopMenus} back={() => void navigate(-1)} forward={() => void navigate(1)} canBack={settingsOpen || navigation.index > 0} canForward={navigation.index < navigation.entries.length - 1} sidebar={sidebar} toggleSidebar={() => setSidebar(v => !v)} blocked={!!modal || !!selectionDetail || sidebarDialog || updateDialog} report={report}/><div className="desktop-workarea"><ActivityRail settings={settingsOpen} blocked={!!modal || !!selectionDetail || sidebarDialog || updateDialog} home={() => setSettingsOpen(false)} create={() => { setSettingsOpen(false); void newSession(); }} search={() => setModal('search')} projects={() => { setSettingsOpen(false); setSidebar(true); }} preferences={() => { setSettingsTab('general'); openSettings(); }}/><div ref={panels.root} className={`app ${settingsOpen ? 'settings-open' : ''} ${sidebar ? '' : 'sidebar-hidden'} ${right.tabs.length ? '' : 'context-hidden'} ${visibleSideChat?'has-side-chat':''} ${visibleSubagents?'has-subagent-panel':''}`}>
+  return <ReplyTranslationContext.Provider value={prefs.autoTranslateReplies}><PlanDisplayContext.Provider value={planDisplay}><div className="desktop-shell" inert={updateDialog}><DesktopTitleBar menus={desktopMenus} back={() => void navigate(-1)} forward={() => void navigate(1)} canBack={settingsOpen || navigation.index > 0} canForward={navigation.index < navigation.entries.length - 1} sidebar={sidebar} toggleSidebar={() => setSidebar(v => !v)} blocked={!!modal || !!selectionDetail || sidebarDialog || updateDialog} report={report}/><div className="desktop-workarea"><ActivityRail settings={settingsOpen} blocked={!!modal || !!selectionDetail || sidebarDialog || updateDialog} home={() => setSettingsOpen(false)} create={() => { setSettingsOpen(false); void newSession(); }} search={() => setModal('search')} projects={() => { setSettingsOpen(false); setSidebar(true); }} preferences={() => { setSettingsTab('general'); openSettings(); }}/><div ref={panels.root} className={`app ${settingsOpen ? 'settings-open' : ''} ${sidebar ? '' : 'sidebar-hidden'} ${right.tabs.length ? '' : 'context-hidden'} ${visibleSideChat?'has-side-chat':''} ${visibleSubagents?'has-subagent-panel':''}`}>
     <aside className={`sidebar ${sidebar ? "" : "pane-collapsed"}`} hidden={settingsOpen} aria-hidden={!sidebar} inert={!sidebar || !!modal || !!selectionDetail || sidebarDialog}>
       {!settingsOpen ? <div {...panels.handle('left')}/> : null}
       <div className="brand"><span>SuperCode</span><button className="icon-button brand-search" aria-label="搜索会话" title="搜索会话 (Ctrl+K)" onClick={() => setModal('search')}><Search size={16}/></button></div>
@@ -1050,13 +1072,31 @@ export default function App() {
         <button className={`icon-button ${logsOpen ? 'on' : ''}`} title="运行日志" onClick={() => setLogsOpen(v => !v)}><Terminal size={16} /></button>
         <button className="icon-button" aria-label={showContext ? '收起工作空间' : '打开工作空间'} aria-pressed={showContext} title={showContext ? '关闭工作空间' : '打开工作空间'} onClick={() => showContext ? right.close('workspace') : openWorkspace()}>{showContext ? <PanelRightClose size={17} /> : <PanelRightOpen size={17} />}</button>
       </div></header>
-      <div className="chat-viewport"><div className="chat-scroll" aria-busy={!ready} ref={scrollArea} onClickCapture={e => { if ((e.target as Element).closest('.activity-row, .activity-group-summary, .activity-toggle-more, .turn-process-toggle')) stickToBottom.current = false; }} onScroll={() => { if (settingsOpenRef.current) return; const el = scrollArea.current; if (el) { stickToBottom.current = el.scrollHeight - el.scrollTop - el.clientHeight < 100; setShowJump(!stickToBottom.current); } }}>
-        {!ready ? <div className="startup-loading" role="status"><span className="pending-text">正在加载工作区…</span></div> : messages.length || busy || messagesLoading || currentRequests.length ? <div className="messages" aria-busy={messagesLoading}>{hasMore ? <button className="load-earlier" disabled={messagesLoading} onClick={() => void loadMessages(sessionId, messages.find(m => m.seq > 0)?.seq).catch(report)}>{messagesLoading ? '正在加载…' : '加载更早的消息'}</button> : null}{messagesLoading && !messages.length ? <div className="working-indicator"><span className="pending-text">正在加载会话…</span></div> : null}<Conversation messages={messages} agentName={agentName} autoExpand={autoExpand} showDiff={showDiff} openFile={showFile} openPath={openPath} projectId={projectId} sessionId={sessionId} sessionStatus={sending && !isActive(session?.status) ? 'starting' : session?.status} pendingLabel={sending && !isActive(session?.status) ? '正在发送…' : undefined} activeTurnId={session?.turnId} openSubagent={openSubagent} onPlanAction={agentId==='codex' && !busy && !configuring && !followups.rows.length ? respondPlan : undefined} />{handoffTarget ? <div className="working-indicator" role="status"><span className="pending-text">{handoffTarget === '@compact' ? '正在压缩上下文…' : `正在切换到 ${handoffTarget}…`}</span></div> : null}{currentRequests.filter(request => request.method !== 'item/tool/requestUserInput').map(request => <Suspense key={String(request.id)} fallback={<div className="working-indicator">正在加载确认请求…</div>}><RequestCard request={request} respond={result => respondRequest(request, result)} openFile={showFile} messages={messages} /></Suspense>)}</div>
+      <div className="chat-viewport"><div className="chat-scroll" aria-busy={!ready} ref={scrollArea} onClickCapture={e => { if ((e.target as Element).closest('.activity-row, .activity-group-summary, .activity-toggle-more, .turn-process-toggle, .turn-artifacts, .artifact-feedback, .reply-translation')) stickToBottom.current = false; }} onScroll={() => {
+        if (settingsOpenRef.current) return;
+        const el = scrollArea.current;
+        if (!el) return;
+        const upward = el.scrollTop < historyScrollTop.current;
+        historyScrollTop.current = el.scrollTop;
+        stickToBottom.current = el.scrollHeight - el.scrollTop - el.clientHeight < 100;
+        setShowJump(!stickToBottom.current);
+        if (upward) loadEarlierMessages();
+      }} onWheel={event => {
+        if (event.deltaY >= 0 || event.ctrlKey || event.defaultPrevented) return;
+        // Let an inner code/output pane consume its own upward scrolling.
+        let target = event.target instanceof Element ? event.target : null;
+        while (target && target !== scrollArea.current) {
+          if (target.scrollTop > 0 && target.scrollHeight > target.clientHeight) return;
+          target = target.parentElement;
+        }
+        loadEarlierMessages();
+      }}>
+        {!ready ? <div className="startup-loading" role="status"><span className="pending-text">正在加载工作区…</span></div> : messages.length || busy || messagesLoading || currentRequests.length ? <div className="messages" aria-busy={messagesLoading}>{hasMore ? <div className="history-loading" role="status" aria-live="polite">{messagesLoading ? '正在加载更早的消息…' : null}</div> : null}{messagesLoading && !messages.length ? <div className="working-indicator"><span className="pending-text">正在加载会话…</span></div> : null}<Conversation messages={messages} agentName={agentName} autoExpand={autoExpand} showDiff={showDiff} openFile={showFile} openPath={openPath} projectId={projectId} sessionId={sessionId} sessionStatus={sending && !isActive(session?.status) ? 'starting' : session?.status} pendingLabel={sending && !isActive(session?.status) ? '正在发送…' : undefined} activeTurnId={session?.turnId} openSubagent={openSubagent} onPlanAction={agentId==='codex' && !busy && !configuring && !followups.rows.length ? respondPlan : undefined} />{handoffTarget ? <div className="working-indicator" role="status"><span className="pending-text">{handoffTarget === '@compact' ? '正在压缩上下文…' : `正在切换到 ${handoffTarget}…`}</span></div> : null}{currentRequests.filter(request => request.method !== 'item/tool/requestUserInput').map(request => <Suspense key={String(request.id)} fallback={<div className="working-indicator">正在加载确认请求…</div>}><RequestCard request={request} respond={result => respondRequest(request, result)} openFile={showFile} messages={messages} /></Suspense>)}</div>
           : <NewChat project={project} projects={projects} selectProject={selectProject} addProject={() => void addProject()}/>}
       </div>
       {showJump ? <JumpToLatest onClick={() => { stickToBottom.current = true; setShowJump(false); scrollToLatest(scrollArea.current, !prefs.animations || window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'instant' : 'smooth'); }} /> : null}
       </div>
-      <div className={`composer-area${questionPending ? ' has-question' : ''}`}>{draftStore.persistenceError ? <div className="error-banner draft-persistence-error" role="alert"><span>{draftStore.persistenceError}</span><button type="button" className="quiet-button" onClick={draftStore.retryPersistence}>重试保存</button></div> : null}{error ? <div className="error-banner" role="alert"><span>{error}</span><button className="icon-button" title="关闭提示" onClick={() => setError('')}><X size={15} /></button></div> : null}
+      <div className={`composer-area${questionPending ? ' has-question' : ''}`}>{draftStore.persistenceError ? <div className="error-banner draft-persistence-error" role="alert"><span>{draftStore.persistenceError}</span><button type="button" className="quiet-button" onClick={draftStore.retryPersistence}>重试保存</button></div> : null}{error ? <ChatErrorBanner error={error} dismiss={() => setError('')}/> : null}
         {commandMessage ? <div className="command-feedback" role="status"><pre>{commandMessage}</pre><button className="icon-button" title="关闭命令结果" onClick={() => setCommandMessage('')}><X size={14} /></button></div> : null}
         {questionPending ? <Suspense fallback={<div className="working-indicator">正在加载提问…</div>}><QuestionDock requests={currentRequests} respond={respondRequest} /></Suspense> : null}
         <div className="plan-decision-dock" ref={setPlanDock}/>
@@ -1114,5 +1154,5 @@ export default function App() {
       {modal === 'search' ? <><div className="search-field"><Search size={17} /><input autoFocus value={search} onChange={e => setSearch(e.target.value)} placeholder="搜索项目或会话…" aria-label="搜索项目或会话" /></div><div className="search-results">{shownProjects.map(p => <div key={p.id}><button onClick={() => { selectProject(p); setModal(null); }}><Folder size={16} /><strong>{p.name}</strong></button>{sessions.filter(s => s.projectId === p.id && s.title.toLowerCase().includes(search.toLowerCase())).map(s => <button key={s.id} onClick={() => void selectSession(s)}><MessageSquare size={15} /><span>{s.title}</span></button>)}</div>)}{sessions.filter(s => !s.projectId && s.title.toLowerCase().includes(search.toLowerCase())).map(s => <button key={s.id} onClick={() => void selectSession(s)}><MessageSquare size={15}/><span>{s.title}</span></button>)}{!shownProjects.length && !sessions.some(s => !s.projectId && s.title.toLowerCase().includes(search.toLowerCase())) ? <p className="muted">没有找到匹配的会话。</p> : null}</div></> : null}
       {modal === 'rename' ? <><form onSubmit={e => { e.preventDefault(); void saveRename(); }}><label htmlFor="rename">会话名称</label><input id="rename" autoFocus value={rename} onChange={e => setRename(e.target.value)} maxLength={100} /><div className="modal-actions"><button type="button" className="quiet-button" disabled={busy || modalWorking} onClick={() => void archive()}>归档会话</button><button className="primary-button" disabled={!rename.trim() || modalWorking}>{modalWorking ? '保存中…' : '保存'}</button></div></form></> : null}
     </section></div> : null}
-  </div></div></div></PlanDisplayContext.Provider>;
+  </div></div></div></PlanDisplayContext.Provider></ReplyTranslationContext.Provider>;
 }

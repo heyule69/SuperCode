@@ -150,6 +150,17 @@ it('does not create a failed card for an old filename merely mentioned in a sent
   expect(call).not.toHaveBeenCalled();
 });
 
+it('keeps a mentioned placeholder screenshot as text without loading a nonexistent image', async () => {
+  const text = '3. **还有占位内容没填：** Releases 地址、Issues 地址、许可证，以及被注释掉的截图 `docs/screenshot.png`。\n\n' +
+    '4. 这个目录还不是 git 仓库。\n\n你接下来要做什么？';
+  await act(async () => root.render(<Markdown text={text} streaming/>));
+  await act(async () => root.render(<Markdown text={text}/>));
+  expect(container.textContent).toContain('docs/screenshot.png');
+  expect(container.querySelector('[data-resource-path="docs/screenshot.png"]')).not.toBeNull();
+  expect(container.querySelector('.chat-media-card')).toBeNull();
+  expect(call).not.toHaveBeenCalled();
+});
+
 
 it('resolves relative generated images against a projectless chat workspace', async () => {
   await act(async () => root.render(<MediaContext.Provider value={{ sessionId: 'chat-files' }}><Markdown text="![生成图片](result.png)"/></MediaContext.Provider>));

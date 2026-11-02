@@ -1,0 +1,7 @@
+.magpie-offline-banner{align-items:flex-start;gap:10px}
+.magpie-offline-body{min-width:0;flex:1;display:flex;flex-direction:column;gap:8px}
+.magpie-offline-action{display:flex;align-items:center;flex-wrap:wrap;gap:8px 12px}
+.magpie-offline-action .quiet-button{display:inline-flex;align-items:center;justify-content:center;gap:6px;min-height:32px;flex-shrink:0}
+.magpie-open-status{color:var(--text)}
+.magpie-open-error{overflow-wrap:anywhere}
+.magpie-offline-banner>.icon-button{flex-shrink:0}

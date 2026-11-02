@@ -23,6 +23,25 @@ it('keeps incidental old filenames in prose while previewing explicit output loc
   expect(referencedMedia(text).map(ref => ref.path)).toEqual(['过程素材/渲染/樱花草MV-阿梓-v2.mp4', 'voice.wav']);
 });
 
+it.each([
+  '还有占位内容没填：Releases 地址、Issues 地址、许可证，以及被注释掉的截图 `docs/screenshot.png`。',
+  '旧素材 `assets/panda-source.png` 和 `assets/mascot-source.jpg` 都在项目里。',
+  '图片还未生成：`D:/work/outputs/preview.png`。',
+  '`C:\\Users\\Alice\\Desktop\\截图.png` 是文档中的示例路径。',
+  '请删除旧视频 `outputs/old.mp4`，保留音频 `outputs/voice.wav`。',
+  '远程图片示例：`https://example.com/preview.png`。',
+])('does not turn media paths mentioned in prose into previews: %s', text => {
+  expect(referencedMedia(text)).toEqual([]);
+});
+
+it('retains standalone output paths and list items alongside explicit media links', () => {
+  const text = '`D:/work/预览.png`\n\n- `renders/demo.mp4`\n2. `audio/voice.wav`\n\n' +
+    '[图片](docs/screenshot.png)\n\n![封面](cover.png)';
+  expect(referencedMedia(text).map(ref => ref.path)).toEqual([
+    'D:/work/预览.png', 'renders/demo.mp4', 'audio/voice.wav', 'docs/screenshot.png',
+  ]);
+});
+
 it('preserves normalized screenshot references when large tool diagnostics are bounded', () => {
   const media = [{ type: 'media', kind: 'image', path: 'D:/cache/截图.png', name: '截图' }];
   const item = { id: 'shot', type: 'mcpToolCall', status: 'completed', arguments: Object.fromEntries(Array.from({ length: 40 }, (_, i) => [`part${i}`, 'x'.repeat(32768)])), media };

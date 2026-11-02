@@ -1822,6 +1822,7 @@ pub async fn summary(
     session: &Session,
     input: &str,
     route: Option<&crate::session_config::Route>,
+    purpose: &str,
 ) -> Result<String, String> {
     let mut fresh = session.clone();
     fresh.native_id = None;
@@ -1877,7 +1878,7 @@ pub async fn summary(
             if session.agent=="pi" { let(p,id)=model.split_once('/').ok_or("Pi 模型缺少供应商")?;summary_request(&client,&mut rx,"set_model",json!({"provider":p,"modelId":id})).await?; }
             else { summary_request(&client,&mut rx,"session/set_model",json!({"sessionId":native,"modelId":model})).await?; }
         }
-        let t=Turn { client:client.clone(),requests:Arc::new(Mutex::new(HashMap::new())),session:session.id.clone(),native,turn:format!("handoff-{}",uuid::Uuid::new_v4()),agent:session.agent.clone(),stopped:AtomicBool::new(false),accepting:AtomicBool::new(false),inputs_pending:AtomicU64::new(0),input_done:Notify::new(),settled:AtomicBool::new(false),prompt_accepted:AtomicBool::new(false),prompt_ready:Notify::new(),started:AtomicBool::new(false),stop_done:AtomicBool::new(true),signature:String::new() };
+        let t=Turn { client:client.clone(),requests:Arc::new(Mutex::new(HashMap::new())),session:session.id.clone(),native,turn:format!("{purpose}-{}",uuid::Uuid::new_v4()),agent:session.agent.clone(),stopped:AtomicBool::new(false),accepting:AtomicBool::new(false),inputs_pending:AtomicU64::new(0),input_done:Notify::new(),settled:AtomicBool::new(false),prompt_accepted:AtomicBool::new(false),prompt_ready:Notify::new(),started:AtomicBool::new(false),stop_done:AtomicBool::new(true),signature:String::new() };
         let mut mapper=Mapper{priced:!config["baseUrl"].is_string(),..Mapper::default()};
         let mut texts=std::collections::BTreeMap::new();
         let prompt=prompt_content(&session.agent,&[json!({"type":"text","text":input})],"");
@@ -1901,7 +1902,7 @@ pub async fn summary(
         while let Ok(value)=rx.try_recv(){summary_notification(&value)?;for e in mapper.map(&t,&value){collect_summary_item(&mut texts,&e["params"]["item"])?;}}
         for item in mapper.finish(false){collect_summary_item(&mut texts,&item)?;}
         if mapper.failed {return Err(mapper.failure.unwrap_or("模型未完成压缩".into()));}
-        if mapper.usage.is_object(){let mut usage=mapper.usage;usage["purpose"]="handoff".into();app.state::<AppState>().store.record_usage(session,&t.turn,usage)?;}
+        if mapper.usage.is_object(){crate::handoff::record_text_usage(&app.state::<AppState>().store,session,&t.turn,purpose,mapper.usage)?;}
         Ok(texts.into_values().collect::<Vec<_>>().join("\n"))
     }).await;
     client.close().await;
@@ -1916,7 +1917,11 @@ fn collect_summary_item(
     }
     if item["type"] == "agentMessage" {
         if let (Some(id), Some(text)) = (item["id"].as_str(), item["text"].as_str()) {
-            texts.insert(id.to_owned(), protocol::bounded(text, 24 * 1024));
+            let bytes = texts.iter().filter(|(key, _)| key.as_str() != id).map(|(_, text)| text.len()).sum::<usize>();
+            if bytes + text.len() > 24 * 1024 || texts.len() >= 128 && !texts.contains_key(id) {
+                return Err("独立文本生成结果过长".into());
+            }
+            texts.insert(id.to_owned(), text.to_owned());
         }
     }
     Ok(())
@@ -2607,6 +2612,18 @@ out({type:'agent_end'});out({type:'agent_settled'});
             .await
             .insert(request_id.clone(), request);
         let active = boot.after_setup("native-existing".into());
+        // Synthetic Pi RPC events: no real Agent or model is invoked here.
+        let mut retry_mapper = Mapper::default();
+        let transient = retry_mapper.map(&active, &json!({"type":"message_end","message":{"role":"assistant","stopReason":"error","errorMessage":"transient","content":[]}}));
+        assert!(transient.iter().all(|e| e["method"] != "error"));
+        let retry = retry_mapper.map(&active, &json!({"type":"auto_retry_start","attempt":1,"maxAttempts":3,"delayMs":2000}));
+        assert_eq!(retry[0]["params"]["connection"]["status"], "retrying");
+        retry_mapper.map(&active, &json!({"type":"auto_retry_end","success":true}));
+        assert!(!retry_mapper.failed && retry_mapper.failure.is_none());
+        retry_mapper.map(&active, &json!({"type":"auto_retry_end","success":false,"finalError":"exhausted"}));
+        assert!(retry_mapper.failed);
+        assert_eq!(retry_mapper.failure.as_deref(), Some("exhausted"));
+
         assert!(Arc::ptr_eq(&turn.requests, &active.requests));
         let rebound = rebind_public_requests(
             &mut *active.requests.lock().await,
@@ -2984,6 +3001,16 @@ write(v.type?{type:'response',command:method,id:v.id,success:true,data:{session:
         )
         .is_err());
         assert_eq!(texts.len(), 1);
+    }
+
+    #[test]
+    fn independent_text_generation_bounds_total_output_across_items() {
+        let mut texts = std::collections::BTreeMap::new();
+        collect_summary_item(&mut texts, &json!({"id":"a","type":"agentMessage","text":"a".repeat(16000)})).unwrap();
+        assert!(collect_summary_item(&mut texts, &json!({"id":"b","type":"agentMessage","text":"b".repeat(16000)})).is_err());
+        assert!(collect_summary_item(&mut texts, &json!({"id":"a","type":"agentMessage","text":"a".repeat(25000)})).is_err());
+        assert_eq!(texts.len(), 1);
+        assert_eq!(texts["a"].len(), 16000);
     }
 
     #[test]

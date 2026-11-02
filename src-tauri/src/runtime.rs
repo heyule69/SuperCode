@@ -477,6 +477,15 @@ impl Client {
                     let active = state.store.session(&id).ok().is_some_and(|s| matches!(s.status.as_str(), "running" | "starting" | "waiting"));
                     crate::runtime_diagnostics::record(&reader_app, Some(&id), "agent_connection_closed",
                         json!({"active":active,"pid":pid,"exitCode":exit_code,"errorType":active.then_some("connection")}));
+                    if active {
+                        if let Ok(session) = state.store.session(&id) {
+                            if let (Some(native), Some(turn)) = (session.native_id.as_deref(), session.turn_id.as_deref()) {
+                                publish_event(&reader_app, json!({"method":"turn/connection/updated","params":{"threadId":native,"turnId":turn,"appSessionId":id,"connection":{"status":"disconnected","kind":"network","at":chrono::Utc::now().timestamp_millis()}}}));
+                            } else {
+                                let _ = state.store.save_message(&format!("connection-closed-{}", uuid::Uuid::new_v4()), &id, "system", "与 Codex 的连接已断开，本轮已停止。请检查连接后重新发送消息。", "error", &Value::Null);
+                            }
+                        }
+                    }
                     if let Some(buffer) = state.activity.existing(&id) {
                         if let Ok(mut activity) = buffer.lock() {
                             for item in activity.finish("interrupted") {
@@ -635,6 +644,10 @@ mod transport;
 pub(crate) use transport::read_frame;
 
 pub(crate) fn publish_event(app: &AppHandle, mut message: Value) {
+    if let Some(retry) = crate::run_connection::codex(&message, chrono::Utc::now().timestamp_millis().max(0) as u64) {
+        crate::runtime_diagnostics::observe(app, &message);
+        message = retry;
+    }
     if message["params"]["appSessionId"].is_null() {
         if let Some(native) = message["params"]["threadId"].as_str() {
             if let Ok(session) = app.state::<AppState>().store.for_native(native) { message["params"]["appSessionId"] = session.id.into(); }

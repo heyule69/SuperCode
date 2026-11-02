@@ -17,6 +17,7 @@ const emptyProfiles: AgentProfile[] = [];
 const agentNames: Record<string, string> = { claude: 'Claude Code', codex: 'Codex', opencode: 'OpenCode', pi: 'Pi', gemini: 'Gemini CLI' };
 import { createChatSession } from './chatSession';
 import { isProviderRequired, requireChatConnection } from './chatConnection';
+import { ChatErrorBanner } from './ChatErrorBanner';
 import { planFollowup, type PlanDecision } from './planPresentation';
 import { Conversation } from './Conversation';
 import { PlanDisplayContext } from './PlanDisplayContext';
@@ -174,13 +175,13 @@ export default function SideChat({draft,projectId,agent,connectionId,defaults,cl
     <header className="side-chat-header"><MessageSquare size={16}/><strong>侧边聊天</strong>
       {!embedded ? <button className="icon-button" aria-label="关闭侧边聊天" title="关闭侧边聊天" onClick={()=>{if(session)opened(session);close();}}><X size={16}/></button> : null}
     </header>
-    <div className="side-chat-scroll" ref={area} onClickCapture={e=>{if((e.target as Element).closest('.turn-process-toggle, .activity-group-summary, .activity-row, .activity-toggle-more'))stickToBottom.current=false;}} onScroll={()=>{const el=area.current;if(el)stickToBottom.current=el.scrollHeight-el.scrollTop-el.clientHeight<100;}}>
+    <div className="side-chat-scroll" ref={area} onClickCapture={e=>{if((e.target as Element).closest('.turn-process-toggle, .activity-group-summary, .activity-row, .activity-toggle-more, .turn-artifacts, .artifact-feedback, .reply-translation'))stickToBottom.current=false;}} onScroll={()=>{const el=area.current;if(el)stickToBottom.current=el.scrollHeight-el.scrollTop-el.clientHeight<100;}}>
       {messages.length||busy?<Conversation messages={messages} agentName={agentName} autoExpand={false} projectId={projectId} sessionId={session?.id} sessionStatus={sending&&!isActive(session?.status)?'starting':session?.status} pendingLabel={sending&&!isActive(session?.status)?'正在发送…':undefined} activeTurnId={session?.turnId} openFile={openSessionFile} openPath={openSessionPath} showDiff={showDiff} onPlanAction={agent==='codex' && !busy && !configuring && !followups.rows.length ? respondPlan : undefined}/>
         :<div className="side-chat-welcome"><MessageSquare size={24} strokeWidth={1.5}/><h2>继续探讨</h2><p>围绕选中内容开启一个独立对话</p></div>}
       {requests.filter(r=>r.method!=='item/tool/requestUserInput').map(r=><Suspense key={String(r.id)} fallback={<p>正在加载确认请求…</p>}><RequestCard request={r} respond={result=>respondRequest(r,result)} openFile={openSessionFile} messages={messages}/></Suspense>)}
     </div>
     <footer className={'composer-area side-chat-composer-area'+(questionPending?' has-question':'')}>
-      {error?<div className="error-banner" role="alert"><span>{error}</span><button className="icon-button" aria-label="关闭侧边聊天提示" onClick={()=>setError('')}><X size={14}/></button></div>:null}
+      {error?<ChatErrorBanner error={error} dismiss={()=>setError('')} dismissLabel="关闭侧边聊天提示"/>:null}
       {followups.rows.length&&!session?.turnId?<p className="side-chat-queue-note">已排队，将在当前任务完成后发送</p>:null}
       {questionPending?<Suspense fallback={<p>正在加载提问…</p>}><QuestionDock requests={requests} respond={respondRequest}/></Suspense>:null}
       <div className="plan-decision-dock" ref={setPlanDock}/>

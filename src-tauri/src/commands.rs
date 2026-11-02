@@ -1128,14 +1128,14 @@ pub async fn open_project_path(
             &project_id,
             session_id.as_deref(),
             &path,
-            action == "reveal",
+            action == "reveal" || action == "open",
         )?;
         match action.as_str() {
             "reveal" => app
                 .opener()
                 .reveal_item_in_dir(file)
                 .map_err(|error| error.to_string()),
-            "open" if system_document(&file) => app
+            "open" if file.is_dir() || system_document(&file) => app
                 .opener()
                 .open_path(file.to_string_lossy().into_owned(), None::<&str>)
                 .map_err(|error| error.to_string()),

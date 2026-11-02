@@ -23,6 +23,15 @@ impl Mapper {
         let mut item = None;
         let mut delta = None;
         if t.agent == "pi" {
+            if let Some(connection) = crate::run_connection::pi(v, chrono::Utc::now().timestamp_millis().max(0) as u64) {
+                out.push(event(t, "turn/connection/updated", json!({"connection":connection})));
+                if v["type"] == "auto_retry_end" && v["success"] == true { self.failed = false; self.failure = None; }
+                if v["type"] == "auto_retry_end" && v["success"] != true {
+                    self.failed = true;
+                    if let Some(error) = v["finalError"].as_str() { self.failure = Some(protocol::bounded(error, 4096)); }
+                }
+                return out;
+            }
             match v["type"].as_str().unwrap_or("") {
                 "message_start" if v["message"]["role"] == "assistant" => self.message += 1,
                 "message_update" => {
@@ -105,7 +114,8 @@ impl Mapper {
                     }
                     if let Some(error) = m["errorMessage"].as_str() {
                         self.failure = Some(protocol::bounded(error, 4096));
-                        out.push(event(t, "error", json!({"error":{"message":error}})));
+                        // Pi announces whether it will retry after message_end.
+                        // A definitive failure is retained by turn/completed.
                     }
                     if m["usage"].is_object() {
                         out.push(event(

@@ -154,7 +154,11 @@
 .provider-account-controls { padding: 10px 0; }
 .magpie-trigger .provider-logo { width: 17px; height: 17px; border-radius: 3px; }
 .magpie-status-dot { width: 5px; height: 5px; border-radius: 50%; background: var(--muted); visibility: hidden; flex: 0 0 5px; }
-.magpie-status-dot.is-added { visibility: visible; background: #398363; }
+.magpie-status-dot.is-added { visibility: visible; background: var(--muted); }
+.magpie-status-dot.reachable { background: #398363; }
+.magpie-status-dot.offline { background: #b78028; }
+.magpie-menu-heading .magpie-gateway-status { display:block; max-width:250px; min-height:32px; margin-top:4px; white-space:normal; line-height:1.5; }
+.magpie-gateway-status[data-state="offline"] { color:var(--text); }
 .magpie-popover { position: fixed; z-index: 110; width: 314px; padding: 8px; overflow: auto; overscroll-behavior: contain; border: 1px solid var(--line); border-radius: 11px; background: var(--surface); color: var(--text); box-shadow: 0 10px 32px #0002, 0 2px 5px #0001; }
 .magpie-menu-heading { display: flex; align-items: center; gap: 10px; padding: 10px 10px 13px; margin-bottom: 5px; border-bottom: 1px solid var(--line); }
 .magpie-menu-heading .provider-mark { width: 34px; height: 34px; border-radius: 8px; display: flex; align-items: center; justify-content: center; background: var(--surface2); }

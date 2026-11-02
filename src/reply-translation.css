@@ -1,0 +1,5 @@
+.reply-text { min-width: 0; }
+.reply-translation { display: flex; align-items: center; flex-wrap: wrap; gap: 4px 12px; margin-top: 8px; min-height: 22px; color: var(--muted); font-size: 12px; line-height: 1.5; }
+.reply-translation .text-button { color: var(--muted); font: inherit; padding: 2px 0; }
+.reply-translation .text-button:hover { color: var(--text); }
+.reply-translation .text-button:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; border-radius: 3px; }

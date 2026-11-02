@@ -16,6 +16,8 @@ pub struct Artifact {
     pub path: String,
     pub name: String,
     pub size: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<&'static str>,
 }
 
 fn display_path(path: &Path) -> String {
@@ -59,7 +61,7 @@ fn resolve(paths: &[String], root: Option<&Path>) -> Result<Vec<Artifact>, Strin
             Err(error) => return Err(format!("无法访问产物 {}：{error}", path.display())),
         };
         let info = std::fs::metadata(&path).map_err(|error| error.to_string())?;
-        if !info.is_file() {
+        if !(info.is_file() || info.is_dir()) {
             continue;
         }
         let name = path
@@ -72,7 +74,8 @@ fn resolve(paths: &[String], root: Option<&Path>) -> Result<Vec<Artifact>, Strin
             Artifact {
                 path: display_path(&path),
                 name,
-                size: info.len(),
+                size: if info.is_file() { info.len() } else { 0 },
+                kind: info.is_dir().then_some("directory"),
             },
         );
     }
@@ -337,12 +340,7 @@ mod tests {
             assert_eq!(files[0].path, display_path(&path.canonicalize().unwrap()));
             assert_eq!(std::fs::read(path).unwrap(), bytes);
         }
-        assert!(resolve(
-            &["missing.xlsx".into(), display_path(&root.0)],
-            Some(&root.0)
-        )
-        .unwrap()
-        .is_empty());
+        assert!(resolve(&["missing.xlsx".into()], Some(&root.0)).unwrap().is_empty());
         let empty = root.write("empty.txt", b"");
         assert_eq!(resolve(&[display_path(&empty)], None).unwrap()[0].size, 0);
     }
@@ -357,6 +355,22 @@ mod tests {
         root.write("outputs/old.xlsx", b"existing");
         tracker.begin("s", "unchanged", &root.0);
         assert!(tracker.finish("s", "unchanged", true).unwrap().is_empty());
+    }
+
+    #[test]
+    fn explicit_directories_are_metadata_only_and_cannot_be_saved_as_a_file() {
+        let root = Fixture::new();
+        root.write("网页项目/正文.custom", &[0xff, 0xfe, 0]);
+        let path = root.0.join("网页项目");
+        let entries = resolve(&["网页项目/".into(), display_path(&path)], Some(&root.0)).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].kind, Some("directory"));
+        assert_eq!(entries[0].size, 0);
+        assert!(copy_file(&path, &root.0.join("copy")).is_err());
+        let file = root.write("empty.unknown", b"");
+        let entries = resolve(&[display_path(&file)], None).unwrap();
+        assert_eq!(entries[0].kind, None);
+        assert!(serde_json::to_value(&entries[0]).unwrap().get("kind").is_none());
     }
 
     #[test]

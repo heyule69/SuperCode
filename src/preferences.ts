@@ -7,10 +7,10 @@ export interface Preferences {
   themeColors?: ThemeColorPreferences;
   animations: boolean; notifyComplete: boolean; notifyError: boolean; notifyApproval: boolean; sound: boolean;
   notificationsEnabled: boolean; notificationMode: 'unseen' | 'background' | 'always'; notificationDetails: boolean;
-  enterSend: boolean; defaultAgent: string; defaultPermission: string;
+  enterSend: boolean; autoTranslateReplies: boolean; defaultAgent: string; defaultPermission: string;
 }
 export const systemFont = '-apple-system-body, ui-sans-serif, -apple-system, system-ui, "Segoe UI", Helvetica, "Microsoft YaHei", Arial, sans-serif, "Apple Color Emoji", "Segoe UI Emoji"';
-export const defaults: Preferences = { typographyVersion: 2, theme: 'light', uiFont: 'system', codeFont: 'Consolas', uiSize: 13, chatSize: 14, animations: true, notifyComplete: true, notifyError: true, notifyApproval: true, sound: false, notificationsEnabled: true, notificationMode: 'unseen', notificationDetails: false, enterSend: true, defaultAgent: 'claude', defaultPermission: 'ask' };
+export const defaults: Preferences = { typographyVersion: 2, theme: 'light', uiFont: 'system', codeFont: 'Consolas', uiSize: 13, chatSize: 14, animations: true, notifyComplete: true, notifyError: true, notifyApproval: true, sound: false, notificationsEnabled: true, notificationMode: 'unseen', notificationDetails: false, enterSend: true, autoTranslateReplies: true, defaultAgent: 'claude', defaultPermission: 'ask' };
 export function loadPreferences(): Preferences {
   try {
     const raw = JSON.parse(localStorage.getItem('supercode.preferences') ?? '{}');
@@ -23,7 +23,7 @@ export function loadPreferences(): Preferences {
     if (raw.themeColors != null) prefs.themeColors = normalizeThemeColors(raw.themeColors);
     if (!['light', 'dark', 'graphite', 'sand', 'system'].includes(prefs.theme)) prefs.theme = defaults.theme;
     prefs.defaultPermission = compatiblePermission(prefs.defaultPermission, prefs.defaultAgent);
-    for (const key of ['notificationsEnabled', 'notificationDetails', 'notifyComplete', 'notifyError', 'notifyApproval', 'sound'] as const) {
+    for (const key of ['autoTranslateReplies', 'notificationsEnabled', 'notificationDetails', 'notifyComplete', 'notifyError', 'notifyApproval', 'sound'] as const) {
       if (typeof prefs[key] !== 'boolean') prefs[key] = defaults[key];
     }
     if (!['unseen', 'background', 'always'].includes(prefs.notificationMode)) prefs.notificationMode = defaults.notificationMode;

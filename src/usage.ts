@@ -1,6 +1,9 @@
 export interface TokenBreakdown { inputTokens?: number; cachedInputTokens?: number; cacheWriteInputTokens?: number; outputTokens?: number; reasoningOutputTokens?: number; totalTokens?: number }
-export interface TokenUsage { total: TokenBreakdown; last: TokenBreakdown; turn?: TokenBreakdown; contextTokens?: number | null; modelContextWindow?: number | null; costUsd?: number | null; cumulative?: boolean }
+export interface TokenUsage { total: TokenBreakdown; last: TokenBreakdown; turn?: TokenBreakdown; contextTokens?: number | null; modelContextWindow?: number | null; costUsd?: number | null; cumulative?: boolean; purpose?: string }
 export interface UsageRecord { sessionId: string; turnId: string; agent: string; model: string; data: TokenUsage; at: number; title: string }
+export function latestChatUsage(records: UsageRecord[]): TokenUsage | undefined {
+  return records.find(record => !['translation', 'handoff'].includes(record.data.purpose ?? ''))?.data;
+}
 export const number = (n?: number | null) => n == null ? '—' : Intl.NumberFormat('zh-CN').format(n);
 export const compactNumber = (n: number) => n >= 1_000_000 ? `${(n / 1_000_000).toFixed(2)}M` : n >= 1000 ? `${(n / 1000).toFixed(1)}K` : number(n);
 export function contextUsage(usage?: TokenUsage, fallbackWindow?: number) {

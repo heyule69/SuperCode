@@ -1180,6 +1180,10 @@ impl Stream {
         if !message["parent_tool_use_id"].is_null() {
             return events;
         }
+        if let Some(connection) = crate::run_connection::claude(message, chrono::Utc::now().timestamp_millis().max(0) as u64) {
+            events.push(event("turn/connection/updated", native, turn, json!({"connection":connection})));
+            return events;
+        }
         match message["type"].as_str().unwrap_or("") {
             "stream_event" => {
                 let e = &message["event"];
@@ -1407,6 +1411,17 @@ fn same_context_model(left: &str, right: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn main_api_retry_is_forwarded_but_a_subagent_retry_cannot_replace_primary_status() {
+        let mut stream = super::Stream::default();
+        let mut message = serde_json::json!({"type":"system","subtype":"api_retry","attempt":2,"max_retries":10,"retry_delay_ms":1000,"error_status":429});
+        let events = stream.translate(&message, "native", "turn");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["method"], "turn/connection/updated");
+        assert_eq!(events[0]["params"]["turnId"], "turn");
+        message["parent_tool_use_id"] = serde_json::json!("child-tool");
+        assert!(stream.translate(&message, "native", "turn").is_empty());
+    }
     use super::*;
     #[test]
     fn prompt_snapshot_refresh_requires_a_compatible_cli() {

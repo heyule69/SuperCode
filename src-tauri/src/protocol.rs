@@ -262,6 +262,12 @@ impl ActivityBuffer {
             self.cached_bytes = 0;
         }
         let method = event["method"].as_str()?;
+        if let Some(mut marker) = self.items.iter().find(|item| item["type"] == "runMarker").cloned() {
+            if crate::run_connection::update(&mut marker, event, millis()) {
+                self.replace(marker.clone());
+                if matches!(method, "turn/connection/updated" | "error") { return Some(marker); }
+            }
+        }
         if method == "turn/started" {
             self.items.clear();
             self.item_bytes.clear();
@@ -402,6 +408,7 @@ impl ActivityBuffer {
             .drain(..)
             .map(|mut i| {
                 if i["type"] == "runMarker" {
+                    crate::run_connection::finish(&mut i, status, millis());
                     i["durationMs"] =
                         json!(millis().saturating_sub(i["startedAt"].as_u64().unwrap_or(millis())));
                 }

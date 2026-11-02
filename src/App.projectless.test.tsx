@@ -68,6 +68,26 @@ beforeEach(() => {
 });
 afterEach(async () => { await act(async()=>root.unmount()); container.remove(); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
 async function render() { await act(async()=>{root.render(<App/>); await new Promise(resolve=>setTimeout(resolve,30));}); }
+it('shows recoverable retries in the active chat without a terminal error banner or resending the task', async () => {
+  localStorage.setItem('supercode.session', 'retry-chat');
+  data.sessions = [{ id:'retry-chat', projectId:'existing', title:'连接状态', agent:'claude', connectionId:'api:claude', model:'test-model', status:'running', nativeId:'retry-native', turnId:'retry-turn', updatedAt:1 }];
+  messages = [{ id:'user-retry', seq:1, sessionId:'retry-chat', role:'user', kind:'userMessage', text:'继续完善页面', data:null },
+    { id:'run-retry-turn', seq:2, sessionId:'retry-chat', role:'activity', kind:'runMarker', text:'', data:{ turnId:'retry-turn', status:'inProgress', startedAt:Date.now() } }];
+  await render();
+  await act(async () => { notify({ method:'error', params:{ threadId:'retry-native', turnId:'retry-turn', willRetry:true, error:{ message:'Reconnecting... 1/5' } } }); await new Promise(resolve => setTimeout(resolve, 80)); });
+  expect(container.querySelector('.error-banner')).toBeNull();
+  expect(container.querySelector('.turn-connection')?.textContent).toContain('正在重试模型请求');
+  await act(async () => {
+    notify({ method:'turn/connection/updated', params:{ appSessionId:'retry-chat', threadId:'retry-native', turnId:'retry-turn', connection:{ status:'retrying', at:Date.now(), kind:'network', attempt:2, maxAttempts:5 } } });
+    notify({ method:'turn/connection/updated', params:{ appSessionId:'other', threadId:'retry-native', turnId:'retry-turn', connection:{ status:'failed', at:Date.now() } } });
+    await new Promise(resolve => setTimeout(resolve, 80));
+  });
+  expect(container.querySelector('.turn-connection')?.textContent).toContain('正在重新连接模型');
+  expect(container.querySelector('.turn-connection')?.textContent).toContain('第 2 / 5 次');
+  expect(call).not.toHaveBeenCalledWith('send_chat_message', expect.anything());
+  await act(async () => { notify({ method:'error', params:{ threadId:'retry-native', turnId:'retry-turn', willRetry:false, error:{ message:'最终连接错误' } } }); await new Promise(resolve => setTimeout(resolve, 80)); });
+  expect(container.querySelector('.error-banner')?.textContent).toContain('最终连接错误');
+});
 async function type(text: string) {
   const textarea = container.querySelector<HTMLTextAreaElement>('.composer textarea')!;
   await act(async()=>{Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype,'value')!.set!.call(textarea,text);textarea.dispatchEvent(new Event('input',{bubbles:true}));});
@@ -75,6 +95,26 @@ async function type(text: string) {
 async function send() {
   await act(async()=>{container.querySelector<HTMLFormElement>('.composer')!.dispatchEvent(new Event('submit',{bubbles:true,cancelable:true}));await new Promise(resolve=>setTimeout(resolve,30));});
 }
+it('keeps the draft and blocks task creation when the selected Magpie gateway is offline', async () => {
+  data.profiles = [{ id:'magpie:claude', agent:'claude', name:'Magpie', providerId:'magpie', source:'magpie', model:'saved-model', models:['saved-model'], current:true, hasCredential:true }];
+  const base = vi.mocked(call).getMockImplementation()!;
+  vi.mocked(call).mockImplementation(async (command, args = {}) => {
+    if (command === 'check_chat_connection') throw new Error('Magpie 网关未连接，请先打开 Magpie 后再发送。');
+    return base(command, args);
+  });
+  await render(); await type('保留这份任务草稿'); await send();
+  expect(container.querySelector('.error-banner')?.textContent).toContain('Magpie 尚未打开或网关未连接');
+  expect(container.querySelector<HTMLTextAreaElement>('[aria-label="消息"]')?.value).toBe('保留这份任务草稿');
+  expect(call).not.toHaveBeenCalledWith('create_session', expect.anything());
+  expect(call).not.toHaveBeenCalledWith('send_chat_message', expect.anything());
+  expect(vi.mocked(call).mock.calls.some(([command]) => command === 'open_magpie')).toBe(false);
+  await act(async () => [...container.querySelectorAll<HTMLButtonElement>('.error-banner button')].find(button => button.textContent === '打开 Magpie')!.click());
+  expect(call).toHaveBeenCalledWith('open_magpie');
+  expect(container.querySelector('.error-banner')?.textContent).toContain('已请求打开');
+  expect(container.querySelector<HTMLTextAreaElement>('[aria-label="消息"]')?.value).toBe('保留这份任务草稿');
+  expect(call).not.toHaveBeenCalledWith('create_session', expect.anything());
+  expect(call).not.toHaveBeenCalledWith('send_chat_message', expect.anything());
+});
 
 it('adds a dropped Excel file as its original path and sends it without importing its contents', async () => {
   const attachment = { kind:'file', name:'预算表.xlsx', path:'D:\\中文目录 with spaces\\预算表.xlsx' };
@@ -1072,14 +1112,180 @@ it('folds restored legacy progress and tools while preserving the final answer t
   await act(async () => container.querySelector<HTMLButtonElement>('.turn-process-toggle')!.click());
   expect(container.querySelectorAll('.turn-process-content .activity-group-summary')).toHaveLength(50);
   expect(container.querySelector('.turn-process-content')?.textContent).toContain('旧执行过程 26');
-  await act(async () => { container.querySelector<HTMLButtonElement>('.load-earlier')!.click(); await vi.dynamicImportSettled(); });
+  const area = container.querySelector<HTMLElement>('.chat-scroll')!;
+  Object.defineProperties(area, {
+    clientHeight: { value:500, configurable:true },
+    scrollHeight: { get:() => 1200 + (container.querySelector('[aria-label="你的消息"]') ? 350 : 0), configurable:true },
+  });
+  await act(async () => { area.scrollTop = 240; area.dispatchEvent(new Event('scroll')); });
+  await act(async () => { area.scrollTop = 40; area.dispatchEvent(new Event('scroll')); await vi.dynamicImportSettled(); });
   expect(vi.mocked(call).mock.calls.some(([command,args]) => command === 'list_messages' && args?.before === 28)).toBe(true);
+  expect(area.scrollTop).toBe(390);
   expect(container.querySelector('.load-earlier')).toBeNull();
   expect(container.querySelectorAll('.turn-process-content .activity-group-summary')).toHaveLength(62);
   expect(container.querySelector('.turn-process-content')?.textContent).toContain('旧执行过程 0');
   expect(container.querySelector('.turn-final-result')?.textContent).not.toContain('旧执行过程 0');
   expect(container.querySelector('.turn-final-result .message:last-child')).toBe(final);
   expect(container.querySelectorAll('[aria-label="你的消息"]')).toHaveLength(1);
+});
+
+it('keeps the current chat position when an artifact group expands or changes page', async () => {
+  let resizeMessages!: () => void;
+  vi.stubGlobal('ResizeObserver',class {
+    constructor(private callback:ResizeObserverCallback) {}
+    observe(target:Element) { if(target.classList.contains('messages'))resizeMessages=()=>this.callback([],this as unknown as ResizeObserver); }
+    disconnect() {} unobserve() {}
+  });
+  localStorage.setItem('supercode.session','chat');
+  data.sessions=[{id:'chat',projectId:'existing',title:'产物分组',agent:'claude',connectionId:'api:claude',model:null,status:'idle',nativeId:'native',turnId:null,updatedAt:1}];
+  const files=Array.from({length:24},(_,index)=>({path:`D:/outputs/step-${index}.png`,name:`step-${index}.png`,size:1024}));
+  messages=[
+    {id:'u',seq:1,sessionId:'chat',role:'user',kind:'userMessage',text:'生成截图',data:{}},
+    {id:'answer',seq:2,sessionId:'chat',role:'assistant',kind:'agentMessage',text:'截图已生成。',data:{}},
+    {id:'files',seq:3,sessionId:'chat',role:'activity',kind:'turnArtifacts',text:'',data:{artifacts:files}},
+  ];
+  const original=vi.mocked(call).getMockImplementation()!;
+  vi.mocked(call).mockImplementation(async(command,args={})=>command==='resolve_artifact_references'?files:original(command,args));
+  await render();await act(async()=>{await vi.dynamicImportSettled();});
+  const area=container.querySelector<HTMLElement>('.chat-scroll')!;
+  const scroll=vi.spyOn(area,'scrollTo');
+  await act(async()=>container.querySelector<HTMLButtonElement>('[aria-label="展开图片"]')!.click());
+  await act(async()=>resizeMessages());
+  expect(scroll).not.toHaveBeenCalled();
+  await act(async()=>container.querySelector<HTMLButtonElement>('[aria-label="下一页图片"]')!.click());
+  await act(async()=>resizeMessages());
+  expect(scroll).not.toHaveBeenCalled();
+});
+
+function paginatedChat() {
+  localStorage.setItem('supercode.session', 'chat');
+  data.sessions = [{id:'chat',projectId:'existing',title:'分页会话',agent:'claude',connectionId:'api:claude',model:null,status:'idle',nativeId:'native',turnId:null,updatedAt:1}];
+  const history: Message[] = Array.from({length:205}, (_, index) => ({
+    id:`history-${index}`, seq:index + 1, sessionId:'chat', role:index % 2 ? 'assistant' : 'user',
+    kind:index % 2 ? 'agentMessage' : 'userMessage', text:`历史 ${index + 1}`, data:{status:'completed'},
+  }));
+  const original = vi.mocked(call).getMockImplementation()!;
+  const page = (before: unknown) => history.filter(message => message.seq < Number(before ?? Infinity)).slice(-100);
+  return { original, page };
+}
+
+it('loads one older page per upward gesture, including when the visible content does not fill the viewport', async () => {
+  const { original, page } = paginatedChat();
+  let finish!: (value: Message[]) => void;
+  vi.mocked(call).mockImplementation((command,args={}) => command !== 'list_messages' ? original(command,args)
+    : args.before === 106 ? new Promise(resolve => { finish = resolve; }) : Promise.resolve(page(args.before)));
+  await render(); await act(async () => { await vi.dynamicImportSettled(); });
+  const area = container.querySelector<HTMLElement>('.chat-scroll')!;
+  const olderReads = () => vi.mocked(call).mock.calls.filter(([command,args]) => command === 'list_messages' && args?.before != null);
+  expect(olderReads()).toHaveLength(0);
+  expect(container.querySelector('.load-earlier')).toBeNull();
+  expect(container.textContent).not.toContain('加载更早的消息');
+  await act(async () => { area.dispatchEvent(new WheelEvent('wheel',{deltaY:80,bubbles:true})); });
+  expect(olderReads()).toHaveLength(0);
+  await act(async () => {
+    area.dispatchEvent(new WheelEvent('wheel',{deltaY:-80,bubbles:true}));
+    area.dispatchEvent(new WheelEvent('wheel',{deltaY:-80,bubbles:true}));
+    area.dispatchEvent(new Event('scroll'));
+  });
+  expect(olderReads()).toHaveLength(1);
+  expect(container.querySelector('[role="status"]')?.textContent).toBe('正在加载更早的消息…');
+  await act(async () => { finish(page(106)); await vi.dynamicImportSettled(); });
+  expect(container.textContent).toContain('历史 6');
+  expect(olderReads()).toHaveLength(1);
+  await act(async () => { area.dispatchEvent(new Event('scroll')); });
+  expect(olderReads()).toHaveLength(1);
+  await act(async () => { area.dispatchEvent(new WheelEvent('wheel',{deltaY:-80,bubbles:true})); await vi.dynamicImportSettled(); });
+  expect(olderReads()).toHaveLength(2);
+  expect(olderReads()[1][1]?.before).toBe(6);
+  expect(container.textContent).toContain('历史 1');
+  await act(async () => { area.dispatchEvent(new WheelEvent('wheel',{deltaY:-80,bubbles:true})); });
+  expect(olderReads()).toHaveLength(2);
+});
+
+it('ignores downward and distant scrolls and does not request history while settings hide the chat', async () => {
+  const { original, page } = paginatedChat();
+  vi.mocked(call).mockImplementation((command,args={}) => command === 'list_messages' ? Promise.resolve(page(args.before)) : original(command,args));
+  await render(); await act(async () => { await vi.dynamicImportSettled(); });
+  const area = container.querySelector<HTMLElement>('.chat-scroll')!;
+  Object.defineProperties(area, {clientHeight:{value:400,configurable:true},scrollHeight:{value:2000,configurable:true}});
+  const olderReads = () => vi.mocked(call).mock.calls.filter(([command,args]) => command === 'list_messages' && args?.before != null);
+  await act(async () => { area.scrollTop = 600; area.dispatchEvent(new Event('scroll')); });
+  await act(async () => { area.scrollTop = 300; area.dispatchEvent(new Event('scroll')); area.dispatchEvent(new WheelEvent('wheel',{deltaY:-60,bubbles:true})); });
+  expect(olderReads()).toHaveLength(0);
+  await act(async () => { container.querySelector<HTMLButtonElement>('button[aria-label="设置"]')!.click(); });
+  await act(async () => { area.scrollTop = 0; area.dispatchEvent(new Event('scroll')); area.dispatchEvent(new WheelEvent('wheel',{deltaY:-60,bubbles:true})); });
+  expect(olderReads()).toHaveLength(0);
+  await act(async () => { container.querySelector<HTMLButtonElement>('button[aria-label="聊天"]')!.click(); });
+  expect(area.scrollTop).toBe(300);
+  expect(olderReads()).toHaveLength(0);
+  await act(async () => { area.scrollTop = 40; area.dispatchEvent(new Event('scroll')); await vi.dynamicImportSettled(); });
+  expect(olderReads()).toHaveLength(1);
+});
+
+it('allows another upward gesture to retry a failed page without retrying in the background', async () => {
+  const { original, page } = paginatedChat();
+  let fail = true;
+  vi.mocked(call).mockImplementation((command,args={}) => {
+    if (command !== 'list_messages') return original(command,args);
+    if (args.before != null && fail) { fail = false; return Promise.reject(new Error('历史暂时不可用')); }
+    return Promise.resolve(page(args.before));
+  });
+  await render(); await act(async () => { await vi.dynamicImportSettled(); });
+  const area = container.querySelector<HTMLElement>('.chat-scroll')!;
+  const olderReads = () => vi.mocked(call).mock.calls.filter(([command,args]) => command === 'list_messages' && args?.before != null);
+  await act(async () => { area.dispatchEvent(new WheelEvent('wheel',{deltaY:-60,bubbles:true})); });
+  expect(container.textContent).toContain('历史暂时不可用');
+  expect(olderReads()).toHaveLength(1);
+  await act(async () => { area.dispatchEvent(new Event('scroll')); });
+  expect(olderReads()).toHaveLength(1);
+  await act(async () => { area.dispatchEvent(new WheelEvent('wheel',{deltaY:-60,bubbles:true})); await vi.dynamicImportSettled(); });
+  expect(olderReads()).toHaveLength(2);
+  expect(container.textContent).toContain('历史 6');
+});
+
+it('keeps a pending older-page result and error isolated from the newly selected chat', async () => {
+  const { original, page } = paginatedChat();
+  data.sessions.push({...data.sessions[0],id:'other',title:'另一会话',nativeId:'other-native'});
+  let rejectOld!: (error: Error) => void;
+  vi.mocked(call).mockImplementation((command,args={}) => {
+    if (command !== 'list_messages') return original(command,args);
+    if (args.sessionId === 'chat' && args.before != null) return new Promise((_resolve,reject) => { rejectOld = reject; });
+    return Promise.resolve(page(args.before).map(message => args.sessionId === 'other' ? {...message,sessionId:'other',text:`另一会话 ${message.seq}`} : message));
+  });
+  await render(); await act(async () => { await vi.dynamicImportSettled(); });
+  const area = container.querySelector<HTMLElement>('.chat-scroll')!;
+  await act(async () => { area.dispatchEvent(new WheelEvent('wheel',{deltaY:-60,bubbles:true})); });
+  await act(async () => { container.querySelector<HTMLButtonElement>('.session-row[title="另一会话"]')!.click(); await vi.dynamicImportSettled(); });
+  await act(async () => { area.dispatchEvent(new WheelEvent('wheel',{deltaY:-60,bubbles:true})); await vi.dynamicImportSettled(); });
+  expect(call).toHaveBeenCalledWith('list_messages',{sessionId:'other',before:106});
+  await act(async () => { rejectOld(new Error('旧会话加载失败')); });
+  expect(container.querySelector('.messages')?.textContent).toContain('另一会话 6');
+  expect(container.querySelector('.messages')?.textContent).not.toContain('历史 6');
+  expect(container.textContent).not.toContain('旧会话加载失败');
+});
+
+it('lets an inner code pane consume upward wheel input and ignores zoom gestures', async () => {
+  const { original, page } = paginatedChat();
+  vi.mocked(call).mockImplementation((command,args={}) => command === 'list_messages' ? Promise.resolve(page(args.before)) : original(command,args));
+  await render(); await act(async () => { await vi.dynamicImportSettled(); });
+  const area = container.querySelector<HTMLElement>('.chat-scroll')!;
+  const code = document.createElement('pre'); area.append(code);
+  Object.defineProperties(code,{clientHeight:{value:100},scrollHeight:{value:1000}});
+  code.scrollTop = 100;
+  const olderReads = () => vi.mocked(call).mock.calls.filter(([command,args]) => command === 'list_messages' && args?.before != null);
+  await act(async () => { code.dispatchEvent(new WheelEvent('wheel',{deltaY:-60,bubbles:true})); });
+  expect(olderReads()).toHaveLength(0);
+  const zoom = new WheelEvent('wheel',{deltaY:-60,bubbles:true});
+  // happy-dom's WheelEvent omits MouseEvent modifier properties.
+  Object.defineProperty(zoom,'ctrlKey',{value:true});
+  await act(async () => { area.dispatchEvent(zoom); });
+  expect(olderReads()).toHaveLength(0);
+  await act(async () => { area.dispatchEvent(new WheelEvent('wheel',{deltaY:0,deltaX:-60,bubbles:true})); });
+  expect(olderReads()).toHaveLength(0);
+  code.scrollTop = 0;
+  await act(async () => { code.dispatchEvent(new WheelEvent('wheel',{deltaY:-60,bubbles:true})); await vi.dynamicImportSettled(); });
+  expect(olderReads()).toHaveLength(1);
+  code.remove();
 });
 
 it('keeps restored active, failed and interrupted legacy conversations expanded', async () => {

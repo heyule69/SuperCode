@@ -8,6 +8,7 @@ import type { Message } from './types';
 import type { TurnLifecycle } from './turnPresentation';
 import * as diffs from './diff';
 import { call } from './api';
+import { ReplyTranslationContext } from './ReplyText';
 
 vi.mock('./api', () => ({ desktop: true, call: vi.fn(async (command:string) => command==='resolve_artifact_references'?[]:{ token: 'full', previewToken: 'small' }) }));
 vi.mock('@tauri-apps/api/core', () => ({ convertFileSrc: (token: string) => `http://supercode-media.localhost/${token}` }));
@@ -24,6 +25,31 @@ beforeEach(async () => {
   await act(async () => { await import('./Markdown'); });
 });
 afterEach(async () => { await act(async () => root.unmount()); node.remove(); vi.unstubAllGlobals(); });
+
+it('translates assistant progress and final text without changing user input, raw tools, saved text or artifact references', async () => {
+  const original = vi.mocked(call).getMockImplementation()!;
+  const messages = [message('translation-user', 'user', 'Please keep my user message in English.'),
+    message('translation-progress', 'assistant', 'Next I will update the header.', 'agentMessage', { status:'completed', phase:'commentary' }),
+    message('translation-tool', 'tool', 'Raw tool output stays in English.', 'commandExecution', { status:'completed', command:'npm run build' }),
+    message('translation-final', 'assistant', 'I have completed the report: [report](D:/outputs/report.md).')];
+  const snapshot = JSON.stringify(messages);
+  vi.mocked(call).mockImplementation(async (command, args = {}) => command === 'translate_reply'
+    ? String(args.text).replace('Next I will update the header.', '接下来更新标题。').replace('I have completed the report:', '报告已完成：') : original(command, args));
+  try {
+    await act(async () => root.render(<ReplyTranslationContext.Provider value><Conversation messages={messages} agentName="Codex" autoExpand processDisplay="timeline" showDiff={() => {}} openFile={() => {}} sessionId="translation-integration" /></ReplyTranslationContext.Provider>));
+    await act(async () => { await new Promise(resolve => setTimeout(resolve, 800)); });
+    expect(node.textContent).toContain('接下来更新标题。');
+    expect(node.textContent).toContain('报告已完成：');
+    expect(node.textContent).toContain('Please keep my user message in English.');
+    await act(async () => node.querySelector<HTMLButtonElement>('.activity-row')!.click());
+    expect(node.textContent).toContain('Raw tool output stays in English.');
+    const requests = vi.mocked(call).mock.calls.filter(([command]) => command === 'translate_reply');
+    expect(requests).toHaveLength(2);
+    expect(requests.every(([, args]) => !String(args?.text).includes('user message') && !String(args?.text).includes('Raw tool'))).toBe(true);
+    expect(JSON.stringify(messages)).toBe(snapshot);
+    expect(node.querySelector('a[title="D:/outputs/report.md"]')).not.toBeNull();
+  } finally { vi.mocked(call).mockImplementation(original); }
+});
 
 it('shows a discovered final spreadsheet even when the assistant forgot its link, and retains it after history reload',async()=>{
   const file={path:'D:/outputs/报告.xlsx',name:'报告.xlsx',size:1234};
@@ -42,6 +68,20 @@ it('shows a discovered final spreadsheet even when the assistant forgot its link
     expect(node.querySelector('[aria-label="执行过程"]')).toBeNull();
     expect(node.querySelector('.turn-changes')).toBeNull();
   } finally {vi.mocked(call).mockImplementation(original);}
+});
+it('presents final delivery URLs after completion and history reload without promoting tool URLs or reference links',async()=>{
+  let messages=mergeEvent([message('u','user','制作并发布网页')],{method:'turn/started',params:{turn:{id:'website-turn'}}},'s');
+  messages=mergeEvent(messages,{method:'item/completed',params:{turnId:'website-turn',item:{id:'tool',type:'commandExecution',command:'echo https://tool.example.com',status:'completed'}}},'s');
+  messages=mergeEvent(messages,{method:'item/completed',params:{turnId:'website-turn',item:{id:'final',type:'agentMessage',phase:'final_answer',text:'已部署：[项目预览](https://demo.example.com/)\n\n参考：[官方文档](https://docs.example.com/)',status:'completed'}}},'s');
+  const props={agentName:'Codex',autoExpand:false,showDiff:()=>{},openFile:()=>{},sessionId:'s'};
+  await act(async()=>root.render(<Conversation {...props} messages={messages} sessionStatus="running" activeTurnId="website-turn"/>));
+  expect(node.querySelector('.artifact-link')).toBeNull();
+  messages=mergeEvent(messages,{method:'turn/completed',params:{turn:{id:'website-turn',status:'completed'}}},'s');
+  await act(async()=>root.render(<Conversation {...props} messages={JSON.parse(JSON.stringify(messages))} sessionStatus="idle"/>));
+  expect(node.querySelectorAll('.artifact-link')).toHaveLength(1);
+  expect(node.querySelector('.artifact-link a')?.getAttribute('href')).toBe('https://demo.example.com/');
+  expect(node.querySelector('.artifact-link')?.textContent).toContain('项目预览');
+  expect(node.querySelector('.artifact-link')?.textContent).not.toContain('docs.example.com');
 });
 it('does not parse completed history diffs again when only the latest streamed answer changes', async () => {
   const showDiff = vi.fn(), openFile = vi.fn(), parse = vi.spyOn(diffs,'diffFiles');
@@ -101,6 +141,19 @@ it('keeps legacy edit arguments out of the conversation when the operation patch
   expect(showDiff).toHaveBeenCalledWith('本次变更 · old.ts','此记录没有保存可展示的代码差异。');
 });
 async function render(messages: Message[], autoExpand = false, lifecycle: TurnLifecycle = {}) { await act(async () => root.render(<Conversation messages={messages} agentName="Codex" autoExpand={autoExpand} sessionStatus={lifecycle.sessionStatus} activeTurnId={lifecycle.activeTurnId} showDiff={() => {}} openFile={() => {}}/>)); }
+it('replaces the generic working line with live reconnection and restores the same turn after new output', async () => {
+  let rows = mergeEvent([message('retry-user', 'user', '继续')], { method:'turn/started', params:{ turn:{ id:'retry' } } }, 's');
+  rows = mergeEvent(rows, { method:'turn/connection/updated', params:{ turnId:'retry', connection:{ status:'retrying', at:Date.now(), kind:'network', attempt:1, maxAttempts:5 } } }, 's');
+  await render(rows, false, { sessionStatus:'running', activeTurnId:'retry' });
+  expect(node.querySelector('.turn-connection')?.textContent).toContain('正在重新连接模型');
+  expect(node.querySelector('.working-indicator')).toBeNull();
+  rows = mergeEvent(rows, { method:'item/agentMessage/delta', params:{ turnId:'retry', itemId:'reply', delta:'继续完成页面。' } }, 's');
+  await render(rows, false, { sessionStatus:'running', activeTurnId:'retry' });
+  expect(node.textContent).toContain('连接已恢复'); expect(node.textContent).toContain('继续完成页面。');
+  rows = mergeEvent(rows, { method:'turn/completed', params:{ turn:{ id:'retry', status:'completed' } } }, 's');
+  await render(rows, false, { sessionStatus:'idle', activeTurnId:null });
+  expect(node.querySelector('.turn-connection')).toBeNull();
+});
 async function toggle() { await act(async () => node.querySelector<HTMLButtonElement>('.turn-process-toggle')!.click()); }
 
 it('offers execution only on the latest successfully completed native plan, not on streaming or historical plans',async()=>{

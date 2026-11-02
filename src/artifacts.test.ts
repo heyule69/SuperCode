@@ -17,6 +17,12 @@ it('does not invent a product for normal chat, progress, a bare filename or an e
 it('does not promote a mentioned configuration or signing-key location into a final download',()=>{
   expect(referencedArtifacts('私钥已保存到 `C:\\Users\\Administrator\\.supercode-signing\\update.key`，没有上传到 GitHub。\n\n修改了 `src/App.tsx`。')).toEqual([]);
 });
+it('does not turn incidental old or hypothetical output paths into delivery claims',()=>{
+  expect(referencedArtifacts('请删除旧文件 `outputs/old.mp4`，稍后再生成新视频。')).toEqual([]);
+  expect(referencedArtifacts('这里的占位路径是 `outputs/example.custom`。')).toEqual([]);
+  expect(referencedArtifacts('脚本里引用了 `outputs/data.json`。')).toEqual([]);
+  expect(referencedArtifacts('文件已保存到 `outputs/报告.xlsx`。')).toEqual(['outputs/报告.xlsx']);
+});
 it('retains discovered outputs across live events and saved history without showing them as tool activity',()=>{
   const event={method:'turn/artifacts/updated',params:{threadId:'native',turnId:'t',artifacts:[{path:'D:/outputs/报告.xlsx',name:'报告.xlsx',size:128}],error:null}};
   expect(isDisplayEvent(event)).toBe(true);

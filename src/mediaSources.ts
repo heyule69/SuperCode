@@ -59,9 +59,15 @@ export function referencedMedia(text: string): MediaReference[] {
     const source = match[2] ?? match[3] ?? match[4];
     if (embedded.has(source)) continue;
     if (match[4] && /^(?:ffmpeg|ffprobe|convert|magick|python|node|curl|wget|copy|cp|mv|del|rm|start|npm|npx|git|powershell|cmd)\s|&&|\|/i.test(source)) continue;
-    // A filename mentioned in prose is not an output location. Keep it as text
-    // rather than resolving an old/elsewhere file against the workspace root.
-    if (match[4] && !/[\\/]/.test(source)) continue;
+    // Inline code in a sentence can describe a missing placeholder or an old
+    // asset. Only a standalone path (optionally a list item) claims an output.
+    if (match[4]) {
+      if (!/[\\/]/.test(source)) continue;
+      const start = prose.lastIndexOf('\n', match.index) + 1;
+      const end = prose.indexOf('\n', match.index);
+      const line = prose.slice(start, end < 0 ? prose.length : end).trim();
+      if (!/^(?:(?:[-+*]|\d+[.)])\s+)?`[^`\n]+`$/.test(line)) continue;
+    }
     const ref = mediaReference(source, match[1]);
     if (ref) refs.push(ref);
   }

@@ -1575,6 +1575,25 @@ mod tests {
         }
     }
     #[test]
+    fn display_translation_billing_does_not_replace_chat_counters_or_history() {
+        let store = Store::from_connection(Connection::open_in_memory().unwrap()).unwrap();
+        let project = store.add_project(Path::new("D:/translation-usage")).unwrap();
+        let chat = store.create_session(&project.id, None).unwrap();
+        store.bind_native(&chat.id, "original-thread").unwrap();
+        let chat = store.session(&chat.id).unwrap();
+        let usage = |total| serde_json::json!({"cumulative":true,"total":{"totalTokens":total}});
+        store.record_usage(&chat, "chat-first", usage(100)).unwrap();
+        crate::handoff::record_text_usage(&store, &chat, "translation-1", "translation", usage(30)).unwrap();
+        store.record_usage(&chat, "chat-next", usage(150)).unwrap();
+        let rows = store.usage_records(Some(&chat.id)).unwrap();
+        let translation = rows.iter().find(|r| r["turnId"] == "translation-1").unwrap();
+        assert_eq!(translation["data"]["turn"]["totalTokens"], 30);
+        assert_eq!(translation["data"]["purpose"], "translation");
+        assert_eq!(rows.iter().find(|r| r["turnId"] == "chat-next").unwrap()["data"]["turn"]["totalTokens"], 50);
+        assert_eq!(store.session(&chat.id).unwrap().native_id.as_deref(), Some("original-thread"));
+        assert!(store.messages(&chat.id, None).unwrap().is_empty());
+    }
+    #[test]
     fn separately_reported_context_and_billing_restore_for_every_agent() {
         let store = Store::from_connection(Connection::open_in_memory().unwrap()).unwrap();
         let project = store.add_project(Path::new("D:/usage-fixture")).unwrap();

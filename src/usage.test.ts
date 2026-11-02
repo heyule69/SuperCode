@@ -1,8 +1,15 @@
 import { describe, expect, it } from 'vitest';
-import { contextUsage, usageDay, usageGroups, usageTotals, type UsageRecord } from './usage';
+import { contextUsage, latestChatUsage, usageDay, usageGroups, usageTotals, type UsageRecord } from './usage';
 
 const record = (sessionId: string, model: string, at: number): UsageRecord => ({ sessionId, model, at, turnId: `${sessionId}:${at}`, agent: 'claude', title: sessionId, data: { total: { inputTokens: 1000, outputTokens: 100, totalTokens: 1100, cachedInputTokens: 800 }, last: {} } });
 describe('usage views', () => {
+  it('counts translation costs without using auxiliary calls as the chat context', () => {
+    const chat = record('s', 'model', 1), translation = record('s', 'model', 2), handoff = record('s', 'model', 3);
+    translation.data.purpose = 'translation'; handoff.data.purpose = 'handoff';
+    expect(latestChatUsage([translation, handoff, chat])).toBe(chat.data);
+    expect(latestChatUsage([translation, handoff])).toBeUndefined();
+    expect(usageTotals([translation, handoff, chat]).tokens).toBe(3300);
+  });
   it('uses turn deltas and never adds cached input twice', () => {
     const r = record('s1', 'glm', 1); r.data.turn = { inputTokens: 200, outputTokens: 30, cachedInputTokens: 100, totalTokens: 230 }; r.data.costUsd = 0;
     expect(usageTotals([r])).toEqual({ input: 200, output: 30, cached: 100, tokens: 230, cost: 0, priced: 1 });
