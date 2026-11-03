@@ -3,12 +3,13 @@ import { call } from './api';
 import type { Skill } from './ClientSettings';
 import { type Attachment } from './attachments';
 import { AttachmentImage } from './AttachmentImage';
+import { skillLabel } from './skillPresentation';
 export type { Attachment } from './attachments';
 export { AddMenu } from './ComposerAddMenu';
 export function ComposerSkills({ attachments, remove }: { attachments: Attachment[]; remove: (path: string) => void }) {
   const skills = attachments.filter(a => a.kind === 'skill');
   return skills.length ? <div className="composer-skills" role="list" aria-label="已选择技能">{skills.map(skill => <div className="composer-skill" role="listitem" key={skill.path} title={`${skill.name} · 在输入文字开头按退格键移除技能`}>
-      <Box size={17} aria-hidden="true" /><span>{skill.name.charAt(0).toUpperCase() + skill.name.slice(1)}</span>
+      <Box size={17} aria-hidden="true" /><span>{skillLabel(skill)}</span>
       <button type="button" className="remove-skill" aria-label={`移除技能 ${skill.name}`} title="移除技能" onClick={() => remove(skill.path)}><X size={13} /></button>
     </div>)}</div> : null;
 }

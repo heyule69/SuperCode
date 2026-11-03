@@ -4,7 +4,7 @@
 
 一个轻量、本地优先的多 Agent 编程桌面工作台。把 **Codex、Claude Code、OpenCode、Pi 和 Gemini CLI** 放进同一个界面，管理项目、模型连接与工具，用对话完成开发任务。
 
-当前版本 **0.2.14**，主要支持 **Windows**。桌面核心采用 Rust + Tauri 2，前端采用 React + TypeScript，聊天与配置保存在本机 SQLite 数据库中。
+当前版本 **0.2.15**，主要支持 **Windows**。桌面核心采用 Rust + Tauri 2，前端采用 React + TypeScript，聊天与配置保存在本机 SQLite 数据库中。
 
 [下载 Windows 安装包](https://github.com/heyule69/SuperCode/releases/latest) · [版本记录](https://github.com/heyule69/SuperCode/releases) · [反馈问题](https://github.com/heyule69/SuperCode/issues)
 
@@ -55,6 +55,12 @@ Gemini CLI 要求 **0.63.0 或以上版本**。0.2.5 已通过官方 CLI 0.63.0 
 - 在工作空间浏览文件、查看 Git 变更和每轮代码改动；代码与差异支持语法高亮和行号。
 - 聊天中明确引用的文件可预览、系统打开或在文件夹中定位，支持绝对路径、相对路径和文件链接。
 - 右侧工作空间、计划、浏览器、代码改动、侧边聊天与子代理分别使用标签，可切换、关闭和调整面板宽度。
+
+### 网站和长期服务
+
+- 需要在任务完成后继续使用的网站服务或 SSH 转发，应通过独立服务托管入口启动，不能依赖临时终端的后台进程。该入口由 Agent 使用，启动和停止都需要在聊天审批卡片中明确确认。
+- 托管服务独立于 Agent 进程组，结束任务、空闲回收 Agent 或收起浏览器面板不会停止它；显式停止服务或退出 SuperCode 时结束。最多同时托管 8 个服务，输出按有界原始字节日志保存，按需读取。
+- 远程正式部署应使用远端平台的独立服务管理方式，避免挂在临时 SSH 前台会话上；需要退出 SuperCode 后仍可使用的网站，也应独立部署。运行中的进程不代表网址已可访问，Agent 交付前仍需检查实际网址。
 
 ### 模型连接与权限
 

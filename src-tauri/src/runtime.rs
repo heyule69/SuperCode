@@ -363,6 +363,7 @@ impl Client {
         }
         if let Some(id) = &session_id { command.env("SUPERCODE_SESSION_ID", id); }
         else { command.env_remove("SUPERCODE_SESSION_ID"); }
+        crate::managed_services::configure(&mut command, &app.state::<AppState>().data_dir);
         let mut child = command
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
@@ -653,6 +654,7 @@ pub(crate) fn publish_event(app: &AppHandle, mut message: Value) {
             if let Ok(session) = app.state::<AppState>().store.for_native(native) { message["params"]["appSessionId"] = session.id.into(); }
         }
     }
+    crate::managed_services::observe(app, &message);
     crate::media::normalize_event(app, &mut message);
     if let Some(artifacts) = crate::artifacts::observe(app, &message) { publish_event(app, artifacts); }
     if matches!(message["method"].as_str(),Some("item/started"|"item/updated"|"item/completed")) {
@@ -836,6 +838,7 @@ pub async fn idle_watch(app: AppHandle) {
     loop {
         tokio::time::sleep(Duration::from_secs(30)).await;
         crate::runtime_diagnostics::cleanup(&app);
+        crate::managed_services::reap(&app).await;
         let state = app.state::<AppState>();
         state.claude.release_idle().await;
         state.native.release_idle().await;

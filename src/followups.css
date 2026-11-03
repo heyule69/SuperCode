@@ -3,7 +3,8 @@
 .followup-row { display:flex; align-items:center; gap:8px; min-height:36px; padding:4px 8px; border:0; font-size:var(--chat-size,13px); }
 .followup-icon { flex:none; color:var(--muted); opacity:.7; }
 .followup-content { flex:1; min-width:0; }
-.followup-content > span { display:block; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; line-height:1.5; }
+.followup-summary { display:flex; align-items:center; flex-wrap:wrap; gap:4px 10px; min-width:0; }
+.followup-summary > .followup-text { flex:1 1 100px; min-width:0; display:block; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; line-height:1.5; }
 .followup-content small { display:block; margin-top:2px; color:var(--muted); font-size:11px; line-height:1.4; }
 .followup-content small[role="alert"] { color:var(--danger,#e56b6b); white-space:normal; overflow-wrap:anywhere; }
 .followup-actions { display:flex; flex:none; align-items:center; gap:2px; }

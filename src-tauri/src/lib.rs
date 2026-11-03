@@ -63,6 +63,7 @@ mod official_models;
 mod outbox;
 mod platform_usage;
 mod process;
+mod managed_services;
 mod protocol;
 mod run_connection;
 mod reply_translation;
@@ -104,6 +105,12 @@ pub fn run() {
         eprintln!("{error}");
         std::process::exit(2);
     });
+    if args.get(1).is_some_and(|arg| arg == "--service-control") {
+        if let Err(error) = managed_services::run_controller(diagnostic_dir.as_deref()) {
+            eprintln!("{error}"); std::process::exit(1);
+        }
+        return;
+    }
     if args.get(1).is_some_and(|arg| arg == "--browser-mcp") {
         if let Err(error) = browser_bridge::run(&args[2..]) {
             eprintln!("{error}");
@@ -216,6 +223,7 @@ pub fn run() {
         .manage(outbox::Outbox::default())
         .manage(media::Media::default())
         .manage(reply_translation::Translations::default())
+        .manage(managed_services::Services::default())
         .register_asynchronous_uri_scheme_protocol(
             "supercode-media",
             |context, request, responder| {
@@ -281,6 +289,9 @@ pub fn run() {
                 artifact_snapshots: std::sync::Mutex::new(artifacts::Tracker::default()),
             });
             runtime_diagnostics::record(app.handle(), None, "app_started", serde_json::json!({}));
+            if let Err(error) = managed_services::initialize(app.handle(), &dir) {
+                runtime_diagnostics::message(app.handle(), None, "services", "error", "service_host_unavailable", &error);
+            }
             if let Some(window) = app.get_webview_window("main") {
                 window_viewport::install(&window)?;
             }
@@ -508,6 +519,7 @@ pub fn run() {
                 runtime_diagnostics::record(app, None, "app_exited", serde_json::json!({}));
                 desktop_control::shutdown(app);
                 browser::shutdown(app);
+                managed_services::shutdown(app);
                 let state = app.state::<AppState>();
                 if let Ok(mut client) = state.runtime.client.try_lock() {
                     client.take();

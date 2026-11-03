@@ -1,6 +1,7 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { call } from './api';
 import type { Followup, FollowupPayload } from './Followups';
+import { skillMessageText } from './skillPresentation';
 
 interface Edit { row: Followup; token: string; originalDraft: FollowupPayload }
 interface Options {
@@ -53,7 +54,7 @@ export function useFollowupEditor(sessionId: string, options: Options) {
         return;
       }
       edits.current.set(key, { ...edit, originalDraft });
-      callbacks.current.setDraft(edit.row.payload, key);
+      callbacks.current.setDraft({...edit.row.payload,text:skillMessageText(edit.row.payload.text,edit.row.payload.attachments)}, key);
       await callbacks.current.reload();
       focusRequested.current = key;
     } catch (error) { callbacks.current.report(error); }

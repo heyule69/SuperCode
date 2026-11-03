@@ -46,6 +46,14 @@ async function render(draft:SideDraft, options:Partial<ComponentProps<typeof Sid
   await act(async()=>root.render(<SideChat draft={draft} projectId="" agent="pi" connectionId={draft.connectionId??'@local'} defaults={defaults} close={()=>{}} opened={()=>{}} openFile={()=>{}} showDiff={()=>{}} providerRequired={providerRequired} {...options}/>));
 }
 async function send() {await act(async()=>{container.querySelector('form')!.dispatchEvent(new Event('submit',{bubbles:true,cancelable:true}));});}
+it('keeps selected skills as structured attachments when sending a skill-only side chat',async()=>{
+  missing=false;
+  const attachments=[{kind:'skill' as const,name:'save',path:'D:/skills/save/SKILL.md'}];
+  await render({key:'skill-only',text:'',payload:{...defaults,text:'',attachments}});
+  expect(container.querySelector('.composer-skill')?.textContent).toContain('Save');
+  await send();
+  expect(call).toHaveBeenCalledWith('enqueue_followup',expect.objectContaining({payload:expect.objectContaining({text:'请执行所选技能。',attachments})}));
+});
 it('preserves an offline Magpie draft, opens the app on click and only submits on a later send', async () => {
   missing = false;
   let offline = true;

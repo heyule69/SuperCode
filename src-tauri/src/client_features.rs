@@ -107,6 +107,9 @@ pub(crate) fn validate_steering_settings(
 
 const ARTIFACT_GUIDANCE: &str = "Final files in SuperCode: when the task produces files for the user, save newly generated deliverables under the workspace outputs/ directory and include Markdown links with their absolute paths in the final reply. Keep intermediate scripts, logs and preview renders outside outputs/. Link an existing file at its original path when appropriate. Only present files that actually exist; do not create a file or an empty outputs directory just for an ordinary chat response.";
 
+const SERVICE_GUIDANCE: &str = "Persistent websites and services in SuperCode: a background terminal or Start-Process is not a persistence guarantee. Agent processes and their descendants are reclaimed after inactivity. Never stop a website, server, SSH tunnel or other service that the user expects to keep using merely because your task, tool call, browser inspection or verification is finished. For remote deployments, use the remote platform's durable service manager and verify that the service survives closing the deployment/SSH session; do not leave it attached to a temporary foreground shell. For local preview servers or SSH forwards that must outlive the agent, use SuperCode's application-owned service controller through the agent's normal native command/approval mechanism. It does not grant permission or bypass read-only mode, sandbox restrictions, native approvals or a user stop. Start and stop also wait for an explicit approval card in the current SuperCode chat. Explain the request and wait; never approve it yourself or try to bypass that card. Resolve the existing SUPERCODE_SERVICE_EXE and SUPERCODE_SERVICE_DATA_DIR environment values; invoke that executable with the separate arguments --service-control --user-data-dir DATA_DIR and send one UTF-8 JSON request on stdin. Start schema: {\"operation\":\"start\",\"name\":\"preview\",\"program\":\"absolute path to node.exe/python.exe/ssh.exe/etc\",\"cwd\":\"absolute workspace path\",\"args\":[\"separate literal arguments\"]}. Use the actual foreground executable, not npm.cmd/bat or an interpolated shell command. Query with {\"operation\":\"list\"}; explicitly stop an owned service only when authorized using {\"operation\":\"stop\",\"id\":\"returned service id\"}. Reuse the returned id and same name/workspace to avoid duplicates. These services survive agent completion, agent idle cleanup and browser-panel closure; they end when explicitly stopped or SuperCode exits. For operation beyond application exit, use independent hosting instead. A running PID does not prove a website is available: check its real URL before reporting success. Service logs are bounded raw byte files at logPath; read them only as needed, without changing their encoding. If the controller request loses confirmation, query list before retrying; do not assume failure and start another copy.";
+const SERVICE_REMINDER: &str = "Keep delivered websites/services running after this task. Background tools are temporary. Use independent remote hosting or the approved SuperCode service controller described in your instructions (SUPERCODE_SERVICE_EXE / SUPERCODE_SERVICE_DATA_DIR); preserve native approvals and verify the actual URL. Do not stop services during task cleanup unless authorized.";
+
 const PROGRESS_GUIDANCE: &str = "Progress communication in this interactive app:\n\
 For substantial or multi-step work, proactively send brief, user-visible assistant messages in the user's language. Do not leave the user with only reasoning events and tool records until the final answer.\n\
 Before the first tool call for substantial work, emit one short ordinary assistant text message. Do not go directly from a thinking block to a tool call. Thinking or reasoning content is not a public progress update, even if it contains a sentence addressed to the user.\n\
@@ -132,7 +135,7 @@ pub(crate) fn progress_context(mut content: Vec<Value>) -> Vec<Value> {
     {
         return content;
     }
-    content.insert(0, json!({"type":"text","text":format!("{PROGRESS_REMINDER}\n{ARTIFACT_GUIDANCE}\n[User request follows]")}));
+    content.insert(0, json!({"type":"text","text":format!("{PROGRESS_REMINDER}\n{ARTIFACT_GUIDANCE}\n{SERVICE_REMINDER}\n[User request follows]")}));
     content
 }
 
@@ -145,7 +148,7 @@ pub fn instructions(app: &AppHandle) -> String {
         .flatten()
         .unwrap_or_default();
     let tools = automation_instructions(&servers(app).unwrap_or_default());
-    format!("Read and write every project text file as UTF-8 without BOM. Tell the user before converting non-UTF-8 files.\nYou are running inside the SuperCode graphical desktop app. The conversation supports inline images, video and audio, not just terminal text. Tool image results are displayed automatically. To show a local media file, write ![descriptive caption](<absolute file path>); use an absolute path with spaces inside angle brackets. The same syntax supports video and audio files. Use ordinary Markdown links for files that should only be referenced. Do not open another application or copy screenshots to the desktop merely to make media visible in the conversation. Never claim a media file was shown unless you actually returned the media result or referenced an existing file.\n{ARTIFACT_GUIDANCE}\n{PROGRESS_GUIDANCE}\n{tools}\n{text}")
+    format!("Read and write every project text file as UTF-8 without BOM. Tell the user before converting non-UTF-8 files.\nYou are running inside the SuperCode graphical desktop app. The conversation supports inline images, video and audio, not just terminal text. Tool image results are displayed automatically. To show a local media file, write ![descriptive caption](<absolute file path>); use an absolute path with spaces inside angle brackets. The same syntax supports video and audio files. Use ordinary Markdown links for files that should only be referenced. Do not open another application or copy screenshots to the desktop merely to make media visible in the conversation. Never claim a media file was shown unless you actually returned the media result or referenced an existing file.\n{ARTIFACT_GUIDANCE}\n{SERVICE_GUIDANCE}\n{PROGRESS_GUIDANCE}\n{tools}\n{text}")
 }
 
 #[tauri::command]
@@ -258,7 +261,7 @@ pub fn prepare_input(text: &str, attachments: &[Attachment]) -> Result<PreparedI
             _ => return Err("附件类型无效".into()),
         }
         metadata.push(
-            json!({"kind":a.kind,"path":p,"name":if a.kind == "image" { &a.name } else { &name }}),
+            json!({"kind":a.kind,"path":p,"name":if a.kind == "image" || a.kind == "skill" { &a.name } else { &name }}),
         );
     }
     if expanded.len() > crate::input_limits::TEXT_LIMIT {
@@ -684,6 +687,7 @@ mod tests {
         let reminder = prepared[0]["text"].as_str().unwrap();
         assert!(reminder.starts_with("[SuperCode communication preference]"));
         assert!(reminder.contains(ARTIFACT_GUIDANCE));
+        assert!(reminder.contains(SERVICE_REMINDER));
         assert!(reminder.ends_with("[User request follows]"));
         assert!(prepared[0]["text"].as_str().unwrap().contains("Respect an explicit request for silence or a strict output-only format"));
     }
@@ -954,6 +958,7 @@ mod tests {
         assert!(!reference.contains("$(echo unchanged)"));
         assert_eq!(inputs.codex[2]["type"], "localImage");
         assert_eq!(inputs.codex[3]["type"], "skill");
+        assert_eq!(inputs.metadata["attachments"][2]["name"], "test");
         assert_eq!(inputs.claude[2]["source"]["media_type"], "image/png");
         assert!(inputs.claude[3]["text"]
             .as_str()

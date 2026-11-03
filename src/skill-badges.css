@@ -1,0 +1,5 @@
+.skill-badges{display:inline-flex;align-items:center;flex-wrap:wrap;gap:6px 12px;min-width:0;max-width:100%;vertical-align:middle}
+.skill-badge{display:inline-flex;align-items:center;gap:6px;min-width:0;max-width:100%;min-height:24px;color:var(--chat-link);font-size:var(--ui-size,13px);font-weight:600}
+.skill-badge>svg{flex:none}
+.skill-badge>span{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.message-attachments>.skill-badges{padding:0;border:0;color:var(--chat-link);border-radius:0}

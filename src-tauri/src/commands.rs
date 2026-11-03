@@ -685,6 +685,9 @@ pub async fn interrupt_turn(session_id: String, app: AppHandle) -> Result<(), St
 
 #[tauri::command]
 pub async fn respond_request(id: Value, result: Value, app: AppHandle) -> Result<(), String> {
+    if let Some(id) = id.as_str().filter(|id| id.starts_with("service-approval:")) {
+        return crate::managed_services::respond(&app,id,&result);
+    }
     let state = app.state::<AppState>();
     if id.as_str().is_some_and(|id| {
         id.starts_with("opencode:") || id.starts_with("pi:") || id.starts_with("gemini:")
@@ -1390,7 +1393,7 @@ mod tests {
 #[tauri::command]
 pub async fn pending_requests(app: AppHandle) -> Result<Vec<Value>, String> {
     let state = app.state::<AppState>();
-    let mut requests = vec![];
+    let mut requests = crate::managed_services::pending(&app);
     for client in state.runtime.clients().await {
         requests.extend(client.requests.lock().await.values().cloned());
     }

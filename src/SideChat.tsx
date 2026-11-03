@@ -18,6 +18,7 @@ const agentNames: Record<string, string> = { claude: 'Claude Code', codex: 'Code
 import { createChatSession } from './chatSession';
 import { isProviderRequired, requireChatConnection } from './chatConnection';
 import { ChatErrorBanner } from './ChatErrorBanner';
+import { skillMessageText } from './skillPresentation';
 import { planFollowup, type PlanDecision } from './planPresentation';
 import { Conversation } from './Conversation';
 import { PlanDisplayContext } from './PlanDisplayContext';
@@ -29,7 +30,7 @@ const QuestionDock=lazy(()=>import('./QuestionDock'));
 export interface SideDraft {key:string;text:string;payload?:FollowupPayload;sourceId?:string;projectId?:string;agent?:string;connectionId?:string}
 interface PendingConnection {agent:string;id:string}
 export default function SideChat({draft,projectId,agent,connectionId,defaults,close,opened,openFile,showDiff,resizeHandle,providerRequired,manageProviders,pendingConnectionChanged,profiles=emptyProfiles,catalog,enterSend=true,hidden=false,embedded=false}:{draft:SideDraft;projectId:string;agent:string;connectionId:string;defaults:FollowupPayload;close:()=>void;opened:(session:Session)=>void;openFile:(path:string,line?:number,workspaceSessionId?:string)=>void;resizeHandle?:ReactNode;showDiff:(name:string,text:string)=>void;providerRequired:(agent:string,draft:SideDraft)=>void;manageProviders?:(agent:string,draft:SideDraft)=>void;pendingConnectionChanged?:(connection:PendingConnection|null)=>void;profiles?:AgentProfile[];catalog?:ModelCatalog;enterSend?:boolean;hidden?:boolean;embedded?:boolean}){
-  const [input,setInput]=useState(draft.text);const [session,setSession]=useState<Session>();const [error,setError]=useState('');const [sending,setSending]=useState(false);const [stopping,setStopping]=useState(false);
+  const [input,setInput]=useState(()=>skillMessageText(draft.text,draft.payload?.attachments??defaults.attachments));const [session,setSession]=useState<Session>();const [error,setError]=useState('');const [sending,setSending]=useState(false);const [stopping,setStopping]=useState(false);
   const parentPlanDisplay=useContext(PlanDisplayContext);
   const [planDock,setPlanDock]=useState<HTMLDivElement|null>(null);
   const planDisplay=useMemo(()=>({openPlan:parentPlanDisplay.openPlan,decisionContainer:planDock}),[parentPlanDisplay.openPlan,planDock]);
@@ -161,7 +162,7 @@ export default function SideChat({draft,projectId,agent,connectionId,defaults,cl
   async function stop(){const s=current.current;if(!s||stopping)return;setStopping(true);try{await call('interrupt_turn',{sessionId:s.id});}catch(e){setError(String(e));}finally{setStopping(false);}}
   async function send(){
     if(configuringLock.current||sendLock.current||importing||!hasDraft||followupEditor.busy)return;
-    const sent={...options.current,text:inputRef.current};if(followupEditor.editingId){await withPendingConnection(()=>followupEditor.save(sent));return;}
+    const sent={...options.current,text:inputRef.current.trim() || !options.current.attachments.some(a=>a.kind==='skill') ? inputRef.current : '请执行所选技能。'};if(followupEditor.editingId){await withPendingConnection(()=>followupEditor.save(sent));return;}
     sendLock.current=true;setSending(true);setError('');let s=current.current;const route=connectionRoute(s),operation=beginPendingConnection(route);
     try{await requireChatConnection(route.agent,route.id,s?.id);if(!operation.active())return;
       if(!s){s=await createChatSession({projectId,agent:route.agent,connectionId:route.id,model:sent.model??''});if(!operation.active())return;current.current=s;setSession(s);}

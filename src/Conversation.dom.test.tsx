@@ -141,6 +141,24 @@ it('keeps legacy edit arguments out of the conversation when the operation patch
   expect(showDiff).toHaveBeenCalledWith('本次变更 · old.ts','此记录没有保存可展示的代码差异。');
 });
 async function render(messages: Message[], autoExpand = false, lifecycle: TurnLifecycle = {}) { await act(async () => root.render(<Conversation messages={messages} agentName="Codex" autoExpand={autoExpand} sessionStatus={lifecycle.sessionStatus} activeTurnId={lifecycle.activeTurnId} showDiff={() => {}} openFile={() => {}}/>)); }
+it('renders current and historical skill-only messages as skill badges without changing their saved content',async()=>{
+  const rows=[message('skill-current','user','请执行所选技能。','userMessage',{attachments:[{kind:'skill',name:'save',path:'D:/skills/save/SKILL.md'}]}),
+    message('skill-old','user','请执行所选技能 save。','userMessage',{attachments:[{kind:'skill',name:'SKILL.md',path:'D:/skills/save/SKILL.md'}]})];
+  const original=JSON.stringify(rows);await render(rows);
+  expect([...node.querySelectorAll('.skill-badge')].map(b=>b.textContent)).toEqual(['Save','Save']);
+  expect(node.textContent).not.toContain('请执行所选技能');expect(node.textContent).not.toContain('SKILL.md');
+  expect(JSON.stringify(rows)).toBe(original);
+  await render([message('skill-explained','user','保存本次修改','userMessage',{attachments:[{kind:'skill',name:'save',path:'D:/skills/save/SKILL.md'},{kind:'file',name:'report.pdf',path:'D:/report.pdf'}]})]);
+  expect(node.textContent).toContain('保存本次修改');expect(node.textContent).toContain('report.pdf');expect(node.querySelector('.skill-badge')?.textContent).toBe('Save');
+});
+it.each(['running', 'starting', 'tool'] as const)('does not add a connection card to an 83-second-old %s turn without an engine notification', async state => {
+  const marker = message('silent-run', 'activity', '', 'runMarker', {status:'inProgress',turnId:'silent',startedAt:Date.now()-83000,lastProgressAt:Date.now()-83000});
+  const tool = message('silent-tool', 'tool', '', 'commandExecution', {command:'npm run build',status:'running'});
+  await render([items[0], marker, ...(state === 'tool' ? [tool] : [])], false, {sessionStatus:state === 'starting' ? 'starting' : 'running',activeTurnId:'silent'});
+  expect(node.querySelector('.turn-connection')).toBeNull();
+  expect(node.textContent).not.toContain('未收到新进展');
+  expect(node.textContent).toContain(state === 'tool' ? '正在执行命令' : state === 'starting' ? '正在启动 Agent' : '正在处理');
+});
 it('replaces the generic working line with live reconnection and restores the same turn after new output', async () => {
   let rows = mergeEvent([message('retry-user', 'user', '继续')], { method:'turn/started', params:{ turn:{ id:'retry' } } }, 's');
   rows = mergeEvent(rows, { method:'turn/connection/updated', params:{ turnId:'retry', connection:{ status:'retrying', at:Date.now(), kind:'network', attempt:1, maxAttempts:5 } } }, 's');

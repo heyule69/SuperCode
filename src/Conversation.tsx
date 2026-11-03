@@ -4,6 +4,8 @@ import { conversationTurns, isActivity, type ConversationTurn } from './events';
 import { isActive, type Message } from './types';
 import { ReplyText } from './ReplyText';
 import { TurnConnection } from './TurnConnection';
+import { SkillBadges } from './SkillBadges';
+import { skillMessageText } from './skillPresentation';
 import { diffFiles } from './diff';
 import { CopyButton } from './CopyButton';
 import { activityStatus, concisePath, summarizeActivities } from './activityPresentation';
@@ -157,6 +159,7 @@ const MessageView = memo(function MessageView({ message: m, openFile }: { messag
   if (!m.text && m.role === 'assistant' && !media.length) return null;
   const attachments = Array.isArray(m.data?.attachments) ? m.data.attachments as {name:string;kind:string;path?:string}[] : [];
   const user = m.role === 'user';
+  const displayedText = user ? skillMessageText(m.text, attachments) : m.text;
   const images = user ? attachments.filter(a => a.kind === 'image' && a.path) : [];
   const inlineAttachments = user ? attachments.filter(a => a.kind !== 'image' || !a.path) : attachments;
   const hasBubble = !user || !!m.text || inlineAttachments.length > 0;
@@ -165,11 +168,11 @@ const MessageView = memo(function MessageView({ message: m, openFile }: { messag
     {user ? <MediaList media={media}/> : null}
     {hasBubble ? <div className="message-content">
       {m.role === 'system' ? <div className="system-message-label">{informational ? m.kind === 'goalState' ? '目标' : '命令结果' : '运行提示'}</div> : null}
-      {inlineAttachments.length ? <div className="message-attachments">{inlineAttachments.map((a,i) => a.kind === 'image' && a.path ? <span className="message-image-attachment" key={a.path}><AttachmentImage attachment={{ name:a.name, path:a.path }}/></span> : <span key={i}><FileCode2 size={12}/>{a.name}</span>)}</div> : null}
-      {user ? m.text ? <div className="message-text">{m.text}</div> : null : m.role === 'assistant' ? <ReplyText text={m.text} openFile={openFile} streaming={pending(m.data?.status)} /> : <Suspense fallback={<div className="message-text">{m.text}</div>}><Markdown text={m.text} openFile={openFile} /></Suspense>}
+      {inlineAttachments.length ? <div className="message-attachments"><SkillBadges attachments={inlineAttachments}/>{inlineAttachments.filter(a=>a.kind!=='skill').map((a,i) => a.kind === 'image' && a.path ? <span className="message-image-attachment" key={a.path}><AttachmentImage attachment={{ name:a.name, path:a.path }}/></span> : <span key={i}><FileCode2 size={12}/>{a.name}</span>)}</div> : null}
+      {user ? displayedText ? <div className="message-text">{displayedText}</div> : null : m.role === 'assistant' ? <ReplyText text={m.text} openFile={openFile} streaming={pending(m.data?.status)} /> : <Suspense fallback={<div className="message-text">{m.text}</div>}><Markdown text={m.text} openFile={openFile} /></Suspense>}
       {user ? null : <MediaList media={media}/>}
     </div> : null}
-    {user && m.text ? <CopyButton className="copy-message user-copy" text={m.text} label="复制消息" iconOnly /> : null}
+    {user && displayedText ? <CopyButton className="copy-message user-copy" text={m.text} label="复制消息" iconOnly /> : null}
   </article>;
 });
 
@@ -223,7 +226,7 @@ const TurnView = memo(function TurnView({ turn, lifecycle, pendingLabel, agentNa
     if (waiting) content.push(<TurnProgress key="turn-progress" label={pendingLabel} />);
     else if (live) {
       const activities = items.filter(item => !isSubagent(item));
-      content.push(<TurnConnection key={processKey} active connection={marker?.data?.connection} lastProgressAt={Number(marker?.data?.lastProgressAt ?? marker?.data?.startedAt)} waitingForTool={items.some(m => m.role === 'tool' && pending(m.data?.status))} starting={lifecycle.sessionStatus === 'starting'} normalLabel={!Array.isArray(blocks.at(-1)) ? activities.length ? summarizeActivities(activities, true).label : responsePendingLabel : undefined} />);
+      content.push(<TurnConnection key={processKey} active connection={marker?.data?.connection} normalLabel={!Array.isArray(blocks.at(-1)) ? activities.length ? summarizeActivities(activities, true).label : responsePendingLabel : undefined} />);
     }
     return content;
   }
@@ -257,7 +260,7 @@ export const Conversation = memo(function Conversation({ messages, agentName, au
   }, [messages]);
   const mediaContext = useMemo(() => ({ projectId, sessionId, openFile }), [projectId, sessionId, openFile]);
   const subagents = useMemo(() => ({ agents:collectSubagents(messages), open:openSubagent }), [messages, openSubagent]);
-  return <SubagentContext.Provider value={subagents}><MediaContext.Provider value={mediaContext}><ResourceMenu openFile={openFile} openPath={openPath}><ConversationIndex turns={turns}/>{turns.map((turn, index) => <TurnView key={turn.id} turn={turn} lifecycle={{ sessionStatus, activeTurnId, latest: index === turns.length - 1 }} pendingLabel={pendingLabel} agentName={agentName} autoExpand={autoExpand} processDisplay={processDisplay} showDiff={showDiff} openFile={openFile} onPlanAction={onPlanAction} />)}{!turns.length && isActive(sessionStatus) ? <TurnConnection key={sessionId} active={sessionStatus !== 'waiting'} starting={sessionStatus === 'starting'} normalLabel={pendingLabel} /> : null}</ResourceMenu></MediaContext.Provider></SubagentContext.Provider>;
+  return <SubagentContext.Provider value={subagents}><MediaContext.Provider value={mediaContext}><ResourceMenu openFile={openFile} openPath={openPath}><ConversationIndex turns={turns}/>{turns.map((turn, index) => <TurnView key={turn.id} turn={turn} lifecycle={{ sessionStatus, activeTurnId, latest: index === turns.length - 1 }} pendingLabel={pendingLabel} agentName={agentName} autoExpand={autoExpand} processDisplay={processDisplay} showDiff={showDiff} openFile={openFile} onPlanAction={onPlanAction} />)}{!turns.length && isActive(sessionStatus) ? <TurnConnection key={sessionId} active={sessionStatus !== 'waiting'} normalLabel={pendingLabel} /> : null}</ResourceMenu></MediaContext.Provider></SubagentContext.Provider>;
 });
 
 export function JumpToLatest({ onClick }: { onClick: () => void }) { return <button className="jump-to-latest" onClick={onClick}><ArrowDown size={14} />回到最新消息</button>; }

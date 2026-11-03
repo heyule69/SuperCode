@@ -68,6 +68,20 @@ beforeEach(() => {
 });
 afterEach(async () => { await act(async()=>root.unmount()); container.remove(); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
 async function render() { await act(async()=>{root.render(<App/>); await new Promise(resolve=>setTimeout(resolve,30));}); }
+it.each(['accept','decline'])('requires an explicit %s response for an application-owned service approval', async decision => {
+  localStorage.setItem('supercode.session','service-chat');
+  data.sessions = [{id:'service-chat',projectId:'existing',title:'网站服务',agent:'claude',connectionId:'api:claude',model:'test-model',status:'running',nativeId:'service-native',turnId:'service-turn',updatedAt:1}];
+  messages = [{id:'service-user',seq:1,sessionId:'service-chat',role:'user',kind:'userMessage',text:'保留网站运行',data:null}];
+  await render();
+  await act(async () => { notify({id:'service-approval:test',method:'item/commandExecution/requestApproval',params:{appSessionId:'service-chat',turnId:'service-turn',toolName:'启动独立服务',reason:'服务会运行到显式停止或关闭 SuperCode。',command:'node.exe preview.mjs',cwd:'D:/preview',availableDecisions:['accept','decline']}}); await new Promise(resolve=>setTimeout(resolve,70)); });
+  for (let attempts=0; attempts<40 && !container.querySelector('.request-card'); attempts++) await act(async()=>{await new Promise(resolve=>setTimeout(resolve,25));});
+  const card = container.querySelector('.request-card')!;
+  expect(card.textContent).toContain('启动独立服务'); expect(card.textContent).toContain('显式停止');
+  expect(card.textContent).not.toContain('本会话允许此命令');
+  expect(call).not.toHaveBeenCalledWith('respond_request',expect.anything());
+  await act(async () => [...card.querySelectorAll<HTMLButtonElement>('button')].find(button=>button.textContent === (decision==='accept'?'允许本次':'拒绝'))!.click());
+  expect(call).toHaveBeenCalledWith('respond_request',{id:'service-approval:test',result:{decision}});
+});
 it('shows recoverable retries in the active chat without a terminal error banner or resending the task', async () => {
   localStorage.setItem('supercode.session', 'retry-chat');
   data.sessions = [{ id:'retry-chat', projectId:'existing', title:'连接状态', agent:'claude', connectionId:'api:claude', model:'test-model', status:'running', nativeId:'retry-native', turnId:'retry-turn', updatedAt:1 }];

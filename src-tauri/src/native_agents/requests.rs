@@ -50,6 +50,9 @@ impl Client {
         diagnostics: Option<(AppHandle, String, Option<String>)>,
     ) -> Result<(Arc<Self>, mpsc::Receiver<Value>), String> {
         let mut command = launch.command(&[]);
+        if let Some((app, _, _)) = &diagnostics {
+            crate::managed_services::configure(&mut command, &app.state::<AppState>().data_dir);
+        }
         let gemini = args.first().is_some_and(|arg| arg == "--acp");
         if gemini {
             // A managed API connection must not inherit Google login, Vertex,

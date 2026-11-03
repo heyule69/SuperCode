@@ -5,6 +5,8 @@ import { listen } from '@tauri-apps/api/event';
 import { call, desktop } from './api';
 import type { Attachment } from './ComposerMenus';
 import { AttachmentImage } from './AttachmentImage';
+import { SkillBadges } from './SkillBadges';
+import { skillMessageText } from './skillPresentation';
 
 export interface FollowupPayload { text:string; model:string|null; readOnly:boolean; permissionMode:string; attachments:Attachment[]; effort:string|null }
 export interface Followup { id:string; sessionId:string; payload:FollowupPayload; status:string; error:string|null }
@@ -29,11 +31,13 @@ export function FollowupQueue({rows,agent,turnId,steeringMode,change,steer,openS
   if(!visible.length)return null;
   return <section className="followup-queue" aria-label="排队消息"><div className="followup-list">{visible.map(row=>{
     const locked=!!working||['sending','steering','editing'].includes(row.status);
-    const image=row.payload.attachments.find(attachment=>attachment.kind==='image');
+    const files=row.payload.attachments.filter(attachment=>attachment.kind!=='skill');
+    const image=files.find(attachment=>attachment.kind==='image');
+    const text=skillMessageText(row.payload.text,row.payload.attachments);
     return <div className="followup-row" key={row.id} data-followup-id={row.id}>
       <ListEnd size={15} className="followup-icon"/>
-      {image?<div className="followup-thumbnail"><AttachmentImage attachment={image}/>{row.payload.attachments.length>1?<span>{row.payload.attachments.length}</span>:null}</div>:row.payload.attachments.length?<span className="followup-attachment" title={`${row.payload.attachments.length} 个附件`}><Paperclip size={15}/><small>{row.payload.attachments.length}</small></span>:null}
-        <div className="followup-content"><span title={row.payload.text}>{row.payload.text}</span>{row.error?<small role="alert">{row.error}</small>:row.status==='paused'?<small>已暂停</small>:null}</div>
+      {image?<div className="followup-thumbnail"><AttachmentImage attachment={image}/>{files.length>1?<span>{files.length}</span>:null}</div>:files.length?<span className="followup-attachment" title={`${files.length} 个附件`}><Paperclip size={15}/><small>{files.length}</small></span>:null}
+        <div className="followup-content"><div className="followup-summary"><SkillBadges attachments={row.payload.attachments}/>{text?<span className="followup-text" title={text}>{text}</span>:null}</div>{row.error?<small role="alert">{row.error}</small>:row.status==='paused'?<small>已暂停</small>:null}</div>
         <div className="followup-actions">{['paused','failed'].includes(row.status)?<button disabled={locked} onClick={()=>void run(row.id,()=>change(row.id,'resume'))}>继续排队</button>:null}
           <button disabled={!turnId||locked} title={interrupt?'停止当前任务并发送这条消息':'补充当前任务，在 Agent 下一可接收的位置生效'} onClick={()=>void run(row.id,()=>steer(row.id))}><CornerDownRight size={15}/>{interrupt?'停止并引导':'引导'}</button>
           <button className="icon-button" aria-label="删除排队消息" disabled={locked} onClick={()=>void run(row.id,()=>change(row.id,'remove'))}><Trash2 size={15}/></button>

@@ -610,6 +610,7 @@ pub async fn send(
     let claude_context=crate::model_context::configure_claude(&mut command,&config,model.as_deref());
     if let Some(launch_model)=&claude_context.launch_model { command.arg(format!("--model={launch_model}")); }
     command.env("SUPERCODE_SESSION_ID", &session.id);
+    crate::managed_services::configure(&mut command, &app.state::<AppState>().data_dir);
     command.env("CLAUDE_CODE_SDK_READS_SESSION_STATE", "1");
     let mut child = command
         .current_dir(cwd)
