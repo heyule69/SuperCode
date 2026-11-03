@@ -16,6 +16,18 @@ pub(super) fn startup_model(mut config: Value, model: Option<&str>) -> Value {
     }
     config
 }
+
+pub(super) fn session_params(method: &str, mut params: Value) -> Value {
+    if matches!(method, "session/new" | "session/load") {
+        if let Some(cwd) = params["cwd"].as_str() {
+            // Gemini's trust lookup does not equate a Windows verbatim path
+            // with its ordinary spelling. Match the scoped trust-file key.
+            let cwd = crate::agents::ordinary(PathBuf::from(cwd));
+            params["cwd"] = json!(cwd.to_string_lossy());
+        }
+    }
+    params
+}
 pub(super) async fn fast_test_launch(
     launch: &crate::agents::Launch,
     home: &Path,
@@ -116,7 +128,27 @@ pub(super) async fn configure(
     home: &Path,
     config: &Value,
     permission: &str,
+    workspace: &Path,
 ) -> Result<(Vec<String>, Vec<(String, String)>), String> {
+    // Full access in the host authorizes this workspace, never its parent or
+    // another session. Gemini's ACP cannot ask its own folder-trust question.
+    let trusted_folders = if permission == "full" {
+        let workspace = tokio::fs::canonicalize(workspace)
+            .await
+            .map_err(|error| format!("无法确认 Gemini 工作目录：{error}"))?;
+        if !workspace.is_dir() {
+            return Err("Gemini 工作目录不是文件夹".into());
+        }
+        let workspace = crate::agents::ordinary(workspace);
+        let mut folders = serde_json::Map::new();
+        folders.insert(
+            workspace.to_string_lossy().into_owned(),
+            json!("TRUST_FOLDER"),
+        );
+        Value::Object(folders)
+    } else {
+        json!({})
+    };
     let settings_dir = home.join(".gemini");
     tokio::fs::create_dir_all(&settings_dir)
         .await
@@ -124,6 +156,14 @@ pub(super) async fn configure(
     let settings_file = settings_dir.join("supercode-settings.json");
     let defaults_file = settings_dir.join("supercode-defaults.json");
     let policy_file = settings_dir.join("supercode-policy.toml");
+    // This file belongs to SuperCode's isolated GEMINI_CLI_HOME. Replacing it
+    // also revokes a previous full-access grant when mode/workspace changes.
+    tokio::fs::write(
+        settings_dir.join("trustedFolders.json"),
+        serde_json::to_vec(&trusted_folders).map_err(|error| error.to_string())?,
+    )
+    .await
+    .map_err(|error| format!("无法保存 Gemini 会话的工作目录信任：{error}"))?;
     let auth = authentication(config);
     let settings = json!({
         "security":{"auth":{"selectedType":auth["methodId"]},"disableAlwaysAllow":true},
@@ -206,6 +246,180 @@ pub(super) async fn configure(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_working_directories_use_the_trusted_path_spelling_without_changing_other_fields() {
+        for method in ["session/new", "session/load"] {
+            for (cwd, expected) in [
+                (
+                    r"\\?\D:\中文目录 with spaces\project",
+                    r"D:\中文目录 with spaces\project",
+                ),
+                (r"\\?\UNC\server\share\project", r"\\server\share\project"),
+                ("/tmp/project", "/tmp/project"),
+            ] {
+                let original = json!({"cwd":cwd,"sessionId":"native-id","mcpServers":[{"name":"server","url":"https://example.invalid","headers":[{"name":"Authorization","value":"fixture-secret"}]}]});
+                let normalized = session_params(method, original.clone());
+                assert_eq!(normalized["cwd"], expected);
+                assert_eq!(normalized["sessionId"], original["sessionId"]);
+                assert_eq!(normalized["mcpServers"], original["mcpServers"]);
+            }
+        }
+        let prompt =
+            json!({"cwd":r"\\?\D:\literal","prompt":[{"type":"text","text":r"\\?\D:\literal"}]});
+        assert_eq!(session_params("session/prompt", prompt.clone()), prompt);
+        let missing = json!({"sessionId":"native-id"});
+        assert_eq!(session_params("session/load", missing.clone()), missing);
+    }
+
+    #[tokio::test]
+    async fn full_access_trust_is_scoped_to_the_current_workspace_and_revoked_for_other_modes() {
+        let root =
+            std::env::temp_dir().join(format!("supercode-gemini-trust-{}", uuid::Uuid::new_v4()));
+        let home_a = root.join("home-a");
+        let home_b = root.join("home-b");
+        let workspace_a = root.join("中文目录 with spaces/first");
+        let workspace_b = root.join("中文目录 with spaces/second");
+        tokio::fs::create_dir_all(&workspace_a).await.unwrap();
+        tokio::fs::create_dir_all(&workspace_b).await.unwrap();
+        let trusted_path = home_a.join(".gemini/trustedFolders.json");
+        let read_trust = || async {
+            serde_json::from_slice::<Value>(&tokio::fs::read(&trusted_path).await.unwrap()).unwrap()
+        };
+        let key_a = crate::agents::ordinary(workspace_a.canonicalize().unwrap())
+            .to_string_lossy()
+            .into_owned();
+        let key_b = crate::agents::ordinary(workspace_b.canonicalize().unwrap())
+            .to_string_lossy()
+            .into_owned();
+        configure(&home_a, &json!({}), "full", &workspace_a)
+            .await
+            .unwrap();
+        let trust = read_trust().await;
+        assert_eq!(trust.as_object().unwrap().len(), 1);
+        assert_eq!(trust[&key_a], "TRUST_FOLDER");
+        assert!(!home_b.exists());
+        let settings: Value = serde_json::from_slice(
+            &tokio::fs::read(home_a.join(".gemini/supercode-settings.json"))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(settings.pointer("/security/folderTrust/enabled").is_none());
+        assert!(settings
+            .pointer("/security/workspaceTrust/enabled")
+            .is_none());
+        configure(&home_a, &json!({}), "full", &workspace_b)
+            .await
+            .unwrap();
+        let trust = read_trust().await;
+        assert_eq!(trust.as_object().unwrap().len(), 1);
+        assert_eq!(trust[&key_b], "TRUST_FOLDER");
+        assert!(trust.get(&key_a).is_none());
+        for mode in ["read", "ask", "strict", "summary"] {
+            configure(&home_a, &json!({}), "full", &workspace_a)
+                .await
+                .unwrap();
+            configure(&home_a, &json!({}), mode, &workspace_a)
+                .await
+                .unwrap();
+            assert_eq!(read_trust().await, json!({}), "{mode}");
+        }
+        configure(&home_b, &json!({}), "full", &workspace_b)
+            .await
+            .unwrap();
+        assert_eq!(read_trust().await, json!({}));
+        assert!(
+            configure(&home_a, &json!({}), "full", &root.join("missing"))
+                .await
+                .is_err()
+        );
+        let file = root.join("not-a-directory");
+        tokio::fs::write(&file, b"fixture").await.unwrap();
+        assert!(configure(&home_a, &json!({}), "full", &file).await.is_err());
+        assert_eq!(read_trust().await, json!({}));
+        tokio::fs::remove_dir_all(root.canonicalize().unwrap())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires explicitly supplied installed Gemini CLI and Node paths; no provider credentials or model calls"]
+    async fn installed_cli_full_access_respects_workspace_trust_without_model_calls() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        let program = PathBuf::from(
+            std::env::var("SUPERCODE_GEMINI_TRUST_NODE")
+                .expect("Supply the managed Node executable"),
+        );
+        let script = PathBuf::from(
+            std::env::var("SUPERCODE_GEMINI_TRUST_CLI")
+                .expect("Supply the installed Gemini CLI entrypoint"),
+        );
+        assert!(program.is_file() && script.is_file());
+        let root = std::env::temp_dir().join(format!(
+            "supercode-gemini-native-trust-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let cwd = root.join("中文目录 with spaces/project");
+        let sibling = root.join("中文目录 with spaces/other-project");
+        tokio::fs::create_dir_all(cwd.join(".git")).await.unwrap();
+        tokio::fs::create_dir_all(sibling.join(".git"))
+            .await
+            .unwrap();
+        let contacts = Arc::new(AtomicUsize::new(0));
+        let calls = contacts.clone();
+        let router = axum::Router::new().fallback(move || {
+            let calls = calls.clone();
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                (axum::http::StatusCode::SERVICE_UNAVAILABLE, axum::Json(json!({"error":{"message":"No model calls are permitted in this local test"}})))
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let http = tokio::spawn(async move { axum::serve(listener, router).await });
+        let home = root.join("managed-home");
+        let config = json!({"model":"gemini-4-argon","baseUrl":base,"apiKey":"local-test-not-a-provider-key"});
+        let (args, mut env) = configure(&home, &config, "full", &cwd).await.unwrap();
+        env.push(("GEMINI_CLI_NO_RELAUNCH".into(), "true".into()));
+        let launch = crate::agents::Launch {
+            program,
+            prefix: vec![script.to_string_lossy().into_owned()],
+            source: "explicit-local-trust-test".into(),
+        };
+        let (client, mut events) =
+            super::super::Client::start(&launch, &args, &cwd, &env, false, None)
+                .await
+                .unwrap();
+        let result: Result<(),String> = async {
+            let initialized = super::super::probe_request(&client, &mut events, "initialize", super::super::init()).await?;
+            super::super::validate_acp("gemini", &initialized)?;
+            super::super::probe_request(&client, &mut events, "authenticate", authentication(&config)).await?;
+            // canonicalize preserves Windows' verbatim prefix, as stored project paths do.
+            let native_cwd = cwd.canonicalize().map_err(|error|error.to_string())?;
+            let session = super::super::probe_request(&client, &mut events, "session/new", json!({"cwd":native_cwd,"mcpServers":[]})).await?;
+            let session_id = session["sessionId"].as_str().ok_or("CLI did not return a session ID")?;
+            super::super::probe_request(&client, &mut events, "session/set_mode", json!({"sessionId":session_id,"modeId":"yolo"})).await?;
+            let other = super::super::probe_request(&client, &mut events, "session/new", json!({"cwd":sibling.canonicalize().map_err(|error|error.to_string())?,"mcpServers":[]})).await?;
+            let error = super::super::probe_request(&client, &mut events, "session/set_mode", json!({"sessionId":other["sessionId"],"modeId":"yolo"})).await.unwrap_err();
+            assert!(error.contains("工作目录未受信任"), "{error}");
+            super::super::probe_request(&client, &mut events, "session/set_mode", json!({"sessionId":other["sessionId"],"modeId":"default"})).await?;
+            Ok(())
+        }.await;
+        client.close().await;
+        http.abort();
+        assert_eq!(contacts.load(Ordering::SeqCst), 0);
+        let resolved = root.canonicalize().unwrap();
+        assert_eq!(
+            resolved.parent(),
+            Some(std::env::temp_dir().canonicalize().unwrap().as_path())
+        );
+        tokio::fs::remove_dir_all(resolved).await.unwrap();
+        result.unwrap();
+    }
 
     #[tokio::test]
     async fn probe_observer_preserves_requests_and_bounds_error_diagnostics_without_credentials() {
@@ -388,7 +602,7 @@ writeSync(1,JSON.stringify({completed:true,calls})+'\n');
             json!({"model":"profile-default","apiKey":"fixture-key"}),
             Some("--literal-custom-model"),
         );
-        let (args, env) = configure(&root, &config, "summary").await.unwrap();
+        let (args, env) = configure(&root, &config, "summary", &root).await.unwrap();
         assert!(args.contains(&"--model=--literal-custom-model".into()));
         assert!(!args.contains(&"--literal-custom-model".into()));
         assert!(env.contains(&("GEMINI_MODEL".into(), "--literal-custom-model".into())));
@@ -399,7 +613,7 @@ writeSync(1,JSON.stringify({completed:true,calls})+'\n');
         assert!(!String::from_utf8(settings).unwrap().contains("fixture-key"));
         let mut invalid = config;
         invalid["model"] = json!("model\n--yolo");
-        assert!(configure(&root, &invalid, "summary").await.is_err());
+        assert!(configure(&root, &invalid, "summary", &root).await.is_err());
         let resolved = root.canonicalize().unwrap();
         assert_eq!(
             resolved.parent(),

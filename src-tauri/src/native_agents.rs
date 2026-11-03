@@ -65,7 +65,7 @@ pub async fn probe_cancel(
                     None,
                     true,
                 );
-                let (args, values) = gemini::configure(&home, &json!({}), "summary").await?;
+                let (args, values) = gemini::configure(&home, &json!({}), "summary", cwd).await?;
                 env = values;
                 args
             } else if pi {
@@ -904,7 +904,7 @@ async fn start_configured(
             session.map(|s| s.id.as_str()),
             permission == "summary" || session.is_none(),
         );
-        let (values, environment) = gemini::configure(&home, &config, permission).await?;
+        let (values, environment) = gemini::configure(&home, &config, permission, cwd).await?;
         args.extend(values);
         env.extend(environment);
         if connection_test {
@@ -2042,7 +2042,7 @@ mod tests {
         let cwd = stage.join("workspace");
         tokio::fs::create_dir_all(cwd.join(".git")).await.unwrap();
         let home = gemini::home(&stage, None, true);
-        let (args, mut env) = gemini::configure(&home, &config, "summary").await.unwrap();
+        let (args, mut env) = gemini::configure(&home, &config, "summary", &cwd).await.unwrap();
         env.extend([
             ("GEMINI_CLI_NO_RELAUNCH".into(), "true".into()),
             ("SUPERCODE_GEMINI_PROBE_BASE".into(), gemini::api_endpoint(&config).0),
@@ -2111,7 +2111,7 @@ mod tests {
             socket.write_all(wire.as_bytes()).await.unwrap();
         });
         let config = json!({"protocol":"gemini","baseUrl":base,"model":"gemini-fixture","apiKey":"controlled-fixture-key"});
-        let (args, mut env) = gemini::configure(&home, &config, "summary").await.unwrap();
+        let (args, mut env) = gemini::configure(&home, &config, "summary", &cwd).await.unwrap();
         for name in ["USERPROFILE", "HOME", "APPDATA", "LOCALAPPDATA", "TEMP", "TMP"] {
             let path = if matches!(name, "USERPROFILE" | "HOME") { home.clone() } else { stage.join(name) };
             tokio::fs::create_dir_all(&path).await.unwrap();
@@ -2225,7 +2225,7 @@ process.exit(19);
             true,
         );
         let config = json!({"protocol":"gemini","baseUrl":"https://fixture.invalid/google/v1beta","apiKey":"fixture-key","model":"gemini-fixture"});
-        let (args, env) = gemini::configure(&home, &config, "strict").await.unwrap();
+        let (args, env) = gemini::configure(&home, &config, "strict", Path::new(".")).await.unwrap();
         let (client, mut rx) = Client::start(&launch, &args, Path::new("."), &env, false, None)
             .await
             .unwrap();
@@ -2422,8 +2422,8 @@ process.exit(25);
         let home_a = gemini::home(&root, Some("a"), false);
         let home_b = gemini::home(&root, Some("b"), false);
         let config = json!({"baseUrl":"https://fixture.invalid/v1beta","protocol":"gemini","apiKey":"fixture-key"});
-        let (args_a, mut env_a) = gemini::configure(&home_a, &config, "strict").await.unwrap();
-        let (args_b, mut env_b) = gemini::configure(&home_b, &config, "strict").await.unwrap();
+        let (args_a, mut env_a) = gemini::configure(&home_a, &config, "strict", Path::new(".")).await.unwrap();
+        let (args_b, mut env_b) = gemini::configure(&home_b, &config, "strict", Path::new(".")).await.unwrap();
         env_a.push(("SUPERCODE_SESSION_ID".into(), "a".into()));
         env_b.push(("SUPERCODE_SESSION_ID".into(), "b".into()));
         let servers =

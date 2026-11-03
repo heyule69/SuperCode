@@ -36,6 +36,7 @@ pub(super) struct Client {
     pub(super) pending: Mutex<HashMap<String, Reply>>,
     pub(super) sequence: AtomicU64,
     pub(super) pi: bool,
+    gemini: bool,
     pub(super) alive: AtomicBool,
     pub(super) concurrent_prompt: AtomicBool,
     transient_home: Option<std::path::PathBuf>,
@@ -127,6 +128,7 @@ impl Client {
             sequence: AtomicU64::new(1),
             alive: AtomicBool::new(true),
             pi,
+            gemini,
             concurrent_prompt: AtomicBool::new(false),
             transient_home,
         });
@@ -261,6 +263,9 @@ impl Client {
         method: &str,
         mut params: Value,
     ) -> Result<(String, oneshot::Receiver<Result<Value, String>>), String> {
+        if self.gemini {
+            params = gemini::session_params(method, params);
+        }
         let id = self.sequence.fetch_add(1, Ordering::Relaxed).to_string();
         if let Some((app, source, session)) = &self.diagnostics {
             if source == "gemini"
@@ -344,6 +349,9 @@ pub(super) fn response(v: &Value, pi: bool) -> Result<Value, String> {
             Ok(v["data"].clone())
         }
     } else if v.get("error").is_some() {
+        if v["error"]["data"]["details"] == "Cannot enable privileged approval modes in an untrusted folder." {
+            return Err("当前 Gemini 工作目录未受信任，无法启用完全访问权限。".into());
+        }
         Err(protocol::bounded(
             v["error"]["message"].as_str().unwrap_or("ACP 请求失败"),
             4096,
@@ -356,6 +364,15 @@ pub(super) fn response(v: &Value, pi: bool) -> Result<Value, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn folder_trust_rejection_is_explained_without_exposing_arbitrary_error_data() {
+        let error = json!({"error":{"code":-32603,"message":"Internal error","data":{"details":"Cannot enable privileged approval modes in an untrusted folder.","secret":"must-not-be-shown"}}});
+        let text = response(&error, false).unwrap_err();
+        assert!(text.contains("工作目录未受信任"));
+        assert!(!text.contains("must-not-be-shown"));
+        let other = json!({"error":{"message":"Other error","data":{"details":"private diagnostics"}}});
+        assert_eq!(response(&other, false).unwrap_err(), "Other error");
+    }
     #[test]
     fn startup_requests_rebind_to_actual_native_session_without_changing_wire_or_children() {
         for agent in ["pi", "opencode", "gemini"] {
