@@ -119,6 +119,9 @@ fn bundled_catalog() -> &'static Value {
 
 /// Display metadata only: never send a URL, credential or CLI configuration to the picker.
 pub fn model_source(config: &Value, agent: &str, connection_name: Option<&str>) -> Value {
+    if agent == "gemini" && config["official"] == true {
+        return json!({"providerId":"google","providerName":"Google","connectionName":connection_name.unwrap_or("Google 官方账号"),"mark":"G"});
+    }
     if matches!(agent, "opencode" | "pi") && configured_base_url(config).is_none() {
         return json!({"providerId":"custom","providerName":"本机模型配置","connectionName":connection_name.unwrap_or("本机配置"),"mark":if agent=="pi"{"P"}else{"O"}});
     }

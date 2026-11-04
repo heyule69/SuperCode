@@ -42,7 +42,7 @@ it('exposes native Gemini API to compatible engines while keeping Codex on Respo
   expect(protocolLabels.gemini).toBe('Gemini API');
   for (const agent of ['opencode', 'pi']) expect(agentProtocols[agent]).toContain('gemini');
   expect(agentProtocols.gemini).toEqual(['gemini']);
-  expect(officialProvider('gemini')).toBeNull();
+  expect(officialProvider('gemini')).toEqual({id:'google',name:'Google 官方登录'});
   expect(agentProtocols.codex).toEqual(['responses']);
   const fixture = [{ id: 'google', name: 'Google', mark: 'G', category: '国际', presets: [{ id: 'native', name: 'Gemini API', protocol: 'gemini', baseUrl: 'https://generativelanguage.googleapis.com/v1beta', models: ['gemini-test'] }, { id: 'compat', name: 'Chat', protocol: 'chat', baseUrl: 'https://generativelanguage.googleapis.com/v1beta/openai', models: ['gemini-test'] }] }] as Provider[];
   expect(providersForAgent(fixture, 'gemini')[0].presets.map(preset => preset.protocol)).toEqual(['gemini']);

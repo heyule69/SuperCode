@@ -3,6 +3,7 @@ import { Check, Globe, Monitor, RefreshCw, ShieldCheck, X } from 'lucide-react';
 import { listen } from '@tauri-apps/api/event';
 import { call, desktop } from './api';
 import { automationDownload, automationKinds, automationWorking, mergeAutomationProgress, type AutomationKind, type AutomationStatus } from './automation';
+import { SettingRow, SettingsGroup, SettingsSwitch } from './SettingsPage';
 import './automation.css';
 
 const initial: AutomationStatus[] = automationKinds.map(kind => ({ kind, phase: 'notInstalled', message: '尚未安装', installation: null, received: null, total: null, enabled: false }));
@@ -11,7 +12,20 @@ export default function AutomationSettings({ busy }: { busy: boolean }) {
   const [loading, setLoading] = useState(desktop);
   const [working, setWorking] = useState(false);
   const [error, setError] = useState('');
+  const [proactiveControl, setProactiveControl] = useState(false);
+  const [policyReady, setPolicyReady] = useState(false);
+  const [savingPolicy, setSavingPolicy] = useState(false);
+  const [policyMessage, setPolicyMessage] = useState('');
+  const policyLock = useRef(false);
   const mounted = useRef(false);
+  useEffect(() => {
+    if (!desktop) return;
+    let disposed = false;
+    void call<{ allowProactiveControl: boolean }>('get_automation_policy').then(policy => {
+      if (!disposed) { setProactiveControl(policy.allowProactiveControl); setPolicyReady(true); }
+    }).catch(error => { if (!disposed) setError(String(error)); });
+    return () => { disposed = true; };
+  }, []);
   useEffect(() => {
     mounted.current = true;
     if (!desktop) return () => { mounted.current = false; };
@@ -39,10 +53,21 @@ export default function AutomationSettings({ busy }: { busy: boolean }) {
       try { const result = await call<AutomationStatus[]>('list_automation'); if (mounted.current) setItems(result); } catch { /* Keep the error and previous state. */ }
     } finally { if (mounted.current) setWorking(false); }
   }
+  async function savePolicy(allowProactiveControl: boolean) {
+    if (policyLock.current) return;
+    policyLock.current = true; setSavingPolicy(true); setError(''); setPolicyMessage('');
+    try {
+      const policy = await call<{ allowProactiveControl: boolean }>('set_automation_policy', { allowProactiveControl });
+      if (mounted.current) { setProactiveControl(policy.allowProactiveControl); setPolicyMessage('已保存，下一次任务生效'); }
+    } catch (error) { if (mounted.current) setError(String(error)); }
+    finally { policyLock.current = false; if (mounted.current) setSavingPolicy(false); }
+  }
   const locked = busy || working || loading || items.some(item => automationWorking(item.phase));
   return <div className="client-settings-page automation-page">
     <div className="settings-page-heading"><h2>自动化工具</h2></div>
-    <p className="automation-intro">浏览器和电脑操作随 SuperCode 提供，使用时按需启动。</p>
+    <p className="automation-intro">浏览器和电脑操作随 SuperCode 提供，可在你明确要求时使用。</p>
+    <SettingsGroup title="控制偏好"><SettingRow title="允许 Agent 主动控制" description="默认关闭。关闭时，仅在你明确要求操作浏览器或电脑时使用，无需先打开此开关。开启后，Agent 可按任务需要自行决定；打开开关本身不会开始控制。"><SettingsSwitch label="允许 Agent 主动控制" checked={proactiveControl} disabled={!desktop || !policyReady || savingPolicy} change={value => void savePolicy(value)}/></SettingRow><div className="automation-policy-scope">控制授权仅限当前任务，相关操作可连续完成。任务结束后，无关任务不会沿用这次授权。</div></SettingsGroup>
+    {policyMessage ? <p className="provider-feedback" role="status"><Check size={14}/>{policyMessage}</p> : null}
     {!desktop ? <p className="automation-notice">请在 SuperCode 桌面端安装和测试。</p> : busy ? <p className="automation-notice">当前任务结束后，可以安装或更改工具。</p> : null}
     {error ? <p className="cc-error" role="alert">{error}</p> : null}
     <div className="automation-cards" aria-busy={loading}>

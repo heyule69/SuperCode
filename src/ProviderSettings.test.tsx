@@ -83,6 +83,25 @@ it('keeps the selected Agent while adding and exposes only its official login',a
   expect(providerCard('ChatGPT 官方登录')).toBeDefined();expect(providerCard('Claude 官方登录')).toBeUndefined();expect(providerCard('Anthropic API')).toBeUndefined();
   await act(async()=>providerCard('自定义 / 兼容 API').click());expect(node.querySelector('.provider-engine-note')?.textContent).toContain('Codex');expect(node.querySelector('#provider-protocol')?.textContent).toBe('OpenAI Responses');
 });
+
+it('adds Google login to Gemini, waits for confirmation, and can cancel the pending authorization',async()=>{
+  const original = mocks.call.getMockImplementation()!;
+  mocks.call.mockImplementation(async(command:string,args:unknown)=>command==='start_official_account_login'?{accountId:'google-login',message:'请在浏览器完成登录'}:command==='finish_official_account_login'?{loggedIn:false}:original(command,args));
+  await render(); await act(async()=>tab('gemini').click()); await act(async()=>button('添加').click());
+  expect(providerCard('Google 官方登录')).toBeDefined(); expect(providerCard('ChatGPT 官方登录')).toBeUndefined();
+  await act(async()=>providerCard('Google 官方登录').click());
+  expect(mocks.call).toHaveBeenCalledWith('list_official_accounts',{agent:'gemini',force:false});
+  expect(node.querySelector('#provider-key')).toBeNull();
+  await act(async()=>button('添加账号').click());
+  await act(async()=>{const input=node.querySelector<HTMLInputElement>('#official-account-name')!;Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value')!.set!.call(input,'Google 工作账号');input.dispatchEvent(new Event('input',{bubbles:true}));});
+  await act(async()=>node.querySelector('.official-account-add')!.dispatchEvent(new Event('submit',{bubbles:true,cancelable:true})));
+  expect(mocks.call).toHaveBeenCalledWith('start_official_account_login',{agent:'gemini',name:'Google 工作账号'});
+  await act(async()=>button('检查登录').click());
+  expect(node.textContent).toContain('尚未完成登录'); expect(node.textContent).toContain('等待浏览器登录');
+  await act(async()=>button('取消').click());
+  expect(mocks.call).toHaveBeenCalledWith('cancel_official_account_login',{accountId:'google-login'});
+  expect(sessionStorage.getItem('supercode.officialAccountLogin')).toBeNull();
+});
 it('uses fixed Anthropic Messages for Claude third-party connections',async()=>{
   await render();await act(async()=>button('添加').click());expect(providerCard('OpenAI API')).toBeUndefined();expect(providerCard('Groq')).toBeUndefined();await act(async()=>providerCard('Kimi / Moonshot').click());
   expect(node.querySelector('#provider-key')).not.toBeNull();expect(node.querySelector('#provider-protocol')?.textContent).toBe('Anthropic Messages');expect(node.querySelector('.provider-engine-note')?.textContent).toContain('Claude Code');
@@ -282,10 +301,10 @@ it('keeps native official accounts out of deletion and opens account management 
   expect(mocks.call.mock.calls.some(([command]) => ['delete_provider_profiles', 'remove_official_account', 'logout_agent_account'].includes(command))).toBe(false);
 });
 
-it('offers Gemini CLI with its native protocol and no unrelated official-account login', async () => {
+it('offers Gemini CLI with its native API protocol and Google official login', async () => {
   await render(); expect(tab('gemini')).toBeDefined(); await act(async () => tab('gemini').click()); await act(async () => button('添加').click());
   expect(node.querySelector('.provider-api-heading')!.textContent).toContain('Gemini API');
-  expect(node.querySelector('.official-login-card')).toBeNull();
+  expect(node.querySelector('.official-login-card')?.textContent).toContain('Google 官方登录');
 });
 
 it.each(['opencode', 'pi'])('protects %s protocol changes only while that saved connection is in use', async agent => {

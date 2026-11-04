@@ -1,4 +1,4 @@
-//! Explicit, application-owned services. The approved native shell invokes the
+//! Application-owned services. The authorized native shell invokes the
 //! controller, but the GUI starts the service outside the agent's Windows job.
 use crate::process;
 use axum::{
@@ -29,6 +29,9 @@ const MAX_RUNNING: usize = 8;
 const MAX_RECORDS: usize = 16;
 const FORMAT: &str = "supercode-services-v1";
 
+#[path = "service_permissions.rs"]
+mod permissions;
+
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum Request {
@@ -56,6 +59,8 @@ struct Endpoint {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Envelope {
     session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    session_token: Option<String>,
     request: Request,
 }
 
@@ -217,7 +222,16 @@ struct ServiceManager {
 }
 impl ServiceManager {
     async fn execute(&self, request: Request) -> Result<Value, String> {
+        self.execute_checked(request, || Ok(())).await
+    }
+    async fn execute_checked(
+        &self,
+        request: Request,
+        check: impl FnOnce() -> Result<(), String>,
+    ) -> Result<Value, String> {
         let mut entries = self.entries.lock().await;
+        // No await between the final host permission check and process launch.
+        check()?;
         for entry in entries.iter_mut() {
             entry.refresh()?;
         }
@@ -467,6 +481,7 @@ struct Bridge {
     token: String,
     manager: Arc<ServiceManager>,
     approvals: Arc<Approvals>,
+    permissions: Arc<permissions::Permissions>,
     app: Option<tauri::AppHandle>,
 }
 impl Bridge {
@@ -484,11 +499,8 @@ impl Bridge {
                 }
                 current.turn_id
             } else {
-                None
+                self.permissions.turn(session)
             };
-            // Validate before presenting an approval, but launch only after the
-            // explicit GUI response. A shell invocation alone is not proof of
-            // permission to run outside that agent's sandbox.
             if let Request::Start {
                 name,
                 program,
@@ -498,22 +510,47 @@ impl Bridge {
             {
                 validate_launch(name, program, cwd, args)?;
             }
-            self.approvals
-                .confirm(
-                    self.app.clone(),
-                    session,
-                    original_turn.as_deref(),
-                    &envelope.request,
-                )
-                .await?;
-            if let Some(app) = &self.app {
-                let current = app.state::<crate::AppState>().store.session(session)?;
-                if current.turn_id != original_turn
-                    || !matches!(current.status.as_str(), "starting" | "running" | "waiting")
-                {
-                    return Err("任务已停止或切换，未执行旧的服务请求".into());
-                }
+            let automatic = self.permissions.full(
+                session,
+                envelope.session_token.as_deref(),
+                original_turn.as_deref(),
+            );
+            if !automatic {
+                self.approvals
+                    .confirm(
+                        self.app.clone(),
+                        session,
+                        original_turn.as_deref(),
+                        &envelope.request,
+                    )
+                    .await?;
             }
+            return self
+                .manager
+                .execute_checked(envelope.request, || {
+                    if let Some(app) = &self.app {
+                        let current = app.state::<crate::AppState>().store.session(session)?;
+                        if current.turn_id != original_turn
+                            || !matches!(
+                                current.status.as_str(),
+                                "starting" | "running" | "waiting"
+                            )
+                        {
+                            return Err("任务已停止或切换，未执行旧的服务请求".into());
+                        }
+                    }
+                    if automatic
+                        && !self.permissions.full(
+                            session,
+                            envelope.session_token.as_deref(),
+                            original_turn.as_deref(),
+                        )
+                    {
+                        return Err("任务权限已更改或任务已结束，未执行服务操作".into());
+                    }
+                    Ok(())
+                })
+                .await;
         }
         self.manager.execute(envelope.request).await
     }
@@ -547,6 +584,7 @@ fn router(bridge: Bridge) -> axum::Router {
 pub struct Services {
     running: Mutex<Option<Running>>,
     approvals: Arc<Approvals>,
+    permissions: Arc<permissions::Permissions>,
 }
 struct Running {
     task: tauri::async_runtime::JoinHandle<()>,
@@ -606,6 +644,7 @@ pub fn initialize(app: &tauri::AppHandle, data: &Path) -> Result<(), String> {
         token: token.clone(),
         manager: manager.clone(),
         approvals: app.state::<Services>().approvals.clone(),
+        permissions: app.state::<Services>().permissions.clone(),
         app: Some(app.clone()),
     });
     let task = tauri::async_runtime::spawn(async move {
@@ -622,6 +661,7 @@ pub fn initialize(app: &tauri::AppHandle, data: &Path) -> Result<(), String> {
     Ok(())
 }
 pub fn shutdown(app: &tauri::AppHandle) {
+    app.state::<Services>().permissions.clear();
     app.state::<Services>()
         .approvals
         .pending
@@ -652,8 +692,32 @@ pub fn respond(app: &tauri::AppHandle, id: &str, result: &Value) -> Result<(), S
     app.state::<Services>().approvals.respond(id, result)
 }
 pub fn observe(app: &tauri::AppHandle, message: &Value) {
+    if message["method"] == "turn/started" {
+        if let (Some(session), Some(turn)) = (
+            message["params"]["appSessionId"].as_str(),
+            message["params"]["turn"]["id"].as_str(),
+        ) {
+            if app
+                .state::<crate::AppState>()
+                .store
+                .session(session)
+                .is_ok_and(|current| {
+                    current.turn_id.as_deref() == Some(turn)
+                        && matches!(current.status.as_str(), "starting" | "running" | "waiting")
+                })
+            {
+                app.state::<Services>().permissions.bind(session, turn);
+            }
+        }
+    }
     if message["method"] == "turn/completed" {
         if let Some(session) = message["params"]["appSessionId"].as_str() {
+            if let Some(turn) = message["params"]["turn"]["id"]
+                .as_str()
+                .or(message["params"]["turnId"].as_str())
+            {
+                app.state::<Services>().permissions.finish(session, turn);
+            }
             app.state::<Services>().approvals.cancel_turn(
                 session,
                 message["params"]["turn"]["id"]
@@ -678,11 +742,42 @@ pub async fn reap(app: &tauri::AppHandle) {
     }
 }
 
-pub fn configure(command: &mut tokio::process::Command, data: &Path) {
+pub fn prepare(app: &tauri::AppHandle, session: &str, permission: &str) -> String {
+    app.state::<Services>()
+        .permissions
+        .prepare(session, permission == "full")
+}
+pub fn failed(app: &tauri::AppHandle, session: &str, attempt: &str) {
+    app.state::<Services>().permissions.fail(session, attempt);
+}
+pub fn update_permission(app: &tauri::AppHandle, session: &str, turn: &str, permission: &str) {
+    app.state::<Services>()
+        .permissions
+        .update(session, turn, permission == "full");
+}
+pub fn interrupt(app: &tauri::AppHandle, session: &str) {
+    let services = app.state::<Services>();
+    services.permissions.revoke(session);
+    services.approvals.cancel_turn(session, None);
+}
+pub fn configure(
+    command: &mut tokio::process::Command,
+    app: &tauri::AppHandle,
+    session: Option<&str>,
+) {
     if let Ok(executable) = std::env::current_exe() {
         command.env("SUPERCODE_SERVICE_EXE", executable);
     }
-    command.env("SUPERCODE_SERVICE_DATA_DIR", data);
+    command.env(
+        "SUPERCODE_SERVICE_DATA_DIR",
+        &app.state::<crate::AppState>().data_dir,
+    );
+    command.env_remove("SUPERCODE_SERVICE_TOKEN");
+    if let Some(session) = session {
+        let token = app.state::<Services>().permissions.token(session);
+        crate::runtime_diagnostics::register_secrets(app, &json!({"token":token}));
+        command.env("SUPERCODE_SERVICE_TOKEN", token);
+    }
 }
 async fn control(data: &Path, request: Request) -> Result<Value, String> {
     let path = data.join("services/bridge.json");
@@ -705,6 +800,7 @@ async fn control(data: &Path, request: Request) -> Result<Value, String> {
     }
     let envelope = Envelope {
         session_id: std::env::var("SUPERCODE_SESSION_ID").ok(),
+        session_token: std::env::var("SUPERCODE_SERVICE_TOKEN").ok(),
         request,
     };
     control_envelope(endpoint, envelope).await
@@ -791,6 +887,7 @@ mod tests {
             token: "test-private-token".into(),
             manager: manager.clone(),
             approvals: Arc::new(Approvals::default()),
+            permissions: Arc::new(permissions::Permissions::default()),
             app: None,
         });
         for (token, origin, body, expected) in [
@@ -904,10 +1001,12 @@ mod tests {
             token: "private".into(),
             manager: manager.clone(),
             approvals: approvals.clone(),
+            permissions: Arc::new(permissions::Permissions::default()),
             app: None,
         };
         let mut operation = Box::pin(bridge.execute(Envelope {
             session_id: Some(uuid::Uuid::new_v4().to_string()),
+            session_token: None,
             request: Request::Start {
                 name: "denied".into(),
                 program: std::env::current_exe().unwrap(),
@@ -930,6 +1029,191 @@ mod tests {
             .unwrap();
         assert!(operation.await.is_err());
         assert!(manager.entries.lock().await.is_empty());
+    }
+    #[tokio::test]
+    async fn restricted_or_other_session_tokens_cannot_auto_approve_services() {
+        for (full, valid_token) in [(false, true), (true, false)] {
+            let root = root();
+            let permissions = Arc::new(permissions::Permissions::default());
+            let session = uuid::Uuid::new_v4().to_string();
+            permissions.prepare(&session, full);
+            permissions.bind(&session, "turn");
+            let token = permissions.token(if valid_token {
+                &session
+            } else {
+                "other-session"
+            });
+            let approvals = Arc::new(Approvals::default());
+            let bridge = Bridge {
+                token: "bridge".into(),
+                manager: manager(&root),
+                approvals: approvals.clone(),
+                permissions,
+                app: None,
+            };
+            let mut operation = Box::pin(bridge.execute(Envelope {
+                session_id: Some(session),
+                session_token: Some(token),
+                request: Request::Stop {
+                    id: uuid::Uuid::new_v4().to_string(),
+                },
+            }));
+            assert!(
+                tokio::time::timeout(Duration::from_millis(20), &mut operation)
+                    .await
+                    .is_err()
+            );
+            let event = approvals.events().pop().unwrap();
+            assert_eq!(event["params"]["turnId"], "turn");
+            approvals
+                .respond(
+                    event["id"].as_str().unwrap(),
+                    &json!({"decision":"decline"}),
+                )
+                .unwrap();
+            assert!(operation.await.unwrap_err().contains("拒绝"));
+        }
+    }
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn full_access_service_outlives_its_turn_without_an_extra_approval() {
+        let root = root();
+        let node = crate::process::find_program("node")
+            .expect("Node is required for the service lifecycle test");
+        let script = root.join("server.cjs");
+        let ready = root.join("ready.json");
+        std::fs::write(&script, "const fs=require('node:fs'),http=require('node:http'); const server=http.createServer((req,res)=>res.end('service-alive')); server.listen(0,'127.0.0.1',()=>fs.writeFileSync(process.argv[2],JSON.stringify({port:server.address().port})));").unwrap();
+        let permissions = Arc::new(permissions::Permissions::default());
+        let session = uuid::Uuid::new_v4().to_string();
+        let token = permissions.token(&session);
+        permissions.prepare(&session, true);
+        permissions.bind(&session, "turn-one");
+        let approvals = Arc::new(Approvals::default());
+        let bridge = Bridge {
+            token: "bridge".into(),
+            manager: manager(&root),
+            approvals: approvals.clone(),
+            permissions: permissions.clone(),
+            app: None,
+        };
+        let started = tokio::time::timeout(
+            Duration::from_secs(3),
+            bridge.execute(Envelope {
+                session_id: Some(session.clone()),
+                session_token: Some(token.clone()),
+                request: Request::Start {
+                    name: "automatic-preview".into(),
+                    program: node,
+                    cwd: root.clone(),
+                    args: vec![
+                        script.to_string_lossy().into_owned(),
+                        ready.to_string_lossy().into_owned(),
+                    ],
+                },
+            }),
+        )
+        .await
+        .expect("Full access must not wait for an approval card")
+        .unwrap();
+        assert!(approvals.events().is_empty());
+        let port = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Ok(bytes) = std::fs::read(&ready) {
+                    if let Ok(value) = serde_json::from_slice::<Value>(&bytes) {
+                        break value["port"].as_u64().unwrap();
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap();
+        let url = format!("http://127.0.0.1:{port}/");
+        assert_eq!(
+            client.get(&url).send().await.unwrap().text().await.unwrap(),
+            "service-alive"
+        );
+        permissions.finish(&session, "turn-one");
+        assert_eq!(
+            client.get(&url).send().await.unwrap().text().await.unwrap(),
+            "service-alive"
+        );
+        assert_eq!(
+            bridge.manager.execute(Request::List {}).await.unwrap()["services"][0]["state"],
+            "running"
+        );
+        permissions.prepare(&session, true);
+        permissions.bind(&session, "turn-two");
+        let stopped = bridge
+            .execute(Envelope {
+                session_id: Some(session),
+                session_token: Some(token),
+                request: Request::Stop {
+                    id: started["id"].as_str().unwrap().into(),
+                },
+            })
+            .await
+            .unwrap();
+        assert_eq!(stopped["state"], "stopped");
+        assert!(approvals.events().is_empty());
+        assert!(client.get(&url).send().await.is_err());
+    }
+    #[tokio::test]
+    async fn a_queued_full_access_launch_is_revoked_before_the_process_can_start() {
+        let root = root();
+        let node =
+            crate::process::find_program("node").expect("Node is required for the service test");
+        let script = root.join("must-not-start.cjs");
+        let marker = root.join("unexpected-start");
+        std::fs::write(
+            &script,
+            "require('node:fs').writeFileSync(process.argv[2],'started');",
+        )
+        .unwrap();
+        let permissions = Arc::new(permissions::Permissions::default());
+        let session = uuid::Uuid::new_v4().to_string();
+        let token = permissions.token(&session);
+        permissions.prepare(&session, true);
+        permissions.bind(&session, "turn");
+        let manager = manager(&root);
+        let approvals = Arc::new(Approvals::default());
+        let bridge = Bridge {
+            token: "bridge".into(),
+            manager: manager.clone(),
+            approvals: approvals.clone(),
+            permissions: permissions.clone(),
+            app: None,
+        };
+        let guard = manager.entries.lock().await;
+        let mut operation = Box::pin(bridge.execute(Envelope {
+            session_id: Some(session.clone()),
+            session_token: Some(token),
+            request: Request::Start {
+                name: "revoked".into(),
+                program: node,
+                cwd: root,
+                args: vec![
+                    script.to_string_lossy().into_owned(),
+                    marker.to_string_lossy().into_owned(),
+                ],
+            },
+        }));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut operation)
+                .await
+                .is_err()
+        );
+        assert!(approvals.events().is_empty());
+        permissions.finish(&session, "turn");
+        drop(guard);
+        assert!(operation.await.unwrap_err().contains("任务权限"));
+        assert!(manager.entries.lock().await.is_empty());
+        assert!(!marker.exists());
     }
     #[test]
     fn output_is_bounded_and_retains_raw_non_utf8_bytes() {
@@ -1027,6 +1311,7 @@ else {process.stdin.once('data',async()=>{spawn(process.execPath,[process.argv[1
             token: endpoint.token,
             manager: manager.clone(),
             approvals: approvals.clone(),
+            permissions: Arc::new(permissions::Permissions::default()),
             app: None,
         });
         struct Server(tokio::task::JoinHandle<()>);
@@ -1051,6 +1336,7 @@ else {process.stdin.once('data',async()=>{spawn(process.execPath,[process.argv[1
             &request_file,
             serde_json::to_vec(&Envelope {
                 session_id: Some(session.clone()),
+                session_token: None,
                 request: Request::Start {
                     name: "preview".into(),
                     program: node.clone(),
@@ -1127,6 +1413,7 @@ else {process.stdin.once('data',async()=>{spawn(process.execPath,[process.argv[1
                     endpoint,
                     Envelope {
                         session_id: Some(session.into()),
+                        session_token: None,
                         request
                     }
                 ),

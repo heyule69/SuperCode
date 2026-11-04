@@ -435,7 +435,11 @@ impl Runtime {
         let permission = plan_execution_permission(&request["params"]["toolName"], &result)?;
         let signature = permission.map(|permission| execution_signature(&turn.signature.lock().unwrap(), permission)).transpose()?;
         let response = tool_response(&request["params"]["toolName"], input, &result)?;
-        turn.write(json!({"type":"control_response","response":{"subtype":"success","request_id":raw_id,"response":response}})).await?;
+        if let Some(permission) = permission { crate::managed_services::update_permission(app, &turn.session, &turn.id(), permission); }
+        if let Err(error) = turn.write(json!({"type":"control_response","response":{"subtype":"success","request_id":raw_id,"response":response}})).await {
+            if permission.is_some() { crate::managed_services::update_permission(app, &turn.session, &turn.id(), "read"); }
+            return Err(error);
+        }
         if let Some(signature) = signature { *turn.signature.lock().unwrap() = signature; }
         requests.remove(key);
         publish(
@@ -610,7 +614,7 @@ pub async fn send(
     let claude_context=crate::model_context::configure_claude(&mut command,&config,model.as_deref());
     if let Some(launch_model)=&claude_context.launch_model { command.arg(format!("--model={launch_model}")); }
     command.env("SUPERCODE_SESSION_ID", &session.id);
-    crate::managed_services::configure(&mut command, &app.state::<AppState>().data_dir);
+    crate::managed_services::configure(&mut command, app, Some(&session.id));
     command.env("CLAUDE_CODE_SDK_READS_SESSION_STATE", "1");
     let mut child = command
         .current_dir(cwd)
@@ -1024,6 +1028,7 @@ pub async fn send(
 
 #[derive(Default)]
 struct Stream {
+    retrying: bool,
     context_tokens: Option<u64>,
     uncached_input_tokens: Option<u64>,
     cached_input_tokens: Option<u64>,
@@ -1182,8 +1187,20 @@ impl Stream {
             return events;
         }
         if let Some(connection) = crate::run_connection::claude(message, chrono::Utc::now().timestamp_millis().max(0) as u64) {
+            self.retrying = true;
             events.push(event("turn/connection/updated", native, turn, json!({"connection":connection})));
             return events;
+        }
+        // A native model response proves recovery even while its thinking block
+        // is empty. Emit the transition so it also reaches the persisted marker.
+        let response = match message["type"].as_str() {
+            Some("stream_event") if message["event"]["type"] == "message_start" => Some(&message["event"]["message"]),
+            Some("assistant") if message["isApiErrorMessage"] != true => Some(&message["message"]),
+            _ => None,
+        };
+        if self.retrying && response.is_some_and(|reply| reply["id"].as_str().is_some_and(|id| !id.is_empty()) && reply["model"] != "<synthetic>") {
+            self.retrying = false;
+            events.push(event("turn/connection/updated", native, turn, json!({"connection":{"status":"restored","kind":"unknown","at":chrono::Utc::now().timestamp_millis().max(0) as u64}})));
         }
         match message["type"].as_str().unwrap_or("") {
             "stream_event" => {
@@ -1422,6 +1439,49 @@ mod tests {
         assert_eq!(events[0]["params"]["turnId"], "turn");
         message["parent_tool_use_id"] = serde_json::json!("child-tool");
         assert!(stream.translate(&message, "native", "turn").is_empty());
+    }
+    #[test]
+    fn retry_recovery_is_persisted_at_response_start_before_thinking_has_text() {
+        let mut stream = super::Stream::default();
+        let mut activity = crate::protocol::ActivityBuffer::default();
+        activity.update(&super::event("turn/started", "native", "turn", serde_json::json!({"turn":{"id":"turn"}})));
+        let start = serde_json::json!({"type":"stream_event","event":{"type":"message_start","message":{"id":"response","model":"model","usage":{"input_tokens":0}}}});
+        assert!(stream.translate(&start, "native", "turn").iter().all(|event| event["method"] != "turn/connection/updated"));
+        let retry = serde_json::json!({"type":"system","subtype":"api_retry","attempt":1,"max_retries":10,"retry_delay_ms":591});
+        for event in stream.translate(&retry, "native", "turn") { activity.update(&event); }
+        let restored = stream.translate(&start, "native", "turn").into_iter()
+            .find(|event| event["method"] == "turn/connection/updated")
+            .expect("The new model response must end retrying before any thinking or answer text");
+        assert_eq!(restored["params"]["connection"]["status"], "restored");
+        let saved = activity.update(&restored).expect("Recovery must be returned for persistence");
+        let (_, _, kind, data) = crate::protocol::item_message(&saved).unwrap();
+        assert_eq!(kind, "runMarker");
+        assert_eq!(data["turnId"], "turn");
+        assert_eq!(data["connection"]["status"], "restored");
+        assert!(data["connection"]["retryAt"].is_null());
+        let thinking = serde_json::json!({"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}});
+        for event in stream.translate(&thinking, "native", "turn") { activity.update(&event); }
+        assert_eq!(activity.snapshot("native")[0]["connection"]["status"], "restored");
+        assert!(stream.translate(&start, "native", "turn").iter().all(|event| event["method"] != "turn/connection/updated"));
+    }
+    #[test]
+    fn pending_retry_recovers_on_a_main_assistant_response_but_not_child_or_error_messages() {
+        let mut stream = super::Stream::default();
+        let retry = serde_json::json!({"type":"system","subtype":"api_retry","attempt":1,"max_retries":10});
+        let response = serde_json::json!({"type":"assistant","message":{"id":"new-thinking","model":"model","content":[{"type":"thinking","thinking":""}]}});
+        for noise in [
+            serde_json::json!({"type":"tool_progress","tool_use_id":"tool","elapsed_time_seconds":10}),
+            serde_json::json!({"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"tool","content":"local output"}]}}),
+            serde_json::json!({"type":"assistant","isApiErrorMessage":true,"message":{"id":"error","model":"<synthetic>","content":[{"type":"text","text":"API Error"}]}}),
+            serde_json::json!({"type":"stream_event","parent_tool_use_id":"child","event":{"type":"message_start","message":{"id":"child-response","model":"model"}}}),
+            serde_json::json!({"type":"assistant","parent_tool_use_id":"child","message":{"id":"child-response","model":"model","content":[{"type":"text","text":"child response"}]}}),
+        ] {
+            stream.translate(&retry, "native", "turn");
+            assert!(stream.translate(&noise, "native", "turn").iter().all(|event| event["method"] != "turn/connection/updated"));
+            let events = stream.translate(&response, "native", "turn");
+            assert!(events.iter().any(|event| event["method"] == "turn/connection/updated" && event["params"]["connection"]["status"] == "restored"));
+            assert!(stream.translate(&response, "native", "turn").iter().all(|event| event["method"] != "turn/connection/updated"));
+        }
     }
     use super::*;
     #[test]

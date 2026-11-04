@@ -32,6 +32,7 @@ struct Login {
     _input: Option<tokio::process::ChildStdin>,
     _job: process::JobGuard,
     reader: Option<JoinHandle<()>>,
+    result: Option<std::sync::Arc<Mutex<Option<Result<Value, String>>>>>,
 }
 struct PendingDirectory {
     path: PathBuf,
@@ -54,7 +55,7 @@ impl Drop for Login {
 }
 
 pub(crate) fn account_directory(base: &Path, agent: &str, id: &str) -> Result<PathBuf, String> {
-    if !matches!(agent, "claude" | "codex") {
+    if !matches!(agent, "claude" | "codex" | "gemini") {
         return Err("此 Agent 不支持官方账号管理".into());
     }
     let uuid = uuid::Uuid::parse_str(id).map_err(|_| "账号标识无效")?;
@@ -90,6 +91,8 @@ pub(crate) fn configure_in(
         command.env(
             if agent == "codex" {
                 "CODEX_HOME"
+            } else if agent == "gemini" {
+                "GEMINI_CLI_HOME"
             } else {
                 "CLAUDE_CONFIG_DIR"
             },
@@ -107,8 +110,8 @@ fn profile(agent: &str, id: &str, name: &str) -> Profile {
         agent: agent.into(),
         name: name.into(),
         config: json!({
-            "official":true,"accountId":id,"source":"official","providerId":if agent == "claude" {"anthropic"} else {"openai"},
-            "protocol":if agent == "claude" {"anthropic"} else {"responses"},"env":{},"config":"model_provider = 'openai'\n"
+            "official":true,"accountId":id,"source":"official","providerId":match agent {"claude"=>"anthropic","gemini"=>"google",_=>"openai"},
+            "protocol":match agent {"claude"=>"anthropic","gemini"=>"gemini",_=>"responses"},"env":{},"config":if agent == "gemini" {""} else {"model_provider = 'openai'\n"}
         }),
     }
 }
@@ -206,6 +209,11 @@ pub async fn start_official_account_login(
             .spawn()
             .map_err(|_| "无法启动 Codex 官方登录")?;
         (child, true)
+    } else if agent == "gemini" {
+        let mut command = crate::native_agents::gemini_accounts::login_command(&app, &id).await?;
+        let child = command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null())
+            .spawn().map_err(|_| "无法启动 Gemini 官方登录")?;
+        (child, false)
     } else {
         let mut command = accounts::claude_command(&app, &["auth", "login", "--claudeai"])?;
         configure(&mut command, &app, &agent, &config)?;
@@ -222,6 +230,7 @@ pub async fn start_official_account_login(
     let job = process::JobGuard::attach(&child)?;
     let mut reader = None;
     let mut login_input = None;
+    let mut login_result = None;
     if auth_url {
         let mut input = child.stdin.take().ok_or("无法连接登录进程")?;
         let mut output = tokio::io::BufReader::new(child.stdout.take().ok_or("无法读取登录进程")?);
@@ -246,6 +255,20 @@ pub async fn start_official_account_login(
             while matches!(crate::runtime::read_frame(&mut output).await, Ok(Some(_))) {}
         }));
         login_input = Some(input);
+    } else if agent == "gemini" {
+        let mut input = child.stdin.take().ok_or("无法连接 Gemini 登录进程")?;
+        let mut output = tokio::io::BufReader::new(child.stdout.take().ok_or("无法读取 Gemini 登录响应")?);
+        tokio::time::timeout(std::time::Duration::from_secs(30), crate::native_agents::gemini_accounts::initialize(&mut input, &mut output))
+            .await.map_err(|_| "启动 Google 官方登录超时")??;
+        let result = std::sync::Arc::new(Mutex::new(None));
+        let completed = result.clone();
+        let cwd = pending_directory.path.join("login-runtime");
+        reader = Some(tokio::spawn(async move {
+            let outcome = tokio::time::timeout(std::time::Duration::from_secs(600), crate::native_agents::gemini_accounts::complete(&mut input, &mut output, &cwd))
+                .await.map_err(|_| "Google 登录超时，请取消后重新登录".to_owned()).and_then(|result| result);
+            *completed.lock().await = Some(outcome);
+        }));
+        login_result = Some(result);
     }
     logins.insert(
         id.clone(),
@@ -256,6 +279,7 @@ pub async fn start_official_account_login(
             _input: login_input,
             _job: job,
             reader,
+            result: login_result,
         },
     );
     pending_directory.keep = true;
@@ -272,6 +296,12 @@ pub async fn finish_official_account_login(
     let login = logins
         .get(&account_id)
         .ok_or("登录已结束，请重新添加账号")?;
+    let gemini_catalog = if let Some(result) = &login.result {
+        match result.lock().await.clone() {
+            None => return Ok(json!({"loggedIn":false})),
+            Some(result) => Some(result?),
+        }
+    } else { None };
     let mut status = app
         .state::<accounts::Accounts>()
         .get_for(&login.agent, Some(&account_id), true, &app)
@@ -283,6 +313,11 @@ pub async fn finish_official_account_login(
     if login.agent == "claude" {
         profile.config["model"] = "sonnet".into();
         profile.config["models"] = json!(["sonnet", "opus", "haiku"]);
+    } else if let Some(catalog) = gemini_catalog {
+        let rows = catalog["data"].as_array().ok_or("Google 模型目录无效")?;
+        profile.config["model"] = rows.iter().find(|row| row["isDefault"] == true).map(|row| row["model"].clone()).ok_or("Google 默认模型无效")?;
+        profile.config["models"] = rows.iter().map(|row| row["model"].clone()).collect();
+        crate::native_agents::gemini_accounts::save_catalog(&app, &profile.config, &catalog)?;
     } else if let Ok(catalog) =
         crate::official_models::catalog(&app, Some(&account_id), false).await
     {
@@ -421,7 +456,7 @@ mod tests {
     fn native_commands_use_account_specific_credential_stores() {
         let id = uuid::Uuid::new_v4().to_string();
         let root = Path::new("D:/SuperCode");
-        for (agent, variable) in [("codex", "CODEX_HOME"), ("claude", "CLAUDE_CONFIG_DIR")] {
+        for (agent, variable) in [("codex", "CODEX_HOME"), ("claude", "CLAUDE_CONFIG_DIR"), ("gemini", "GEMINI_CLI_HOME")] {
             let mut command = tokio::process::Command::new("unused-test-program");
             configure_in(
                 &mut command,
@@ -446,7 +481,7 @@ mod tests {
     }
     #[test]
     fn two_official_accounts_keep_distinct_defaults_chat_bindings_and_reopen_correctly() {
-        for agent in ["codex", "claude"] {
+        for agent in ["codex", "claude", "gemini"] {
             let path =
                 std::env::temp_dir().join(format!("sc-account-test-{}.db", uuid::Uuid::new_v4()));
             let a = profile(agent, &uuid::Uuid::new_v4().to_string(), "个人账号");
@@ -486,7 +521,7 @@ mod tests {
     }
     #[test]
     fn official_accounts_can_be_added_and_selected_while_the_active_account_is_locked() {
-        for agent in ["codex", "claude"] {
+        for agent in ["codex", "claude", "gemini"] {
             let store = crate::storage::Store::from_connection(rusqlite::Connection::open_in_memory().unwrap()).unwrap();
             let active = profile(agent, &uuid::Uuid::new_v4().to_string(), "Active account");
             store.import_profiles(&[active.clone()]).unwrap();

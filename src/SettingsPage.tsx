@@ -23,7 +23,7 @@ const groups = [
   ] },
   { label: '集成', items: [
     { id: 'plugins', label: '插件与 MCP', icon: Puzzle, terms: '工具 服务' },
-    { id: 'automation', label: '自动化工具', icon: Globe, terms: '浏览器 电脑 Playwright' },
+    { id: 'automation', label: '自动化工具', icon: Globe, terms: '浏览器 电脑 Playwright 主动控制 控制偏好' },
   ] },
   { label: '应用', items: [
     { id: 'usage', label: '用量', icon: ChartNoAxesColumn, terms: 'Token 统计' },

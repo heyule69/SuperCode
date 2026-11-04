@@ -43,7 +43,7 @@ impl Profile {
             return false;
         }
         if self.config["official"] == true {
-            return matches!(self.agent.as_str(), "claude" | "codex");
+            return matches!(self.agent.as_str(), "claude" | "codex" | "gemini");
         }
         if self.agent == "claude" {
             return self.config["env"]["ANTHROPIC_BASE_URL"]

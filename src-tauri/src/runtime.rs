@@ -363,7 +363,7 @@ impl Client {
         }
         if let Some(id) = &session_id { command.env("SUPERCODE_SESSION_ID", id); }
         else { command.env_remove("SUPERCODE_SESSION_ID"); }
-        crate::managed_services::configure(&mut command, &app.state::<AppState>().data_dir);
+        crate::managed_services::configure(&mut command, &app, session_id.as_deref());
         let mut child = command
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
@@ -654,7 +654,6 @@ pub(crate) fn publish_event(app: &AppHandle, mut message: Value) {
             if let Ok(session) = app.state::<AppState>().store.for_native(native) { message["params"]["appSessionId"] = session.id.into(); }
         }
     }
-    crate::managed_services::observe(app, &message);
     crate::media::normalize_event(app, &mut message);
     if let Some(artifacts) = crate::artifacts::observe(app, &message) { publish_event(app, artifacts); }
     if matches!(message["method"].as_str(),Some("item/started"|"item/updated"|"item/completed")) {
@@ -672,6 +671,7 @@ pub(crate) fn publish_event(app: &AppHandle, mut message: Value) {
         if let Some(item)=message["params"]["item"].as_object_mut() { item.remove("fileSnapshot"); }
     }
     persist_event(app, &message);
+    crate::managed_services::observe(app, &message);
     crate::runtime_diagnostics::observe(app, &message);
     crate::desktop_control::observe(app, &message);
     crate::browser::observe(app, &message);

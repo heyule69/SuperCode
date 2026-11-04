@@ -8,13 +8,14 @@ export function connectionIds(agent: string, profiles: AgentProfile[], officialA
   const own = profiles.filter(p => p.agent === agent);
   const defaultId = own.find(p => p.current)?.id ?? (officialAgents.includes(agent) ? '@official' : '@local');
   const canonical = (id: string) => agent === 'codex' && (id === '@local' || own.some(p => p.id === id && p.officialAccount && !p.accountId)) ? '@official' : id;
-  const nativeIds = ['opencode', 'pi', 'gemini'].includes(agent) ? ['@local'] : ['@official'];
+  const nativeIds = ['opencode', 'pi'].includes(agent) ? ['@local'] : agent === 'gemini' ? ['@official', '@local'] : ['@official'];
   const available = new Set([...own.map(p => canonical(p.id)), ...nativeIds]);
   if (agent !== 'codex' && (saved?.includes('@local') || !saved && defaultId === '@local')) available.add('@local');
   return [...new Set([...(saved ?? [defaultId]), ...own.map(p => p.id), ...nativeIds].map(canonical))].filter(id => available.has(id));
 }
 
 export function nativeConnectionSource(agent: string, id: string): ModelSource {
+  if (id === '@official' && agent === 'gemini') return { providerId: 'google', providerName: 'Google', connectionName: 'Google 官方账号', mark: 'G' };
   return id === '@official'
     ? { providerId: agent === 'claude' ? 'anthropic' : 'openai', providerName: agent === 'claude' ? 'Anthropic' : 'OpenAI', connectionName: agent === 'claude' ? 'Claude 官方账号' : 'ChatGPT 官方账号', mark: agent === 'claude' ? 'A' : 'O' }
     : { providerId: 'custom', providerName: '本机 CLI 配置', connectionName: '本机 CLI 配置', mark: '本' };
@@ -23,7 +24,7 @@ export function nativeConnectionSource(agent: string, id: string): ModelSource {
 // The persisted route list also contains legacy CLI fallbacks. They are not
 // configured suppliers; only a confirmed native login creates an account row.
 export function visibleProviderIds(agent: string, profiles: AgentProfile[], loggedInAgents: string[], order?: ConnectionOrder): string[] {
-  const loggedIn = loggedInAgents.includes(agent) && ['codex', 'claude'].includes(agent);
+  const loggedIn = loggedInAgents.includes(agent) && ['codex', 'claude', 'gemini'].includes(agent);
   return connectionIds(agent, profiles, loggedInAgents, order).filter(id => {
     if (id === '@local') return false;
     if (id === '@official') return loggedIn;

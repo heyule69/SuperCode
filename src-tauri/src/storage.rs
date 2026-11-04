@@ -537,7 +537,7 @@ impl Store {
         Ok(value.as_deref() == Some("1"))
     }
     pub fn use_official(&self, agent: &str) -> Result<()> {
-        if !matches!(agent, "claude" | "codex") {
+        if !matches!(agent, "claude" | "codex" | "gemini") {
             return Err("此 Agent 尚不支持官方账号".into());
         }
         self.make_connection_default(agent, crate::session_config::OFFICIAL)

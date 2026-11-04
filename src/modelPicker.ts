@@ -82,7 +82,7 @@ export function modelGroups({ models, catalogLoaded = false, profiles, activePro
   const currentId = connectionId ?? activeProfile?.id ?? '';
   const currentProfile = profiles.find(p => p.agent === agent && p.id === currentId);
   const legacyOfficial = agent === 'codex' && currentId === '@local' && source?.available === true && source.connectionName === 'ChatGPT 官方账号';
-  const officialRoute = ['claude', 'codex'].includes(agent) && (currentId === '@official' || !!currentProfile?.officialAccount || legacyOfficial);
+  const officialRoute = ['claude', 'codex', 'gemini'].includes(agent) && (currentId === '@official' || !!currentProfile?.officialAccount || legacyOfficial);
   const officialCurrent = agent === 'codex' && officialRoute && !currentProfile?.accountId;
   const accountKey = currentProfile?.accountId ? currentId : agent;
   const verifiedAgents = officialRoute && source?.available === false ? loggedInAgents.filter(id => id !== accountKey) : officialRoute && source?.available === true ? [...new Set([...loggedInAgents, accountKey])] : loggedInAgents;

@@ -144,3 +144,14 @@ it('hides saved official models until login is verified, while leaving configure
   expect(modelGroups({ models: [model('saved-official')], profiles: [official, api], activeProfile: official, agent: 'claude', value: 'saved-official', connectionId: official.id }).map(g => g.id)).toEqual(['api']);
   expect(modelGroups({ models: [], profiles: [official, api], activeProfile: official, source: { ...kimi, available: false }, loggedInAgents: ['claude'], agent: 'claude', value: 'saved-official', connectionId: official.id }).map(g => g.id)).toEqual(['api']);
 });
+
+it('selects verified Gemini Google accounts independently of Gemini API connections', () => {
+  const google = {...profile('account:google','auto'),agent:'gemini',accountId:'google',officialAccount:true,hasCredential:false,name:'Google 工作账号'};
+  const api = {...profile('gemini-api','gemini-api-model'),agent:'gemini'};
+  const source = {providerId:'google',providerName:'Google',connectionName:google.name,mark:'G',available:true};
+  const input = {models:[model('auto')],profiles:[google,api],activeProfile:google,source,agent:'gemini',value:'auto',connectionId:google.id,order:{gemini:[google.id,api.id]}};
+  const groups = modelGroups(input);
+  expect(groups.map(group=>group.id)).toEqual([google.id,api.id]);
+  expect(groups[0].options[0]).toMatchObject({connectionId:google.id,model:'auto',selected:true,source:{providerId:'google',connectionName:'Google 工作账号'}});
+  expect(modelGroups({...input,source:{...source,available:false},loggedInAgents:[google.id]}).map(group=>group.id)).toEqual([api.id]);
+});

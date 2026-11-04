@@ -70,6 +70,9 @@ pub(super) fn api_endpoint(config: &Value) -> (String, String) {
 }
 
 pub(super) fn authentication(config: &Value) -> Value {
+    if config["official"] == true {
+        return json!({"methodId":"oauth-personal"});
+    }
     let (base, _) = api_endpoint(config);
     let official = reqwest::Url::parse(&base)
         .ok()
@@ -130,6 +133,9 @@ pub(super) async fn configure(
     permission: &str,
     workspace: &Path,
 ) -> Result<(Vec<String>, Vec<(String, String)>), String> {
+    if config["official"] == true && crate::providers::key(config).is_some() {
+        return Err("Google 官方登录不能同时配置 API Key".into());
+    }
     // Full access in the host authorizes this workspace, never its parent or
     // another session. Gemini's ACP cannot ask its own folder-trust question.
     let trusted_folders = if permission == "full" {
@@ -204,7 +210,7 @@ pub(super) async fn configure(
         // A single equals-form argument keeps even a leading '-' literal.
         args.push(format!("--model={model}"));
     }
-    let env = vec![
+    let mut env: Vec<(String, String)> = vec![
         (
             "GEMINI_CLI_HOME".into(),
             crate::agents::ordinary(home.to_owned())
@@ -234,13 +240,33 @@ pub(super) async fn configure(
         ("GOOGLE_GEMINI_BASE_URL".into(), base),
         ("GOOGLE_GENAI_API_VERSION".into(), version),
         ("GEMINI_FORCE_FILE_STORAGE".into(), "true".into()),
+        ("GEMINI_FORCE_ENCRYPTED_FILE_STORAGE".into(), "false".into()),
+        ("GEMINI_CLI_TRUSTED_FOLDERS_PATH".into(), crate::agents::ordinary(settings_dir.join("trustedFolders.json")).to_string_lossy().into_owned()),
         ("GOOGLE_GENAI_USE_VERTEXAI".into(), "false".into()),
         ("GOOGLE_GENAI_USE_GCA".into(), "false".into()),
         ("GEMINI_CLI_CUSTOM_HEADERS".into(), "".into()),
         ("GEMINI_SYSTEM_MD".into(), "".into()),
         ("NO_BROWSER".into(), "true".into()),
     ];
+    if config["official"] == true {
+        env.retain(|(name, _)| !matches!(name.as_str(), "GEMINI_API_KEY" | "GOOGLE_GEMINI_BASE_URL" | "GOOGLE_GENAI_API_VERSION"));
+        env.iter_mut().find(|(name, _)| name == "GOOGLE_GENAI_USE_GCA").unwrap().1 = "true".into();
+    }
     Ok((args, env))
+}
+
+pub(super) fn clear_environment(command: &mut tokio::process::Command) {
+    for name in [
+        "GEMINI_API_KEY", "GEMINI_MODEL", "GOOGLE_API_KEY", "GOOGLE_APPLICATION_CREDENTIALS",
+        "GOOGLE_GENAI_USE_VERTEXAI", "GOOGLE_GENAI_USE_GCA", "GOOGLE_VERTEX_BASE_URL",
+        "GOOGLE_CLOUD_PROJECT", "GOOGLE_CLOUD_PROJECT_ID", "GOOGLE_CLOUD_LOCATION",
+        "GOOGLE_GEMINI_BASE_URL", "GOOGLE_GENAI_API_VERSION", "GEMINI_CLI_CUSTOM_HEADERS",
+        "GEMINI_API_KEY_AUTH_MECHANISM", "GEMINI_SYSTEM_MD", "GEMINI_FORCE_FILE_STORAGE",
+        "GEMINI_FORCE_ENCRYPTED_FILE_STORAGE", "GEMINI_CLI_USE_COMPUTE_ADC", "GEMINI_CLI_HOME",
+        "GEMINI_CLI_SYSTEM_SETTINGS_PATH", "GEMINI_CLI_SYSTEM_DEFAULTS_PATH", "GEMINI_CLI_TRUSTED_FOLDERS_PATH",
+    ] {
+        command.env_remove(name);
+    }
 }
 
 #[cfg(test)]
@@ -382,8 +408,11 @@ mod tests {
         let base = format!("http://{}", listener.local_addr().unwrap());
         let http = tokio::spawn(async move { axum::serve(listener, router).await });
         let home = root.join("managed-home");
-        let config = json!({"model":"gemini-4-argon","baseUrl":base,"apiKey":"local-test-not-a-provider-key"});
+        let config = json!({"baseUrl":base,"apiKey":"local-test-not-a-provider-key"});
         let (args, mut env) = configure(&home, &config, "full", &cwd).await.unwrap();
+        // OAuth uses an account home while policy/trust remain per conversation.
+        // Exercise that same layout with the local fake API, without Google login.
+        env.iter_mut().find(|(name, _)| name == "GEMINI_CLI_HOME").unwrap().1 = root.join("account-home").to_string_lossy().into_owned();
         env.push(("GEMINI_CLI_NO_RELAUNCH".into(), "true".into()));
         let launch = crate::agents::Launch {
             program,
@@ -397,10 +426,13 @@ mod tests {
         let result: Result<(),String> = async {
             let initialized = super::super::probe_request(&client, &mut events, "initialize", super::super::init()).await?;
             super::super::validate_acp("gemini", &initialized)?;
+            assert!(initialized["authMethods"].as_array().unwrap().iter().any(|method| method["id"] == "oauth-personal"));
             super::super::probe_request(&client, &mut events, "authenticate", authentication(&config)).await?;
             // canonicalize preserves Windows' verbatim prefix, as stored project paths do.
             let native_cwd = cwd.canonicalize().map_err(|error|error.to_string())?;
             let session = super::super::probe_request(&client, &mut events, "session/new", json!({"cwd":native_cwd,"mcpServers":[]})).await?;
+            let catalog = super::super::gemini_accounts::parse_catalog(&session)?;
+            assert!(catalog["data"].as_array().unwrap().iter().any(|model| model["isDefault"] == true));
             let session_id = session["sessionId"].as_str().ok_or("CLI did not return a session ID")?;
             super::super::probe_request(&client, &mut events, "session/set_mode", json!({"sessionId":session_id,"modeId":"yolo"})).await?;
             let other = super::super::probe_request(&client, &mut events, "session/new", json!({"cwd":sibling.canonicalize().map_err(|error|error.to_string())?,"mcpServers":[]})).await?;

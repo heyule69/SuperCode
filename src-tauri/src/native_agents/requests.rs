@@ -51,46 +51,22 @@ impl Client {
         diagnostics: Option<(AppHandle, String, Option<String>)>,
     ) -> Result<(Arc<Self>, mpsc::Receiver<Value>), String> {
         let mut command = launch.command(&[]);
-        if let Some((app, _, _)) = &diagnostics {
-            crate::managed_services::configure(&mut command, &app.state::<AppState>().data_dir);
+        if let Some((app, _, session)) = &diagnostics {
+            crate::managed_services::configure(&mut command, app, session.as_deref());
         }
         let gemini = args.first().is_some_and(|arg| arg == "--acp");
         if gemini {
-            // A managed API connection must not inherit Google login, Vertex,
-            // API keys, hooks or another CLI's settings from its parent process.
-            for name in [
-                "GEMINI_API_KEY",
-                "GEMINI_MODEL",
-                "GOOGLE_API_KEY",
-                "GOOGLE_APPLICATION_CREDENTIALS",
-                "GOOGLE_GENAI_USE_VERTEXAI",
-                "GOOGLE_GENAI_USE_GCA",
-                "GOOGLE_VERTEX_BASE_URL",
-                "GOOGLE_CLOUD_PROJECT",
-                "GOOGLE_CLOUD_PROJECT_ID",
-                "GOOGLE_CLOUD_LOCATION",
-                "GOOGLE_GEMINI_BASE_URL",
-                "GOOGLE_GENAI_API_VERSION",
-                "GEMINI_CLI_CUSTOM_HEADERS",
-                "GEMINI_API_KEY_AUTH_MECHANISM",
-                "GEMINI_SYSTEM_MD",
-                "GEMINI_FORCE_FILE_STORAGE",
-                "GEMINI_CLI_USE_COMPUTE_ADC",
-                "GEMINI_CLI_HOME",
-                "GEMINI_CLI_SYSTEM_SETTINGS_PATH",
-                "GEMINI_CLI_SYSTEM_DEFAULTS_PATH",
-            ] {
-                command.env_remove(name);
-            }
+            gemini::clear_environment(&mut command);
         }
         let transient_home = gemini
             .then(|| {
-                let home = std::path::PathBuf::from(
+                let settings = std::path::PathBuf::from(
                     env.iter()
-                        .find(|(key, _)| key == "GEMINI_CLI_HOME")?
+                        .find(|(key, _)| key == "GEMINI_CLI_SYSTEM_SETTINGS_PATH")?
                         .1
                         .clone(),
                 );
+                let home = settings.parent()?.parent()?.to_path_buf();
                 let name = home.file_name()?.to_str()?;
                 (uuid::Uuid::parse_str(name).is_ok() && home.parent()?.file_name()? == "transient")
                     .then_some(home)

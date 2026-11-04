@@ -9,5 +9,5 @@ export function providersForAgent(providers: Provider[], agent: string): Provide
   return providers.map(provider => ({ ...provider, presets: provider.presets.filter(preset => protocols.includes(preset.protocol)) })).filter(provider => provider.presets.length > 0);
 }
 export function officialProvider(agent: string) {
-  return agent === 'claude' ? { id: 'anthropic', name: 'Claude 官方登录' } : agent === 'codex' ? { id: 'openai', name: 'ChatGPT 官方登录' } : null;
+  return agent === 'claude' ? { id: 'anthropic', name: 'Claude 官方登录' } : agent === 'codex' ? { id: 'openai', name: 'ChatGPT 官方登录' } : agent === 'gemini' ? { id: 'google', name: 'Google 官方登录' } : null;
 }

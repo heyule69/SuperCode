@@ -19,6 +19,7 @@ use tokio::{
     sync::{mpsc, oneshot, Mutex, Notify},
 };
 mod gemini;
+pub(crate) mod gemini_accounts;
 mod mapper;
 mod requests;
 use mapper::*;
@@ -907,7 +908,10 @@ async fn start_configured(
         let (values, environment) = gemini::configure(&home, &config, permission, cwd).await?;
         args.extend(values);
         env.extend(environment);
-        if connection_test {
+        if config["official"] == true {
+            gemini_accounts::apply_home(&app.state::<AppState>().data_dir, &config, &mut env)?;
+        }
+        if connection_test && config["official"] != true {
             probe_launch = gemini::fast_test_launch(launch, &home).await?;
             if probe_launch.is_some() {
                 env.push(("GEMINI_CLI_NO_RELAUNCH".into(), "true".into()));

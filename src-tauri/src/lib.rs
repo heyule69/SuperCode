@@ -32,6 +32,7 @@ mod computer_native;
 mod computer_smoke;
 mod connection_order;
 mod connection_usage;
+mod control_policy;
 mod credentials;
 mod desktop_control;
 mod desktop_control_smoke;
@@ -487,6 +488,8 @@ pub fn run() {
             agent_commands::execute_agent_command,
             client_features::get_client_preferences,
             client_features::save_client_preferences,
+            control_policy::get_automation_policy,
+            control_policy::set_automation_policy,
             client_features::get_usage,
             client_features::get_account_limits,
             platform_usage::get_platform_usage,

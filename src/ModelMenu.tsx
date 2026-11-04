@@ -106,7 +106,7 @@ export function ModelMenu({ value, models, catalogLoaded, catalogWarning, profil
   useEffect(() => { if (!open) setShowNote(false); }, [open]);
   useEffect(() => { setLoggedInAgents([]); }, [agent, profiles]);
   useEffect(() => {
-    if (!open || !desktop || !['claude', 'codex'].includes(agent)) return;
+    if (!open || !desktop || !['claude', 'codex', 'gemini'].includes(agent)) return;
     let disposed = false;
     void call<{ agent: string; connectionId?: string; loggedIn: boolean }[]>('list_provider_accounts', { force: false }).then(rows => {
       if (!disposed) setLoggedInAgents(rows.filter(row => row.loggedIn).map(row => row.connectionId ?? row.agent));

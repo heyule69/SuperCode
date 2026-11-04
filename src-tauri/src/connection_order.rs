@@ -75,7 +75,7 @@ pub(crate) fn order(conn: &Connection, agent: &str) -> Result<Vec<String>> {
             }
         });
     let mut available: Vec<_> = ids.into_iter().filter(|id| !aliases.contains(id)).collect();
-    if matches!(agent, "codex" | "claude") {
+    if matches!(agent, "codex" | "claude" | "gemini") {
         available.push(OFFICIAL.into());
     }
     // Keep the pre-existing CLI route available, without adding it to accounts

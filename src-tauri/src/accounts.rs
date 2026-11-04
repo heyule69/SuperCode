@@ -12,7 +12,7 @@ use tokio::sync::Mutex;
 #[derive(Default)]
 pub struct Accounts {
     cache: Mutex<BTreeMap<String, (Instant, Value)>>,
-    checks: [Mutex<()>; 2],
+    checks: [Mutex<()>; 3],
 }
 impl Accounts {
     pub(crate) async fn get(
@@ -33,6 +33,7 @@ impl Accounts {
         let index = match agent {
             "codex" => 0,
             "claude" => 1,
+            "gemini" => 2,
             _ => return Err("不支持此 Agent 的官方账号".into()),
         };
         let _check = self.checks[index].lock().await;
@@ -70,11 +71,12 @@ pub async fn list_provider_accounts(
             Err(error) => json!({"agent":agent,"loggedIn":false,"error":error}),
         }
     }
-    let (codex, claude) = tokio::join!(
+    let (codex, claude, gemini) = tokio::join!(
         one("codex", force.unwrap_or(false), &app),
-        one("claude", force.unwrap_or(false), &app)
+        one("claude", force.unwrap_or(false), &app),
+        one("gemini", force.unwrap_or(false), &app)
     );
-    let mut rows = vec![codex, claude];
+    let mut rows = vec![codex, claude, gemini];
     for profile in app
         .state::<AppState>()
         .store
@@ -292,6 +294,9 @@ async fn read_official_status(
 ) -> Result<Value, String> {
     if agent == "codex" {
         return crate::official_models::status(app, account_id);
+    }
+    if agent == "gemini" {
+        return crate::native_agents::gemini_accounts::status(&app.state::<AppState>().data_dir, account_id);
     }
     if agent != "claude" {
         return Err("不支持此 Agent 的账号".into());

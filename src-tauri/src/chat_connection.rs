@@ -47,7 +47,7 @@ fn connection_kind(
         return Err(PROVIDER_REQUIRED.into());
     }
     if id == OFFICIAL {
-        return if matches!(agent, "claude" | "codex") {
+        return if matches!(agent, "claude" | "codex" | "gemini") {
             Ok(ConnectionKind::Official)
         } else {
             Err(PROVIDER_REQUIRED.into())
@@ -302,13 +302,15 @@ mod tests {
     #[tokio::test]
     async fn official_connections_require_confirmed_login_not_just_a_selected_flag() {
         let store = store();
-        for agent in ["claude", "codex"] {
+        for agent in ["claude", "codex", "gemini"] {
             let profile = Profile {
                 id: format!("official:{agent}"),
                 agent: agent.into(),
                 name: "Official".into(),
                 config: if agent == "codex" {
                     json!({"config":"model_provider = \"openai\""})
+                } else if agent == "gemini" {
+                    json!({"official":true,"providerId":"google","protocol":"gemini"})
                 } else {
                     json!({"env":{}})
                 },

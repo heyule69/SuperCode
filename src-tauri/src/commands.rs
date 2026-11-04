@@ -241,6 +241,11 @@ pub async fn list_models(
         catalog["source"] = source;
         return Ok(catalog);
     }
+    if agent == "gemini" && route.config["official"] == true {
+        let mut catalog = crate::native_agents::gemini_accounts::catalog(&app, &route.config, force_refresh.unwrap_or(false)).await?;
+        catalog["source"] = source;
+        return Ok(catalog);
+    }
     if matches!(agent, "opencode" | "pi" | "gemini") {
         let mut catalog = crate::providers::catalog_models(&route.config);
         catalog["source"] = source;
@@ -402,6 +407,11 @@ pub(crate) async fn send_chat_message_inner(
         let _ = state.store.set_status(&session_id, "failed", None);
         return Err("推理档位无效".into());
     }
+    if let Err(error) = crate::control_policy::prepare(&app, &mut prepared) {
+        let _ = state.store.set_status(&session_id, "failed", None);
+        return Err(error);
+    }
+    let service_attempt = crate::managed_services::prepare(&app, &session_id, if read_only { "read" } else { permission });
     let result = send_inner(
         &session_id,
         &text,
@@ -414,6 +424,7 @@ pub(crate) async fn send_chat_message_inner(
     )
     .await;
     if result.is_err() {
+        crate::managed_services::failed(&app, &session_id, &service_attempt);
         if state
             .store
             .session(&session_id)
@@ -645,6 +656,7 @@ pub(crate) fn codex_thread_request(
 pub async fn interrupt_turn(session_id: String, app: AppHandle) -> Result<(), String> {
     crate::browser::stop(&app, &session_id);
     crate::desktop_control::stop_session(&app, &session_id);
+    crate::managed_services::interrupt(&app, &session_id);
     let state = app.state::<AppState>();
     let session = state.store.session(&session_id)?;
     crate::runtime_diagnostics::record(

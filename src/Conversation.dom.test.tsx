@@ -159,6 +159,22 @@ it.each(['running', 'starting', 'tool'] as const)('does not add a connection car
   expect(node.textContent).not.toContain('未收到新进展');
   expect(node.textContent).toContain(state === 'tool' ? '正在执行命令' : state === 'starting' ? '正在启动 Agent' : '正在处理');
 });
+it('ends a confirmed retry when the model starts a new response even before thinking has text', async () => {
+  let rows = mergeEvent([message('retry-user', 'user', '继续修改')], { method:'turn/started', params:{ turn:{ id:'retry' } } }, 's');
+  rows = mergeEvent(rows, { method:'turn/connection/updated', params:{ turnId:'retry', connection:{ status:'retrying', at:Date.now(), kind:'unknown', attempt:1, maxAttempts:10 } } }, 's');
+  await render(rows, false, { sessionStatus:'running', activeTurnId:'retry' });
+  expect(node.textContent).toContain('正在重试模型请求');
+  rows = mergeEvent(rows, { method:'turn/connection/updated', params:{ turnId:'retry', connection:{ status:'restored', at:Date.now(), kind:'unknown' } } }, 's');
+  rows = mergeEvent(rows, { method:'item/started', params:{ turnId:'retry', item:{ id:'thinking', type:'reasoning', summary:[''], status:'inProgress' } } }, 's');
+  const saved = JSON.parse(JSON.stringify(rows)) as Message[];
+  await render(saved, false, { sessionStatus:'running', activeTurnId:'retry' });
+  expect(node.textContent).toContain('连接已恢复');
+  expect(node.textContent).not.toContain('正在重试模型请求');
+  expect(node.querySelector('.connection-spinner')).toBeNull();
+  rows = mergeEvent(rows, { method:'turn/connection/updated', params:{ turnId:'retry', connection:{ status:'retrying', at:Date.now()+1, kind:'unknown', attempt:1, maxAttempts:10 } } }, 's');
+  await render(rows, false, { sessionStatus:'running', activeTurnId:'retry' });
+  expect(node.textContent).toContain('正在重试模型请求');
+});
 it('replaces the generic working line with live reconnection and restores the same turn after new output', async () => {
   let rows = mergeEvent([message('retry-user', 'user', '继续')], { method:'turn/started', params:{ turn:{ id:'retry' } } }, 's');
   rows = mergeEvent(rows, { method:'turn/connection/updated', params:{ turnId:'retry', connection:{ status:'retrying', at:Date.now(), kind:'network', attempt:1, maxAttempts:5 } } }, 's');

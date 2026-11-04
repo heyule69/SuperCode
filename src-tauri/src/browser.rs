@@ -693,8 +693,18 @@ async fn evaluate(
         args["contextId"] = json!(context);
     }
     let value = cdp(app, tab, "Runtime.evaluate", args, lease).await?;
-    if !value["exceptionDetails"].is_null() {
-        return Err("网页发生变化，请重新读取浏览器快照".into());
+    evaluation_result(value)
+}
+fn evaluation_result(value: Value) -> Result<Value, String> {
+    if let Some(details) = value.get("exceptionDetails").filter(|details| !details.is_null()) {
+        let message = details["exception"]["description"].as_str()
+            .or_else(|| details["exception"]["value"].as_str())
+            .or_else(|| details["text"].as_str())
+            .map(str::to_owned).unwrap_or_else(|| details.to_string());
+        return Err(format!("浏览器页面脚本异常：{}", crate::protocol::bounded(&message, 2048)));
+    }
+    if let Some(error) = value.get("error").filter(|error| !error.is_null()) {
+        return Err(format!("浏览器协议调用失败：{}", crate::protocol::bounded(&error.to_string(), 2048)));
     }
     Ok(value["result"]["value"].clone())
 }
@@ -966,14 +976,16 @@ async fn execute(
     );
     let mut may_have_run = false;
     let action=async{
-        cue(app,tab,None,true,Some(lease)).await?;
         if name=="browser_snapshot" {return snapshot(app,tab,lease).await;}
         if name=="browser_navigate" {
+            // Navigation must not depend on script execution in the old page:
+            // a failed document can still be replaced by a valid navigation.
             let address=url(args["url"].as_str().unwrap())?;
             may_have_run=true;tab.observation.lock().unwrap().take();
             let navigation=cdp(app,tab,"Page.navigate",json!({"url":address.as_str()}),Some(lease)).await?;
             if let Some(error)=navigation["errorText"].as_str(){return Err(format!("网页加载失败：{error}"));}
         }else{
+            cue(app,tab,None,true,Some(lease)).await?;
             let context=observation(tab,&args["snapshotId"])?;
             let point=if matches!(name,"browser_click"|"browser_fill"){
                 let ready=tokio::time::timeout(Duration::from_secs(2),ready_point(app,tab,&args,context,lease,name=="browser_fill")).await;
@@ -1001,7 +1013,7 @@ async fn execute(
         tokio::select!{_=tokio::time::sleep(Duration::from_millis(400))=>{},_=cancelled(lease)=>return Err("user_takeover".into())};
         match snapshot(app,tab,lease).await {
             Ok(value)=>Ok(value),
-            Err(error) if error!="user_takeover"=>Ok(browser_bridge::text_result(json!({"completed":true,"observationWarning":error,"nextStep":"The action already ran. Do not repeat it. Read a new browser_snapshot to check the result."}),false)),
+            Err(error) if error!="user_takeover"=>Ok(browser_bridge::text_result(json!({"completed":true,"observationWarning":error,"nextStep":"The action was dispatched, but page observation failed. Inspect the reported error and page loading state before requesting a new snapshot. Do not repeat the action or report that the page loaded successfully."}),false)),
             Err(error)=>Err(error),
         }
     }.await;
@@ -1011,7 +1023,7 @@ async fn execute(
         Err(error) => {
             status(app, tab, "error", &error);
             Ok(browser_bridge::text_result(
-                json!({"error":error,"actionMayHaveRun":may_have_run,"nextStep":"Obtain a fresh observation. Never repeat an action that may already have run."}),
+                json!({"error":error,"actionMayHaveRun":may_have_run,"nextStep":"Inspect the reported error and page loading state. Resolve page or script failures before obtaining a new snapshot. Never repeat an action that may already have run."}),
                 true,
             ))
         }
@@ -1419,6 +1431,26 @@ pub async fn smoke(app: AppHandle) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn page_script_errors_retain_the_actual_exception_instead_of_claiming_a_stale_snapshot() {
+        // Recorded when a gzip decoding failure left document.documentElement null.
+        let error = evaluation_result(json!({"result":{"type":"object","subtype":"error"},"exceptionDetails":{"text":"Uncaught","exception":{"description":"TypeError: Cannot read properties of null (reading 'append')\n    at <anonymous>:16:51"}}})).unwrap_err();
+        assert!(error.starts_with("浏览器页面脚本异常：TypeError:"));
+        assert!(error.contains("reading 'append'"));
+        assert!(!error.contains("网页发生变化"));
+        assert!(!error.contains("重新读取浏览器快照"));
+        let thrown = evaluation_result(json!({"exceptionDetails":{"text":"Uncaught","exception":{"value":"page-load-failed"}}})).unwrap_err();
+        assert!(thrown.contains("page-load-failed"));
+        let protocol = evaluation_result(json!({"error":{"code":-32000,"message":"Cannot find context with specified id"}})).unwrap_err();
+        assert!(protocol.contains("Cannot find context with specified id"));
+        let large = evaluation_result(json!({"exceptionDetails":{"text":"错误".repeat(3000)}})).unwrap_err();
+        assert!(large.len() < 2200);
+    }
+    #[test]
+    fn successful_page_evaluation_and_undefined_cue_results_are_preserved() {
+        assert_eq!(evaluation_result(json!({"result":{"type":"object","value":{"url":"http://localhost/","elements":[]}}})).unwrap(), json!({"url":"http://localhost/","elements":[]}));
+        assert_eq!(evaluation_result(json!({"result":{"type":"undefined"}})).unwrap(), Value::Null);
+    }
     #[test]
     fn browser_lease_is_selected_by_session_even_with_the_same_agent() {
         let make = |id: &str, agent: &str| Lease { session:id.into(), agent:agent.into(), turn:None, gate:Arc::new(AtomicBool::new(true)), presented:Arc::new(AtomicBool::new(false)) };

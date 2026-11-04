@@ -1,4 +1,5 @@
 .automation-intro { color:var(--muted); margin:-12px 0 32px; line-height:1.6; }
+.automation-policy-scope { border-top:1px solid var(--line); padding:12px 20px; color:var(--muted); font-size:12px; line-height:1.7; }
 .automation-cards { display:grid; gap:20px; }
 .automation-card { background:var(--surface); border:1px solid var(--line); border-radius:16px; padding:24px; }
 .automation-card header { display:flex; align-items:center; gap:14px; }

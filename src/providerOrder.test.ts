@@ -1,13 +1,23 @@
 import { expect, it } from 'vitest';
 import { connectionIds, mergeVisibleOrder, moveConnection, visibleProviderIds } from './providerOrder';
 import type { AgentProfile } from './types';
-it('keeps native OpenCode, Pi and Gemini routes, orders their providers, and never invents an official account', () => {
-  for (const agent of ['opencode', 'pi', 'gemini']) {
+it('keeps native OpenCode and Pi routes, orders their providers, and never invents an official account', () => {
+  for (const agent of ['opencode', 'pi']) {
     expect(connectionIds(agent, [], [], {})).toEqual(['@local']);
     const own = { id: 'api', agent, name: 'API', model: 'm', current: true, hasCredential: true };
     expect(connectionIds(agent, [own], [], { [agent]: ['api', '@official', '@local'] })).toEqual(['api', '@local']);
     expect(connectionIds(agent, [own], [], { [agent]: ['@local', 'api'] })).toEqual(['@local', 'api']);
   }
+});
+
+it('keeps Gemini APIs and each verified Google account separate without exposing an unconfirmed login', () => {
+  const api: AgentProfile = {id:'api',agent:'gemini',name:'Gateway',model:'gateway-model',hasCredential:true,current:true};
+  const account: AgentProfile = {id:'account:a',accountId:'a',agent:'gemini',name:'Google 工作账号',model:'auto',officialAccount:true,hasCredential:false,current:false};
+  const order = {gemini:['api','account:a','@local','@official']};
+  expect(visibleProviderIds('gemini',[api,account],[],order)).toEqual(['api']);
+  expect(visibleProviderIds('gemini',[api,account],['account:a'],order)).toEqual(['api','account:a']);
+  expect(visibleProviderIds('gemini',[api,account],['gemini','account:a'],order)).toEqual(['api','account:a','@official']);
+  expect(connectionIds('gemini',[],[],{gemini:['@local']})).toEqual(['@local','@official']);
 });
 
 const profiles: AgentProfile[] = [
