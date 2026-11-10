@@ -1,5 +1,5 @@
 import catalog from '../resources/providers.json';
-import type { AgentProfile, Model, ModelSource } from './types';
+import type { AgentProfile, Model, ModelCatalog, ModelSource } from './types';
 import { nativeConnectionSource, visibleProviderIds, type ConnectionOrder } from './providerOrder';
 
 export interface ModelOption extends Model {
@@ -78,7 +78,7 @@ function optionsFor(models: Model[], source: ModelSource, connectionId: string, 
   });
 }
 
-export function modelGroups({ models, catalogLoaded = false, profiles, activeProfile, source, agent, value, connectionId, order, loggedInAgents = [] }: { models: Model[]; catalogLoaded?: boolean; profiles: AgentProfile[]; activeProfile?: AgentProfile; source?: ModelSource; agent: string; value: string; connectionId?: string; order?: ConnectionOrder; loggedInAgents?: string[] }): ModelGroup[] {
+export function modelGroups({ models, catalogLoaded = false, catalogs = {}, profiles, activeProfile, source, agent, value, connectionId, order, loggedInAgents = [] }: { models: Model[]; catalogLoaded?: boolean; catalogs?: Record<string, ModelCatalog>; profiles: AgentProfile[]; activeProfile?: AgentProfile; source?: ModelSource; agent: string; value: string; connectionId?: string; order?: ConnectionOrder; loggedInAgents?: string[] }): ModelGroup[] {
   const currentId = connectionId ?? activeProfile?.id ?? '';
   const currentProfile = profiles.find(p => p.agent === agent && p.id === currentId);
   const legacyOfficial = agent === 'codex' && currentId === '@local' && source?.available === true && source.connectionName === 'ChatGPT 官方账号';
@@ -100,8 +100,8 @@ export function modelGroups({ models, catalogLoaded = false, profiles, activePro
     if (id === currentGroupId) return current;
     const profile = profiles.find(p => p.agent === agent && p.id === id);
     const officialProfile = id === '@official' ? profiles.find(p => p.agent === agent && p.officialAccount && !p.accountId && (p.model || p.models?.length)) : undefined;
-    const groupSource = profile ? sourceForProfile(profile) : nativeConnectionSource(agent, id);
-    const groupModels = profile ? profileModels(profile) : id === '@official' && agent === 'codex' ? officialModels : officialProfile ? profileModels(officialProfile) : [];
+    const groupSource = catalogs[id]?.source ?? (profile ? sourceForProfile(profile) : nativeConnectionSource(agent, id));
+    const groupModels = catalogs[id]?.data ?? (profile ? profileModels(profile) : id === '@official' && agent === 'codex' ? officialModels : officialProfile ? profileModels(officialProfile) : []);
     return { id, source: groupSource, options: optionsFor(groupModels, groupSource, id, false, '') };
   }).filter(g => g.id === currentGroupId || g.options.length > 0);
 }

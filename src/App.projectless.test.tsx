@@ -1005,6 +1005,26 @@ it('waits for hosted-route capacity and never substitutes the publisher window w
   await act(async () => notify({method:'thread/tokenUsage/updated',params:{threadId:'native-context',turnId:'turn-context',tokenUsage:{total:{},last:{},contextTokens:96000,modelContextWindow:160000,cumulative:false}}}));
   expect(container.querySelector('.usage-trigger')?.textContent).toBe('上下文 60%');
 });
+it('automatically refreshes a selected Magpie catalog on every opening without changing the chosen model', async () => {
+  const profile = { id:'magpie:claude', agent:'claude', name:'Magpie', providerId:'magpie', model:'saved-model', models:['saved-model'], current:true, hasCredential:true };
+  data.profiles = [profile];
+  const source = { providerId:'magpie', providerName:'Magpie', mark:'M', available:true };
+  let ids = ['saved-model'];
+  const fallback = vi.mocked(call).getMockImplementation()!;
+  vi.mocked(call).mockImplementation(async (command,args) => command==='get_model_source' ? source : command==='list_models' ? {data:ids.map(model=>({id:model,model,displayName:model,isDefault:model==='saved-model'})),source} : fallback(command,args));
+  await render();
+  ids = ['saved-model','new-model'];
+  await act(async () => container.querySelector<HTMLButtonElement>('[aria-label="选择模型"]')!.click());
+  expect(container.querySelector('.model-menu-scroll')?.textContent).toContain('new-model');
+  expect(call).toHaveBeenCalledWith('list_models', {agent:'claude',sessionId:null,connectionId:profile.id,forceRefresh:true});
+  await act(async () => container.querySelector<HTMLButtonElement>('[aria-label="关闭模型选择"]')!.click());
+  ids.push('another-new-model');
+  await act(async () => container.querySelector<HTMLButtonElement>('[aria-label="选择模型"]')!.click());
+  expect(container.querySelector('.model-menu-scroll')?.textContent).toContain('another-new-model');
+  expect(container.querySelector('.model-chip-name')?.textContent).toBe('saved-model');
+  expect(vi.mocked(call).mock.calls.filter(([command])=>command==='list_models')).toHaveLength(3);
+  expect(call).not.toHaveBeenCalledWith('switch_session_model',expect.anything());
+});
 it('loads official models locally on startup, reuses the result, and explicitly refreshes without a CLI', async () => {
   localStorage.setItem('supercode.session','official-chat');
   const official = { id:'official', agent:'codex', name:'ChatGPT', officialAccount:true, model:'old', models:['old','older','oldest'], current:true, hasCredential:false };

@@ -2,6 +2,7 @@ import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { Check, ChevronDown, LoaderCircle, MessageSquare, Plus, RefreshCw, Search, SlidersHorizontal, X } from 'lucide-react';
 import { call, desktop } from './api';
 import { magpieGatewayText, useMagpieGateway } from './useMagpieGateway';
+import { useMagpieCatalogs } from './useMagpieCatalogs';
 import { filterModelGroups, isKimiSource, modelGroups, sourceLabel, type ModelOption } from './modelPicker';
 import type { AgentProfile, Model, ModelSource } from './types';
 import { useFloatingLayer } from './useFloatingLayer';
@@ -81,8 +82,9 @@ export function ModelMenu({ value, models, catalogLoaded, catalogWarning, profil
   const searchInput = useRef<HTMLInputElement>(null);
   const popover = useRef<HTMLDivElement>(null);
   const note = useRef<HTMLDivElement>(null);
-  const groups = useMemo(() => modelGroups({ value, models, catalogLoaded, profiles, activeProfile, source, agent, connectionId, order, loggedInAgents }), [value, models, catalogLoaded, profiles, activeProfile, source, agent, connectionId, order, loggedInAgents]);
   const currentId = connectionId ?? activeProfile?.id ?? '';
+  const { catalogs, loading: loadingMagpie, warning: magpieWarning, refresh: refreshMagpie } = useMagpieCatalogs(open, agent, currentId, profiles);
+  const groups = useMemo(() => modelGroups({ value, models, catalogLoaded, catalogs, profiles, activeProfile, source, agent, connectionId, order, loggedInAgents }), [value, models, catalogLoaded, catalogs, profiles, activeProfile, source, agent, connectionId, order, loggedInAgents]);
   const magpieCurrent = profiles.find(profile => profile.agent === agent && profile.id === currentId && (profile.providerId === 'magpie' || profile.modelSource?.providerId === 'magpie' || source?.providerId === 'magpie'));
   const magpieGateway = useMagpieGateway(open && !!magpieCurrent, agent, magpieCurrent?.id);
   const currentGroup = groups.find(g => g.id === currentId || g.options.some(option => option.connectionId === currentId));
@@ -180,7 +182,7 @@ export function ModelMenu({ value, models, catalogLoaded, catalogWarning, profil
   return <div className="composer-menu-anchor" ref={anchor}>
     <button ref={trigger} type="button" className="composer-chip model-chip" aria-label={needsProvider ? '添加模型供应商' : '选择模型'} aria-haspopup={needsProvider ? undefined : 'dialog'} aria-expanded={open} disabled={busy}
       title={[selectedName, selectedSource && sourceLabel(selectedSource), selected && `模型 ID：${selected.model}`, effortName && `推理强度：${effortName}${!effort && effectiveEffort ? '（默认）' : ''}`].filter(Boolean).join('\n')}
-      onClick={() => { if (needsProvider) { manage(); return; } setOpen(v => !v); setSearch(''); setFilter(null); pendingFocus.current = null; setPage(Math.floor(Math.max(0, groups.flatMap(group => group.options).findIndex(option => option.selected)) / MODEL_PAGE_SIZE)); if (!open && desktop && !loading && (officialCodex || !models.length)) reload(); }}>
+      onClick={() => { if (needsProvider) { manage(); return; } setOpen(v => !v); setSearch(''); setFilter(null); pendingFocus.current = null; setPage(Math.floor(Math.max(0, groups.flatMap(group => group.options).findIndex(option => option.selected)) / MODEL_PAGE_SIZE)); if (!open && desktop && !loading && (magpieCurrent || officialCodex || !models.length)) reload(magpieCurrent ? true : undefined); }}>
       {selectedSource?.mark ? <span className="model-provider-mark" aria-hidden="true"><ProviderIcon provider={selectedSource.providerId} name={selectedSource.connectionName || selectedSource.providerName} mark={selectedSource.mark}/></span> : null}
       <span className="model-chip-name">{selectedName}</span>
       {effortName ? <span className="model-chip-effort" title={`推理强度：${effortName}`}>{effortName}</span> : null}
@@ -191,7 +193,7 @@ export function ModelMenu({ value, models, catalogLoaded, catalogWarning, profil
       <div className="model-menu-heading"><h2>选择模型</h2><span title={selectedName}>{selectedName}</span><button type="button" className="icon-button" aria-label="关闭模型选择" onClick={() => close(true)}><X size={15}/></button></div>
       <div className="model-picker-search search-field">
         <Search size={15}/><input ref={searchInput} aria-label="搜索模型菜单" placeholder="搜索模型或供应商" value={search} onChange={e => { setSearch(e.target.value); setPage(0); pendingFocus.current = null; }} />
-        <button type="button" className="icon-button" aria-label="刷新模型" title="刷新模型" disabled={loading || busy || !desktop} onClick={() => reload(true)}>{loading ? <LoaderCircle size={15} className="spin" /> : <RefreshCw size={15} />}</button>
+        <button type="button" className="icon-button" aria-label="刷新模型" title="刷新模型" disabled={loading || loadingMagpie || busy || !desktop} onClick={() => { reload(true); refreshMagpie(); }}>{loading || loadingMagpie ? <LoaderCircle size={15} className="spin" /> : <RefreshCw size={15} />}</button>
       </div>
       {available.length > 1 ? <div className="model-provider-filters" role="group" aria-label="按供应商筛选">
         <button type="button" aria-pressed={filter === null} onClick={() => { setFilter(null); setPage(0); }}>全部</button>
@@ -213,6 +215,7 @@ export function ModelMenu({ value, models, catalogLoaded, catalogWarning, profil
       <div className="model-menu-footer">
         {visible.some(group => group.source.providerId === 'magpie') ? <p className="model-catalog-warning magpie-gateway-status" role="status" data-state={magpieGateway}>{magpieGatewayText(magpieGateway)}</p> : null}
         {catalogWarning ? <p className="model-catalog-warning" role="status">{catalogWarning}</p> : null}
+        {magpieWarning ? <p className="model-catalog-warning" role="status">{magpieWarning}</p> : null}
         {selected && contextVariants.length > 1 ? <ModelSetting label="上下文" value={selected.model} options={contextVariants.map(id => ({ value: id, label: /\[1m\]$/i.test(id) ? '1M' : '默认' }))} choose={model => void choose({ ...selected, model, defaultReasoningEffort: effort })}/> : null}
         {efforts.length ? <ModelSetting label="推理强度" value={effort} options={[{ value: '', label: '默认' }, ...efforts.map(value => ({ value, label: effortLabels[value] ?? value }))]} choose={setEffort}/> : null}
         <div className="model-menu-actions">
