@@ -16,24 +16,34 @@ pub async fn summarize(
     app: &AppHandle,
     session: &Session,
     route: &Route,
+    model: &str,
     input: &str,
 ) -> Result<String, String> {
+    let session = summary_session(session, route, model);
     crate::runtime_diagnostics::register_secrets(app, &route.config);
     let started = std::time::Instant::now();
     crate::runtime_diagnostics::record(
         app,
         Some(&session.id),
         "context_summary_started",
-        json!({"source":session.agent,"model":session.model,"inputBytes":input.len()}),
+        json!({"source":session.agent,"model":session.model,"connectionId":route.id,"inputBytes":input.len()}),
     );
-    let result = text_only(app, session, route, input, INSTRUCTIONS, "handoff").await;
+    let result = text_only(app, &session, route, input, INSTRUCTIONS, "handoff").await;
     crate::runtime_diagnostics::record(
         app,
         Some(&session.id),
         "context_summary_finished",
         json!({"source":session.agent,"status":if result.is_ok(){"completed"}else{"failed"},"durationMs":started.elapsed().as_millis() as u64,"error":result.as_ref().err()}),
     );
-    result.map_err(|e| format!("上下文压缩失败，仍使用原模型：{e}"))
+    result.map_err(|e| format!("上下文压缩失败，聊天记录未改动：{e}"))
+}
+
+fn summary_session(session: &Session, route: &Route, model: &str) -> Session {
+    let mut target = session.clone();
+    target.model = Some(model.into());
+    target.connection_id = Some(route.id.clone());
+    target.native_id = None;
+    target
 }
 
 // An isolated, tools-disabled generation. Never resume or write the chat thread.
@@ -144,7 +154,7 @@ async fn claude_summary(
         };
         let (_, value) = tokio::try_join!(write, read_claude_summary(stdout, &progress))?;
         let status = child.wait().await.map_err(|_|"压缩进程状态异常")?;
-        if !status.success() { return Err("原供应商无法完成压缩，请检查连接或稍后重试".into()); }
+        if !status.success() { return Err("所选模型无法完成压缩，请检查连接".into()); }
         let summary = validate_summary(value["result"].as_str().unwrap_or(""))?;
         let usage = &value["usage"];
         let tokens = usage["input_tokens"].as_u64().unwrap_or(0) + usage["output_tokens"].as_u64().unwrap_or(0);
@@ -189,7 +199,7 @@ async fn read_claude_summary(
                     .and_then(|errors| errors.iter().find_map(Value::as_str))
                     .or_else(|| value["result"].as_str())
                     .filter(|s| !s.trim().is_empty())
-                    .unwrap_or("原供应商无法完成压缩，请检查连接或稍后重试");
+                    .unwrap_or("所选模型无法完成压缩，请检查连接");
                 return Err(protocol::bounded(error, 4096));
             }
             validate_summary(value["result"].as_str().unwrap_or(""))?;
@@ -252,11 +262,25 @@ async fn codex_summary(
     instructions: &str,
     purpose: &str,
 ) -> Result<String, String> {
-    let client = app
-        .state::<AppState>()
-        .runtime
-        .get_for_session(app, Some(&session.id))
-        .await?;
+    // The saved chat still points to the old connection until the summary is
+    // committed. Give the selected connection its own worker rather than
+    // resolving or replacing the original chat's client.
+    let runtime = crate::runtime::Runtime::default();
+    let result = codex_summary_with_runtime(&runtime, session, route, input, app, instructions, purpose).await;
+    runtime.shutdown().await;
+    result
+}
+
+async fn codex_summary_with_runtime(
+    runtime: &crate::runtime::Runtime,
+    session: &Session,
+    route: &Route,
+    input: &str,
+    app: &AppHandle,
+    instructions: &str,
+    purpose: &str,
+) -> Result<String, String> {
+    let client = runtime.get_for_connection(app, None, Some(&route.id)).await?;
     let project = app.state::<AppState>().store.session_workspace(&session)?;
     let thread = client.request("thread/start",json!({"cwd":project.path,"model":session.model,"modelProvider":route.provider(),"sandbox":"read-only","approvalPolicy":"untrusted","ephemeral":true,"developerInstructions":instructions,"config":{"features.shell_tool":false,"web_search":"disabled"}})).await?;
     let native = thread["thread"]["id"]
@@ -308,7 +332,7 @@ async fn codex_summary(
             } else if fail {
                 Err("压缩请求尝试调用工具或请求审批，切换已取消".into())
             } else if method == "error" || p["turn"]["status"] != "completed" {
-                Err("原供应商的压缩请求未完成".into())
+                Err("所选模型的压缩请求未完成".into())
             } else {
                 output_buffer
                     .lock()
@@ -382,6 +406,52 @@ fn validate_summary(text: &str) -> Result<String, String> {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn handoff_uses_the_selected_connection_and_model_without_rebinding_the_chat() {
+        for agent in ["claude", "codex", "opencode", "pi", "gemini"] {
+            let store = crate::storage::Store::from_connection(
+                rusqlite::Connection::open_in_memory().unwrap(),
+            ).unwrap();
+            let profile = |id: &str| crate::ccswitch::Profile {
+                id: id.into(), agent: agent.into(), name: id.into(),
+                config: json!({"model":"saved-default","env":{"ANTHROPIC_MODEL":"saved-default"}}),
+            };
+            store.import_profiles(&[profile("exhausted"), profile("available")]).unwrap();
+            let project = store.add_project(std::path::Path::new("D:/handoff-target-test")).unwrap();
+            let session = store.create_configured_session(
+                &project.id, Some("exhausted-model".into()), agent, Some("exhausted"),
+            ).unwrap();
+            store.bind_native(&session.id, "original-native").unwrap();
+            store.save_message("goal", &session.id, "user", "keep my task", "userMessage", &Value::Null).unwrap();
+            let before = store.session(&session.id).unwrap();
+            let route = store.route_for(agent, "available").unwrap();
+            let summary = summary_session(&before, &route, "available-selected-model");
+
+            assert_eq!(summary.model.as_deref(), Some("available-selected-model"), "{agent}");
+            assert_eq!(summary.connection_id.as_deref(), Some("available"), "{agent}");
+            assert!(summary.native_id.is_none(), "{agent}: must not resume the exhausted model's thread");
+            assert_eq!(summary.id, before.id);
+            assert_eq!(summary.project_id, before.project_id);
+            // Codex's worker must resolve the explicit target without the still-old chat binding.
+            assert_eq!(store.route_with_connection(agent, None, summary.connection_id.as_deref()).unwrap().id, "available");
+            if agent == "claude" {
+                assert_eq!(crate::providers::real_claude_model(&route.config, summary.model.as_deref()).as_deref(), Some("available-selected-model"));
+            }
+            let retained = store.session(&session.id).unwrap();
+            assert_eq!(retained.model, before.model);
+            assert_eq!(retained.connection_id, before.connection_id);
+            assert_eq!(retained.native_id, before.native_id);
+            assert_eq!(store.messages(&session.id, None).unwrap().len(), 1);
+
+            // Same-connection manual compaction still uses the current chat model,
+            // even when it differs from the connection's saved default.
+            let current = store.route_for(agent, "exhausted").unwrap();
+            let compact = summary_session(&before, &current, before.model.as_deref().unwrap());
+            assert_eq!(compact.model, before.model);
+            assert_eq!(compact.connection_id, before.connection_id);
+        }
+    }
 
     #[test]
     fn independent_text_prompt_keeps_embedded_instructions_as_json_data() {

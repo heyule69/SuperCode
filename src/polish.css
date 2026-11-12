@@ -205,7 +205,7 @@ input:focus-visible, textarea:focus-visible, select:focus-visible { outline:0; b
 .settings-page-heading h2 { white-space:nowrap; }
 .settings-page-heading > div { flex-shrink:0; }
 .settings-nav button { text-align:left; }
-.settings-modal input:not([type=checkbox]), .settings-modal select, .settings-modal textarea { border-radius:6px; }
+.settings-modal input:not([type=checkbox]):not([type=radio]), .settings-modal select, .settings-modal textarea { border-radius:6px; }
 .settings-modal textarea:focus-visible { border-color:var(--accent); box-shadow:0 0 0 1px var(--accent); }
 .provider-preset:hover, .saved-provider:hover { border-color:var(--line); background:var(--hover); }
 .provider-model-row:hover { background:var(--surface2); }

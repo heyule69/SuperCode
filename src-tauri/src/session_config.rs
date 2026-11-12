@@ -500,9 +500,7 @@ async fn change_session_model(
         let input = state.store.handoff_input(&session_id)?;
         let mode = context_mode(force_compact, previous.id == next.id && previous.config["deleted"] != true, session.native_id.is_some(), input.as_ref().map(|(s,_)|s.as_str()));
         let summary = if mode == "summary" { if let Some((input, seq)) = &input {
-            let mut summarizing = session.clone();
-            let route = if previous.config["deleted"] == true { summarizing.model = Some(model.into()); &next } else { &previous };
-            Some((crate::handoff::summarize(&app,&summarizing,route,input).await?,*seq))
+            Some((crate::handoff::summarize(&app,&session,&next,model,input).await?,*seq))
         } else { None } } else { None };
         let marker = json!({"from":previous.source(&session.agent),"to":next.source(&session.agent),"fromModel":session.model,"toModel":model,"status":"completed","compactOnly":force_compact,"contextMode":mode,"hasHistory":input.is_some()});
         state.store.commit_model_switch(&session,&next,model,summary.as_ref().map(|(s,seq)|(s.as_str(),*seq)),&marker)
