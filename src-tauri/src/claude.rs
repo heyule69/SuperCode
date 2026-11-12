@@ -474,6 +474,7 @@ pub async fn send(
     let mut config = route.config;
     crate::runtime_diagnostics::register_secrets(app, &config);
     let model = crate::providers::real_claude_model(&config, model.as_deref());
+    crate::claude_models::apply(&mut config, model.as_deref())?;
     let signature = json!([
         fingerprint,
         crate::client_features::tool_configuration(app)?,
@@ -530,7 +531,9 @@ pub async fn send(
     }
     let bridge = if config["protocol"] == "chat" {
         let bridge = crate::bridge::Bridge::start(config.clone()).await?;
-        config["env"] = json!({"ANTHROPIC_BASE_URL":bridge.base_url,"ANTHROPIC_AUTH_TOKEN":bridge.token,"ANTHROPIC_MODEL":model,"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC":"1"});
+        config["env"]["ANTHROPIC_BASE_URL"] = json!(bridge.base_url);
+        config["env"]["ANTHROPIC_AUTH_TOKEN"] = json!(bridge.token);
+        config["env"]["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] = json!("1");
         Some(bridge)
     } else {
         None
@@ -616,6 +619,7 @@ pub async fn send(
     command.env("SUPERCODE_SESSION_ID", &session.id);
     crate::managed_services::configure(&mut command, app, Some(&session.id));
     command.env("CLAUDE_CODE_SDK_READS_SESSION_STATE", "1");
+    command.env("CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST", "1");
     let mut child = command
         .current_dir(cwd)
         .stdin(std::process::Stdio::piped())

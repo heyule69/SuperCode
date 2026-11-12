@@ -10,6 +10,7 @@ import { agentProtocols, officialProvider, protocolLabels, providersForAgent } f
 import OfficialAccounts from './OfficialAccounts';
 import { ModelPagination, pageModels } from './ModelPagination';
 import { MagpieMenu } from './MagpieMenu';
+import { ClaudeModelMapping } from './ClaudeModelMapping';
 const providers = catalog as Provider[];
 const CCSwitchSettings = lazy(() => import('./CCSwitchSettings'));
 const blank: Config = { id: null, name: '', agent: 'claude', providerId: 'custom', plan: 'anthropic', protocol: 'anthropic', baseUrl: '', model: '', models: [], hasCredential: false };
@@ -24,6 +25,8 @@ export default function ProviderSettings({ profiles, officialAgents, order, runn
   const [managingAccounts, setManagingAccounts] = useState(false);
   const [importing, setImporting] = useState(false);
   const [agentTab, setAgentTab] = useState(initialAgent);
+  const [mappingProfile, setMappingProfile] = useState<AgentProfile | null>(null);
+  useEffect(() => { setMappingProfile(null); }, [agentTab, adding, importing, managingAccounts]);
   const [nativeId, setNativeId] = useState<string | null>(null);
   const [dragId, setDragId] = useState('');
   const [dropTarget, setDropTarget] = useState<{ id: string; edge: 'before' | 'after' } | null>(null);
@@ -197,7 +200,7 @@ export default function ProviderSettings({ profiles, officialAgents, order, runn
     <div className="provider-tabs" role="tablist" aria-label="按 Agent 分类">{providerAgents.map(a => <button key={a.id} role="tab" id={`providers-${a.id}-tab`} aria-controls="provider-connections" aria-selected={agentTab === a.id} className={agentTab === a.id ? 'selected' : ''} disabled={working || managingAccounts} onClick={() => { setAgentTab(a.id); setConfig(null); setNativeId(null); setConnectionSearch(''); setSearch(''); setMessage(''); setSelectedIds([]); setDeleteIds([]); clearDrag(); }}><AgentIcon agent={a.id}/>{a.name}<span>{visibleProviderIds(a.id, profiles, loggedInAgents, order).length}</span></button>)}</div>
     {error ? <p className="cc-error" role="alert">{error}</p> : null}
     {message ? <p className="provider-feedback" role="status"><Check size={15} />{message}</p> : null}
-    <div className="provider-view">{importing ? <Suspense fallback={<p className="muted">加载中…</p>}><CCSwitchSettings agent={agentTab} busy={working} runningConnections={runningConnections} updated={updated} back={() => setImporting(false)} /></Suspense> : managingAccounts ? <OfficialAccounts agent={agentTab} runningConnections={runningConnections} back={() => { setManagingAccounts(false); setAdding(false); }} updated={async resetAgent => { await refreshAccounts(); await updated(resetAgent); }}/> : adding ? <div className="provider-picker">
+    <div className="provider-view">{mappingProfile ? <ClaudeModelMapping key={mappingProfile.id} profile={mappingProfile} busy={working} inUse={!!runningConnections.claude?.includes(mappingProfile.id)} back={() => setMappingProfile(null)} save={mapping => void run(async () => { await call('save_claude_model_mapping', { id: mappingProfile.id, mapping }); await updated(); setMessage('Claude 模型映射已保存，从下一次发送生效。'); })}/> : importing ? <Suspense fallback={<p className="muted">加载中…</p>}><CCSwitchSettings agent={agentTab} busy={working} runningConnections={runningConnections} updated={updated} back={() => setImporting(false)} /></Suspense> : managingAccounts ? <OfficialAccounts agent={agentTab} runningConnections={runningConnections} back={() => { setManagingAccounts(false); setAdding(false); }} updated={async resetAgent => { await refreshAccounts(); await updated(resetAgent); }}/> : adding ? <div className="provider-picker">
       <div className="provider-picker-heading"><h3>添加 {providerAgents.find(a => a.id === agentTab)?.name} 连接</h3><button className="quiet-button" disabled={working} onClick={() => setAdding(false)}><ArrowLeft size={15} />返回</button></div>
       {official ? <div className="provider-official-section"><h4>官方账号</h4><button className="provider-preset official-login-card" disabled={working || !desktop} onClick={() => { setManagingAccounts(true); setAdding(false); setError(''); setMessage(''); }}><span className={`provider-mark mark-${official.id}`}><ProviderIcon provider={official.id}/></span><span><strong>{official.name}</strong><small>浏览器登录 · 支持多个账号</small></span><ChevronRight size={16}/></button></div> : null}
       <div className="provider-api-heading"><h4>{official ? '第三方 / API 连接' : 'API 连接'}</h4><span>{agentProtocols[agentTab].map(id => protocolLabels[id]).join(' / ')}</span></div>
@@ -246,6 +249,7 @@ export default function ProviderSettings({ profiles, officialAgents, order, runn
             const inUse = p.source === 'magpie' ? magpieBusy : !!runningConnections[p.agent]?.includes(id);
             return <div className="provider-sort-row magpie-managed-row" key={`${agentTab}:${id}`} data-connection-id={id} data-managed="magpie">
               <div className="saved-provider"><span className="provider-mark mark-magpie"><ProviderIcon provider="magpie"/></span><span><strong>{name}<span className="magpie-managed-badge">Magpie 管理</span></strong><small>{p.models?.length ?? 0} 个模型 · 供应商与模型由 Magpie 管理</small></span>{isDefault ? <span className="connection-state enabled">新聊天默认</span> : null}{inUse ? <span className="connection-state">任务使用中</span> : null}</div>
+              {p.agent === 'claude' ? <button className="quiet-button provider-mapping-button" disabled={!desktop || working} aria-label={`配置 ${name} 的 Claude 模型映射`} onClick={() => setMappingProfile(p)}>模型映射</button> : null}
               <button className="quiet-button magpie-remove" disabled={!desktop || working || inUse} title={inUse ? 'Magpie 连接正被任务使用，完成或停止后可移除' : '只移除 SuperCode 中的连接，保留 Magpie 与聊天记录'} aria-label={`移除 ${name}`} onClick={() => void run(() => removeMagpie(p))}>移除</button>
             </div>;
           }
@@ -260,6 +264,7 @@ export default function ProviderSettings({ profiles, officialAgents, order, runn
               <span className={`provider-mark mark-${p?.providerId ?? native.providerId}`}>{id === '@local' ? <AgentIcon agent={agentTab}/> : <ProviderIcon provider={p?.officialAccount ? (agentTab === 'claude' ? 'anthropic' : 'openai') : p?.modelSource?.providerId ?? p?.providerId ?? native.providerId} name={name} mark={p?.modelSource?.mark ?? p?.name.slice(0, 1).toUpperCase() ?? native.mark}/>}</span>
               <span><strong>{name}</strong><small>{subtitle}</small></span><span className={`connection-state ${isDefault ? 'enabled' : ''}`}>{isDefault ? '新聊天默认' : p ? p.officialAccount ? '官方登录' : p.hasCredential ? '已配置' : '未保存密钥' : '本机登录'}</span>{runningConnections[agentTab]?.includes(id) ? <span className="connection-state">任务使用中</span> : null}<ChevronRight size={16}/>
             </button>
+            {p && p.agent === 'claude' && !p.officialAccount ? <button type="button" className="quiet-button provider-mapping-button" disabled={!desktop || working} aria-label={`配置 ${name} 的 Claude 模型映射`} onClick={() => setMappingProfile(p)}>模型映射</button> : null}
             <div className="provider-order-actions"><button type="button" className="icon-button" aria-label={`上移 ${name}`} title="上移" disabled={sortingDisabled || index === 0} onClick={() => move(id, -1)}><ArrowUp size={14}/></button><button type="button" className="icon-button" aria-label={`下移 ${name}`} title="下移" disabled={sortingDisabled || index === ids.length - 1} onClick={() => move(id, 1)}><ArrowDown size={14}/></button></div>
             {p && !p.officialAccount ? <button type="button" className="icon-button provider-row-delete" aria-label={`删除 ${name}`} title={canDelete(id) ? `删除 ${name}` : '任务使用中的连接暂时不能删除'} disabled={!desktop || working || !canDelete(id)} onClick={() => setDeleteIds([id])}><Trash2 size={15}/></button> : null}
           </div>;

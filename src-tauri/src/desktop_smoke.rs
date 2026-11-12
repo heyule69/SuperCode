@@ -3,7 +3,7 @@
 use crate::{desktop_lifecycle, tray_popup, AppState};
 use serde_json::json;
 use std::time::Duration;
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Emitter, Manager};
 
 pub async fn run(app: AppHandle) {
     if std::env::args().any(|arg| arg == "--tray-hover-test") {
@@ -17,7 +17,8 @@ pub async fn run(app: AppHandle) {
         app.exit(0);
         return;
     }
-    let result = verify(&app).await;
+    let badge_test = std::env::args().any(|arg| arg == "--taskbar-badge-test");
+    let result = if badge_test { verify_badge(&app).await } else { verify(&app).await };
     let report = match result {
         Ok(value) => json!({"ok":true,"result":value}),
         Err(error) => json!({"ok":false,"error":error}),
@@ -27,7 +28,7 @@ pub async fn run(app: AppHandle) {
         .join(".supercode");
     let _ = std::fs::create_dir_all(&root);
     let _ = std::fs::write(
-        root.join("desktop-smoke-report.json"),
+        root.join(if badge_test { "taskbar-badge-smoke-report.json" } else { "desktop-smoke-report.json" }),
         serde_json::to_vec_pretty(&report).unwrap_or_default(),
     );
     println!("{report}");
@@ -39,6 +40,54 @@ pub async fn run(app: AppHandle) {
     } else {
         app.exit(1);
     }
+}
+
+async fn badge_count(app: &AppHandle, expected: usize) -> Result<(), String> {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while crate::taskbar_badge::applied_count(app) != Some(expected) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }).await.map_err(|_| format!("任务栏角标未更新为 {expected}"))
+}
+
+async fn verify_badge(app: &AppHandle) -> Result<serde_json::Value, String> {
+    let main = app.get_webview_window("main").ok_or("主窗口不存在")?;
+    main.show().map_err(|error| error.to_string())?;
+    main.minimize().map_err(|error| error.to_string())?;
+    badge_count(app, 0).await?;
+    let state = app.state::<AppState>();
+    let mut tasks = Vec::new();
+    for index in 0..3 {
+        let chat = state.store.create_projectless_session(&state.data_dir.join("chats"), None, "codex", None)?;
+        state.store.set_status(&chat.id, "running", Some("badge-fixture"))?;
+        state.store.complete_turn(&chat.id, "badge-fixture", "completed")?;
+        tasks.push(chat.id);
+        app.emit("workspace-updated", ()).map_err(|error| error.to_string())?;
+        badge_count(app, index + 1).await?;
+    }
+    #[cfg(windows)]
+    for count in [1, 2, 3, 12, 100] {
+        let icon = crate::taskbar_badge::badge_icon(count)?;
+        image::save_buffer(state.data_dir.join(format!("taskbar-badge-{count}.png")), icon.rgba(), icon.width(), icon.height(), image::ColorType::Rgba8)
+            .map_err(|error| error.to_string())?;
+    }
+    if std::env::args().any(|arg| arg == "--badge-preview") {
+        tokio::time::sleep(Duration::from_secs(40)).await;
+    }
+    for (index, id) in tasks.iter().enumerate() {
+        if !state.store.mark_session_read(id, 0)? { return Err("角标测试未能标记已读".into()); }
+        app.emit("workspace-updated", ()).map_err(|error| error.to_string())?;
+        badge_count(app, 2 - index).await?;
+    }
+    let archived = state.store.create_projectless_session(&state.data_dir.join("chats"), None, "codex", None)?;
+    state.store.set_status(&archived.id, "running", Some("archive-fixture"))?;
+    state.store.complete_turn(&archived.id, "archive-fixture", "completed")?;
+    app.emit("workspace-updated", ()).map_err(|error| error.to_string())?;
+    badge_count(app, 1).await?;
+    state.store.archive(&archived.id)?;
+    app.emit("workspace-updated", ()).map_err(|error| error.to_string())?;
+    badge_count(app, 0).await?;
+    Ok(json!({"taskbarBadge":true,"automaticEventUpdates":true,"completionCounts":[0,1,2,3],"readingCounts":[2,1,0],"archiveClearsBadge":true,"dataDirectory":state.data_dir,"fixtureOnly":true}))
 }
 
 async fn hover_fixture(app: &AppHandle) -> Result<(), String> {

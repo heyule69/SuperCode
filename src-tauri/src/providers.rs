@@ -708,6 +708,14 @@ pub(crate) fn make_profile(mut s: Settings, previous: Option<&Profile>) -> Resul
     } else {
         config["apiKey"] = json!(secret);
     }
+    if s.agent == "claude" {
+        if let Some(previous) = previous.filter(|profile| {
+            profile.agent == "claude" && settings(profile).protocol == s.protocol
+                && configured_base_url(&profile.config).as_deref().and_then(|url| api_base(url, &s.protocol).ok()).as_deref() == Some(request_base.as_str())
+        }) {
+            crate::claude_models::preserve(&mut config, previous)?;
+        }
+    }
     if s.agent == "codex" {
         let mut table = toml::Table::new();
         table.insert("model".into(), toml::Value::String(s.model.clone()));
@@ -1294,6 +1302,8 @@ async fn test_claude_plan(
     launch: &crate::agents::Launch,
 ) -> Result<Value, String> {
     let model = real_claude_model(&profile.config, None).ok_or("请填写模型 ID")?;
+    let mut config = profile.config.clone();
+    crate::claude_models::apply(&mut config, Some(&model))?;
     let mut cmd = launch.command(&[
         "--print",
         "--output-format",
@@ -1319,17 +1329,19 @@ async fn test_claude_plan(
         "ANTHROPIC_DEFAULT_SONNET_MODEL",
         "ANTHROPIC_DEFAULT_HAIKU_MODEL",
         "ANTHROPIC_SMALL_FAST_MODEL",
+        "CLAUDE_CODE_SUBAGENT_MODEL",
+        "CLAUDE_CODE_SUBAGENT_MODEL_FORCE",
     ] {
         cmd.env_remove(key);
     }
-    if let Some(env) = profile.config["env"].as_object() {
+    if let Some(env) = config["env"].as_object() {
         for (k, v) in env {
             if let Some(v) = v.as_str() {
                 cmd.env(k, v);
             }
         }
     }
-    let context = crate::model_context::configure_claude(&mut cmd, &profile.config, Some(&model));
+    let context = crate::model_context::configure_claude(&mut cmd, &config, Some(&model));
     if let Some(launch_model) = context.launch_model {
         cmd.args(["--model", &launch_model]);
     }

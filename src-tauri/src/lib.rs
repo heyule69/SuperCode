@@ -22,6 +22,7 @@ mod ccswitch;
 mod chat_connection;
 mod claude;
 mod claude_connection;
+mod claude_models;
 mod claude_tasks;
 mod client_features;
 mod commands;
@@ -81,6 +82,7 @@ mod smoke;
 mod storage;
 mod startup_data;
 mod tray_popup;
+mod taskbar_badge;
 mod ui_recovery;
 mod usage_tokens;
 mod window_state;
@@ -142,7 +144,7 @@ pub fn run() {
         return;
     }
     let desktop_test = std::env::args()
-        .any(|arg| matches!(arg.as_str(), "--desktop-smoke-test" | "--tray-hover-test"));
+        .any(|arg| matches!(arg.as_str(), "--desktop-smoke-test" | "--tray-hover-test" | "--taskbar-badge-test"));
     let desktop_control_test = std::env::args().any(|arg| arg == "--desktop-control-test");
     let browser_test = std::env::args().any(|arg| arg == "--browser-smoke-test");
     let browser_viewport_test = std::env::args().any(|arg| arg == "--browser-viewport-test");
@@ -246,6 +248,7 @@ pub fn run() {
         .manage(ui_recovery::UiRecovery::default())
         .manage(runtime_diagnostics::Diagnostics::default())
         .manage(desktop_lifecycle::DesktopLifecycle::default())
+        .manage(taskbar_badge::TaskbarBadge::default())
         .manage(desktop_control::DesktopControl::default())
         .manage(browser::Browser::default())
         .manage(tray_popup::TrayPopup::default())
@@ -290,6 +293,7 @@ pub fn run() {
                 artifact_snapshots: std::sync::Mutex::new(artifacts::Tracker::default()),
             });
             runtime_diagnostics::record(app.handle(), None, "app_started", serde_json::json!({}));
+            taskbar_badge::install(app.handle());
             if let Err(error) = managed_services::initialize(app.handle(), &dir) {
                 runtime_diagnostics::message(app.handle(), None, "services", "error", "service_host_unavailable", &error);
             }
@@ -474,6 +478,8 @@ pub fn run() {
             magpie::remove_magpie,
             connection_order::reorder_provider_connections,
             providers::fetch_provider_models,
+            claude_models::get_claude_model_mapping,
+            claude_models::save_claude_model_mapping,
             providers::fetch_provider_models_for_settings,
             providers::test_provider_connection,
             accounts::official_account_status,

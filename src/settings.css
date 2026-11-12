@@ -179,6 +179,17 @@
 .magpie-managed-row .saved-provider strong { display: flex; align-items: center; flex-wrap: wrap; gap: 7px; }
 .magpie-managed-badge { display: inline-block; font-size: 10px; font-weight: 400; padding: 2px 6px; color: var(--muted); border: 1px solid var(--line); border-radius: 4px; line-height: 1.4; }
 .magpie-remove { flex-shrink: 0; margin: 0 8px; }
+.provider-mapping-button { flex-shrink: 0; font-size: 11px; }
+.claude-model-mapping { max-width: 850px; overflow-y: auto; padding-right: 8px; }
+.claude-model-mapping fieldset { margin: 16px 0; padding: 16px; border: 1px solid var(--line); border-radius: 8px; min-width: 0; }
+.claude-model-mapping legend { padding: 0 6px; font-size: 12px; }
+.claude-mapping-mode { display: flex; flex-wrap: wrap; gap: 14px 24px; }
+.claude-mapping-mode label,.claude-mapping-force { display: flex; align-items: center; gap: 8px; font-size: 12px; }
+.claude-mapping-fields { display: flex; flex-direction: column; gap: 12px; }
+.claude-mapping-row { display: grid; grid-template-columns: 180px minmax(0,1fr); align-items: center; gap: 12px; }
+.claude-mapping-row label { font-size: 12px; }
+.claude-model-mapping .provider-plan-help { line-height: 1.7; font-size: 12px; color: var(--muted); }
+@media (max-width: 760px) { .claude-mapping-row { grid-template-columns: 1fr; gap: 6px; } }
 .provider-account-controls p { font-size: 12px; line-height: 1.7; margin: 0 0 12px; }
 @media (max-width: 760px) {
   .provider-sort-row .saved-provider { gap: 9px; flex-wrap: wrap; }

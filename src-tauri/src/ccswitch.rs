@@ -222,6 +222,8 @@ fn claude_env(raw: &Value) -> Value {
                                 "MAX_THINKING_TOKENS",
                                 "CLAUDE_CODE_MAX_OUTPUT_TOKENS",
                                 "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS",
+                                "CLAUDE_CODE_SUBAGENT_MODEL",
+                                "CLAUDE_CODE_SUBAGENT_MODEL_FORCE",
                             ]
                             .contains(&k.as_str()))
                 })

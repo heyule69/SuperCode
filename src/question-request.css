@@ -39,18 +39,24 @@
 .question-request-option-arrow { align-self: center; margin-left: auto; flex-shrink: 0; color: var(--muted); opacity: 0; }
 .question-request-option:hover .question-request-option-arrow, .question-request-option:focus-visible .question-request-option-arrow { opacity: 1; }
 .question-request-footer { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 10px; margin-top: 10px; }
-.question-request-custom { display: flex; align-items: flex-start; gap: 8px; flex: 1 1 160px; min-width: 0; padding: 5px 0; color: var(--muted); }
+.question-request-footer.has-custom-answer { gap: 6px; padding: 5px; border: 1px solid var(--composer-line, var(--line)); border-radius: 16px; background: var(--surface); transition: border-color 120ms, box-shadow 120ms; }
+.question-request-footer.has-custom-answer:focus-within { border-color: color-mix(in srgb, var(--text) 32%, transparent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--text) 5%, transparent); }
+.question-request-custom { display: flex; align-items: flex-start; gap: 9px; flex: 1 1 160px; min-width: 0; min-height: 36px; padding: 7px 8px; color: var(--muted); cursor: text; }
 .question-request-custom > svg { margin-top: 3px; flex-shrink: 0; }
-.question-request-custom textarea { width: 100%; min-height: 22px; max-height: 72px; resize: none; background: transparent; border: 0; padding: 0; margin: 0; line-height: 22px; font-size: inherit; overflow-y: auto; }
-.question-request-custom textarea::placeholder { color: var(--muted); opacity: .75; }
-.question-request-custom textarea:focus-visible { outline-offset: 5px; border-radius: 2px; }
+.question-request-custom textarea { flex: 1; width: 100%; min-width: 0; min-height: 22px; max-height: 72px; resize: none; background: transparent; border: 0; border-radius: 0; outline: none; box-shadow: none; padding: 0; margin: 0; color: var(--text); caret-color: var(--text); font: inherit; line-height: 22px; overflow-y: auto; }
+.question-request-custom textarea::placeholder { color: var(--muted); opacity: .85; }
+.question-request-custom textarea:focus-visible { outline: none; box-shadow: none; }
+.question-request-custom textarea:disabled { cursor: default; opacity: .6; }
 .question-request-footer-space { flex: 1; }
 .question-request-actions { display: flex; align-items: center; gap: 6px; flex-shrink: 0; margin-left: auto; }
-.question-request-actions > button { min-height: 32px; padding: 5px 12px; border-radius: 18px; font-size: 12px; font-weight: 550; white-space: nowrap; }
+.question-request-actions > button { min-height: 36px; padding: 6px 14px; border-radius: 12px; font-size: 12px; font-weight: 550; white-space: nowrap; }
+.question-request-actions > button:focus-visible { outline-offset: 1px; }
 .question-request-actions .question-request-back { display: grid; place-items: center; min-width: 32px; padding: 5px; color: var(--muted); background: transparent; }
 .question-request-skip { border: 1px solid color-mix(in srgb, var(--muted) 25%, transparent); background: transparent; }
+.has-custom-answer .question-request-skip { border-color: transparent; color: var(--muted); }
 .question-request-skip:hover { background: var(--hover); }
 .question-request-send { background: var(--text); color: var(--bg); }
+.question-request-send:hover:not(:disabled) { background: color-mix(in srgb, var(--text) 86%, var(--bg)); }
 .question-request-send[hidden] { display:none; }
 .question-request-send:disabled { background: color-mix(in srgb, var(--text) 24%, transparent); color: var(--text); opacity: .65; }
 .question-request-error { color: var(--danger); font-size: 12px; line-height: 1.6; margin: 12px 0 0; overflow-wrap: anywhere; }

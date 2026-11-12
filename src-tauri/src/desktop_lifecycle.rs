@@ -150,6 +150,7 @@ fn menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
 }
 
 pub fn refresh(app: &AppHandle) {
+    crate::taskbar_badge::refresh(app);
     let Some(state) = app.try_state::<DesktopLifecycle>() else {
         return;
     };

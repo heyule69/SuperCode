@@ -16,6 +16,17 @@ const trigger=()=>node.querySelector<HTMLButtonElement>('button[aria-label="Magp
 async function render(profiles:AgentProfile[]=[existing],updated: (agent?:string,prefer?:boolean)=>Promise<void>=async()=>{},runningConnections:Record<string,string[]>={}){await act(async()=>root.render(<ProviderSettings profiles={profiles} officialAgents={[]} runningConnections={runningConnections} updated={updated}/>))}
 beforeEach(()=>{(globalThis as any).IS_REACT_ACT_ENVIRONMENT=true;node=document.createElement('div');document.body.append(node);root=createRoot(node);mocks.call.mockReset();mocks.call.mockImplementation(async(command:string)=>command==='list_provider_accounts'?[]:undefined)});
 afterEach(async()=>{await act(async()=>root.unmount());node.remove()});
+it('edits Claude mappings for managed Magpie without editing its gateway or credentials', async () => {
+ const mapping={mode:'follow',sonnet:'',opus:'',haiku:'',fable:'',subagent:'',forceSubagent:false};
+ mocks.call.mockImplementation(async(command:string)=>command==='list_provider_accounts'?[]:command==='get_claude_model_mapping'?mapping:undefined);
+ const updated=vi.fn(async()=>{}); await render([existing,...managed()],updated);
+ await act(async()=>node.querySelector<HTMLButtonElement>('[aria-label="配置 Magpie 的 Claude 模型映射"]')!.click());
+ expect(mocks.call).toHaveBeenCalledWith('get_claude_model_mapping',{id:'magpie:claude'});
+ expect(node.querySelector('#provider-key')).toBeNull(); expect(node.querySelector('#provider-url')).toBeNull();
+ await act(async()=>node.querySelector('form[aria-label="Claude 模型映射"]')!.dispatchEvent(new Event('submit',{bubbles:true,cancelable:true})));
+ expect(mocks.call).toHaveBeenCalledWith('save_claude_model_mapping',{id:'magpie:claude',mapping}); expect(updated).toHaveBeenCalled();
+ expect(mocks.call.mock.calls.some(([command])=>['save_provider_profile','use_magpie'].includes(command))).toBe(false);
+});
 it('distinguishes saved model counts from the current gateway state without auto-launching it', async () => {
  let gateway='offline';mocks.call.mockImplementation(async(command:string)=>command==='list_provider_accounts'?[]:command==='get_magpie_status'?{state:gateway}:undefined);
  await render(managed());await act(async()=>trigger().click());
@@ -50,7 +61,7 @@ it('adds all managed routes without any API form and keeps the full large catalo
  expect(mocks.call).toHaveBeenCalledWith('use_magpie');expect(updated).toHaveBeenCalledWith('claude',true);
  await render([existing,...all],updated);
  const row=node.querySelector<HTMLElement>('[data-managed="magpie"]')!;expect(row.textContent).toContain('5000 个模型');expect(row.textContent).toContain('Magpie 管理');
- expect(row.querySelectorAll('button')).toHaveLength(1);expect(row.querySelector('button')?.textContent).toBe('移除');expect(row.querySelectorAll('input')).toHaveLength(0);
+ expect(row.querySelectorAll('button')).toHaveLength(2);expect(row.querySelector('[aria-label="移除 Magpie"]')?.textContent).toBe('移除');expect(row.querySelectorAll('input')).toHaveLength(0);
  expect(node.querySelector('#provider-url')).toBeNull();expect(node.querySelector('#provider-key')).toBeNull();expect(node.querySelectorAll('.provider-model-row')).toHaveLength(0);
  expect(mocks.call.mock.calls.some(([c])=>['save_provider_profile','fetch_provider_models_for_settings','get_provider_profile'].includes(c))).toBe(false);
  await act(async()=>trigger().click());expect(menuButton('已添加到 SuperCode').disabled).toBe(true);
@@ -70,7 +81,7 @@ it('protects the entire integration when another Agent is using its managed conn
 it('shows an old Magpie profile as read-only but removes only that legacy route',async()=>{
  const legacy={...managed()[0],id:'legacy-gateway',source:'manual',name:'旧 Magpie'};await render([existing,legacy]);
  const row=node.querySelector<HTMLElement>('[data-managed="magpie"]')!;expect(row.querySelector('.saved-provider')?.tagName).toBe('DIV');expect(row.querySelector('[aria-label*="上移"]')).toBeNull();
- await act(async()=>row.querySelector<HTMLButtonElement>('button')!.click());expect(mocks.call).toHaveBeenCalledWith('delete_provider_profiles',{agent:'claude',ids:['legacy-gateway']});
+ await act(async()=>row.querySelector<HTMLButtonElement>('[aria-label="移除 旧 Magpie"]')!.click());expect(mocks.call).toHaveBeenCalledWith('delete_provider_profiles',{agent:'claude',ids:['legacy-gateway']});
 });
 it('keeps a failed add retryable without opening an API editor or changing suppliers',async()=>{
  mocks.call.mockImplementation(async(command:string)=>{if(command==='use_magpie')throw Error('请先打开 Magpie');return command==='list_provider_accounts'?[]:undefined});const updated=vi.fn(async()=>{});

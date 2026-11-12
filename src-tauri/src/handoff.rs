@@ -82,9 +82,11 @@ async fn claude_summary(
     let launch = crate::agents::resolve(app, "claude")?;
     let mut config = route.config.clone();
     let model = crate::providers::real_claude_model(&config, session.model.as_deref());
+    crate::claude_models::apply(&mut config, model.as_deref())?;
     let _bridge = if config["protocol"] == "chat" {
         let bridge = crate::bridge::Bridge::start(config.clone()).await?;
-        config["env"] = json!({"ANTHROPIC_BASE_URL":bridge.base_url,"ANTHROPIC_AUTH_TOKEN":bridge.token,"ANTHROPIC_MODEL":model});
+        config["env"]["ANTHROPIC_BASE_URL"] = json!(bridge.base_url);
+        config["env"]["ANTHROPIC_AUTH_TOKEN"] = json!(bridge.token);
         Some(bridge)
     } else {
         None

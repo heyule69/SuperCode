@@ -105,7 +105,7 @@ export default function QuestionRequest({ request, respond }: Props) {
       })}</div>
     </div> : <p role="alert" className="question-request-error">Agent 没有提供可回答的问题，可以跳过后继续。</p>}
     {error ? <p className="question-request-error" role="alert">{error}</p> : null}
-    <footer className="question-request-footer">
+    <footer className={`question-request-footer${custom && question ? ' has-custom-answer' : ''}`}>
       {custom && question ? <label className="question-request-custom"><Pencil size={15} aria-hidden="true" />
         <textarea ref={input} rows={1} aria-label={`自定义回答：${question.question}`} disabled={disabled} placeholder="或自行撰写回复" value={answers[question.id] ?? ''} onChange={e => {
           setAnswers(old => ({ ...old, [question.id]: e.target.value }));
