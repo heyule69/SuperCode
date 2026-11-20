@@ -548,6 +548,11 @@ mod tests {
         store.acknowledge_linkage_updates(&root.id,cursor,Some("已说明过的准备状态")).unwrap();
         let restored = Store::from_connection(store.0.into_inner().unwrap()).unwrap();
         restored.acknowledge_linkage_updates(&root.id,cursor,None).unwrap();
+        assert_eq!(restored.session(&worker.id).unwrap().status,"interrupted");
+        // Restart recovery interrupts the old process. Resume execution before
+        // simulating a new native event; a stale process must stay rejected.
+        assert!(!restored.record_linkage_update(&root.id,&worker.id,&message("stale-after-reopen","旧进程消息")).unwrap());
+        restored.set_status(&worker.id,"running",Some("worker-turn")).unwrap();
         let next = progress(&restored,&root,&worker,"next");
         assert!(restored.acknowledge_linkage_updates(&root.id,next,None).is_err());
         assert_eq!(restored.claim_linkage_update(&root.id).unwrap(),Some((1,next)));
