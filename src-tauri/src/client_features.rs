@@ -122,6 +122,11 @@ Answer simple requests directly. Respect an explicit request for silence, minima
 const PROGRESS_REMINDER: &str = "[SuperCode communication preference]\nFor substantial work, send a brief ordinary assistant text update in the user's language before the first tool call and between batches of tool calls. A thinking/reasoning block does not count as a public update. Before a long wait, explain what is running; use background execution and short status checks when supported instead of multi-minute sleep/poll calls. Keep long jobs running and report only verified progress. Respect an explicit request for silence or a strict output-only format.";
 
 pub(crate) fn progress_context(mut content: Vec<Value>) -> Vec<Value> {
+    // Linked roles have their own event-driven communication contract. The
+    // generic pre-tool/polling reminder would create empty wakeups and replies.
+    if content.iter().any(|block| block["type"]=="text" && block["text"].as_str().is_some_and(|text|text.trim_start().starts_with("[SuperCode Agent 联动]"))) {
+        return content;
+    }
     // Resumed native sessions can retain an older system-prompt snapshot.
     // Refresh this small preference with each user turn, preserving the actual
     // request and media; native slash commands must keep their original input.
@@ -140,6 +145,9 @@ pub(crate) fn progress_context(mut content: Vec<Value>) -> Vec<Value> {
 }
 
 pub fn instructions(app: &AppHandle) -> String {
+    instructions_with_progress(app, PROGRESS_GUIDANCE)
+}
+fn instructions_with_progress(app: &AppHandle, progress: &str) -> String {
     let text = app
         .state::<AppState>()
         .store
@@ -149,10 +157,12 @@ pub fn instructions(app: &AppHandle) -> String {
         .unwrap_or_default();
     let tools = automation_instructions(&servers(app).unwrap_or_default());
     let control_policy = crate::control_policy::BASE_GUIDANCE;
-    format!("Read and write every project text file as UTF-8 without BOM. Tell the user before converting non-UTF-8 files.\nYou are running inside the SuperCode graphical desktop app. The conversation supports inline images, video and audio, not just terminal text. Tool image results are displayed automatically. To show a local media file, write ![descriptive caption](<absolute file path>); use an absolute path with spaces inside angle brackets. The same syntax supports video and audio files. Use ordinary Markdown links for files that should only be referenced. Do not open another application or copy screenshots to the desktop merely to make media visible in the conversation. Never claim a media file was shown unless you actually returned the media result or referenced an existing file.\n{ARTIFACT_GUIDANCE}\n{SERVICE_GUIDANCE}\n{PROGRESS_GUIDANCE}\n{control_policy}\n{tools}\n{text}")
+    format!("Read and write every project text file as UTF-8 without BOM. Tell the user before converting non-UTF-8 files.\nYou are running inside the SuperCode graphical desktop app. The conversation supports inline images, video and audio, not just terminal text. Tool image results are displayed automatically. To show a local media file, write ![descriptive caption](<absolute file path>); use an absolute path with spaces inside angle brackets. The same syntax supports video and audio files. Use ordinary Markdown links for files that should only be referenced. Do not open another application or copy screenshots to the desktop merely to make media visible in the conversation. Never claim a media file was shown unless you actually returned the media result or referenced an existing file.\n{ARTIFACT_GUIDANCE}\n{SERVICE_GUIDANCE}\n{progress}\n{control_policy}\n{tools}\n{text}")
 }
 pub fn instructions_for_session(app:&AppHandle,id:Option<&str>)->Result<String,String>{
-    Ok(format!("{}{}",instructions(app),crate::linkage::instructions(app,id)?))
+    let linkage=crate::linkage::instructions(app,id)?;
+    let base=if linkage.is_empty(){instructions(app)}else{instructions_with_progress(app,"Linked communication follows the role contract below. The application monitors execution events; the controller judges and expresses actual progress in its own voice, then can rest while execution continues. The worker reports complete, meaningful stage results and continues work. Do not add generic pre-tool acknowledgements or repeated polling just to keep either model active. Keep reasoning and tool logs in the execution record.")};
+    Ok(format!("{base}{linkage}"))
 }
 
 #[tauri::command]
@@ -703,6 +713,13 @@ mod tests {
         assert!(reminder.contains(SERVICE_REMINDER));
         assert!(reminder.ends_with("[User request follows]"));
         assert!(prepared[0]["text"].as_str().unwrap().contains("Respect an explicit request for silence or a strict output-only format"));
+    }
+    #[test]
+    fn linked_roles_keep_their_event_contract_without_generic_polling_or_pre_tool_reminders() {
+        for role in ["主控", "执行方"] {
+            let content=vec![json!({"type":"text","text":format!("\n[SuperCode Agent 联动]\n{role}的沟通规则")}),json!({"type":"text","text":"完成两项任务"}),json!({"type":"image","source":{"type":"base64","media_type":"image/png","data":"fixture"}})];
+            assert_eq!(progress_context(content.clone()),content);
+        }
     }
     #[test]
     fn progress_context_does_not_wrap_native_commands_or_empty_input() {

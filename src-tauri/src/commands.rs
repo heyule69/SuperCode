@@ -306,6 +306,7 @@ pub async fn send_message(
         None,
         None,
         None,
+        None,
         app,
     )
     .await
@@ -321,6 +322,7 @@ pub async fn send_chat_message(
     attachments: Option<Vec<crate::client_features::Attachment>>,
     effort: Option<String>,
     client_message_id: Option<String>,
+    service_tier: Option<String>,
     app: AppHandle,
 ) -> Result<Session, String> {
     send_chat_message_inner(
@@ -332,6 +334,8 @@ pub async fn send_chat_message(
         attachments,
         effort,
         client_message_id,
+        None,
+        service_tier,
         None,
         app,
     )
@@ -347,6 +351,8 @@ pub(crate) async fn send_chat_message_inner(
     effort: Option<String>,
     client_message_id: Option<String>,
     followup_id: Option<String>,
+    service_tier: Option<String>,
+    internal_review: Option<crate::linkage::ReviewControl>,
     app: AppHandle,
 ) -> Result<Session, String> {
     crate::desktop_lifecycle::ensure_running(&app)?;
@@ -365,6 +371,11 @@ pub(crate) async fn send_chat_message_inner(
     crate::client_features::validate_client_message_id(client_message_id.as_deref())?;
     let state = app.state::<AppState>();
     let session = state.store.session(&session_id)?;
+    if let Some(control)=&internal_review { crate::linkage::validate_review_control(&app,&session_id,control)?; }
+    if service_tier.is_some() {
+        let route = state.store.route(&session.agent, Some(&session_id))?;
+        crate::codex_speed::tier(&session.agent, route.config["official"] == true || route.profile.as_ref().is_some_and(crate::ccswitch::Profile::is_official), service_tier.as_deref())?;
+    }
     crate::chat_connection::check(&app, &session.agent, Some(&session_id), None).await?;
     if session.native_id.is_some()
         && model
@@ -398,6 +409,10 @@ pub(crate) async fn send_chat_message_inner(
     if let Some(id) = client_message_id {
         prepared.metadata["clientMessageId"] = json!(id);
     }
+    if let Some(control)=&internal_review {
+        if let Some(cursor)=control.update_cursor {prepared.metadata["linkageProgress"]=json!({"round":control.round,"cursor":cursor});}
+        else {prepared.metadata["linkageReview"]=json!({"round":control.round});}
+    }
     if effort.as_deref().is_some_and(|v| {
         !matches!(
             v,
@@ -411,10 +426,12 @@ pub(crate) async fn send_chat_message_inner(
         let _ = state.store.set_status(&session_id, "failed", None);
         return Err(error);
     }
-    if let Err(error)=crate::linkage::prepare(&app,&session_id,permission).and_then(|_|crate::linkage::add_prompt(&app,&session_id,&mut prepared)) {
+    let prepare_linkage=if let Some(control)=&internal_review {crate::linkage::prepare_review(&app,&session_id,control,permission)}else{crate::linkage::prepare(&app,&session_id,permission)};
+    if let Err(error)=prepare_linkage.and_then(|_|crate::linkage::add_prompt(&app,&session_id,&mut prepared)) {
         let _=state.store.set_status(&session_id,"failed",None);return Err(error);
     }
     let service_attempt = crate::managed_services::prepare(&app, &session_id, if read_only { "read" } else { permission });
+    let saved_options=(effort.clone(),service_tier.clone());
     let result = send_inner(
         &session_id,
         &text,
@@ -423,9 +440,15 @@ pub(crate) async fn send_chat_message_inner(
         permission,
         prepared,
         effort,
+        service_tier,
         &app,
     )
     .await;
+    if internal_review.is_none() {
+        if let Ok(saved)=&result {
+            if let Err(error)=crate::linkage::remember_controller_options(&app,saved,permission,saved_options.0,saved_options.1){crate::runtime_diagnostics::message(&app,Some(&session_id),"linkage","error","acceptance_options_error",&error);}
+        }
+    }
     if result.is_err() {
         crate::managed_services::failed(&app, &session_id, &service_attempt);
         if state
@@ -447,6 +470,7 @@ async fn send_inner(
     permission: &str,
     mut prepared: crate::client_features::PreparedInput,
     effort: Option<String>,
+    service_tier: Option<String>,
     app: &AppHandle,
 ) -> Result<Session, String> {
     let state = app.state::<AppState>();
@@ -529,6 +553,28 @@ async fn send_inner(
         .runtime
         .get_for_session_context(app, session_id, context)
         .await?;
+    let tier = crate::codex_speed::tier("codex", route.config["official"] == true || route.profile.as_ref().is_some_and(crate::ccswitch::Profile::is_official), service_tier.as_deref())?;
+    if matches!(tier, Some("fast" | "ultrafast")) {
+        let selected_model = model.as_deref().ok_or("请选择模型后再设置速度")?;
+        // Verify with the installed native client only after the user explicitly
+        // selects Fast. Opening the model picker never starts an agent process.
+        let mut cursor = Value::Null;
+        let mut supported = false;
+        let mut model_found = false;
+        for _ in 0..10 {
+            let catalog = client.request("model/list", json!({"cursor":cursor,"limit":100})).await
+                .map_err(|error| format!("无法核对速度支持，请更新 Codex 或选择标准速度：{error}"))?;
+            if let Some(row) = crate::codex_speed::find_model(&catalog, selected_model) {
+                model_found = true;
+                supported = crate::codex_speed::supports(row, tier.unwrap());
+                break;
+            }
+            cursor = catalog["nextCursor"].clone();
+            if cursor.as_str().is_none_or(str::is_empty) { break; }
+        }
+        if !model_found { return Err(crate::codex_speed::missing_model(selected_model)); }
+        if !supported { return Err(format!("当前所选模型未提供{}，请检查账号可用档位或选择其他速度", if tier == Some("ultrafast") { "超快" } else { "Fast" })); }
+    }
     let mode = if read_only { "read" } else { permission };
     let (sandbox, approval, mut policy) = crate::client_features::permission(mode)?;
     let reviewer = crate::client_features::approvals_reviewer(mode);
@@ -580,14 +626,7 @@ async fn send_inner(
     state.store.bind_native(session_id, native)?;
     state.store.set_model(session_id, model.as_deref())?;
     let user_id = crate::client_features::user_message_id(&prepared.metadata);
-    state.store.save_message(
-        &user_id,
-        session_id,
-        "user",
-        text,
-        "userMessage",
-        &prepared.metadata,
-    )?;
+    state.store.save_chat_input(&user_id,session_id,text,&prepared.metadata)?;
     if session.title == "新会话" {
         state
             .store
@@ -623,13 +662,14 @@ async fn send_inner(
     if let Some(collaboration) = collaboration {
         turn["collaborationMode"] = collaboration;
     }
+    crate::codex_speed::apply(&mut turn, tier);
     let reply = client.request("turn/start", turn).await?;
     let turn_id = reply["turn"]["id"].as_str().ok_or("Codex 未返回任务 ID")?;
     client.expect_turn(native, turn_id).await;
     *client.turn_settings.lock().await = Some((
         native.to_owned(),
         turn_id.to_owned(),
-        json!([mode, effort]).to_string(),
+        json!([tier.unwrap_or("default"), mode, effort]).to_string(),
     ));
     state.store.acknowledge_turn_start(session_id, turn_id)?;
     state.store.session(session_id)

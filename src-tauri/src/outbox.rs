@@ -24,6 +24,8 @@ pub struct Payload {
     pub permission_mode: Option<String>,
     pub attachments: Vec<Attachment>,
     pub effort: Option<String>,
+    #[serde(default)]
+    pub service_tier: Option<String>,
 }
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -303,6 +305,8 @@ async fn dispatch(app: &AppHandle, row: &Followup) -> Result<(), String> {
         p.effort.clone(),
         None,
         Some(row.id.clone()),
+        p.service_tier.clone(),
+        None,
         app.clone(),
     )
     .await
@@ -349,6 +353,7 @@ pub async fn steer_followup(
                 let settings=client.turn_settings.lock().await;
                 let (_,_,signature)=settings.as_ref().filter(|(native,turn,_)|Some(native.as_str())==session.native_id.as_deref()&&turn==&expected_turn_id).ok_or("当前任务配置尚未就绪或已变化，请保留排队发送")?;
                 crate::client_features::validate_steering_settings(signature,permission,row.payload.effort.as_deref())?;
+                crate::codex_speed::validate_steering(signature,row.payload.service_tier.as_deref())?;
             }
             let input=if p.codex.iter().any(|v|v["type"]=="skill") {let catalog=client.request("skills/list",json!({"cwds":[store.session_workspace(&session)?.path],"forceReload":false})).await?;crate::client_features::resolve_codex_skills(&p,&catalog)}else{p.codex};
             client.request("turn/steer",json!({"threadId":session.native_id,"expectedTurnId":expected_turn_id,"input":input})).await?;
@@ -404,6 +409,7 @@ pub async fn watch(app: AppHandle) {
             }
             let _ = dispatch_app.emit("followups-updated", ());
             let _ = dispatch_app.emit("workspace-updated", ());
+            crate::linkage::resume_pending_review(&dispatch_app,&row.session_id);
             kick(&dispatch_app);
             });
         }
@@ -428,6 +434,7 @@ mod tests {
             permission_mode: Some("ask".into()),
             attachments: vec![],
             effort: None,
+            service_tier: None,
         }
     }
     #[test]
@@ -517,6 +524,7 @@ mod tests {
         assert_eq!(store.next_followup().unwrap(), Some(independent));
         let mut replacement = payload("修改后的第一条");
         replacement.effort = Some("high".into());
+        replacement.service_tier = Some("ultrafast".into());
         replacement.attachments = vec![Attachment { kind: "image".into(), path: "image.png".into(), name: "图片".into() }];
         store.finish_followup_edit(&first, &edit.token, Some(&replacement)).unwrap();
         let rows = store.followups(Some(&s.id)).unwrap();
@@ -524,6 +532,7 @@ mod tests {
         assert_eq!(rows[0].payload.text, "修改后的第一条");
         assert_eq!(rows[0].payload.attachments[0].path, "image.png");
         assert_eq!(rows[0].payload.effort.as_deref(), Some("high"));
+        assert_eq!(rows[0].payload.service_tier.as_deref(), Some("ultrafast"));
         assert_eq!(store.next_followup().unwrap(), Some(first));
     }
     #[test]

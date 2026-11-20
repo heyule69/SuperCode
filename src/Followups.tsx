@@ -8,7 +8,7 @@ import { AttachmentImage } from './AttachmentImage';
 import { SkillBadges } from './SkillBadges';
 import { skillMessageText } from './skillPresentation';
 
-export interface FollowupPayload { text:string; model:string|null; readOnly:boolean; permissionMode:string; attachments:Attachment[]; effort:string|null }
+export interface FollowupPayload { text:string; model:string|null; readOnly:boolean; permissionMode:string; attachments:Attachment[]; effort:string|null; serviceTier?:string|null }
 export interface Followup { id:string; sessionId:string; payload:FollowupPayload; status:string; error:string|null }
 export function useFollowups(sessionId:string, report:(e:unknown)=>void) {
   const [rows,setRows]=useState<Followup[]>([]);

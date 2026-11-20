@@ -46,6 +46,12 @@ async function render(draft:SideDraft, options:Partial<ComponentProps<typeof Sid
   await act(async()=>root.render(<SideChat draft={draft} projectId="" agent="pi" connectionId={draft.connectionId??'@local'} defaults={defaults} close={()=>{}} opened={()=>{}} openFile={()=>{}} showDiff={()=>{}} providerRequired={providerRequired} {...options}/>));
 }
 async function send() {await act(async()=>{container.querySelector('form')!.dispatchEvent(new Event('submit',{bubbles:true,cancelable:true}));});}
+it.each(['fast','ultrafast'])('snapshots official speed %s and Ultra options into a queued side-chat turn',async serviceTier=>{
+  missing=false;
+  await render({key:'official-speed',text:'保留速度',connectionId:'@official',payload:{...defaults,model:'official-model',effort:'ultra',serviceTier}},{agent:'codex'});
+  await send();
+  expect(call).toHaveBeenCalledWith('enqueue_followup',expect.objectContaining({payload:expect.objectContaining({model:'official-model',effort:'ultra',serviceTier})}));
+});
 it('keeps selected skills as structured attachments when sending a skill-only side chat',async()=>{
   missing=false;
   const attachments=[{kind:'skill' as const,name:'save',path:'D:/skills/save/SKILL.md'}];

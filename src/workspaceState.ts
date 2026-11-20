@@ -9,7 +9,7 @@ export function restoreWorkspace(data: Pick<Bootstrap, 'projects' | 'sessions'>,
   return { project, session: project ? session : undefined };
 }
 
-export interface DraftModel { connectionId: string; model: string; effort?: string }
+export interface DraftModel { connectionId: string; model: string; effort?: string; serviceTier?: string }
 export interface Draft { text: string; attachments: Attachment[]; selection?: DraftModel }
 export function decodeDrafts(raw: string | null): Map<string, Draft> {
   try {
@@ -19,7 +19,7 @@ export function decodeDrafts(raw: string | null): Map<string, Draft> {
       if (!Array.isArray(row) || row.length !== 2 || typeof row[0] !== 'string' || typeof row[1]?.text !== 'string') return [];
       const attachments = Array.isArray(row[1].attachments) ? row[1].attachments.filter((a: Attachment) => a && ['file', 'image', 'directory', 'skill'].includes(a.kind) && typeof a.path === 'string' && typeof a.name === 'string').slice(0, 12) : [];
       const value = row[1].selection;
-      const selection = value && typeof value.connectionId === 'string' && typeof value.model === 'string' ? { connectionId: value.connectionId.slice(0, 256), model: value.model.slice(0, 256), ...(typeof value.effort === 'string' ? { effort: value.effort.slice(0, 64) } : {}) } : undefined;
+      const selection = value && typeof value.connectionId === 'string' && typeof value.model === 'string' ? { connectionId: value.connectionId.slice(0, 256), model: value.model.slice(0, 256), ...(typeof value.effort === 'string' ? { effort: value.effort.slice(0, 64) } : {}), ...(value.serviceTier === 'fast' || value.serviceTier === 'default' || value.serviceTier === 'ultrafast' ? { serviceTier: value.serviceTier } : {}) } : undefined;
       return [[row[0], { text: row[1].text.slice(0, 32000), attachments, ...(selection ? { selection } : {}) }] as [string, Draft]];
     }));
   } catch { return new Map(); }

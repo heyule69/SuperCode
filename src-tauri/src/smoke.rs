@@ -183,6 +183,7 @@ async fn verify_skills(
         }]),
         None,
         None,
+        None,
         app.clone(),
     )
     .await?;
@@ -608,6 +609,7 @@ async fn verify_client(
         ]),
         None,
         None,
+        None,
         app.clone(),
     )
     .await?;
@@ -626,7 +628,7 @@ async fn verify_client(
     }) {
         return Err("附件信息未持久化".into());
     }
-    commands::send_chat_message(session.id.clone(),format!("这是隔离的客户端集成测试。请使用{}将 {} 中 value = 10 改为 value = 20，只修改此文件，保留 UTF-8 无 BOM，然后回复 EDIT_DONE。",if agent=="claude"{"Read 和 Edit 工具"}else{"文件编辑工具"},sample.display()),model.clone(),false,Some("full".into()),None,None,None,app.clone()).await?;
+    commands::send_chat_message(session.id.clone(),format!("这是隔离的客户端集成测试。请使用{}将 {} 中 value = 10 改为 value = 20，只修改此文件，保留 UTF-8 无 BOM，然后回复 EDIT_DONE。",if agent=="claude"{"Read 和 Edit 工具"}else{"文件编辑工具"},sample.display()),model.clone(),false,Some("full".into()),None,None,None,None, app.clone()).await?;
     wait_idle(app, &session.id).await?;
     if features::read_utf8(&sample, 1024)? != "export const value = 20;\n" {
         return Err("完全访问模式的真实文件修改失败".into());

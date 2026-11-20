@@ -4,14 +4,15 @@ import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { useDraftPersistence, useWorkspaceDrafts } from './useWorkspaceDrafts';
 import { readWorkspaceDraft, writeWorkspaceDraft } from './workspaceDrafts';
+import type { DraftModel } from './workspaceState';
 
 let roots: Root[] = [], nodes: HTMLElement[] = [];
 const windows = new Map<string, ReturnType<typeof useWorkspaceDrafts>>();
-function WindowDraft({ name, id, text }: { name: string; id: string; text: string }) {
+function WindowDraft({ name, id, text, selection }: { name: string; id: string; text: string; selection?: DraftModel }) {
   const store = useWorkspaceDrafts(); windows.set(name, store); store.draftKey.current = id;
   const input = useRef(text); input.current = text;
   const attachments = useRef([]);
-  useDraftPersistence(store, { ready: true, key: id, text, attachments: attachments.current }, { text: input, attachments });
+  useDraftPersistence(store, { ready: true, key: id, text, attachments: attachments.current, selection }, { text: input, attachments });
   return null;
 }
 async function mount(name: string, id: string, text: string) {
@@ -21,6 +22,18 @@ async function mount(name: string, id: string, text: string) {
 }
 beforeEach(() => { (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true; localStorage.clear(); windows.clear(); vi.useFakeTimers(); });
 afterEach(async () => { for (const root of roots) await act(async () => root.unmount()); roots = []; nodes.forEach(node => node.remove()); nodes = []; vi.useRealTimers(); vi.unstubAllGlobals(); });
+it('persists a speed-only change and flushes the latest choice on window close', async () => {
+  const first = await mount('first', 'A', '保留草稿');
+  const selection = {connectionId:'@official',model:'official-model',effort:'ultra',serviceTier:'default'};
+  await act(async () => first.render(<WindowDraft name="first" id="A" text="保留草稿" selection={selection}/>));
+  await act(async () => vi.advanceTimersByTime(260));
+  await act(async () => first.render(<WindowDraft name="first" id="A" text="保留草稿" selection={{...selection,serviceTier:'fast'}}/>));
+  await act(async () => vi.advanceTimersByTime(260));
+  expect(readWorkspaceDraft('A')?.selection?.serviceTier).toBe('fast');
+  await act(async () => first.render(<WindowDraft name="first" id="A" text="保留草稿" selection={selection}/>));
+  window.dispatchEvent(new Event('beforeunload'));
+  expect(readWorkspaceDraft('A')?.selection?.serviceTier).toBe('default');
+});
 it('flushes only each window active draft on close, including a draft newer than the debounce', async () => {
   const first = await mount('first', 'A', '草稿 A');
   await mount('second', 'B', '草稿 B');

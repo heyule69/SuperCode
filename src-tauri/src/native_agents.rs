@@ -1559,14 +1559,7 @@ pub async fn send(
     let state = app.state::<AppState>();
     state.store.bind_native(&s.id, &native)?;
     state.store.set_model(&s.id, selected.as_deref())?;
-    state.store.save_message(
-        &crate::client_features::user_message_id(&metadata),
-        &s.id,
-        "user",
-        text,
-        "userMessage",
-        &metadata,
-    )?;
+    state.store.save_chat_input(&crate::client_features::user_message_id(&metadata),&s.id,text,&metadata)?;
     if s.title == "新会话" {
         state
             .store

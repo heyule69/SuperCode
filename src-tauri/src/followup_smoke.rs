@@ -128,6 +128,7 @@ async fn verify(app: &AppHandle) -> Result<Value, String> {
             None,
             None,
             None,
+            None,
             app.clone(),
         )
         .await?;
@@ -142,6 +143,7 @@ async fn verify(app: &AppHandle) -> Result<Value, String> {
             current.model.clone(),
             permission == "read",
             Some(permission.into()),
+            None,
             None,
             None,
             None,
@@ -163,6 +165,7 @@ async fn verify(app: &AppHandle) -> Result<Value, String> {
             permission_mode: Some(permission.into()),
             attachments: vec![],
             effort: None,
+            service_tier: None,
         };
         outbox::enqueue_followup(
             session.id.clone(),
@@ -201,6 +204,7 @@ async fn verify(app: &AppHandle) -> Result<Value, String> {
             current.model.clone(),
             permission == "read",
             Some(permission.into()),
+            None,
             None,
             None,
             None,
@@ -353,6 +357,7 @@ async fn verify(app: &AppHandle) -> Result<Value, String> {
                     None,
                     None,
                     None,
+                    None,
                     app.clone(),
                 )
                 .await?;
@@ -399,6 +404,7 @@ async fn verify(app: &AppHandle) -> Result<Value, String> {
                     current.model.clone(),
                     permission == "read",
                     Some(permission.into()),
+                    None,
                     None,
                     None,
                     None,

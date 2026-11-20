@@ -8,7 +8,10 @@ use rusqlite::{params, Connection, OptionalExtension};
 pub fn schema(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch("CREATE TABLE IF NOT EXISTS linkage_configs(controller_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,configuration TEXT NOT NULL,worker_id TEXT);
         CREATE TABLE IF NOT EXISTS linkage_workers(worker_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,controller_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE);
-        CREATE INDEX IF NOT EXISTS linkage_owner ON linkage_workers(controller_id);")
+        CREATE INDEX IF NOT EXISTS linkage_owner ON linkage_workers(controller_id);
+        CREATE TABLE IF NOT EXISTS linkage_tasks(controller_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,task TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS linkage_updates(seq INTEGER PRIMARY KEY AUTOINCREMENT,controller_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,worker_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,input_seq INTEGER NOT NULL,round INTEGER NOT NULL,kind TEXT NOT NULL,event_key TEXT NOT NULL,message_id TEXT,delivered INTEGER NOT NULL DEFAULT 0,UNIQUE(controller_id,input_seq,round,kind,event_key));
+        CREATE INDEX IF NOT EXISTS linkage_pending_updates ON linkage_updates(controller_id,input_seq,round,delivered,seq);")
 }
 pub fn active_children(conn: &Connection, id: &str) -> Result<bool, String> {
     crate::connection_usage::schema(conn)?;
@@ -184,12 +187,14 @@ mod tests {
                 connection_id: "@local".into(),
                 model_id: "main-model".into(),
                 effort: None,
+                service_tier: None,
             },
             executor: Choice {
                 agent_id: "pi".into(),
                 connection_id: "@local".into(),
                 model_id: "worker-model".into(),
                 effort: None,
+                service_tier: None,
             },
         };
         (store, root, config)
@@ -243,6 +248,7 @@ mod tests {
                 connection_id: "@local".into(),
                 model_id: "model".into(),
                 effort: None,
+                service_tier: None,
             };
             assert!(choice.validate().is_ok());
         }

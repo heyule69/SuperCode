@@ -106,7 +106,7 @@ pub(crate) fn preset() -> Value {
     let models: Vec<_> = catalog["models"].as_array().unwrap().iter().map(|model| json!({
         "id":model["model"],"model":model["model"],"displayName":model["displayName"],"isDefault":model["isDefault"]==true,
         "defaultReasoningEffort":model["defaultReasoningEffort"],"supportedReasoningEfforts":model["efforts"].as_array().unwrap().iter().map(|effort| json!({"reasoningEffort":effort})).collect::<Vec<_>>()
-        ,"contextWindow":model["contextWindow"],"effectiveContextWindowPercent":model["effectiveContextWindowPercent"]
+        ,"contextWindow":model["contextWindow"],"effectiveContextWindowPercent":model["effectiveContextWindowPercent"],"serviceTiers":model["serviceTiers"]
     })).collect();
     json!({"data":models,"origin":"preset","notice":"官方模型目录 · 实际可用范围由账号权限决定"})
 }
@@ -142,7 +142,10 @@ fn parse_catalog(value: &Value) -> Result<Value, String> {
             })
             .collect();
         let mut parsed = crate::model_context::metadata(row);
-        parsed.as_object_mut().unwrap().extend(json!({"id":id,"model":id,"displayName":row["display_name"].as_str().unwrap_or(id),"isDefault":models.is_empty(),"defaultReasoningEffort":row["default_reasoning_level"],"supportedReasoningEfforts":efforts}).as_object().unwrap().clone());
+        let tiers: Vec<_> = row["service_tiers"].as_array().into_iter().flatten()
+            .filter(|tier| matches!(tier["id"].as_str(), Some("fast" | "priority" | "ultrafast")))
+            .map(|tier| if tier["id"] == "ultrafast" { json!({"id":"ultrafast","name":"Ultrafast"}) } else { json!({"id":"fast","name":"Fast"}) }).collect();
+        parsed.as_object_mut().unwrap().extend(json!({"id":id,"model":id,"displayName":row["display_name"].as_str().unwrap_or(id),"isDefault":models.is_empty(),"defaultReasoningEffort":row["default_reasoning_level"],"supportedReasoningEfforts":efforts,"serviceTiers":tiers}).as_object().unwrap().clone());
         models.push(parsed);
     }
     Ok(json!({"data":models,"origin":"officialApi"}))
@@ -265,8 +268,8 @@ mod tests {
     fn full_official_preset_is_app_owned_and_has_distinct_effort_capabilities() {
         let data = preset();
         let rows = data["data"].as_array().unwrap();
-        assert_eq!(rows.len(), 7);
-        assert_eq!(rows[0]["model"], "gpt-6.1-sol");
+        assert_eq!(rows.len(), 9);
+        assert_eq!(rows[0]["model"], "gpt-6.2-sol");
         assert_eq!(rows[0]["contextWindow"], 500000);
         assert_eq!(rows[0]["effectiveContextWindowPercent"], 95);
         assert_eq!(
@@ -278,11 +281,16 @@ mod tests {
             .unwrap()
             .iter()
             .any(|e| e["reasoningEffort"] == "ultra"));
-        assert!(!rows[3]["supportedReasoningEfforts"]
+        assert!(!rows.iter().find(|row| row["model"] == "gpt-6-luna").unwrap()["supportedReasoningEfforts"]
             .as_array()
             .unwrap()
             .iter()
             .any(|e| e["reasoningEffort"] == "ultra"));
+        assert_eq!(rows.iter().find(|row| row["isDefault"] == true).unwrap()["model"],"gpt-6.1-sol");
+        let astra = rows.iter().find(|row| row["model"] == "gpt-6.2-astra").unwrap();
+        assert_eq!(astra["contextWindow"],272000);
+        assert!(crate::codex_speed::supports(&rows[0],"ultrafast"));
+        assert!(crate::codex_speed::supports(astra,"ultrafast"));
     }
     #[test]
     fn direct_catalog_uses_visible_server_order_and_an_empty_catalog_does_not_restore_presets() {
@@ -306,6 +314,14 @@ mod tests {
         assert_eq!(catalog["data"][0]["contextWindow"],600000);
         assert_eq!(catalog["data"][0]["effectiveContextWindowPercent"],95);
         assert!(!catalog.to_string().contains("secret"));
+    }
+    #[test]
+    fn speed_capabilities_are_preserved_without_inventing_unsupported_tiers() {
+        let catalog = parse_catalog(&json!({"models":[{"slug":"model","visibility":"list","service_tiers":[{"id":"priority","name":"Fast","private":"secret"},{"id":"ultrafast","name":"Ultrafast"}]}]})).unwrap();
+        assert_eq!(catalog["data"][0]["serviceTiers"], json!([{"id":"fast","name":"Fast"},{"id":"ultrafast","name":"Ultrafast"}]));
+        assert!(!catalog.to_string().contains("secret"));
+        assert_eq!(parse_catalog(&json!({"models":[{"slug":"model","visibility":"list"}]})).unwrap()["data"][0]["serviceTiers"],json!([]));
+        assert!(preset()["data"].as_array().unwrap().iter().all(crate::codex_speed::supports_fast));
     }
     #[test]
     fn local_official_status_never_treats_api_keys_as_official_login_or_leaks_tokens() {

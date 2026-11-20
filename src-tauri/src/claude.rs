@@ -493,14 +493,7 @@ pub async fn send(
         }
         if c.alive.load(Ordering::Acquire) && *c.signature.lock().unwrap() == signature {
             state.store.set_model(&session.id, model.as_deref())?;
-            state.store.save_message(
-                &crate::client_features::user_message_id(&metadata),
-                &session.id,
-                "user",
-                text,
-                "userMessage",
-                &metadata,
-            )?;
+            state.store.save_chat_input(&crate::client_features::user_message_id(&metadata),&session.id,text,&metadata)?;
             *c.turn.lock().unwrap() = uuid::Uuid::new_v4().to_string();
             c.stopped.store(false, Ordering::Release);
             let input = c.inputs.lock().unwrap().prompt(&c.native, content);
@@ -690,14 +683,7 @@ pub async fn send(
     .map_err(|_| "Claude 初始化超时")??;
     state.store.bind_native(&session.id, &native)?;
     state.store.set_model(&session.id, model.as_deref())?;
-    state.store.save_message(
-        &crate::client_features::user_message_id(&metadata),
-        &session.id,
-        "user",
-        text,
-        "userMessage",
-        &metadata,
-    )?;
+    state.store.save_chat_input(&crate::client_features::user_message_id(&metadata),&session.id,text,&metadata)?;
     if session.title == "新会话" {
         state
             .store

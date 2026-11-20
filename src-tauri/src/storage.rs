@@ -925,6 +925,18 @@ impl Store {
         Ok(())
     }
 
+    pub fn save_chat_input(&self, id: &str, session: &str, text: &str, data: &Value) -> Result<()> {
+        // Internal acceptance turns remain visible as activity, never as words
+        // attributed to the human or as a new user goal in the durable history.
+        if data["linkageProgress"].is_object() {
+            self.save_message(id,session,"activity","主控正在整理执行进展","linkageProgress",data)
+        } else if data["linkageReview"].is_object() {
+            self.save_message(id,session,"activity","主控正在验收剩余任务","linkageReview",data)
+        } else {
+            self.save_message(id,session,"user",text,"userMessage",data)
+        }
+    }
+
     pub fn has_subagent(&self, session: &str, child: &str) -> Result<bool> {
         let conn = self.0.lock().map_err(|e| e.to_string())?;
         conn.query_row(

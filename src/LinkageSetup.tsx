@@ -4,7 +4,7 @@ import { LinkageModelPicker } from './LinkageModelPicker';
 import type { Agent, AgentProfile } from './types';
 import './linkage.css';
 
-export interface LinkageChoice { agentId: string; connectionId: string; modelId: string; effort?: string }
+export interface LinkageChoice { agentId: string; connectionId: string; modelId: string; effort?: string; serviceTier?: string }
 export interface LinkageModel { id: string; name: string }
 export interface LinkageConnection { id: string; name: string; models: LinkageModel[] }
 export interface LinkageCatalog {

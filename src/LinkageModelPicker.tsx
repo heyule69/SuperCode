@@ -41,7 +41,7 @@ export function LinkageModelPicker({ value, catalog, onChange, manage, disabled 
   const source: ModelSource | undefined = catalog?.live?loaded?.catalog?.source:activeProfile?.modelSource ? { ...activeProfile.modelSource, available: !catalog?.error } : undefined;
   return <ModelMenu value={value.modelId} models={catalog?.live?loaded?.catalog?.data??models:models} catalogLoaded={!catalog?.live||!!loaded?.catalog} profiles={profiles} activeProfile={activeProfile} source={source}
     connectionId={value.connectionId} busy={disabled} loading={catalog?.live?!loaded?.catalog&&!loaded?.error:!!catalog?.loading} catalogWarning={loaded?.error??loaded?.catalog?.warning??catalog?.error} agent={value.agentId}
-    choose={async option => onChange({ ...value, connectionId: option.connectionId, modelId: option.model, effort: '' })}
+    choose={async option => onChange({ ...value, connectionId: option.connectionId, modelId: option.model, effort: '', serviceTier: undefined })}
     reload={() => catalog?.live?setRevision(value=>value+1):manage(value.agentId)} manage={() => manage(value.agentId)} effort={value.effort ?? ''}
-    setEffort={effort => onChange({ ...value, effort })} hasConversation={false}/>;
+    setEffort={effort => onChange({ ...value, effort })} serviceTier={value.serviceTier} setServiceTier={serviceTier => onChange({ ...value, serviceTier })} hasConversation={false}/>;
 }

@@ -7,6 +7,15 @@ const profiles: AgentProfile[] = ['claude','codex'].map(agent => ({id:`api:${age
 const chosen = {connectionId:'api:claude',model:'opus',effort:'max'};
 beforeEach(() => localStorage.clear());
 
+it.each(['fast','ultrafast'])('retains official speed %s per selection and reads older saved selections', serviceTier => {
+  const official = {connectionId:'@official',model:'official-model',effort:'ultra',serviceTier};
+  saveModelSelection('codex', official);
+  expect(loadModelSelection('codex', profiles, ['codex'])).toEqual(official);
+  expect(initialModelSelection('codex', profiles, ['codex'], {text:'unfinished',attachments:[],selection:{...official,serviceTier:'default'}})?.serviceTier).toBe('default');
+  saveModelSelection('codex', {...official,serviceTier:undefined});
+  expect(loadModelSelection('codex', profiles, ['codex'])?.serviceTier).toBeUndefined();
+});
+
 it('persists the last explicit selection independently for each Agent', () => {
   saveModelSelection('claude', chosen);
   const codex = {connectionId:'@official',model:'gpt',effort:'high'};

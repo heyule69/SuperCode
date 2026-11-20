@@ -11,13 +11,14 @@ export function loadModelSelection(agent: string, profiles: AgentProfile[], offi
     const value = JSON.parse(localStorage.getItem(prefix + agent) ?? 'null');
     if (!value || typeof value.connectionId !== 'string' || typeof value.model !== 'string' || !value.model
       || value.connectionId.length > 256 || value.model.length > 256 || typeof value.effort !== 'string' || value.effort.length > 64) return;
+    if (value.serviceTier != null && value.serviceTier !== 'fast' && value.serviceTier !== 'default' && value.serviceTier !== 'ultrafast') return;
     if (!hasConnection(agent, value, profiles, officialAgents)) return;
-    return { connectionId: value.connectionId, model: value.model, effort: value.effort };
+    return { connectionId: value.connectionId, model: value.model, effort: value.effort, ...(value.serviceTier ? { serviceTier: value.serviceTier } : {}) };
   } catch { return; }
 }
 
 export function saveModelSelection(agent: string, selection: DraftModel) {
-  localStorage.setItem(prefix + agent, JSON.stringify({ connectionId: selection.connectionId, model: selection.model, effort: selection.effort ?? '' }));
+  localStorage.setItem(prefix + agent, JSON.stringify({ connectionId: selection.connectionId, model: selection.model, effort: selection.effort ?? '', ...(selection.serviceTier ? { serviceTier: selection.serviceTier } : {}) }));
 }
 
 export function initialModelSelection(agent: string, profiles: AgentProfile[], officialAgents: string[], draft?: Draft, fresh = false) {

@@ -199,6 +199,11 @@ fn notify_task(
 ) -> Result<bool, String> {
     let state = app.state::<crate::AppState>();
     let session = state.store.for_native(native_id)?;
+    // A linkage worker ending a round is not a completed user task. The
+    // controller's final, accepted result owns the completion notification.
+    if kind == Kind::Complete && !state.store.linkage_completion_ready(&session.id)? {
+        return Ok(false);
+    }
     // Reject stale events after another turn started, and stopped tasks.
     if kind == Kind::Complete && session.status != "idle"
         || kind == Kind::Error && session.status != "failed"

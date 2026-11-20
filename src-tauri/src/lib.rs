@@ -55,6 +55,8 @@ mod links;
 mod linkage;
 mod linkage_bridge;
 mod linkage_store;
+mod linkage_task;
+mod linkage_updates;
 #[cfg(debug_assertions)]
 mod linkage_smoke;
 mod log_files;
@@ -63,6 +65,7 @@ mod maintenance;
 mod media;
 mod model_context;
 mod codex_context;
+mod codex_speed;
 mod native_agents;
 mod notifications;
 mod official_accounts;
@@ -469,6 +472,7 @@ pub fn run() {
             commands::interrupt_turn,
             commands::respond_request,
             commands::list_models,
+            codex_speed::get_codex_model_speeds,
             providers::get_model_source,
             commands::workspace_changes,
             commands::read_project_file,

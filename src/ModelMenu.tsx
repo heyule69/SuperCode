@@ -3,6 +3,8 @@ import { Check, ChevronDown, LoaderCircle, MessageSquare, Plus, RefreshCw, Searc
 import { call, desktop } from './api';
 import { magpieGatewayText, useMagpieGateway } from './useMagpieGateway';
 import { useMagpieCatalogs } from './useMagpieCatalogs';
+import { useOfficialCatalogs } from './useOfficialCatalogs';
+import { useCodexSpeeds } from './useCodexSpeeds';
 import { filterModelGroups, isKimiSource, modelGroups, sourceLabel, type ModelOption } from './modelPicker';
 import type { AgentProfile, Model, ModelSource } from './types';
 import { useFloatingLayer } from './useFloatingLayer';
@@ -12,7 +14,7 @@ import { MODEL_PAGE_SIZE, ModelPagination, pageModels } from './ModelPagination'
 
 const effortLabels: Record<string, string> = { low: '低', medium: '中', high: '高', xhigh: '极高', max: '最高', ultra: '超高', minimal: '最低', none: '关闭', off: '关闭' };
 
-function ModelSetting({ label, value, options, choose }: { label: string; value: string; options: { value: string; label: string }[]; choose: (value: string) => void }) {
+function ModelSetting({ label, value, options, choose }: { label: string; value: string; options: { value: string; label: string; disabled?: boolean }[]; choose: (value: string) => void }) {
   const [open, setOpen] = useState(false);
   const root = useRef<HTMLDivElement>(null);
   const trigger = useRef<HTMLButtonElement>(null);
@@ -25,12 +27,12 @@ function ModelSetting({ label, value, options, choose }: { label: string; value:
     return () => { document.removeEventListener('pointerdown', outside); document.removeEventListener('focusin', outside); };
   }, [open]);
   useLayoutEffect(() => {
-    if (open) menu.current?.querySelector<HTMLButtonElement>('[aria-checked="true"]')?.focus({ preventScroll: true });
+    if (open) (menu.current?.querySelector<HTMLButtonElement>('[aria-checked="true"]:not(:disabled)') ?? menu.current?.querySelector<HTMLButtonElement>('button:not(:disabled)'))?.focus({ preventScroll: true });
   }, [open]);
   function move(event: React.KeyboardEvent) {
     if (!['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key)) return;
     event.preventDefault();
-    const buttons = Array.from(menu.current?.querySelectorAll<HTMLButtonElement>('button') ?? []);
+    const buttons = Array.from(menu.current?.querySelectorAll<HTMLButtonElement>('button:not(:disabled)') ?? []);
     if (!buttons.length) { setOpen(true); return; }
     const current = buttons.indexOf(document.activeElement as HTMLButtonElement);
     const next = event.key === 'Home' ? 0 : event.key === 'End' ? buttons.length - 1 : event.key === 'ArrowDown' ? (current + 1) % buttons.length : (current <= 0 ? buttons.length : current) - 1;
@@ -43,7 +45,7 @@ function ModelSetting({ label, value, options, choose }: { label: string; value:
         <span>{(options.find(option => option.value === value)?.label ?? effortLabels[value] ?? value) || '默认'}</span><ChevronDown size={13}/>
       </button>
       {open ? <div ref={menu} className="model-setting-menu" role="menu" aria-label={label}>
-        {options.map(option => <button type="button" role="menuitemradio" aria-checked={option.value === value} key={option.value} onClick={() => { setOpen(false); trigger.current?.focus({ preventScroll: true }); choose(option.value); }}>
+        {options.map(option => <button type="button" role="menuitemradio" aria-checked={option.value === value} disabled={option.disabled} key={option.value} onClick={() => { setOpen(false); trigger.current?.focus({ preventScroll: true }); choose(option.value); }}>
           <span>{option.label}</span><span className="model-option-check">{option.value === value ? <Check size={14}/> : null}</span>
         </button>)}
       </div> : null}
@@ -62,10 +64,11 @@ interface Props {
   source?: ModelSource; busy: boolean; loading: boolean; agent: string;
   choose: (option: ModelOption) => Promise<void>; reload: (force?: boolean) => void; manage: () => void;
   effort: string; setEffort: (value: string) => void;
+  serviceTier?: string | null; setServiceTier?: (value: string) => void;
   hasConversation: boolean; connectionId?: string; order?: ConnectionOrder;
 }
 
-export function ModelMenu({ value, models, catalogLoaded, catalogWarning, profiles, activeProfile, source, busy, loading, agent, choose, reload, manage, effort, setEffort, hasConversation, connectionId, order }: Props) {
+export function ModelMenu({ value, models, catalogLoaded, catalogWarning, profiles, activeProfile, source, busy, loading, agent, choose, reload, manage, effort, setEffort, serviceTier, setServiceTier, hasConversation, connectionId, order }: Props) {
   const [open, setOpen] = useState(false);
   const [search, setSearch] = useState('');
   const [filter, setFilter] = useState<string | null>(null);
@@ -75,6 +78,9 @@ export function ModelMenu({ value, models, catalogLoaded, catalogWarning, profil
   const [listHeight, setListHeight] = useState<number>();
   const [showNote, setShowNote] = useState(false);
   const [loggedInAgents, setLoggedInAgents] = useState<string[]>([]);
+  const [accountWarning, setAccountWarning] = useState('');
+  const [accountRevision, setAccountRevision] = useState(0);
+  const refreshedAccount = useRef(0);
   const layer = useFloatingLayer(open, () => setOpen(false), { position: false });
   const anchor = layer.root;
   const trigger = useRef<HTMLButtonElement>(null);
@@ -83,7 +89,9 @@ export function ModelMenu({ value, models, catalogLoaded, catalogWarning, profil
   const popover = useRef<HTMLDivElement>(null);
   const note = useRef<HTMLDivElement>(null);
   const currentId = connectionId ?? activeProfile?.id ?? '';
-  const { catalogs, loading: loadingMagpie, warning: magpieWarning, refresh: refreshMagpie } = useMagpieCatalogs(open, agent, currentId, profiles);
+  const { catalogs: magpieCatalogs, loading: loadingMagpie, warning: magpieWarning, refresh: refreshMagpie } = useMagpieCatalogs(open, agent, currentId, profiles);
+  const official = useOfficialCatalogs(open, agent, currentId, profiles, loggedInAgents);
+  const catalogs = useMemo(() => ({ ...magpieCatalogs, ...official.catalogs }), [magpieCatalogs, official.catalogs]);
   const groups = useMemo(() => modelGroups({ value, models, catalogLoaded, catalogs, profiles, activeProfile, source, agent, connectionId, order, loggedInAgents }), [value, models, catalogLoaded, catalogs, profiles, activeProfile, source, agent, connectionId, order, loggedInAgents]);
   const magpieCurrent = profiles.find(profile => profile.agent === agent && profile.id === currentId && (profile.providerId === 'magpie' || profile.modelSource?.providerId === 'magpie' || source?.providerId === 'magpie'));
   const magpieGateway = useMagpieGateway(open && !!magpieCurrent, agent, magpieCurrent?.id);
@@ -101,6 +109,11 @@ export function ModelMenu({ value, models, catalogLoaded, catalogWarning, profil
   const efforts = selected?.supportedReasoningEfforts?.map(e => e.reasoningEffort) ?? (selected && agent === 'claude' ? ['low', 'medium', 'high', 'max'] : []);
   const effectiveEffort = effort || selected?.defaultReasoningEffort;
   const effortName = selected && (efforts.length || effectiveEffort) ? effectiveEffort ? effortLabels[effectiveEffort] ?? effectiveEffort : '默认' : '';
+  const speeds = useCodexSpeeds(open && !!officialCodex && !!selected && desktop, currentGroup?.id ?? currentId, selected?.model ?? '');
+  const declaredSpeeds = selected?.serviceTiers?.map(tier => tier.id === 'priority' ? 'fast' : tier.id) ?? [];
+  const offeredSpeeds = ['fast', 'ultrafast'].filter(tier => declaredSpeeds.includes(tier) || speeds.tiers?.includes(tier) || serviceTier === tier);
+  const showSpeeds = officialCodex && offeredSpeeds.length > 0 && !!setServiceTier;
+  const speedLabels: Record<string, string> = { default: '标准', fast: 'Fast', ultrafast: '超快' };
   const contextVariants = selected && isKimiSource(selected.source) && agent === 'claude' && selected.rawIds.some(id => /^k3\[1m\]$/i.test(id)) && selected.rawIds.includes('k3') ? selected.rawIds : [];
 
   function close(focus = false) { setOpen(false); setShowNote(false); if (focus) trigger.current?.focus({ preventScroll: true }); }
@@ -110,11 +123,15 @@ export function ModelMenu({ value, models, catalogLoaded, catalogWarning, profil
   useEffect(() => {
     if (!open || !desktop || !['claude', 'codex', 'gemini'].includes(agent)) return;
     let disposed = false;
-    void call<{ agent: string; connectionId?: string; loggedIn: boolean }[]>('list_provider_accounts', { force: false }).then(rows => {
+    setAccountWarning('');
+    const force = refreshedAccount.current !== accountRevision;
+    refreshedAccount.current = accountRevision;
+    void call<{ agent: string; connectionId?: string; loggedIn: boolean; error?: string }[]>('list_provider_accounts', { force }).then(rows => {
       if (!disposed) setLoggedInAgents(rows.filter(row => row.loggedIn).map(row => row.connectionId ?? row.agent));
-    }).catch(() => { if (!disposed) setLoggedInAgents([]); });
+      if (!disposed) setAccountWarning(rows.filter(row => row.agent === agent && row.error).map(row => row.error).join('\n'));
+    }).catch(error => { if (!disposed) { setLoggedInAgents([]); setAccountWarning(`无法读取官方账号：${String(error)}`); } });
     return () => { disposed = true; };
-  }, [open, agent, profiles]);
+  }, [open, agent, profiles, accountRevision]);
   useEffect(() => {
     if (!showNote) return;
     const outside = (event: Event) => { if (!note.current?.contains(event.target as Node)) setShowNote(false); };
@@ -193,7 +210,7 @@ export function ModelMenu({ value, models, catalogLoaded, catalogWarning, profil
       <div className="model-menu-heading"><h2>选择模型</h2><span title={selectedName}>{selectedName}</span><button type="button" className="icon-button" aria-label="关闭模型选择" onClick={() => close(true)}><X size={15}/></button></div>
       <div className="model-picker-search search-field">
         <Search size={15}/><input ref={searchInput} aria-label="搜索模型菜单" placeholder="搜索模型或供应商" value={search} onChange={e => { setSearch(e.target.value); setPage(0); pendingFocus.current = null; }} />
-        <button type="button" className="icon-button" aria-label="刷新模型" title="刷新模型" disabled={loading || loadingMagpie || busy || !desktop} onClick={() => { reload(true); refreshMagpie(); }}>{loading || loadingMagpie ? <LoaderCircle size={15} className="spin" /> : <RefreshCw size={15} />}</button>
+        <button type="button" className="icon-button" aria-label="刷新模型" title="刷新模型" disabled={loading || loadingMagpie || official.loading || busy || !desktop} onClick={() => { reload(true); refreshMagpie(); official.refresh(); speeds.refresh(); setAccountRevision(value => value + 1); }}>{loading || loadingMagpie || official.loading ? <LoaderCircle size={15} className="spin" /> : <RefreshCw size={15} />}</button>
       </div>
       {available.length > 1 ? <div className="model-provider-filters" role="group" aria-label="按供应商筛选">
         <button type="button" aria-pressed={filter === null} onClick={() => { setFilter(null); setPage(0); }}>全部</button>
@@ -216,8 +233,15 @@ export function ModelMenu({ value, models, catalogLoaded, catalogWarning, profil
         {visible.some(group => group.source.providerId === 'magpie') ? <p className="model-catalog-warning magpie-gateway-status" role="status" data-state={magpieGateway}>{magpieGatewayText(magpieGateway)}</p> : null}
         {catalogWarning ? <p className="model-catalog-warning" role="status">{catalogWarning}</p> : null}
         {magpieWarning ? <p className="model-catalog-warning" role="status">{magpieWarning}</p> : null}
+        {accountWarning || official.warning ? <p className="model-catalog-warning" role="status">{accountWarning || official.warning}</p> : null}
+        {official.loading ? <p className="model-catalog-warning" role="status">正在读取官方模型…</p> : null}
         {selected && contextVariants.length > 1 ? <ModelSetting label="上下文" value={selected.model} options={contextVariants.map(id => ({ value: id, label: /\[1m\]$/i.test(id) ? '1M' : '默认' }))} choose={model => void choose({ ...selected, model, defaultReasoningEffort: effort })}/> : null}
         {efforts.length ? <ModelSetting label="推理强度" value={effort} options={[{ value: '', label: '默认' }, ...efforts.map(value => ({ value, label: effortLabels[value] ?? value }))]} choose={setEffort}/> : null}
+        {showSpeeds && setServiceTier ? <ModelSetting label="速度" value={serviceTier || 'default'} options={['default', ...offeredSpeeds].map(value => ({ value, label: speedLabels[value], disabled: value !== 'default' && !speeds.tiers?.includes(value) }))} choose={setServiceTier}/> : null}
+        {officialCodex && speeds.loading ? <p className="model-catalog-warning" role="status">正在核对速度…</p> : null}
+        {officialCodex && speeds.warning ? <p className="model-catalog-warning" role="status">{speeds.warning}</p> : null}
+        {showSpeeds && !speeds.loading && !speeds.warning && offeredSpeeds.includes('ultrafast') && !speeds.tiers?.includes('ultrafast') ? <p className="model-catalog-warning" role="status">当前账号或本机 Codex 未提供超快。</p> : null}
+        {showSpeeds && serviceTier && serviceTier !== 'default' ? <p className="model-catalog-warning" role="status">{speedLabels[serviceTier]}消耗更多额度。</p> : null}
         <div className="model-menu-actions">
           <button type="button" onClick={() => { close(); manage(); }}><SlidersHorizontal size={14}/>模型设置</button>
           {hasConversation ? <div ref={note} className="model-context-note"><button type="button" aria-expanded={showNote} onClick={() => setShowNote(v => !v)}><MessageSquare size={14}/>保留当前聊天</button>{showNote ? <div className="model-switch-note" role="note">切换模型会保留当前聊天。上下文较长或需要跨 Agent 交接时，按需压缩。</div> : null}</div> : null}

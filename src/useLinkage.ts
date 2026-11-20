@@ -4,12 +4,13 @@ import type { LinkageConfiguration, LinkageChoice, LinkageCatalog } from './Link
 import type { Agent, AgentProfile, Message, RpcEvent, Session } from './types';
 import { initialModelSelection } from './modelSelection';
 
-export interface LinkageState { configuration:LinkageConfiguration|null; worker:Session|null; messages:Message[]; active:boolean }
+export interface LinkageTask { objective:string; state:string; round:number; steps:{text:string;done:boolean;evidence:string}[]; reason?:string|null; attempts?:string[]; reviewError?:string|null; executionError?:string|null }
+export interface LinkageState { configuration:LinkageConfiguration|null; worker:Session|null; messages:Message[]; active:boolean; task?:LinkageTask|null }
 const emptyState:LinkageState={configuration:null,worker:null,messages:[],active:false};
 export function defaultLinkageChoice(agent:string,profiles:AgentProfile[],officialAgents:string[]):LinkageChoice{
   const selection=initialModelSelection(agent,profiles,officialAgents);
   const profile=profiles.find(profile=>profile.agent===agent&&profile.current)??profiles.find(profile=>profile.agent===agent);
-  return {agentId:agent,connectionId:selection?.connectionId??profile?.id??(officialAgents.includes(agent)?'@official':'@local'),modelId:selection?.model??profile?.model??'',effort:selection?.effort??''};
+  return {agentId:agent,connectionId:selection?.connectionId??profile?.id??(officialAgents.includes(agent)?'@official':'@local'),modelId:selection?.model??profile?.model??'',effort:selection?.effort??'',...(selection?.serviceTier?{serviceTier:selection.serviceTier}:{})};
 }
 export function linkageCatalogs(agents:Agent[],profiles:AgentProfile[],officialAgents:string[],choices:LinkageChoice[]):LinkageCatalog[]{
   return agents.map(agent=>{

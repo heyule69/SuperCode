@@ -67,5 +67,5 @@ export function useDraftPersistence(store: ReturnType<typeof useWorkspaceDrafts>
       clearTimeout(timer); window.removeEventListener('beforeunload', persist);
       if (current.text.current === text && current.attachments.current === attachments) persist();
     };
-  }, [ready, key, text, attachments, selection?.connectionId, selection?.model, selection?.effort, save, store.draftKey, current.text, current.attachments]);
+  }, [ready, key, text, attachments, selection?.connectionId, selection?.model, selection?.effort, selection?.serviceTier, save, store.draftKey, current.text, current.attachments]);
 }

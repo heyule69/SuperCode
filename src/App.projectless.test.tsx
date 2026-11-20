@@ -110,6 +110,56 @@ async function type(text: string) {
 async function send() {
   await act(async()=>{container.querySelector<HTMLFormElement>('.composer')!.dispatchEvent(new Event('submit',{bubbles:true,cancelable:true}));await new Promise(resolve=>setTimeout(resolve,30));});
 }
+function officialSpeedFixture(modelId = 'official-model') {
+  localStorage.setItem('supercode.agent','codex');
+  data.officialAgents=['codex'];
+  data.profiles.push({id:'api:codex',agent:'codex',name:'Codex API',model:'api-model',hasCredential:true,current:false});
+  const base=vi.mocked(call).getMockImplementation()!;
+  const source={providerId:'openai',providerName:'OpenAI',connectionName:'ChatGPT 官方账号',mark:'O',available:true};
+  vi.mocked(call).mockImplementation(async(command,args={})=>{
+    if(command==='list_provider_accounts')return [{agent:'codex',loggedIn:true}];
+    if(command==='get_codex_model_speeds')return {tiers:['default','fast','ultrafast']};
+    if(command==='get_model_source'&&args.connectionId==='@official')return source;
+    if(command==='list_models'&&args.connectionId==='@official')return {data:[{id:modelId,model:modelId,displayName:modelId,isDefault:true,supportedReasoningEfforts:[{reasoningEffort:'ultra'}],serviceTiers:[{id:'fast',name:'Fast'},{id:'ultrafast',name:'Ultrafast'}]}],source,origin:'preset'};
+    return base(command,args);
+  });
+}
+async function selectOfficialFast() {
+  await act(async()=>container.querySelector<HTMLButtonElement>('.model-chip')!.click());
+  await act(async()=>container.querySelector<HTMLButtonElement>('[aria-label="选择速度"]')!.click());
+  await act(async()=>[...container.querySelectorAll<HTMLButtonElement>('.model-setting-menu button')].find(button=>button.textContent==='Fast')!.click());
+}
+it('sends official Fast with Ultra and retains both settings in its saved draft',async()=>{
+  officialSpeedFixture();await render();await selectOfficialFast();
+  await act(async()=>container.querySelector<HTMLButtonElement>('[aria-label="选择推理强度"]')!.click());
+  await act(async()=>[...container.querySelectorAll<HTMLButtonElement>('.model-setting-menu button')].find(button=>button.textContent==='超高')!.click());
+  await act(async()=>container.querySelector<HTMLButtonElement>('[aria-label="关闭模型选择"]')!.click());
+  await type('核对官方速度');window.dispatchEvent(new Event('beforeunload'));
+  expect(loadModelSelection('codex',data.profiles,['codex'])).toEqual({connectionId:'@official',model:'official-model',effort:'ultra',serviceTier:'fast'});
+  expect(readWorkspaceDraft(':codex')?.selection?.serviceTier).toBe('fast');
+  await send();
+  expect(call).toHaveBeenCalledWith('send_chat_message',expect.objectContaining({model:'official-model',effort:'ultra',serviceTier:'fast'}));
+});
+it('clears official Fast when switching the main draft to an API supplier',async()=>{
+  officialSpeedFixture();await render();await selectOfficialFast();
+  await act(async()=>[...container.querySelectorAll<HTMLButtonElement>('.model-option')].find(button=>button.textContent?.includes('api-model'))!.click());
+  await type('使用 API');await send();
+  expect(call).toHaveBeenCalledWith('create_session',expect.objectContaining({agent:'codex',connectionId:'api:codex'}));
+  expect(call).toHaveBeenCalledWith('send_chat_message',expect.objectContaining({model:'api-model',serviceTier:null}));
+});
+it('snapshots Ultrafast separately from Ultra reasoning in main chat requests and saved drafts',async()=>{
+  officialSpeedFixture('gpt-6.2-sol');await render();
+  await act(async()=>container.querySelector<HTMLButtonElement>('.model-chip')!.click());
+  await act(async()=>container.querySelector<HTMLButtonElement>('[aria-label="选择推理强度"]')!.click());
+  await act(async()=>[...container.querySelectorAll<HTMLButtonElement>('.model-setting-menu button')].find(button=>button.textContent==='超高')!.click());
+  await act(async()=>container.querySelector<HTMLButtonElement>('[aria-label="选择速度"]')!.click());
+  await act(async()=>[...container.querySelectorAll<HTMLButtonElement>('.model-setting-menu button')].find(button=>button.textContent==='超快')!.click());
+  await act(async()=>container.querySelector<HTMLButtonElement>('[aria-label="关闭模型选择"]')!.click());
+  await type('使用超快');window.dispatchEvent(new Event('beforeunload'));
+  expect(readWorkspaceDraft(':codex')?.selection).toEqual({connectionId:'@official',model:'gpt-6.2-sol',effort:'ultra',serviceTier:'ultrafast'});
+  await send();
+  expect(call).toHaveBeenCalledWith('send_chat_message',expect.objectContaining({model:'gpt-6.2-sol',effort:'ultra',serviceTier:'ultrafast'}));
+});
 function linkageFixture(){
   data.agents=['claude','codex','opencode','pi','gemini'].map(id=>({id,name:id==='claude'?'Claude Code':id,installed:true,path:null,connected:true}));
   data.profiles.push({id:'api:codex',agent:'codex',name:'Executor API',model:'worker-model',hasCredential:true,current:true});

@@ -1,7 +1,59 @@
 {
   "source": "https://developers.openai.com/codex/models",
-  "updatedAt": "2026-10-11",
+  "updatedAt": "2026-11-20",
   "models": [
+    {
+      "model": "gpt-6.2-sol",
+      "displayName": "GPT-6.2 Sol",
+      "isDefault": false,
+      "defaultReasoningEffort": "low",
+      "efforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max",
+        "ultra"
+      ],
+      "contextWindow": 500000,
+      "effectiveContextWindowPercent": 95,
+      "serviceTiers": [
+        {
+          "id": "fast",
+          "name": "Fast"
+        },
+        {
+          "id": "ultrafast",
+          "name": "Ultrafast"
+        }
+      ]
+    },
+    {
+      "model": "gpt-6.2-astra",
+      "displayName": "GPT-6.2 Astra",
+      "isDefault": false,
+      "defaultReasoningEffort": "low",
+      "efforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max",
+        "ultra"
+      ],
+      "contextWindow": 272000,
+      "effectiveContextWindowPercent": 95,
+      "serviceTiers": [
+        {
+          "id": "fast",
+          "name": "Fast"
+        },
+        {
+          "id": "ultrafast",
+          "name": "Ultrafast"
+        }
+      ]
+    },
     {
       "model": "gpt-6.1-sol",
       "displayName": "GPT-6.1 Sol",
@@ -16,7 +68,17 @@
         "ultra"
       ],
       "contextWindow": 500000,
-      "effectiveContextWindowPercent": 95
+      "effectiveContextWindowPercent": 95,
+      "serviceTiers": [
+        {
+          "id": "fast",
+          "name": "Fast"
+        },
+        {
+          "id": "ultrafast",
+          "name": "Ultrafast"
+        }
+      ]
     },
     {
       "model": "gpt-6-astra",
@@ -31,7 +93,17 @@
         "ultra"
       ],
       "contextWindow": 272000,
-      "effectiveContextWindowPercent": 95
+      "effectiveContextWindowPercent": 95,
+      "serviceTiers": [
+        {
+          "id": "fast",
+          "name": "Fast"
+        },
+        {
+          "id": "ultrafast",
+          "name": "Ultrafast"
+        }
+      ]
     },
     {
       "model": "gpt-6-sol",
@@ -46,7 +118,13 @@
         "ultra"
       ],
       "contextWindow": 272000,
-      "effectiveContextWindowPercent": 95
+      "effectiveContextWindowPercent": 95,
+      "serviceTiers": [
+        {
+          "id": "fast",
+          "name": "Fast"
+        }
+      ]
     },
     {
       "model": "gpt-6-luna",
@@ -60,7 +138,13 @@
         "max"
       ],
       "contextWindow": 272000,
-      "effectiveContextWindowPercent": 95
+      "effectiveContextWindowPercent": 95,
+      "serviceTiers": [
+        {
+          "id": "fast",
+          "name": "Fast"
+        }
+      ]
     },
     {
       "model": "gpt-5.6-sol",
@@ -75,7 +159,13 @@
         "ultra"
       ],
       "contextWindow": 272000,
-      "effectiveContextWindowPercent": 95
+      "effectiveContextWindowPercent": 95,
+      "serviceTiers": [
+        {
+          "id": "fast",
+          "name": "Fast"
+        }
+      ]
     },
     {
       "model": "gpt-5.6-terra",
@@ -90,7 +180,13 @@
         "ultra"
       ],
       "contextWindow": 272000,
-      "effectiveContextWindowPercent": 95
+      "effectiveContextWindowPercent": 95,
+      "serviceTiers": [
+        {
+          "id": "fast",
+          "name": "Fast"
+        }
+      ]
     },
     {
       "model": "gpt-5.6-luna",
@@ -104,8 +200,16 @@
         "max"
       ],
       "contextWindow": 272000,
-      "effectiveContextWindowPercent": 95
+      "effectiveContextWindowPercent": 95,
+      "serviceTiers": [
+        {
+          "id": "fast",
+          "name": "Fast"
+        }
+      ]
     }
   ],
-  "contextMetadataSource": "Codex native model catalog, verified locally on 2026-10-12; account API metadata takes precedence"
+  "contextMetadataSource": "Codex native model catalog, verified locally on 2026-10-12; account API metadata takes precedence",
+  "speedSource": "https://learn.chatgpt.com/docs/agent-configuration/speed",
+  "speedUpdatedAt": "2026-11-20"
 }

@@ -64,11 +64,15 @@ export default function SideChat({draft,projectId,agent,connectionId,defaults,cl
   function savedDraft():SideDraft{return {...draft,text:inputRef.current,connectionId:selection,payload:options.current,sourceId:source.current};}
   function updateOptions(next:FollowupPayload){options.current=next;setPayload(next);}
   function rememberModel(model: string, effort: string, connectionId = selection) {
-    try { saveModelSelection(agent, { connectionId, model, effort }); } catch { report('模型偏好暂未保存，请检查可用磁盘空间。'); }
+    try { saveModelSelection(agent, { connectionId, model, effort, ...(options.current.serviceTier ? { serviceTier: options.current.serviceTier } : {}) }); } catch { report('模型偏好暂未保存，请检查可用磁盘空间。'); }
   }
   function chooseEffort(effort: string) {
     updateOptions({...options.current,effort:effort||null});
     if(options.current.model)rememberModel(options.current.model,effort);
+  }
+  function chooseServiceTier(serviceTier:string){
+    updateOptions({...options.current,serviceTier});
+    if(options.current.model)rememberModel(options.current.model,options.current.effort??'');
   }
   function permission(mode:PermissionMode){
     if(mode==='read'&&options.current.permissionMode!=='read')executionPermission.current=compatiblePermission(options.current.permissionMode,agent);
@@ -103,7 +107,7 @@ export default function SideChat({draft,projectId,agent,connectionId,defaults,cl
     if(option.connectionId===selection&&option.model===options.current.model){rememberModel(option.model,options.current.effort??'');return;}
     setConfiguring(true);
     try{if(current.current){const saved=await call<Session>('switch_session_model',{sessionId:current.current.id,connectionId:option.connectionId,model:option.model});current.current=saved;setSession(saved);await refresh();}
-      setSelection(option.connectionId);updateOptions({...options.current,model:option.model,effort:option.defaultReasoningEffort??null});rememberModel(option.model,option.defaultReasoningEffort??'',option.connectionId);}
+      setSelection(option.connectionId);updateOptions({...options.current,model:option.model,effort:option.defaultReasoningEffort??null,serviceTier:null});rememberModel(option.model,option.defaultReasoningEffort??'',option.connectionId);}
     catch(e){report(e);}finally{setConfiguring(false);}
   }
   function addAttachments(items:(Attachment|File)[],paths:string[]=[]){
@@ -198,7 +202,7 @@ export default function SideChat({draft,projectId,agent,connectionId,defaults,cl
           <PermissionMenu value={payload.permissionMode as PermissionMode} agent={agent} busy={busy||configuring} onChange={permission} label="侧边聊天权限模式"/>
         </div><div className="composer-right">
           <span className="side-chat-agent" title={agentName}><AgentIcon agent={agent}/><span>{agentName}</span></span>
-          <ModelMenu value={payload.model??''} models={models.data} catalogLoaded={models.origin!=null} catalogWarning={models.warning||models.notice} profiles={profiles} activeProfile={profiles.find(p=>p.id===selection&&p.agent===agent)} connectionId={selection} source={models.source} agent={agent} busy={busy||configuring} loading={loadingModels} choose={chooseModel} reload={force=>void reloadModels(force)} manage={()=>(manageProviders??providerRequired)(agent,savedDraft())} effort={payload.effort??''} setEffort={chooseEffort} hasConversation={!!session?.nativeId}/>
+          <ModelMenu value={payload.model??''} models={models.data} catalogLoaded={models.origin!=null} catalogWarning={models.warning||models.notice} profiles={profiles} activeProfile={profiles.find(p=>p.id===selection&&p.agent===agent)} connectionId={selection} source={models.source} agent={agent} busy={busy||configuring} loading={loadingModels} choose={chooseModel} reload={force=>void reloadModels(force)} manage={()=>(manageProviders??providerRequired)(agent,savedDraft())} effort={payload.effort??''} setEffort={chooseEffort} serviceTier={payload.serviceTier} setServiceTier={chooseServiceTier} hasConversation={!!session?.nativeId}/>
           <button className={'send-button'+(stopMode?' stop-button':'')} type={stopMode?'button':'submit'} disabled={stopMode?!session?.turnId||stopping:sending||importing||configuring||followupEditor.busy||!hasDraft} onClick={stopMode?()=>void stop():undefined} aria-label={stopMode?'停止侧边聊天任务':followupEditor.editingId?'发送侧边聊天修改':'发送侧边聊天消息'} title={stopMode?'停止生成':isActive(session?.status)&&hasDraft?'加入队列，当前任务完成后发送':'发送消息'}>{stopMode?<Square size={14} fill="currentColor"/>:<ArrowUp size={18}/>}</button>
         </div></div>
       </form>

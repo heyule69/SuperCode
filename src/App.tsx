@@ -107,6 +107,7 @@ export default function App() {
   const attachmentJobs = useRef(Promise.resolve());
   const pendingAttachments = useRef(0);
   const [effort, setEffort] = useState('');
+  const [serviceTier, setServiceTier] = useState('');
   const [usage, updateUsage] = useState<TokenUsage>();
   const usageRevision = useRef(0);
   const setUsage = useCallback((value?: TokenUsage) => { usageRevision.current++; updateUsage(value); }, []);
@@ -310,13 +311,13 @@ export default function App() {
     setDraft:(draft,id)=>{
       draftStore.save(id,draft.text,draft.attachments);
       if(current.current.sessionId!==id)return;
-      setInput(draft.text);setAttachments(draft.attachments);setEffort(draft.effort??'');setPermissionMode(draft.permissionMode as PermissionMode);setModel(draft.model??'');setCommandsDismissed(true);
+      setInput(draft.text);setAttachments(draft.attachments);setEffort(draft.effort??'');setServiceTier(draft.serviceTier??'');setPermissionMode(draft.permissionMode as PermissionMode);setModel(draft.model??'');setCommandsDismissed(true);
     },
     reload:followups.reload,report,focus:()=>textarea.current?.focus(),
   });
   const stopMode = (isActive(session?.status) && !!session?.turnId || linkage.state.active) && !hasDraft && !followupEditor.editingId;
   const connectionId = session?.connectionId ?? draftConnectionId ?? profiles.find(p => p.agent === agentId && p.current)?.id ?? (officialAgents.includes(agentId) ? '@official' : '@local');
-  const linkageController={agentId,connectionId,modelId:model,effort};
+  const linkageController={agentId,connectionId,modelId:model,effort,...(serviceTier?{serviceTier}:{})};
   const linkageExecutor=linkage.configuration?.executor??defaultLinkageChoice(agents.find(agent=>agent.connected&&agent.id!==agentId)?.id??agentId,profiles,officialAgents);
   const linkageValue:LinkageConfiguration={mode:linkage.configuration?.mode??'single',controller:linkageController,executor:linkageExecutor};
   const availableLinkageCatalogs=useMemo(()=>linkageCatalogs(agents,profiles,officialAgents,[linkageController,linkageExecutor]),[agents,profiles,officialAgents,agentId,connectionId,model,effort,linkageExecutor.agentId,linkageExecutor.connectionId,linkageExecutor.modelId]);
@@ -445,12 +446,12 @@ export default function App() {
       if (disposed) return;
       const { session: first, project: p } = restoreWorkspace(data, savedWorkspace);
       if (p) { setProjectId(p.id); current.current.projectId = p.id; }
-      if (first) { setSessionId(first.id); setAgentId(first.agent); setModel(first.model ?? ''); draftKey.current = first.id; const selection = draftStore.read(first.id)?.selection; setEffort(selection && selection.connectionId === first.connectionId && selection.model === first.model ? selection.effort ?? '' : ''); current.current = { sessionId: first.id, projectId: first.projectId, nativeId: first.nativeId }; void loadMessages(first.id).catch(report); }
+      if (first) { setSessionId(first.id); setAgentId(first.agent); setModel(first.model ?? ''); draftKey.current = first.id; const selection = draftStore.read(first.id)?.selection; setEffort(selection && selection.connectionId === first.connectionId && selection.model === first.model ? selection.effort ?? '' : ''); setServiceTier(selection && selection.connectionId === first.connectionId && selection.model === first.model ? selection.serviceTier ?? '' : ''); current.current = { sessionId: first.id, projectId: first.projectId, nativeId: first.nativeId }; void loadMessages(first.id).catch(report); }
       else {
         const agent = agentRef.current;
         draftKey.current = `${p?.id ?? ''}:${agent}`;
         const selection = initialModelSelection(agent, data.profiles ?? [], data.officialAgents ?? [], draftStore.read(draftKey.current), savedWorkspace.fresh);
-        setDraftConnectionId(selection?.connectionId); setModel(selection?.model ?? ''); setEffort(selection?.effort ?? '');
+        setDraftConnectionId(selection?.connectionId); setModel(selection?.model ?? ''); setEffort(selection?.effort ?? ''); setServiceTier(selection?.serviceTier ?? '');
       }
       setInput(drafts.current.get(draftKey.current) ?? ''); setAttachments(attachmentDrafts.current.get(draftKey.current) ?? []); setReady(true);
       if (desktop) {
@@ -564,7 +565,7 @@ export default function App() {
   useEffect(() => { setUsage(undefined); if (!desktop || !sessionId) return; let disposed=false; const revision=usageRevision.current; void call<{records:UsageRecord[]}>('get_usage',{sessionId}).then(r=>{if(!disposed && revision===usageRevision.current)setUsage(latestChatUsage(r.records, sessionsRef.current.find(session => session.id === sessionId)));}).catch(report); return ()=>{disposed=true;}; }, [sessionId, setUsage]);
   useEffect(() => { localStorage.setItem('supercode.agent', agentId); }, [agentId]);
   useEffect(() => { if (ready && !detached) { localStorage.setItem('supercode.session', sessionId); localStorage.setItem('supercode.project', projectId); } }, [ready, sessionId, projectId, detached]);
-  useDraftPersistence(draftStore, { ready, key: draftKey.current, text: input, attachments, selection: model ? { connectionId, model, effort } : undefined }, { text: inputRef, attachments: attachmentsRef });
+  useDraftPersistence(draftStore, { ready, key: draftKey.current, text: input, attachments, selection: model ? { connectionId, model, effort, ...(serviceTier ? { serviceTier } : {}) } : undefined }, { text: inputRef, attachments: attachmentsRef });
   useEffect(() => { setCommandSelection(0); if (!input.startsWith('/')) setCommandsDismissed(false); }, [input]);
   useEffect(() => { setCommandsDismissed(false); }, [agentId]);
   useEffect(() => { revealScrollItem(document.getElementById('agent-commands'), document.getElementById(`agent-command-${slashIndex}`)); }, [slashIndex, slashOptions.length]);
@@ -633,7 +634,7 @@ export default function App() {
     draftKey.current = `${(p?.id ?? '')}:${nextAgent}`;
     const selection = initialModelSelection(nextAgent, profiles, officialAgents, draftStore.read(draftKey.current));
     setAgentId(nextAgent); setModels([]); setModelCatalogRevision(''); modelRequest.current++;
-    setDraftConnectionId(selection?.connectionId); setModel(selection?.model ?? ''); setModelSource(undefined); setUsage(undefined); setEffort(selection?.effort ?? '');
+    setDraftConnectionId(selection?.connectionId); setModel(selection?.model ?? ''); setModelSource(undefined); setUsage(undefined); setEffort(selection?.effort ?? ''); setServiceTier(selection?.serviceTier ?? '');
     setAttachments(attachmentDrafts.current.get(draftKey.current) ?? []); setInput(drafts.current.get(draftKey.current) ?? '');
     flush(); setProjectId((p?.id ?? '')); setSessionId(''); setMessages([]); setChanges(emptyChanges);
     setHasMore(false); setShowJump(false); setMessagesLoading(false); stickToBottom.current = true; changesRevision.current++;
@@ -644,7 +645,7 @@ export default function App() {
     setSettingsOpen(false);
     draftStore.save(draftKey.current, inputRef.current, attachmentsRef.current);
     const selection = draftStore.read(s.id)?.selection; setAttachments(attachmentDrafts.current.get(s.id) ?? []);
-    const editingPayload=followupEditor.payloadFor(s.id);setEffort(editingPayload?.effort??(selection && selection.connectionId === s.connectionId && selection.model === s.model ? selection.effort ?? '' : ''));if(editingPayload)setPermissionMode(editingPayload.permissionMode as PermissionMode,s.agent);
+    const editingPayload=followupEditor.payloadFor(s.id);setEffort(editingPayload?.effort??(selection && selection.connectionId === s.connectionId && selection.model === s.model ? selection.effort ?? '' : ''));setServiceTier(editingPayload ? editingPayload.serviceTier??'' : selection && selection.connectionId === s.connectionId && selection.model === s.model ? selection.serviceTier??'' : '');if(editingPayload)setPermissionMode(editingPayload.permissionMode as PermissionMode,s.agent);
     setDraftConnectionId(undefined);
     draftKey.current = s.id; setInput(drafts.current.get(s.id) ?? ''); setHasMore(false); setShowJump(false);
     flush(); setSessionId(s.id); setProjectId(s.projectId); setMessages([]); setAgentId(s.agent); setModels([]); setModelCatalogRevision(''); setModelSource(profiles.find(p => p.id === s.connectionId)?.modelSource); setModel(s.model ?? ''); setUsage(undefined); setError(''); setCommandMessage(''); stickToBottom.current = true;
@@ -673,7 +674,7 @@ export default function App() {
     setModal(null); setError('');
     requestAnimationFrame(() => textarea.current?.focus());
   }
-  function followupPayload(text:string,taskAttachments=attachments):FollowupPayload { return {text,model:model||null,readOnly,permissionMode,attachments:taskAttachments,effort:effort||null}; }
+  function followupPayload(text:string,taskAttachments=attachments):FollowupPayload { return {text,model:model||null,readOnly,permissionMode,attachments:taskAttachments,effort:effort||null,serviceTier:serviceTier||null}; }
   const respondPlan = useStableCallback(async (message:Message,decision:PlanDecision,feedback:string) => {
     const id=sessionId;
     if (!session || session.agent!=='codex' || configuringLock.current || busy || sendLocks.current.has(id) || followups.rows.length || message.sessionId!==id) throw new Error('请等待当前任务结束后再确认计划。');
@@ -745,7 +746,7 @@ export default function App() {
         await followups.reload();await refresh();return;
       }
       flight.track(id); draftStore.remove(originDraft); draftStore.remove(id); setError('');
-      const result = await call<Session>('send_chat_message', { sessionId: id, text, model: model || null, readOnly, permissionMode, attachments: taskAttachments, effort: effort || null, clientMessageId });
+      const result = await call<Session>('send_chat_message', { sessionId: id, text, model: model || null, readOnly, permissionMode, attachments: taskAttachments, effort: effort || null, serviceTier: serviceTier || null, clientMessageId });
       submitted = true;
       setSessions(old => old.map(s => s.id === id ? result : s));
       if (current.current.sessionId === id) { current.current.nativeId = result.nativeId; setModel(result.model ?? ''); }
@@ -839,10 +840,10 @@ export default function App() {
     const magpie = canPreferMagpie && !sessionId && !current.current.sessionId && !sending && requestingDraft === draftKey.current ? data.profiles.find(p => p.agent === agentId && p.providerId === 'magpie' && p.source === 'magpie') : undefined;
     if (magpie?.model) {
       modelRequest.current++; setDraftConnectionId(magpie.id); setModels([]); setModelCatalogRevision(''); setModelSource(magpie.modelSource); setModel(magpie.model); setEffort(''); setUsage(undefined);
-      rememberModel(magpie.id, magpie.model, '');
+      setServiceTier(''); rememberModel(magpie.id, magpie.model, '', '');
     } else if (agentRef.current === agentId && requestedModelChoiceRevision === modelChoiceRevision.current && !sessionId && !current.current.sessionId && requestingDraft === draftKey.current && !sending && (removedDraft || nextDefault !== connectionId && (!draftConnectionId || draftConnectionId === '@local' || _resetAgent === agentId && providerRequiredAgent === agentId))) {
       setDraftConnectionId(undefined); draftModels.current.delete(draftKey.current);
-      modelRequest.current++; setModels([]); setModelCatalogRevision(''); setModelSource(undefined); setModel('');
+      modelRequest.current++; setModels([]); setModelCatalogRevision(''); setModelSource(undefined); setModel(''); setServiceTier('');
     }
     // A blocked side draft has no conversation binding yet. Let an explicitly
     // added default replace its hidden fallback while preserving the saved text.
@@ -850,18 +851,22 @@ export default function App() {
       if (!old || sidePendingConnectionRef.current) return old;
       const agent = old.agent ?? agentId, next = defaultFor(agent);
       if (next === '@local' || next === old.connectionId || !(old.connectionId === '@local' || _resetAgent === agent && providerRequiredAgent === agent)) return old;
-      return { ...old, connectionId: next, payload: old.payload ? { ...old.payload, model: data.profiles.find(p=>p.id===next)?.model ?? null } : old.payload };
+      return { ...old, connectionId: next, payload: old.payload ? { ...old.payload, model: data.profiles.find(p=>p.id===next)?.model ?? null, serviceTier: null } : old.payload };
     });
   }
-  function rememberModel(connectionId: string, model: string, effort: string) {
+  function rememberModel(connectionId: string, model: string, effort: string, tier = serviceTier) {
     modelChoiceRevision.current++;
-    const selection = { connectionId, model, effort };
+    const selection = { connectionId, model, effort, ...(tier ? { serviceTier: tier } : {}) };
     draftModels.current.set(draftKey.current, selection);
     try { saveModelSelection(agentId, selection); } catch { report('模型偏好暂未保存，请检查可用磁盘空间。'); }
   }
   function chooseEffort(value: string) {
     setEffort(value);
     if (model) rememberModel(connectionId, model, value);
+  }
+  function chooseServiceTier(value: string) {
+    setServiceTier(value);
+    if (model) rememberModel(connectionId, model, effort, value);
   }
   async function chooseModel(option: ModelOption) {
     if (busy || configuringLock.current) return;
@@ -873,8 +878,8 @@ export default function App() {
     try {
       if (!sessionId) {
         setDraftConnectionId(option.connectionId); setModel(option.model); setModelSource(option.source); setModels([]); setModelCatalogRevision(''); setUsage(undefined);
-        setEffort(option.defaultReasoningEffort ?? '');
-        rememberModel(option.connectionId, option.model, option.defaultReasoningEffort ?? '');
+        setEffort(option.defaultReasoningEffort ?? ''); setServiceTier('');
+        rememberModel(option.connectionId, option.model, option.defaultReasoningEffort ?? '', '');
         return;
       }
       const id = sessionId;
@@ -882,8 +887,8 @@ export default function App() {
       if (current.current.sessionId === id) {
         current.current.nativeId = saved.nativeId;
         setModel(saved.model ?? option.model); setModels([]); setModelCatalogRevision(''); setModelSource(option.source); setUsage(undefined);
-        setEffort(option.defaultReasoningEffort ?? '');
-        rememberModel(option.connectionId, saved.model ?? option.model, option.defaultReasoningEffort ?? '');
+        setEffort(option.defaultReasoningEffort ?? ''); setServiceTier('');
+        rememberModel(option.connectionId, saved.model ?? option.model, option.defaultReasoningEffort ?? '', '');
         await loadMessages(id);
       }
       await refresh();
@@ -939,19 +944,19 @@ export default function App() {
       const controller=configuration.controller;
       if(controller.agentId!==agentId){
         selectProject(project,controller.agentId);
-        setDraftConnectionId(controller.connectionId);setModel(controller.modelId);setEffort(controller.effort??'');
+        setDraftConnectionId(controller.connectionId);setModel(controller.modelId);setEffort(controller.effort??'');setServiceTier(controller.serviceTier??'');
         linkage.saveDraft(draftKey.current,configuration);
       }else if(sessionId){
         if(controller.connectionId!==connectionId||controller.modelId!==model){
           await call<Session>('switch_session_model',{sessionId,connectionId:controller.connectionId,model:controller.modelId});
         }
         await linkage.persist(sessionId,configuration);
-        setModel(controller.modelId);setEffort(controller.effort??'');
+        setModel(controller.modelId);setEffort(controller.effort??'');setServiceTier(controller.serviceTier??'');
         const updated=await refresh();
         if(current.current.sessionId===sessionId)current.current.nativeId=updated.sessions.find(item=>item.id===sessionId)?.nativeId??null;
         await loadMessages(sessionId);
       }else{
-        setDraftConnectionId(controller.connectionId);setModel(controller.modelId);setEffort(controller.effort??'');
+        setDraftConnectionId(controller.connectionId);setModel(controller.modelId);setEffort(controller.effort??'');setServiceTier(controller.serviceTier??'');
         linkage.saveDraft(draftKey.current,configuration);
       }
       setModels([]);setModelCatalogRevision('');setModelSource(undefined);setLinkageOpen(false);
@@ -977,7 +982,7 @@ export default function App() {
     const data = await refresh();
     const active = current.current;
     const next = data.sessions.find(s => s.id === active.sessionId);
-    if (next && (next.connectionId !== sessions.find(s => s.id === active.sessionId)?.connectionId || next.model !== sessions.find(s => s.id === active.sessionId)?.model)) { setModel(next.model ?? ''); setModels([]); setModelCatalogRevision(''); setUsage(undefined); await loadMessages(next.id); }
+    if (next && (next.connectionId !== sessions.find(s => s.id === active.sessionId)?.connectionId || next.model !== sessions.find(s => s.id === active.sessionId)?.model)) { setModel(next.model ?? ''); setServiceTier(''); setModels([]); setModelCatalogRevision(''); setUsage(undefined); await loadMessages(next.id); }
     if (next && (next.projectId !== active.projectId || next.nativeId !== active.nativeId)) {
       current.current = { sessionId: next.id, projectId: next.projectId, nativeId: next.nativeId };
       setProjectId(next.projectId);
@@ -1164,7 +1169,7 @@ export default function App() {
             <button type="button" className={`composer-chip linkage-entry${linkage.enabled?' enabled':''}`} aria-label="联动设置" aria-haspopup="dialog" aria-expanded={linkageOpen} title={linkage.error||'Agent 联动'} onClick={()=>setLinkageOpen(true)}><Link2 size={14}/><span>{linkage.enabled?'联动中':'联动'}</span></button>
           </div><div className="composer-right">
             <AgentMenu value={agentId} agents={agents} busy={configuring} choose={switchAgent}/>
-            <ModelMenu value={model} models={modelSourceRevision === profileRevision ? models : []} catalogLoaded={modelCatalogRevision === profileRevision} catalogWarning={modelCatalogRevision === profileRevision ? modelCatalogWarning : ''} profiles={profiles} activeProfile={activeProfile} connectionId={connectionId} order={connectionOrder} source={currentModelSource} busy={busy || configuring} loading={loadingModels} agent={agentId} choose={chooseModel} reload={force => void loadModels(force)} manage={() => {setProviderSettingsAgent(agentId);setSettingsTab('providers');openSettings();}} effort={effort} setEffort={chooseEffort} hasConversation={!!session?.nativeId} />
+            <ModelMenu value={model} models={modelSourceRevision === profileRevision ? models : []} catalogLoaded={modelCatalogRevision === profileRevision} catalogWarning={modelCatalogRevision === profileRevision ? modelCatalogWarning : ''} profiles={profiles} activeProfile={activeProfile} connectionId={connectionId} order={connectionOrder} source={currentModelSource} busy={busy || configuring} loading={loadingModels} agent={agentId} choose={chooseModel} reload={force => void loadModels(force)} manage={() => {setProviderSettingsAgent(agentId);setSettingsTab('providers');openSettings();}} effort={effort} setEffort={chooseEffort} serviceTier={serviceTier} setServiceTier={chooseServiceTier} hasConversation={!!session?.nativeId} />
             <button className={`send-button${stopMode ? ' stop-button' : ''}`} type={stopMode ? 'button' : 'submit'} disabled={stopMode ? !session?.turnId && !linkage.state.active || stopping : configuring || !hasDraft || sending || importingImages || followupEditor.busy} onClick={stopMode ? event=>{event.preventDefault();void stop();} : undefined} aria-label={stopMode ? '停止生成' : followupEditor.editingId ? '发送修改' : busy && hasDraft ? '加入队列' : '发送消息'} title={stopMode ? '停止生成' : followupEditor.editingId ? '发送修改，保留原来的顺序' : busy && hasDraft ? '加入队列，当前任务完成后发送' : '发送消息'}>{stopMode ? <Square size={14} fill="currentColor" /> : <ArrowUp size={18} />}</button></div></div>
         </form><div className="composer-footnote"><span /><div>{showPlatformQuota ? <PlatformUsageIndicator key={`${agentId}:${connectionId}`} agent={agentId} connectionId={agentId === 'codex' && connectionId === '@local' ? '@official' : connectionId} revision={quotaRevision} source={quotaSource} openStats={() => {setSettingsTab('quota');openSettings();}} /> : null}<UsageIndicator key={`${sessionId}:${agentId}:${connectionId}:${model}`} usage={usage} contextWindow={contextFallbackWindow} /><span>{prefs.enterSend ? 'Enter 发送' : 'Ctrl Enter 发送'} · Shift Enter 换行</span></div></div>
       </div>
