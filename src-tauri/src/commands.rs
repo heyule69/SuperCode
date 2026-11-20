@@ -411,6 +411,9 @@ pub(crate) async fn send_chat_message_inner(
         let _ = state.store.set_status(&session_id, "failed", None);
         return Err(error);
     }
+    if let Err(error)=crate::linkage::prepare(&app,&session_id,permission).and_then(|_|crate::linkage::add_prompt(&app,&session_id,&mut prepared)) {
+        let _=state.store.set_status(&session_id,"failed",None);return Err(error);
+    }
     let service_attempt = crate::managed_services::prepare(&app, &session_id, if read_only { "read" } else { permission });
     let result = send_inner(
         &session_id,
@@ -555,7 +558,7 @@ async fn send_inner(
     let request = codex_thread_request(
         session.native_id.as_deref(),
         already_loaded,
-        json!({"cwd":project.path,"approvalPolicy":approval,"approvalsReviewer":reviewer,"sandbox":sandbox,"model":model,"modelProvider":route.provider(),"developerInstructions":crate::client_features::instructions(app),"serviceName":"supercode"}),
+        json!({"cwd":project.path,"approvalPolicy":approval,"approvalsReviewer":reviewer,"sandbox":sandbox,"model":model,"modelProvider":route.provider(),"developerInstructions":crate::client_features::instructions_for_session(app,Some(session_id))?,"serviceName":"supercode"}),
     );
     let result = if let Some((method, parameters)) = request {
         client.request(method, parameters).await?
@@ -654,6 +657,14 @@ pub(crate) fn codex_thread_request(
 
 #[tauri::command]
 pub async fn interrupt_turn(session_id: String, app: AppHandle) -> Result<(), String> {
+    let children=crate::linkage::stop_scope(&app,&session_id)?;
+    let mut errors=Vec::new();
+    for child in children { if matches!(child.status.as_str(),"starting"|"running"|"waiting")||app.state::<AppState>().store.session_has_native_tasks(&child.id)? { if let Err(error)=crate::linkage::stop_worker(&app,&child).await { errors.push(error); } } }
+    let current=app.state::<AppState>().store.session(&session_id)?;
+    if matches!(current.status.as_str(),"starting"|"running"|"waiting") { if let Err(error)=interrupt_one(session_id,app).await { errors.push(error); } }
+    if errors.is_empty(){Ok(())}else{Err(errors.join("；"))}
+}
+pub(crate) async fn interrupt_one(session_id:String,app:AppHandle)->Result<(),String>{
     crate::browser::stop(&app, &session_id);
     crate::desktop_control::stop_session(&app, &session_id);
     crate::managed_services::interrupt(&app, &session_id);
@@ -1415,5 +1426,6 @@ pub async fn pending_requests(app: AppHandle) -> Result<Vec<Value>, String> {
     for client in state.native.clients().await {
         requests.extend(client.requests.lock().await.values().cloned());
     }
+    for request in &mut requests {crate::linkage::annotate(&app,request);}
     Ok(requests)
 }

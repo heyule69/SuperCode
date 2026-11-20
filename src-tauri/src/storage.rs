@@ -139,6 +139,7 @@ impl Store {
             migrated?;
         }
         conn.execute_batch("CREATE TABLE IF NOT EXISTS session_workspaces(session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,path TEXT NOT NULL)")?;
+        crate::linkage_store::schema(&conn)?;
         conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS sessions_connection ON sessions(connection_id)",
         )?;
@@ -738,7 +739,7 @@ impl Store {
 
     pub fn sessions(&self) -> Result<Vec<Session>> {
         let conn = self.0.lock().map_err(|e| e.to_string())?;
-        let mut stmt=conn.prepare("SELECT id,project_id,title,agent,model,native_id,status,updated_at,turn_id,connection_id,(SELECT path FROM session_workspaces WHERE session_id=sessions.id) FROM sessions WHERE archived=0 AND (project_id IS NULL OR project_id NOT IN (SELECT id FROM sidebar_items WHERE kind='project' AND removed=1)) ORDER BY coalesce((SELECT pinned FROM sidebar_items WHERE kind='session' AND id=sessions.id),0) DESC,updated_at DESC LIMIT 500").map_err(|e|e.to_string())?;
+        let mut stmt=conn.prepare("SELECT id,project_id,title,agent,model,native_id,status,updated_at,turn_id,connection_id,(SELECT path FROM session_workspaces WHERE session_id=sessions.id) FROM sessions WHERE archived=0 AND id NOT IN (SELECT worker_id FROM linkage_workers) AND (project_id IS NULL OR project_id NOT IN (SELECT id FROM sidebar_items WHERE kind='project' AND removed=1)) ORDER BY coalesce((SELECT pinned FROM sidebar_items WHERE kind='session' AND id=sessions.id),0) DESC,updated_at DESC LIMIT 500").map_err(|e|e.to_string())?;
         let rows = stmt
             .query_map([], Self::session_row)
             .map_err(|e| e.to_string())?
@@ -1104,7 +1105,7 @@ impl Store {
         }
         if data["total"].as_object().is_none_or(|v| v.is_empty()) {
             if let Some(mut existing) = existing {
-                for key in ["contextTokens", "modelContextWindow"] {
+                for key in ["contextTokens", "modelContextWindow", "contextPercent", "contextSource", "contextApproximate", "contextWindowSource"] {
                     if let Some(value) = data.get(key) {
                         existing[key] = value.clone();
                     }
@@ -1126,7 +1127,7 @@ impl Store {
         // Billing and context can arrive in separate events. Missing metadata
         // does not erase the latest measured context; explicit null still resets it.
         if let Some(existing) = existing {
-            for key in ["contextTokens", "modelContextWindow"] {
+            for key in ["contextTokens", "modelContextWindow", "contextPercent", "contextSource", "contextApproximate", "contextWindowSource"] {
                 if data.get(key).is_none() {
                     if let Some(value) = existing.get(key) {
                         data[key] = value.clone();
@@ -1492,6 +1493,30 @@ mod tests {
             .is_err());
         assert!(store.sessions().unwrap().is_empty());
     }
+    #[test]
+    fn native_context_provenance_survives_billing_updates_and_resets_explicitly() {
+        let store = Store::from_connection(Connection::open_in_memory().unwrap()).unwrap();
+        let project = store.add_project(Path::new("D:/native-context-fixture")).unwrap();
+        let session = store.create_session(&project.id, Some("glm".into())).unwrap();
+        let billing = serde_json::json!({"total":{"inputTokens":1000,"outputTokens":200},"last":{},"cumulative":false,"costUsd":0.25});
+        store.record_usage(&session, "turn", billing.clone()).unwrap();
+        store.record_usage(&session, "turn", serde_json::json!({"total":{},"last":{},"contextTokens":70000,"modelContextWindow":1000000,"contextPercent":7,"contextSource":"claude","contextApproximate":false,"contextWindowSource":"runtime"})).unwrap();
+        store.record_usage(&session, "turn", billing).unwrap();
+        let data = &store.usage_records(Some(&session.id)).unwrap()[0]["data"];
+        assert_eq!(data["contextPercent"], 7);
+        assert_eq!(data["contextSource"], "claude");
+        assert_eq!(data["contextApproximate"], false);
+        assert_eq!(data["contextWindowSource"], "runtime");
+        assert_eq!(data["costUsd"], 0.25);
+        assert_eq!(data["turn"]["inputTokens"], 1000);
+        store.record_usage(&session, "turn", serde_json::json!({"total":{},"last":{},"contextTokens":null,"contextPercent":null,"contextSource":"usage","contextApproximate":true})).unwrap();
+        let data = &store.usage_records(Some(&session.id)).unwrap()[0]["data"];
+        assert!(data["contextTokens"].is_null());
+        assert!(data["contextPercent"].is_null());
+        assert_eq!(data["contextSource"], "usage");
+        assert_eq!(data["contextApproximate"], true);
+    }
+
     #[test]
     fn context_only_usage_survives_reload_without_erasing_billing_or_reusing_another_turn() {
         let store = Store::from_connection(Connection::open_in_memory().unwrap()).unwrap();

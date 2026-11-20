@@ -53,6 +53,10 @@ async fn verify(app: &AppHandle) -> Result<Value, String> {
             }
         }
     }
+    #[cfg(debug_assertions)]
+    if std::env::args().any(|arg|arg=="--linkage-smoke-test") {
+        return crate::linkage_smoke::verify(app,&source).await;
+    }
     if std::env::args().any(|arg| arg == "--provider-accounts-test") {
         if let Some(path) = source.codex_path()? {
             state.store.set_setting("codex_path", &path)?;
@@ -448,7 +452,7 @@ async fn verify_activity_details(app: &AppHandle) -> Result<Value, String> {
 pub async fn run(app: AppHandle) {
     let result = verify(&app).await;
     let report = match result {
-        Ok(v) => json!({"ok":true,"result":v}),
+        Ok(v) => json!({"ok":v["allPassed"]!=false,"result":v}),
         Err(e) => json!({"ok":false,"error":e}),
     };
     let dir = std::env::current_dir()
@@ -456,7 +460,9 @@ pub async fn run(app: AppHandle) {
         .join(".supercode");
     let _ = std::fs::write(
         dir.join(
-            if std::env::args().any(|arg|arg=="--activity-details-test") {
+            if std::env::args().any(|arg|arg=="--linkage-smoke-test") {
+                "linkage-smoke-report.json"
+            } else if std::env::args().any(|arg|arg=="--activity-details-test") {
                 "activity-details-report.json"
             } else if std::env::args().any(|arg| arg == "--agent-updates-test") {
                 "agent-updates-report.json"

@@ -1,8 +1,20 @@
 export interface TokenBreakdown { inputTokens?: number; cachedInputTokens?: number; cacheWriteInputTokens?: number; outputTokens?: number; reasoningOutputTokens?: number; totalTokens?: number }
-export interface TokenUsage { total: TokenBreakdown; last: TokenBreakdown; turn?: TokenBreakdown; contextTokens?: number | null; modelContextWindow?: number | null; costUsd?: number | null; cumulative?: boolean; purpose?: string }
+export interface TokenUsage { total: TokenBreakdown; last: TokenBreakdown; turn?: TokenBreakdown; contextTokens?: number | null; modelContextWindow?: number | null; contextPercent?: number | null; contextSource?: 'claude' | 'usage'; contextApproximate?: boolean; contextWindowSource?: 'runtime' | 'catalog'; counterEpoch?: string | null; costUsd?: number | null; cumulative?: boolean; purpose?: string }
 export interface UsageRecord { sessionId: string; turnId: string; agent: string; model: string; data: TokenUsage; at: number; title: string }
-export function latestChatUsage(records: UsageRecord[]): TokenUsage | undefined {
-  return records.find(record => !['translation', 'handoff'].includes(record.data.purpose ?? ''))?.data;
+export function latestChatUsage(records: UsageRecord[], binding?: { agent: string; model?: string | null; nativeId?: string | null }): TokenUsage | undefined {
+  if (binding?.nativeId === null) return undefined;
+  const record = records.find(record => !['translation', 'handoff'].includes(record.data.purpose ?? '')
+    && (!binding || record.agent === binding.agent
+      && (!binding.model || record.model === binding.model)
+      && (binding.nativeId === undefined || record.data.counterEpoch === undefined || record.data.counterEpoch === binding.nativeId)));
+  const data = record?.data;
+  // Old Claude records included output in context and did not retain its source.
+  // Normalize the display only; billing and stored history remain untouched.
+  if (record?.agent === 'claude' && typeof data?.contextTokens === 'number' && !data.contextSource) {
+    const input = data.last?.inputTokens;
+    return { ...data, contextTokens: typeof input === 'number' && Number.isSafeInteger(input) && input >= 0 ? input : data.contextTokens, contextPercent: null, contextSource: 'usage', contextApproximate: true };
+  }
+  return data;
 }
 export const number = (n?: number | null) => n == null ? '—' : Intl.NumberFormat('zh-CN').format(n);
 export const compactNumber = (n: number) => n >= 1_000_000 ? `${(n / 1_000_000).toFixed(2)}M` : n >= 1000 ? `${(n / 1000).toFixed(1)}K` : number(n);
@@ -14,10 +26,16 @@ export function contextUsage(usage?: TokenUsage, fallbackWindow?: number) {
   const lastInput = valid(usage?.last?.inputTokens);
   const last = lastTotal != null && lastTotal > 0 ? lastTotal : lastInput != null ? lastInput + (valid(usage?.last?.outputTokens) ?? 0) : lastTotal;
   const used = valid(usage?.contextTokens) ?? (usage?.contextTokens === undefined && usage?.cumulative !== false ? last : undefined);
-  const capacity = valid(usage?.modelContextWindow) || valid(fallbackWindow);
+  const runtimeCapacity = valid(usage?.modelContextWindow);
+  const capacity = runtimeCapacity || valid(fallbackWindow);
   const window = capacity && capacity > 0 ? capacity : undefined;
-  const percent = used != null && window != null ? Math.min(100, Math.round(used / window * 100)) : undefined;
-  return { used, window, percent, label: percent != null ? `上下文 ${used != null && used > 0 && percent === 0 ? '<1' : percent}%` : used != null ? `上下文 ${compactNumber(used)}` : '上下文 —' };
+  const nativePercent = usage?.contextSource === 'claude' && runtimeCapacity != null && runtimeCapacity > 0 ? valid(usage.contextPercent) : undefined;
+  const rawPercent = used != null && window != null ? Math.min(100, nativePercent != null && nativePercent <= 100 ? nativePercent : used / window * 100) : undefined;
+  const percent = rawPercent != null ? Math.round(rawPercent) : undefined;
+  const estimated = usage?.contextApproximate === true || usage?.contextSource === 'usage' || !!window && !runtimeCapacity;
+  const source = usage?.contextSource === 'claude' ? 'Claude 原生上下文' : usage?.contextSource === 'usage' ? '最近一次请求用量' : 'Agent 上报用量';
+  const windowSource = (!runtimeCapacity && window != null) || usage?.contextWindowSource === 'catalog' ? '模型资料中的上限' : 'Agent 上报上限';
+  return { used, window, percent, rawPercent, estimated, source, windowSource, label: percent != null ? `上下文 ${estimated ? '~' : ''}${used != null && used > 0 && percent === 0 ? '<1' : percent}%` : used != null ? `上下文 ${estimated ? '~' : ''}${compactNumber(used)}` : '上下文 —' };
 }
 export function usageTotals(records: UsageRecord[]) {
   return records.reduce((sum, record) => {

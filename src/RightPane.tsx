@@ -1,11 +1,11 @@
 import { useEffect, useId, useRef, useState, type ReactNode } from 'react';
-import { FolderTree, Globe, Lightbulb, Maximize2, MessagesSquare, Minimize2, PanelRightClose, Plus, Users, X } from 'lucide-react';
+import { FolderTree, Globe, Lightbulb, Link2, Maximize2, MessagesSquare, Minimize2, PanelRightClose, Plus, Users, X } from 'lucide-react';
 import type { RightTab, RightTabKind } from './rightPaneState';
 import { FileIcon } from './FileIcon';
 import { useFloatingLayer } from './useFloatingLayer';
 import './right-pane.css';
 
-const icons: Partial<Record<RightTabKind, typeof Globe>> = { workspace: FolderTree, browser: Globe, question: MessagesSquare, subagents: Users };
+const icons: Partial<Record<RightTabKind, typeof Globe>> = { workspace: FolderTree, browser: Globe, question: MessagesSquare, subagents: Users, linkage:Link2 };
 export default function RightPane({ tabs, active, select, close, closeAll, expanded, expand, openWorkspace, openBrowser, openQuestion, browserEnabled, resizeHandle, hidden, blocked, onMenuVisibility, children }: {
   tabs: RightTab[]; active: string | null; select: (id: string) => void; close: (id: string) => void; closeAll: () => void;
   expanded: boolean; expand: () => void; openWorkspace: () => void; openBrowser: () => void; openQuestion: () => void; browserEnabled: boolean;

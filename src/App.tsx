@@ -1,7 +1,7 @@
 import { latestChatUsage } from './usage';
 import { ReplyTranslationContext } from './ReplyText';
 import { lazy, Suspense, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
-import { Sparkles, ArrowUp, Folder, Globe, MessageSquare, MessagesSquare, MoreHorizontal, PanelLeftOpen, PanelRightClose, PanelRightOpen, RefreshCw, Search, Square, SquarePen, Terminal, X } from 'lucide-react';
+import { Sparkles, ArrowUp, Folder, Globe, Link2, MessageSquare, MessagesSquare, MoreHorizontal, PanelLeftOpen, PanelRightClose, PanelRightOpen, RefreshCw, Search, Square, SquarePen, Terminal, X } from 'lucide-react';
 import { call, desktop, subscribe } from './api';
 import { isDisplayEvent } from './events';
 import { useWorkspaceDrafts, useDraftPersistence } from './useWorkspaceDrafts';
@@ -61,6 +61,11 @@ const BrowserPanel=lazy(()=>import('./BrowserPanel'));
 import { ActivityRail } from './ActivityRail';
 import { AgentMenu } from './AgentMenu';
 import { NewChat } from './NewChat';
+import { useLinkage, defaultLinkageChoice, linkageCatalogs } from './useLinkage';
+import type { LinkageConfiguration } from './LinkageSetup';
+import './linkage.css';
+const LinkageDialog=lazy(()=>import('./LinkageDialog').then(module=>({default:module.LinkageDialog})));
+const LinkagePanel=lazy(()=>import('./LinkagePanel'));
 import { usePanelResize } from './PanelResize';
 import { planFollowup, type PlanDecision } from './planPresentation';
 import './browser-dock.css';
@@ -80,6 +85,7 @@ const emptyChanges: Changes = { isGit: false, branch: '', files: [], diff: '' };
 const statusText: Record<string, string> = { idle: '已就绪', starting: '正在启动', running: '正在工作', waiting: '等待确认', failed: '运行失败', interrupted: '已停止' };
 
 export default function App() {
+  const [linkageOpen,setLinkageOpen]=useState(false);
   const [prefs, setPrefs] = useState(loadPreferences);
   const [ready, setReady] = useState(false);
   const [sideDraft,setSideDraft]=useState<SideDraft|null>(null);
@@ -248,6 +254,7 @@ export default function App() {
   });
   const project = projects.find(p => p.id === projectId);
   const session = sessions.find(s => s.id === sessionId);
+  const linkage=useLinkage(sessionId,draftKey.current);
   const workspacePath = project?.path ?? session?.workspacePath ?? undefined;
   const showSubagents = right.tabs.some(tab => tab.kind === 'subagents') && subagentSelection?.sessionId === sessionId && !!sessionId;
   const visibleSideChat = right.active === 'question';
@@ -287,7 +294,7 @@ export default function App() {
   useChatReadReceipt({ sessionId, status: session?.status, unread: !!sidebarState.sessions[sessionId]?.unread, throughSeq: messages.reduce((seq, message) => Math.max(seq, message.seq), 0), loading: messagesLoading, settingsOpen,
     onRead: id => setSidebarState(old => ({ ...old, sessions: { ...old.sessions, [id]: { ...old.sessions[id], unread: false } } })), onError: report });
   const sending = pendingSends.has(sessionId || draftKey.current);
-  const busy = sending || isActive(session?.status);
+  const busy = sending || isActive(session?.status) || linkage.state.active;
   const anyBusy = pendingSends.size > 0 || !!sidePendingConnection || sessions.some(s => isActive(s.status)) || Object.values(backendRunningConnections).some(ids => ids.length > 0);
   function beginSending() {
     const keys = new Set<string>();
@@ -307,8 +314,12 @@ export default function App() {
     },
     reload:followups.reload,report,focus:()=>textarea.current?.focus(),
   });
-  const stopMode = isActive(session?.status) && !!session?.turnId && !hasDraft && !followupEditor.editingId;
+  const stopMode = (isActive(session?.status) && !!session?.turnId || linkage.state.active) && !hasDraft && !followupEditor.editingId;
   const connectionId = session?.connectionId ?? draftConnectionId ?? profiles.find(p => p.agent === agentId && p.current)?.id ?? (officialAgents.includes(agentId) ? '@official' : '@local');
+  const linkageController={agentId,connectionId,modelId:model,effort};
+  const linkageExecutor=linkage.configuration?.executor??defaultLinkageChoice(agents.find(agent=>agent.connected&&agent.id!==agentId)?.id??agentId,profiles,officialAgents);
+  const linkageValue:LinkageConfiguration={mode:linkage.configuration?.mode??'single',controller:linkageController,executor:linkageExecutor};
+  const availableLinkageCatalogs=useMemo(()=>linkageCatalogs(agents,profiles,officialAgents,[linkageController,linkageExecutor]),[agents,profiles,officialAgents,agentId,connectionId,model,effort,linkageExecutor.agentId,linkageExecutor.connectionId,linkageExecutor.modelId]);
   const runningConnections = useMemo(() => inUseProviderConnections(sessions, profiles, officialAgents, [...pendingProviderConnections.current.values(), ...(sidePendingConnection ? [sidePendingConnection] : [])], backendRunningConnections), [sessions, profiles, officialAgents, pendingSends, sidePendingConnection, backendRunningConnections]);
   const activeProfile = profiles.find(p => p.agent === agentId && p.id === connectionId);
   const [handoffTarget, setHandoffTarget] = useState('');
@@ -416,7 +427,7 @@ export default function App() {
   const refreshUsage = useCallback(async (id: string) => {
     const revision = usageRevision.current;
     const result=await call<{records:UsageRecord[]}>('get_usage',{sessionId:id});
-    if(current.current.sessionId===id && revision===usageRevision.current)setUsage(latestChatUsage(result.records));
+    if(current.current.sessionId===id && revision===usageRevision.current)setUsage(latestChatUsage(result.records, sessionsRef.current.find(session => session.id === id)));
   }, [setUsage]);
   const refreshChanges = useCallback(async (id: string) => {
     if (!id && !current.current.sessionId) return;
@@ -449,6 +460,7 @@ export default function App() {
     }).catch(report);
     void subscribe(event => {
       if (disposed) return;
+      linkage.observe(event);
       const p = event.params;
       const native = p.threadId ?? p.thread?.id;
       const childStatus=subagentEventStatus(event);
@@ -549,7 +561,7 @@ export default function App() {
   useEffect(() => {
     if (settingsOpen && settingsTab === 'resources' && desktop) void inspectRuntime();
   }, [settingsOpen, settingsTab]);
-  useEffect(() => { setUsage(undefined); if (!desktop || !sessionId) return; let disposed=false; const revision=usageRevision.current; void call<{records:UsageRecord[]}>('get_usage',{sessionId}).then(r=>{if(!disposed && revision===usageRevision.current)setUsage(latestChatUsage(r.records));}).catch(report); return ()=>{disposed=true;}; }, [sessionId, setUsage]);
+  useEffect(() => { setUsage(undefined); if (!desktop || !sessionId) return; let disposed=false; const revision=usageRevision.current; void call<{records:UsageRecord[]}>('get_usage',{sessionId}).then(r=>{if(!disposed && revision===usageRevision.current)setUsage(latestChatUsage(r.records, sessionsRef.current.find(session => session.id === sessionId)));}).catch(report); return ()=>{disposed=true;}; }, [sessionId, setUsage]);
   useEffect(() => { localStorage.setItem('supercode.agent', agentId); }, [agentId]);
   useEffect(() => { if (ready && !detached) { localStorage.setItem('supercode.session', sessionId); localStorage.setItem('supercode.project', projectId); } }, [ready, sessionId, projectId, detached]);
   useDraftPersistence(draftStore, { ready, key: draftKey.current, text: input, attachments, selection: model ? { connectionId, model, effort } : undefined }, { text: inputRef, attachments: attachmentsRef });
@@ -592,7 +604,7 @@ export default function App() {
   useModalFocus(!!selectionDetail, selectionModalElement, () => setSelectionDetail(''), textarea);
   useEffect(() => {
     function shortcuts(e: KeyboardEvent) {
-      if (sidebarDialog || updateDialog || selectionDetail) return;
+      if (sidebarDialog || updateDialog || selectionDetail || linkageOpen) return;
       if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'k') { e.preventDefault(); setModal('search'); }
       if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'n') { e.preventDefault(); newSessionRef.current(); }
       if ((e.ctrlKey || e.metaKey) && (e.key === ',' || e.code === 'Comma')) { e.preventDefault(); openSettings(); }
@@ -601,7 +613,7 @@ export default function App() {
       if (e.key === 'Escape' && !modalWorking) { if (modalRef.current) setModal(null); else if (settingsOpenRef.current) setSettingsOpen(false); }
     }
     window.addEventListener('keydown', shortcuts); return () => window.removeEventListener('keydown', shortcuts);
-  }, [modalWorking, sidebarDialog, updateDialog, selectionDetail]);
+  }, [modalWorking, sidebarDialog, updateDialog, selectionDetail, linkageOpen]);
 
   async function addProject(path?: string, browse = false) {
     try {
@@ -699,6 +711,7 @@ export default function App() {
     const taskAttachments = commandSkill && !attachments.some(a => a.path === commandSkill.path) ? [...attachments, { kind: 'skill' as const, name: commandSkill.name, path: commandSkill.path }] : attachments;
     if (taskAttachments.length > 12) { setError('最多添加 12 个附件，请先移除一个附件。'); return; }
     const originalInput = input;
+    const pendingLinkage=linkage.configuration;
     const text = commandSkill ? command!.argument || `请执行所选技能 ${commandSkill.name}。` : input.trim() || (attachments.some(a => a.kind === 'skill') ? '请执行所选技能。' : '请查看附件。'); let id = sessionId;
     const originDraft = draftKey.current;
     const queued = busy || followups.rows.some(row => row.sessionId === id);
@@ -715,7 +728,16 @@ export default function App() {
     }
     try {
       await requireChatConnection(agentId, connectionId, id);
-      if (!id) { const s = await createChatSession({ projectId, model, agent: agentId, connectionId }); id = s.id; setSessions(old => [s, ...old]); if(clientMessageId){const optimistic=pendingMessages.current.get(clientMessageId);if(optimistic)pendingMessages.current.set(clientMessageId,{...optimistic,sessionId:id});} if(current.current.projectId===projectId && draftKey.current===originDraft){setSessionId(id);current.current.sessionId=id;draftKey.current=id;setMessages(old => old.map(message => message.id === clientMessageId ? { ...message, sessionId: id } : message));} }
+      if (!id) {
+        const s = await createChatSession({ projectId, model, agent: agentId, connectionId });
+        id = s.id; setSessions(old => [s, ...old]);
+        if(pendingLinkage)linkage.saveDraft(id,{...pendingLinkage,controller:linkageController});
+        if(clientMessageId){const optimistic=pendingMessages.current.get(clientMessageId);if(optimistic)pendingMessages.current.set(clientMessageId,{...optimistic,sessionId:id});}
+        if(current.current.projectId===projectId && draftKey.current===originDraft){setSessionId(id);current.current.sessionId=id;draftKey.current=id;setMessages(old => old.map(message => message.id === clientMessageId ? { ...message, sessionId: id } : message));}
+      }
+      // Persist before sending, including a previous failed configuration save.
+      // The selected pair stays attached to the new chat until the save succeeds.
+      if(pendingLinkage&&linkage.state.configuration!==pendingLinkage)await linkage.persist(id,{...pendingLinkage,controller:linkageController});
       if (queued) {
         await call('enqueue_followup',{sessionId:id,payload:followupPayload(text,taskAttachments)});
         if(current.current.sessionId===id){setInput('');setAttachments([]);}
@@ -910,6 +932,31 @@ export default function App() {
     selectProject(project, value);
     setLoadingModels(false);
   }
+  async function applyLinkage(configuration:LinkageConfiguration){
+    if(busy||configuringLock.current)throw new Error('请先完成或停止当前任务。');
+    setConfiguring(true);
+    try{
+      const controller=configuration.controller;
+      if(controller.agentId!==agentId){
+        selectProject(project,controller.agentId);
+        setDraftConnectionId(controller.connectionId);setModel(controller.modelId);setEffort(controller.effort??'');
+        linkage.saveDraft(draftKey.current,configuration);
+      }else if(sessionId){
+        if(controller.connectionId!==connectionId||controller.modelId!==model){
+          await call<Session>('switch_session_model',{sessionId,connectionId:controller.connectionId,model:controller.modelId});
+        }
+        await linkage.persist(sessionId,configuration);
+        setModel(controller.modelId);setEffort(controller.effort??'');
+        const updated=await refresh();
+        if(current.current.sessionId===sessionId)current.current.nativeId=updated.sessions.find(item=>item.id===sessionId)?.nativeId??null;
+        await loadMessages(sessionId);
+      }else{
+        setDraftConnectionId(controller.connectionId);setModel(controller.modelId);setEffort(controller.effort??'');
+        linkage.saveDraft(draftKey.current,configuration);
+      }
+      setModels([]);setModelCatalogRevision('');setModelSource(undefined);setLinkageOpen(false);
+    }catch(error){await refresh().catch(report);throw error;}finally{setConfiguring(false);}
+  }
   async function inspectRuntime() { try { setRuntime(await call<RuntimeInfo>('runtime_info')); } catch (e) { report(e); } }
   async function saveCodex() {
     setConfiguring(true);
@@ -950,7 +997,7 @@ export default function App() {
     setModal(null); setSettingsOpen(true);
   }
   async function navigate(direction: -1 | 1) {
-    if (navigating.current || modalRef.current || sidebarDialog) return;
+    if (navigating.current || modalRef.current || linkageOpen || sidebarDialog) return;
     if (direction === -1 && settingsOpenRef.current) { setSettingsOpen(false); return; }
     let next = travel(navigation, direction);
     while (next !== navigation) {
@@ -1054,21 +1101,22 @@ export default function App() {
     ] },
   ];
 
-  return <ReplyTranslationContext.Provider value={prefs.autoTranslateReplies}><PlanDisplayContext.Provider value={planDisplay}><div className="desktop-shell" inert={updateDialog}><DesktopTitleBar menus={desktopMenus} back={() => void navigate(-1)} forward={() => void navigate(1)} canBack={settingsOpen || navigation.index > 0} canForward={navigation.index < navigation.entries.length - 1} sidebar={sidebar} toggleSidebar={() => setSidebar(v => !v)} blocked={!!modal || !!selectionDetail || sidebarDialog || updateDialog} report={report}/><div className="desktop-workarea"><ActivityRail settings={settingsOpen} blocked={!!modal || !!selectionDetail || sidebarDialog || updateDialog} home={() => setSettingsOpen(false)} create={() => { setSettingsOpen(false); void newSession(); }} search={() => setModal('search')} projects={() => { setSettingsOpen(false); setSidebar(true); }} preferences={() => { setSettingsTab('general'); openSettings(); }}/><div ref={panels.root} className={`app ${settingsOpen ? 'settings-open' : ''} ${sidebar ? '' : 'sidebar-hidden'} ${right.tabs.length ? '' : 'context-hidden'} ${visibleSideChat?'has-side-chat':''} ${visibleSubagents?'has-subagent-panel':''}`}>
-    <aside className={`sidebar ${sidebar ? "" : "pane-collapsed"}`} hidden={settingsOpen} aria-hidden={!sidebar} inert={!sidebar || !!modal || !!selectionDetail || sidebarDialog}>
+  return <ReplyTranslationContext.Provider value={prefs.autoTranslateReplies}><PlanDisplayContext.Provider value={planDisplay}><div className="desktop-shell" inert={updateDialog}><DesktopTitleBar menus={desktopMenus} back={() => void navigate(-1)} forward={() => void navigate(1)} canBack={settingsOpen || navigation.index > 0} canForward={navigation.index < navigation.entries.length - 1} sidebar={sidebar} toggleSidebar={() => setSidebar(v => !v)} blocked={!!modal || linkageOpen || !!selectionDetail || sidebarDialog || updateDialog} report={report}/><div className="desktop-workarea"><ActivityRail settings={settingsOpen} blocked={!!modal || linkageOpen || !!selectionDetail || sidebarDialog || updateDialog} home={() => setSettingsOpen(false)} create={() => { setSettingsOpen(false); void newSession(); }} search={() => setModal('search')} projects={() => { setSettingsOpen(false); setSidebar(true); }} preferences={() => { setSettingsTab('general'); openSettings(); }}/><div ref={panels.root} className={`app ${settingsOpen ? 'settings-open' : ''} ${sidebar ? '' : 'sidebar-hidden'} ${right.tabs.length ? '' : 'context-hidden'} ${visibleSideChat?'has-side-chat':''} ${visibleSubagents?'has-subagent-panel':''}`}>
+    <aside className={`sidebar ${sidebar ? "" : "pane-collapsed"}`} hidden={settingsOpen} aria-hidden={!sidebar} inert={!sidebar || !!modal || linkageOpen || !!selectionDetail || sidebarDialog}>
       {!settingsOpen ? <div {...panels.handle('left')}/> : null}
       <div className="brand"><span>SuperCode</span><button className="icon-button brand-search" aria-label="搜索会话" title="搜索会话 (Ctrl+K)" onClick={() => setModal('search')}><Search size={16}/></button></div>
       <button className="new-chat" title="新建聊天 (Ctrl+N)" onClick={() => void newSession()}><SquarePen size={15} />新聊天</button>
-      <Sidebar activeSessionIds={activeSessionIds} projects={projects} sessions={sessions} state={sidebarState} projectId={projectId} sessionId={sessionId} ready={ready} blocked={!!modal || !!selectionDetail || settingsOpen || updateDialog} collapsed={collapsedProjects} setCollapsed={setCollapsedProjects} selectProject={selectProject} selectSession={selectSession} addProject={() => void addProject()} createSession={newSession} updated={reconcileSidebar} dialogChanged={setSidebarDialog}/>
+      <Sidebar activeSessionIds={activeSessionIds} projects={projects} sessions={sessions} state={sidebarState} projectId={projectId} sessionId={sessionId} ready={ready} blocked={!!modal || linkageOpen || !!selectionDetail || settingsOpen || updateDialog} collapsed={collapsedProjects} setCollapsed={setCollapsedProjects} selectProject={selectProject} selectSession={selectSession} addProject={() => void addProject()} createSession={newSession} updated={reconcileSidebar} dialogChanged={setSidebarDialog}/>
     </aside>
 
     <div className="conversation-surface" hidden={settingsOpen}>
-    <main className={`workspace${newChat ? ' new-chat-page' : ''}`} hidden={settingsOpen} inert={!!modal || !!selectionDetail || sidebarDialog}>
-      {desktop ? <AppUpdateNotice busy={anyBusy} blocked={!ready || !!modal || sidebarDialog || !!selectionDetail || settingsOpen || rightMenuOpen} dialogChanged={setUpdateDialog} open={() => { setSettingsTab('about'); openSettings(); }}/> : null}
+    <main className={`workspace${newChat ? ' new-chat-page' : ''}`} hidden={settingsOpen} inert={!!modal || linkageOpen || !!selectionDetail || sidebarDialog}>
+      {desktop ? <AppUpdateNotice busy={anyBusy} blocked={!ready || !!modal || linkageOpen || sidebarDialog || !!selectionDetail || settingsOpen || rightMenuOpen} dialogChanged={setUpdateDialog} open={() => { setSettingsTab('about'); openSettings(); }}/> : null}
       <header className="workspace-header"><div className="breadcrumbs">{!sidebar ? <button className="icon-button" title="展开侧栏" onClick={() => setSidebar(true)}><PanelLeftOpen size={18} /></button> : null}<Folder size={15} /><strong title={`${project?.name ?? '工作区'} · ${session?.title ?? '新会话'}`}>{session?.title ?? project?.name ?? '新聊天'}</strong>{!desktop ? <span className="preview-badge">界面预览</span> : null}</div><div className="header-actions">
         <button className={`icon-button ${right.active==='browser' ? 'on' : ''}`} aria-label="打开内置浏览器" aria-pressed={right.active==='browser'} title={right.active==='browser' ? '关闭浏览器' : '内置浏览器'} disabled={!desktop || !sessionId} onClick={()=>right.active==='browser' ? closeRight('browser') : openBrowser()}><Globe size={16}/></button>
         <button className={`icon-button ${visibleSideChat ? 'on' : ''}`} aria-label="打开侧边提问" title="侧边提问" aria-pressed={visibleSideChat} onClick={()=>void openSide()}><MessagesSquare size={16}/></button>
         {session ? <button className="icon-button" title="会话设置" onClick={() => { setRename(session.title); setModal('rename'); }}><MoreHorizontal size={18} /></button> : null}
+        {linkage.enabled||linkage.state.worker?<button className={`icon-button ${right.active==='linkage'?'on':''}`} aria-label="查看执行 Agent" title="执行 Agent" onClick={()=>right.open({id:'linkage',kind:'linkage',title:'执行 Agent'})}><Link2 size={16}/></button>:null}
         <button className={`icon-button ${logsOpen ? 'on' : ''}`} title="运行日志" onClick={() => setLogsOpen(v => !v)}><Terminal size={16} /></button>
         <button className="icon-button" aria-label={showContext ? '收起工作空间' : '打开工作空间'} aria-pressed={showContext} title={showContext ? '关闭工作空间' : '打开工作空间'} onClick={() => showContext ? right.close('workspace') : openWorkspace()}>{showContext ? <PanelRightClose size={17} /> : <PanelRightOpen size={17} />}</button>
       </div></header>
@@ -1113,10 +1161,11 @@ export default function App() {
               onSkill={addSkill} onPlan={enabled => { setPermissionMode(enabled ? 'read' : executionPermissions.current[agentId] ?? 'ask'); requestAnimationFrame(() => textarea.current?.focus()); }}
               onGoal={objective => void handleCommand('/goal-create', objective, true)} />
             <PermissionMenu value={permissionMode} agent={agentId} busy={busy} onChange={mode => {setPermissionMode(mode);}} />
+            <button type="button" className={`composer-chip linkage-entry${linkage.enabled?' enabled':''}`} aria-label="联动设置" aria-haspopup="dialog" aria-expanded={linkageOpen} title={linkage.error||'Agent 联动'} onClick={()=>setLinkageOpen(true)}><Link2 size={14}/><span>{linkage.enabled?'联动中':'联动'}</span></button>
           </div><div className="composer-right">
             <AgentMenu value={agentId} agents={agents} busy={configuring} choose={switchAgent}/>
             <ModelMenu value={model} models={modelSourceRevision === profileRevision ? models : []} catalogLoaded={modelCatalogRevision === profileRevision} catalogWarning={modelCatalogRevision === profileRevision ? modelCatalogWarning : ''} profiles={profiles} activeProfile={activeProfile} connectionId={connectionId} order={connectionOrder} source={currentModelSource} busy={busy || configuring} loading={loadingModels} agent={agentId} choose={chooseModel} reload={force => void loadModels(force)} manage={() => {setProviderSettingsAgent(agentId);setSettingsTab('providers');openSettings();}} effort={effort} setEffort={chooseEffort} hasConversation={!!session?.nativeId} />
-            <button className={`send-button${stopMode ? ' stop-button' : ''}`} type={stopMode ? 'button' : 'submit'} disabled={stopMode ? !session?.turnId || stopping : configuring || !hasDraft || sending || importingImages || followupEditor.busy} onClick={stopMode ? () => void stop() : undefined} aria-label={stopMode ? '停止生成' : followupEditor.editingId ? '发送修改' : busy && hasDraft ? '加入队列' : '发送消息'} title={stopMode ? '停止生成' : followupEditor.editingId ? '发送修改，保留原来的顺序' : busy && hasDraft ? '加入队列，当前任务完成后发送' : '发送消息'}>{stopMode ? <Square size={14} fill="currentColor" /> : <ArrowUp size={18} />}</button></div></div>
+            <button className={`send-button${stopMode ? ' stop-button' : ''}`} type={stopMode ? 'button' : 'submit'} disabled={stopMode ? !session?.turnId && !linkage.state.active || stopping : configuring || !hasDraft || sending || importingImages || followupEditor.busy} onClick={stopMode ? event=>{event.preventDefault();void stop();} : undefined} aria-label={stopMode ? '停止生成' : followupEditor.editingId ? '发送修改' : busy && hasDraft ? '加入队列' : '发送消息'} title={stopMode ? '停止生成' : followupEditor.editingId ? '发送修改，保留原来的顺序' : busy && hasDraft ? '加入队列，当前任务完成后发送' : '发送消息'}>{stopMode ? <Square size={14} fill="currentColor" /> : <ArrowUp size={18} />}</button></div></div>
         </form><div className="composer-footnote"><span /><div>{showPlatformQuota ? <PlatformUsageIndicator key={`${agentId}:${connectionId}`} agent={agentId} connectionId={agentId === 'codex' && connectionId === '@local' ? '@official' : connectionId} revision={quotaRevision} source={quotaSource} openStats={() => {setSettingsTab('quota');openSettings();}} /> : null}<UsageIndicator key={`${sessionId}:${agentId}:${connectionId}:${model}`} usage={usage} contextWindow={contextFallbackWindow} /><span>{prefs.enterSend ? 'Enter 发送' : 'Ctrl Enter 发送'} · Shift Enter 换行</span></div></div>
       </div>
       {logsOpen ? <section className="logs-panel"><div><span title="自动保存到文件，保留 30 天"><Terminal size={14} />运行日志 · 保留 30 天</span><button className="quiet-button" disabled={!desktop} onClick={() => void openRuntimeLogFolder().catch(report)}>打开文件夹</button><button className="quiet-button" disabled={!desktop || exportingLogs} onClick={() => void exportLogs()}>{exportingLogs ? '正在导出…' : '导出诊断日志'}</button><button className="quiet-button" title="仅清空当前显示，保留日志文件" onClick={() => setLogs([])}>清空显示</button><button className="icon-button" title="关闭日志" onClick={() => setLogsOpen(false)}><X size={15} /></button></div><pre>{logs.length ? logs.join('\n') : '日志已自动保存到文件。可打开文件夹查看，或导出最近 30 天的诊断日志。'}</pre></section> : null}
@@ -1125,7 +1174,7 @@ export default function App() {
 
     <SelectionActions key={sessionId} area={scrollArea} add={text=>{setInput(old=>[old,text.split('\n').map(line=>`> ${line}`).join('\n')].filter(Boolean).join('\n\n'));requestAnimationFrame(()=>textarea.current?.focus());}} details={setSelectionDetail} ask={text=>void openSide(undefined,`关于下面这段内容：\n\n${text}\n\n请帮我进一步解释。`)}/>
     {selectionDetail?<div className="modal-backdrop" onClick={()=>setSelectionDetail('')}><section className="modal" ref={selectionModalElement} tabIndex={-1} role="dialog" aria-modal="true" aria-label="选中内容" onClick={e=>e.stopPropagation()}><div className="modal-heading"><h2>选中内容</h2><button className="icon-button" aria-label="关闭选中内容" onClick={()=>setSelectionDetail('')}><X size={16}/></button></div><pre className="selection-detail">{selectionDetail}</pre><CopyButton text={selectionDetail} label="复制选中内容"/></section></div>:null}
-    <RightPane tabs={right.tabs} active={right.active} select={right.select} close={closeRight} closeAll={closeRightAll} expanded={workspaceExpanded} expand={()=>setWorkspaceExpanded(value=>!value)} openWorkspace={openWorkspace} openBrowser={openBrowser} openQuestion={()=>void openSide()} browserEnabled={desktop && !!sessionId} hidden={settingsOpen || !right.tabs.length} blocked={!!modal || !!selectionDetail || sidebarDialog || updateDialog} onMenuVisibility={setRightMenuOpen} resizeHandle={<div {...panels.handle('right')}/> }>
+    <RightPane tabs={right.tabs} active={right.active} select={right.select} close={closeRight} closeAll={closeRightAll} expanded={workspaceExpanded} expand={()=>setWorkspaceExpanded(value=>!value)} openWorkspace={openWorkspace} openBrowser={openBrowser} openQuestion={()=>void openSide()} browserEnabled={desktop && !!sessionId} hidden={settingsOpen || !right.tabs.length} blocked={!!modal || linkageOpen || !!selectionDetail || sidebarDialog || updateDialog} onMenuVisibility={setRightMenuOpen} resizeHandle={<div {...panels.handle('right')}/> }>
       {context ? <section className="context-panel workspace-panel" aria-label="工作空间" aria-hidden={!showContext} hidden={!showContext} inert={!showContext}>
         <Suspense fallback={<div className="workspace-loading">正在打开工作空间…</div>}><WorkspacePanel embedded active={showContext && !settingsOpen} projectId={projectId} sessionId={sessionId} workspacePath={workspacePath} workspaceName={project?.name ?? session?.title} changes={changes} loading={changesLoading} preview={null} expanded={workspaceExpanded} refresh={() => void refreshChanges(projectId)} close={()=>right.close('workspace')} expand={() => setWorkspaceExpanded(value => !value)} closePreview={()=>{}} openFile={path => void showFile(path)} reviewFile={reviewFile} showDiff={showDiff} reveal={() => void openPath('.', 'reveal').catch(report)}/></Suspense>
       </section> : null}
@@ -1133,9 +1182,11 @@ export default function App() {
       {showBrowser ? <Suspense fallback={<aside className="browser-panel" hidden={right.active!=='browser'}>正在打开浏览器…</aside>}><BrowserPanel embedded key={sessionId} sessionId={sessionId} visible={right.active==='browser' && !settingsOpen && !modal && !sidebarDialog && !selectionDetail && !rightMenuOpen && !updateDialog} close={()=>right.close('browser')} expanded={workspaceExpanded} expand={()=>setWorkspaceExpanded(value=>!value)}/></Suspense> : null}
       {sideDraft && right.tabs.some(tab=>tab.kind==='question') ? <Suspense fallback={<aside className="side-chat" hidden={!visibleSideChat}>正在打开侧边聊天…</aside>}><SideChat pendingConnectionChanged={updateSidePendingConnection} embedded hidden={!visibleSideChat} key={sideDraft.key} draft={sideDraft} projectId={sideDraft.projectId??projectId} agent={sideDraft.agent??agentId} connectionId={sideDraft.connectionId??connectionId} defaults={followupPayload('')} profiles={profiles} enterSend={prefs.enterSend} manageProviders={(agent,draft)=>{setSideDraft(draft);setProviderSettingsAgent(agent);setSettingsTab('providers');openSettings();}} close={()=>closeRight('question')} opened={()=>void refresh()} openFile={showFile} showDiff={showDiff} providerRequired={(agent,draft)=>{setSideDraft(draft);showProviderRequired(agent);}}/></Suspense> : null}
       {showSubagents ? <Suspense fallback={<aside className="subagent-panel" hidden={!visibleSubagents}><span className="pending-text">正在打开子智能体...</span></aside>}><SubagentPanel embedded hidden={!visibleSubagents} agents={subagents} onStatus={updateSubagentStatus} selected={subagentSelection?.key??null} select={key=>setSubagentSelection({sessionId,key})} close={closeSubagents} sessionId={sessionId} projectId={projectId} openFile={showFile} showDiff={showDiff} openPath={openPath} expanded={workspaceExpanded} expand={()=>setWorkspaceExpanded(value=>!value)}/></Suspense> : null}
+      {right.tabs.some(tab=>tab.kind==='linkage')?<Suspense fallback={<div className="workspace-loading">正在读取执行记录…</div>}><LinkagePanel state={linkage.state} hidden={right.active!=='linkage'} projectId={projectId} openFile={showFile} showDiff={showDiff} openPath={openPath}/></Suspense>:null}
     </RightPane>
+    {linkageOpen?<Suspense fallback={<div className="working-indicator">正在打开联动设置…</div>}><LinkageDialog value={linkageValue} catalogs={availableLinkageCatalogs} disabled={busy} onClose={()=>setLinkageOpen(false)} onApply={applyLinkage} manage={agent=>{setLinkageOpen(false);setProviderSettingsAgent(agent);setSettingsTab('providers');openSettings();}}/></Suspense>:null}
 
-    {settingsOpen ? <SettingsPage tab={settingsTab} select={setSettingsTab} blocked={!!modal || !!selectionDetail || sidebarDialog || updateDialog}>
+    {settingsOpen ? <SettingsPage tab={settingsTab} select={setSettingsTab} blocked={!!modal || linkageOpen || !!selectionDetail || sidebarDialog || updateDialog}>
       {modalError ? <div className="error-banner modal-error" role="alert"><span>{modalError}</span><button className="icon-button" aria-label="关闭错误提示" onClick={() => setModalError('')}><X size={14} /></button></div> : null}
       {settingsTab === 'agents' ? <Suspense fallback={<p className="muted pending-text" role="status">正在加载 Agent…</p>}><AgentSettings agents={agents} busy={anyBusy || configuring} loadMcp={loadMcp} setLoadMcp={setLoadMcp} saveMcp={saveCodex}/></Suspense> : null}
       {settingsTab === 'providers' ? <Suspense fallback={<p className="muted">正在加载模型连接…</p>}><ProviderSettings profiles={profiles} officialAgents={officialAgents} order={connectionOrder} runningConnections={runningConnections} updated={connectionUpdated} initialAgent={providerSettingsAgent} /></Suspense> : null}

@@ -151,6 +151,9 @@ pub fn instructions(app: &AppHandle) -> String {
     let control_policy = crate::control_policy::BASE_GUIDANCE;
     format!("Read and write every project text file as UTF-8 without BOM. Tell the user before converting non-UTF-8 files.\nYou are running inside the SuperCode graphical desktop app. The conversation supports inline images, video and audio, not just terminal text. Tool image results are displayed automatically. To show a local media file, write ![descriptive caption](<absolute file path>); use an absolute path with spaces inside angle brackets. The same syntax supports video and audio files. Use ordinary Markdown links for files that should only be referenced. Do not open another application or copy screenshots to the desktop merely to make media visible in the conversation. Never claim a media file was shown unless you actually returned the media result or referenced an existing file.\n{ARTIFACT_GUIDANCE}\n{SERVICE_GUIDANCE}\n{PROGRESS_GUIDANCE}\n{control_policy}\n{tools}\n{text}")
 }
+pub fn instructions_for_session(app:&AppHandle,id:Option<&str>)->Result<String,String>{
+    Ok(format!("{}{}",instructions(app),crate::linkage::instructions(app,id)?))
+}
 
 #[tauri::command]
 pub fn get_client_preferences(app: AppHandle) -> Result<Value, String> {
@@ -481,8 +484,14 @@ pub fn validate_servers(servers: &[ToolServer]) -> Result<(), String> {
     Ok(())
 }
 pub fn codex_mcp_overrides(app: &AppHandle) -> Result<Vec<String>, String> {
+    codex_mcp_overrides_for_session(app,None)
+}
+pub fn servers_for_session(app:&AppHandle,id:Option<&str>)->Result<Vec<ToolServer>,String>{
+    let mut all=servers(app)?;if let Some(server)=crate::linkage::server(app,id)?{all.push(server);}Ok(all)
+}
+pub fn codex_mcp_overrides_for_session(app:&AppHandle,id:Option<&str>)->Result<Vec<String>,String>{
     let mut out = vec![];
-    for s in servers(app)?.into_iter().filter(|s| s.enabled) {
+    for s in servers_for_session(app,id)?.into_iter().filter(|s| s.enabled) {
         let s = crate::desktop_control::wrap(app, s, "codex")?;
         let prefix = format!("mcp_servers.supercode_{}", s.id.replace('-', "_"));
         out.push(format!("{prefix}.enabled=true"));
@@ -503,11 +512,14 @@ pub fn codex_mcp_overrides(app: &AppHandle) -> Result<Vec<String>, String> {
     Ok(out)
 }
 pub fn claude_mcp(app: &AppHandle, native: Value) -> Result<Value, String> {
+    claude_mcp_for_session(app,native,None)
+}
+pub fn claude_mcp_for_session(app:&AppHandle,native:Value,id:Option<&str>)->Result<Value,String>{
     let mut map = native["mcpServers"]
         .as_object()
         .cloned()
         .unwrap_or_default();
-    for s in servers(app)?.into_iter().filter(|s| s.enabled) {
+    for s in servers_for_session(app,id)?.into_iter().filter(|s| s.enabled) {
         let s = crate::desktop_control::wrap(app, s, "claude")?;
         map.insert(
             format!("supercode_{}", s.id),

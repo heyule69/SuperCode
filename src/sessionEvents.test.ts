@@ -20,3 +20,9 @@ it('prefers exact app ownership to a boot or reused native alias for approvals',
   expect(requestBelongsToSession({...request,params:{appSessionId:'other',threadId:'actual'}},'chat',['actual'],true)).toBe(false);
   expect(requestBelongsToSession({...request,params:{threadId:'actual'}},'chat',['actual'])).toBe(true);
 });
+it('routes execution approvals to their controller while keeping execution questions for the controller tools',()=>{
+  const request:RpcEvent={id:'worker-approval',method:'item/commandExecution/requestApproval',params:{appSessionId:'private-worker',linkageParentSessionId:'controller',threadId:'worker-native'}};
+  expect(requestBelongsToSession(request,'controller',['controller-native'])).toBe(true);
+  expect(requestBelongsToSession(request,'other',['worker-native'],true)).toBe(false);
+  expect(requestBelongsToSession({...request,method:'item/tool/requestUserInput'},'controller',['worker-native'],true)).toBe(false);
+});

@@ -29,8 +29,32 @@ describe('usage views', () => {
 });
 
 describe('context occupancy', () => {
+  it('preserves the native context percentage and labels estimated windows', () => {
+    const native = { total: {}, last: {}, contextTokens: 25000, modelContextWindow: 100000, contextPercent: 42, contextSource: 'claude' as const, contextApproximate: false };
+    expect(contextUsage(native).label).toBe('上下文 42%');
+    expect(contextUsage(native).rawPercent).toBe(42);
+    expect(contextUsage({ total: {}, last: {}, contextTokens: 150000, contextSource: 'usage' }, 1000000).label).toBe('上下文 ~15%');
+    expect(contextUsage({ total: {}, last: {}, contextTokens: 150000, contextSource: 'usage' }).label).toBe('上下文 ~150.0K');
+    expect(contextUsage({ ...native, modelContextWindow: undefined }).label).toBe('上下文 25.0K');
+  });
+  it('normalizes legacy Claude measurements to input only without rewriting stored records', () => {
+    const saved = record('s', 'glm-5.3', 1);
+    saved.data = { total: { totalTokens: 999999 }, last: { inputTokens: 151336, outputTokens: 456, totalTokens: 151792 }, contextTokens: 151792, modelContextWindow: 1000000, cumulative: false };
+    const normalized = latestChatUsage([saved])!;
+    expect(normalized.contextTokens).toBe(151336);
+    expect(contextUsage(normalized).label).toBe('上下文 ~15%');
+    expect(saved.data.contextTokens).toBe(151792);
+  });
+  it('does not restore context from a previous model or native thread after a switch', () => {
+    const old = record('s', 'old-model', 1);
+    old.data = { total: {}, last: {}, contextTokens: 80000, modelContextWindow: 1000000, counterEpoch: 'old-native' };
+    expect(latestChatUsage([old], { agent: 'claude', model: 'new-model', nativeId: 'old-native' })).toBeUndefined();
+    expect(latestChatUsage([old], { agent: 'claude', model: 'old-model', nativeId: 'new-native' })).toBeUndefined();
+    expect(latestChatUsage([old], { agent: 'claude', model: 'old-model', nativeId: null })).toBeUndefined();
+    expect(latestChatUsage([old], { agent: 'claude', model: 'old-model', nativeId: 'old-native' })?.contextTokens).toBe(80000);
+  });
   it('shows real tokens when the provider omits capacity', () => {
-    expect(contextUsage({ total: { totalTokens: 90000 }, last: {}, contextTokens: 12345, cumulative: false })).toEqual({ used: 12345, window: undefined, percent: undefined, label: '上下文 12.3K' });
+    expect(contextUsage({ total: { totalTokens: 90000 }, last: {}, contextTokens: 12345, cumulative: false })).toMatchObject({ used: 12345, window: undefined, percent: undefined, label: '上下文 12.3K', estimated: false });
   });
   it('shows percentage with a real capacity and accepts zero usage', () => {
     expect(contextUsage({ total: {}, last: {}, contextTokens: 16000, modelContextWindow: 128000 }).label).toBe('上下文 13%');

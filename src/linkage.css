@@ -1,0 +1,47 @@
+.linkage-setup { width:100%; text-align:left; }
+.linkage-enable-row { display:flex; align-items:center; justify-content:space-between; gap:16px; margin:0 1px 18px; font-size:12px; color:var(--muted); }
+.linkage-toggle { display:flex; align-items:center; width:32px; height:19px; padding:3px; background:var(--hover); border-radius:12px; flex:none; }
+.linkage-toggle > span { width:13px; height:13px; border-radius:50%; background:var(--muted); transition:transform 120ms; }
+.linkage-toggle[aria-checked=true] { background:#3385f5; }
+.linkage-toggle[aria-checked=true] > span { background:#fff; transform:translateX(13px); }
+.linkage-roles { position:relative; display:flex; flex-direction:column; border:1px solid var(--line); border-radius:12px; background:var(--surface); }
+.linkage-role-row { display:grid; grid-template-columns:35px minmax(0,1fr) minmax(0,1.2fr); align-items:center; gap:12px; min-height:76px; padding:18px 16px; }
+.linkage-role-row + .linkage-role-row { border-top:1px solid var(--line); }
+.linkage-role-label { color:var(--muted); font-size:11px; font-weight:500; }
+.linkage-role-row .agent-menu, .linkage-role-model { min-width:0; }
+.linkage-role-row .composer-chip { max-width:100%; height:28px; padding:4px 6px; font-size:calc(var(--ui-size) - 1px); }
+.linkage-role-row .agent-chip > span:not(.agent-logo), .linkage-role-row .model-chip-name { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.linkage-role-row .model-chip-provider { display:none; }
+.linkage-swap { position:absolute; z-index:2; left:17px; top:50%; display:grid; place-items:center; width:30px; height:24px; padding:0; transform:translateY(-50%); border:1px solid var(--line); border-radius:7px; background:var(--surface); color:var(--muted); }
+.linkage-swap > svg { transform:rotate(90deg); width:13px; height:13px; }
+.linkage-swap:hover { background:var(--surface2); color:var(--text); }
+.linkage-ready-dot { display:inline-block; width:5px; height:5px; flex:none; border-radius:50%; background:var(--diff-added); }
+.modal-backdrop.linkage-dialog-backdrop { z-index:120; }
+.modal.linkage-config-dialog { width:560px; max-width:calc(100vw - 32px); max-height:calc(100dvh - 40px); overflow:visible; padding:0 22px 20px; }
+.linkage-config-dialog .modal-header { display:flex; justify-content:space-between; align-items:center; padding:20px 0; margin-bottom:7px; }
+.linkage-config-dialog .modal-header h2 { display:flex; align-items:center; gap:9px; margin:0; font-size:16px; font-weight:550; }
+.linkage-dialog-footer { display:flex; align-items:center; justify-content:flex-end; gap:8px; margin-top:22px; }
+.linkage-dialog-footer > button { flex:none; min-width:64px; }
+.linkage-config-error { margin:14px 0 0; color:var(--danger); font-size:12px; line-height:1.7; }
+.composer .linkage-entry { display:flex;align-items:center;gap:5px;background:transparent;color:var(--muted); }
+.composer .linkage-entry.enabled { background:var(--accent-bg);color:var(--text); }
+.linkage-live-panel { display:flex;flex-direction:column;height:100%;min-height:0;background:var(--bg); }
+.linkage-live-panel > header { display:flex;align-items:center;gap:9px;padding:17px 16px;border-bottom:1px solid var(--line);font-size:12px; }
+.linkage-live-panel > header > .agent-logo { width:22px;height:22px; }
+.linkage-live-panel > header > div { flex:1;min-width:0; }
+.linkage-live-panel > header strong { display:block;font-weight:500; }
+.linkage-live-panel > header small { display:block;margin-top:4px;color:var(--muted);overflow-wrap:anywhere; }
+.linkage-live-panel > header > span { color:var(--muted);font-size:10px; }
+.linkage-live-scroll { flex:1;min-height:0;overflow:auto;padding:18px 14px; }
+.linkage-live-empty { display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;flex:1;padding:30px;color:var(--muted);font-size:12px;text-align:center;line-height:1.8; }
+@media(max-width:540px) {
+  .linkage-role-row { grid-template-columns:30px minmax(0,1fr); gap:6px 10px; padding:14px; }
+  .linkage-role-row .linkage-role-model { grid-column:2; }
+  .linkage-role-label { grid-column:1; grid-row:1 / 3; }
+  .modal.linkage-config-dialog { padding:0 16px 16px; }
+  .linkage-swap { left:14px; }
+}
+@media(prefers-reduced-motion:no-preference) {
+  .linkage-spin { animation:linkage-spin 1.2s linear infinite; }
+  @keyframes linkage-spin { to { transform:rotate(360deg); } }
+}

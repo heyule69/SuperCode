@@ -8,6 +8,7 @@ export function canBindMainThread(session: Pick<Session, 'id' | 'agent' | 'nativ
 }
 
 export function requestBelongsToSession(request: RpcEvent, sessionId: string, natives: readonly (string | null | undefined)[], allowUnscoped = false) {
+  if(typeof request.params.linkageParentSessionId==='string')return request.params.linkageParentSessionId===sessionId&&request.method!=='item/tool/requestUserInput';
   const owner = request.params.appSessionId;
   if (owner !== undefined && owner !== null) return !!sessionId && owner === sessionId;
   return allowUnscoped && !request.params.threadId || natives.includes(request.params.threadId);

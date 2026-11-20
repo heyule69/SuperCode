@@ -59,7 +59,7 @@ describe('subagent presentation',()=>{
     expect(collectSubagents([{...running,text:'File does not exist',data:{...running.data,status:'failed'}}])[0].status).toBe('failed');
     expect(collectSubagents([message('read',{tool:'Read',arguments:{prompt:'quoted text'}},'claudeToolCall')])).toEqual([]);
   });
-  it('uses all six geometric shapes, and assigns a stable shape and color to each identity',()=>{
+  it('uses all six expressions, and assigns a stable expression and color to each identity',()=>{
     const visuals=Array.from({length:100},(_,i)=>subagentVisual(`agent-${i}`));
     expect(new Set(visuals.map(v=>v.shape)).size).toBe(6);
     expect(new Set(visuals.map(v=>v.color)).size).toBe(6);

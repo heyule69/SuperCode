@@ -1,6 +1,6 @@
 import { useEffect, useRef, type RefObject } from 'react';
 
-export function useModalFocus(open: boolean, panel: RefObject<HTMLElement | null>, close: () => void, fallback?: RefObject<HTMLElement | null>, locked = false) {
+export function useModalFocus(open: boolean, panel: RefObject<HTMLElement | null>, close: () => void, fallback?: RefObject<HTMLElement | null>, locked = false, nestedLayers = false) {
   const latest = useRef({ close, locked }); latest.current = { close, locked };
   useEffect(() => {
     if (!open) return;
@@ -9,7 +9,7 @@ export function useModalFocus(open: boolean, panel: RefObject<HTMLElement | null
     const focusable = () => [...(el?.querySelectorAll<HTMLElement>('button:not(:disabled),input:not(:disabled),select:not(:disabled),textarea:not(:disabled),a[href],[tabindex="0"]') ?? [])].filter(item => !item.closest('[hidden],[inert]') && item.getAttribute('aria-hidden') !== 'true');
     (el?.querySelector<HTMLElement>('input:not([type=checkbox]):not(:disabled)') ?? focusable()[0] ?? el)?.focus();
     const trap = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') { event.preventDefault(); event.stopImmediatePropagation(); if (!latest.current.locked) latest.current.close(); return; }
+      if (event.key === 'Escape') { if(nestedLayers&&el?.querySelector('.composer-popover'))return; event.preventDefault(); event.stopImmediatePropagation(); if (!latest.current.locked) latest.current.close(); return; }
       if (event.key !== 'Tab') return;
       const items = focusable(), first = items[0], last = items.at(-1);
       if (!first) { event.preventDefault(); el?.focus(); return; }
@@ -18,5 +18,5 @@ export function useModalFocus(open: boolean, panel: RefObject<HTMLElement | null
     };
     document.addEventListener('keydown', trap, true);
     return () => { document.removeEventListener('keydown', trap, true); if (previous?.isConnected && !previous.closest('[inert],[hidden]')) previous.focus(); else fallback?.current?.focus(); };
-  }, [open, panel, fallback]);
+  }, [open, panel, fallback, nestedLayers]);
 }

@@ -150,6 +150,25 @@ impl Runtime {
         for (_, runtime) in self.sessions.entries() { runtime.shutdown_local().await; }
         self.shutdown_local().await;
     }
+    pub(crate) async fn stop_owned_session(&self,app:&AppHandle,id:&str)->Result<(),String>{
+        let runtime=self.for_session(id);
+        let client=runtime.client.lock().await.clone();
+        runtime.shutdown().await;
+        let state=app.state::<AppState>();
+        if let Some(client)=client {
+            client.requests.lock().await.clear();
+        }
+        state.store.clear_session_usage(id)?;
+        let session=state.store.session(id)?;
+        if let (Some(native),Some(turn))=(session.native_id,session.turn_id){
+            publish_event(app,json!({"method":"turn/completed","params":{"appSessionId":id,"threadId":native,"turn":{"id":turn,"status":"interrupted"}}}));
+        }else{
+            state.store.set_status(id,"interrupted",None)?;
+            crate::linkage::observe(app,&json!({"method":"linkage/stopped","params":{"appSessionId":id,"linkageParentSessionId":state.store.linkage_parent(id)?}}));
+        }
+        let _=app.emit("workspace-updated",());
+        Ok(())
+    }
     async fn shutdown_local(&self) {
         self.epoch.fetch_add(1, Ordering::Relaxed);
         let client = self.client.lock().await.take();
@@ -326,7 +345,7 @@ impl Client {
         let project_config = process::read_codex_project_config(project)?;
         let mut overrides =
             process::codex_config_overrides_for(&global_config, app.state::<AppState>().store.load_mcp()?)?;
-        overrides.extend(crate::client_features::codex_mcp_overrides(&app)?);
+        overrides.extend(crate::client_features::codex_mcp_overrides_for_session(&app,session_id.as_deref())?);
         overrides.extend(crate::extensions::codex_overrides(&app, project)?);
         if route.config["official"] == true {
             overrides.push("model_provider=\"openai\"".into());
@@ -655,6 +674,7 @@ pub(crate) fn publish_event(app: &AppHandle, mut message: Value) {
         }
     }
     crate::media::normalize_event(app, &mut message);
+    crate::linkage::annotate(app,&mut message);
     if let Some(artifacts) = crate::artifacts::observe(app, &message) { publish_event(app, artifacts); }
     if matches!(message["method"].as_str(),Some("item/started"|"item/updated"|"item/completed")) {
         crate::file_changes::normalize_native(&mut message["params"]["item"]);
@@ -671,6 +691,7 @@ pub(crate) fn publish_event(app: &AppHandle, mut message: Value) {
         if let Some(item)=message["params"]["item"].as_object_mut() { item.remove("fileSnapshot"); }
     }
     persist_event(app, &message);
+    crate::linkage::observe(app,&message);
     crate::managed_services::observe(app, &message);
     crate::runtime_diagnostics::observe(app, &message);
     crate::desktop_control::observe(app, &message);
@@ -818,7 +839,11 @@ pub(crate) fn persist_event(app: &AppHandle, message: &Value) {
         _ => Ok(()),
     };
     if result.is_ok() {
-        crate::notifications::on_agent_event(app, &session, message);
+        if let Some(parent)=params["linkageParentSessionId"].as_str(){
+            if message.get("id").is_some()&&method!="item/tool/requestUserInput" {
+                if let Ok(parent)=state.store.session(parent){crate::notifications::on_agent_event(app,&parent,message);}
+            }
+        }else{crate::notifications::on_agent_event(app, &session, message);}
         if matches!(
             method,
             "turn/started" | "turn/completed" | "serverRequest/resolved"

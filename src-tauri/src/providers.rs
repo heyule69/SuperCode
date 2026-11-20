@@ -954,6 +954,29 @@ fn model_listing_endpoint(s: &Settings) -> Result<(String, &str), String> {
         return Ok((format!("{root}/v1/models"), "chat"));
     }
     let mut parsed = reqwest::Url::parse(&base).map_err(|_| "API 地址无效")?;
+    // Bailian's Anthropic endpoint has no /v1/models. Standard API keys use
+    // the same-origin native catalog, with Bearer auth and its own schema.
+    // https://help.aliyun.com/zh/model-studio/list-models
+    let standard_bailian = parsed.host_str().is_some_and(|host| {
+        matches!(host, "dashscope.aliyuncs.com" | "dashscope-intl.aliyuncs.com"
+            | "dashscope-us.aliyuncs.com" | "cn-hongkong.dashscope.aliyuncs.com")
+            || host.strip_suffix(".maas.aliyuncs.com")
+                .and_then(|prefix| prefix.split_once('.'))
+                .is_some_and(|(workspace, region)| {
+                    !workspace.is_empty() && !matches!(workspace, "token-plan" | "trial")
+                        && matches!(region, "cn-beijing" | "ap-southeast-1" | "cn-hongkong"
+                            | "ap-northeast-1" | "eu-central-1" | "us-east-1")
+                })
+    });
+    if standard_bailian && parsed.scheme() == "https"
+        && parsed.port_or_known_default() == Some(443)
+        && (s.protocol == "anthropic" && matches!(parsed.path(), "/apps/anthropic" | "/apps/anthropic/v1")
+            || matches!(s.protocol.as_str(), "anthropic" | "chat" | "responses")
+                && parsed.path() == "/compatible-mode/v1")
+    {
+        parsed.set_path("/api/v1/models");
+        return Ok((parsed.to_string(), "dashscope"));
+    }
     // DeepSeek's Anthropic prefix serves Messages, while its model catalog is
     // the same-origin OpenAI-compatible /models endpoint with Bearer auth.
     // Match the official HTTPS origin and prefix, including imported custom profiles.
@@ -980,6 +1003,9 @@ pub(crate) async fn fetch_models(s: &Settings, secret: Option<&str>) -> Result<(
         client_builder().timeout(std::time::Duration::from_secs(10)).build()
             .map_err(|_| "无法初始化 Magpie 连接")?
     } else { client()? };
+    if listing_protocol == "dashscope" {
+        return fetch_bailian_models(&client, &url, secret).await;
+    }
     let mut models = std::collections::BTreeSet::new();
     let mut metadata = json!({});
     let mut page_token: Option<String> = None;
@@ -1081,6 +1107,63 @@ pub(crate) async fn fetch_models(s: &Settings, secret: Option<&str>) -> Result<(
         return Err(if s.provider_id == "magpie" { "Magpie 尚未提供可用模型，请在 Magpie 中添加或启用供应商后重试。" } else { "供应商没有返回模型列表，请手动添加模型 ID" }.into());
     }
     Ok((models.into_iter().collect(), metadata))
+}
+
+async fn fetch_bailian_models(
+    client: &reqwest::Client,
+    url: &str,
+    secret: Option<&str>,
+) -> Result<(Vec<String>, Value), String> {
+    let mut models = std::collections::BTreeSet::new();
+    let mut metadata = json!({});
+    let mut received = 0;
+    for page in 1..=4 {
+        let request = client.get(url).query(&[
+            ("page_no", page.to_string()),
+            ("page_size", "100".to_owned()),
+            ("capabilities", "TG".to_owned()),
+            ("capabilities", "Reasoning".to_owned()),
+        ]);
+        let response = protocol_headers(request, "dashscope", secret).send().await
+            .map_err(|_| "连接失败或超时，可手动填写模型 ID")?;
+        let value = provider_json(response, secret).await?;
+        if value["success"] != true {
+            let secrets: Vec<_> = secret.into_iter().map(str::to_owned).collect();
+            let mut message = "百炼模型目录请求失败".to_owned();
+            if let Some(reason) = provider_error_reason(value.to_string().as_bytes(), &secrets) {
+                message.push_str(&format!("；供应商原因：{reason}"));
+            }
+            return Err(message);
+        }
+        let rows = value["output"]["models"].as_array().ok_or("百炼模型目录响应格式无效")?;
+        let total = value["output"]["total"].as_u64().ok_or("百炼模型目录分页信息无效")?;
+        received += rows.len() as u64;
+        if rows.is_empty() && received < total {
+            return Err("百炼模型目录分页为空，未返回完整列表".into());
+        }
+        for row in rows {
+            let Some(id) = row["model"].as_str().filter(|id| {
+                !id.is_empty() && id.len() <= 200 && !id.chars().any(char::is_control)
+            }) else { continue };
+            // Match the existing non-gateway catalog's 200-model bound.
+            if models.len() >= 200 && !models.contains(id) { continue; }
+            models.insert(id.to_owned());
+            let safe = crate::model_context::metadata(&json!({
+                "name": row["name"],
+                "context_window": row["model_info"]["context_window"],
+            }));
+            let mut saved = metadata[id].as_object().cloned().unwrap_or_default();
+            saved.extend(safe.as_object().unwrap().clone());
+            metadata[id] = json!(saved);
+        }
+        if received >= total || models.len() >= 200 {
+            if models.is_empty() {
+                return Err("供应商没有返回模型列表，请手动添加模型 ID".into());
+            }
+            return Ok((models.into_iter().collect(), metadata));
+        }
+    }
+    Err("百炼模型目录超过分页限制，未返回完整列表".into())
 }
 
 /// Read the external gateway only when the model picker requests its catalog.
@@ -1390,12 +1473,15 @@ async fn test_claude_plan(
 mod tests {
     use super::*;
     async fn model_peer(responses: Vec<Value>) -> (String, tokio::task::JoinHandle<Vec<String>>) {
+        model_peer_with_status(responses.into_iter().map(|value| (200, value)).collect()).await
+    }
+    async fn model_peer_with_status(responses: Vec<(u16, Value)>) -> (String, tokio::task::JoinHandle<Vec<String>>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let task = tokio::spawn(async move {
             let mut requests = Vec::new();
-            for response in responses {
+            for (status, response) in responses {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let mut bytes = Vec::new();
                 loop {
@@ -1409,7 +1495,7 @@ mod tests {
                 }
                 requests.push(String::from_utf8(bytes).unwrap());
                 let body = response.to_string();
-                let wire = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                let wire = format!("HTTP/1.1 {status} Fixture\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
                 stream.write_all(wire.as_bytes()).await.unwrap();
             }
             requests
@@ -1568,6 +1654,125 @@ mod tests {
             let settings = draft_settings("pi", protocol, base);
             assert_eq!(model_listing_endpoint(&settings).unwrap(), (expected.to_owned(), protocol));
         }
+    }
+    #[test]
+    fn bailian_direct_models_use_native_catalog_and_bearer_auth() {
+        for host in [
+            "llm-n72nynhyoq5fs51k.cn-beijing.maas.aliyuncs.com",
+            "llm-fixture.ap-southeast-1.maas.aliyuncs.com",
+            "llm-fixture.cn-hongkong.maas.aliyuncs.com",
+            "llm-fixture.ap-northeast-1.maas.aliyuncs.com",
+            "llm-fixture.eu-central-1.maas.aliyuncs.com",
+            "llm-fixture.us-east-1.maas.aliyuncs.com",
+            "dashscope.aliyuncs.com",
+            "dashscope-intl.aliyuncs.com",
+            "dashscope-us.aliyuncs.com",
+            "cn-hongkong.dashscope.aliyuncs.com",
+        ] {
+            for (protocol, path) in [
+                ("anthropic", "/apps/anthropic"),
+                ("anthropic", "/apps/anthropic/v1/"),
+                ("anthropic", "/compatible-mode/v1"),
+                ("chat", "/compatible-mode/v1"),
+                ("responses", "/compatible-mode/v1"),
+            ] {
+                let base = format!("https://{host}{path}");
+                let settings = draft_settings("pi", protocol, &base);
+                let (url, listing_protocol) = model_listing_endpoint(&settings).unwrap();
+                assert_eq!(url, format!("https://{host}/api/v1/models"));
+                assert_eq!(listing_protocol, "dashscope");
+                let request = protocol_headers(client().unwrap().get(url), listing_protocol, Some("fixture-secret"))
+                    .build().unwrap();
+                assert_eq!(request.headers()["authorization"], "Bearer fixture-secret");
+                assert!(!request.headers().contains_key("x-api-key"));
+                assert!(!request.headers().contains_key("anthropic-version"));
+                assert_eq!(settings.base_url, base);
+                assert_eq!(settings.protocol, protocol);
+            }
+        }
+    }
+    #[test]
+    fn bailian_catalog_override_is_scoped_to_standard_direct_endpoints() {
+        for base in [
+            "https://gateway.example/apps/anthropic",
+            "https://dashscope.aliyuncs.com.attacker.example/apps/anthropic",
+            "https://llm-fixture.cn-beijing.maas.aliyuncs.com.attacker.example/apps/anthropic",
+            "https://llm-fixture.cn-beijing.maas.aliyuncs.com:8443/apps/anthropic",
+            "https://extra.llm-fixture.cn-beijing.maas.aliyuncs.com/apps/anthropic",
+            "https://llm-fixture.unknown-region.maas.aliyuncs.com/apps/anthropic",
+            "https://llm-fixture.cn-beijing.maas.aliyuncs.com/proxy/apps/anthropic",
+            "https://token-plan.cn-beijing.maas.aliyuncs.com/apps/anthropic",
+            "https://trial.cn-beijing.maas.aliyuncs.com/apps/anthropic",
+            "https://coding.dashscope.aliyuncs.com/apps/anthropic",
+        ] {
+            let settings = draft_settings("claude", "anthropic", base);
+            assert_eq!(model_listing_endpoint(&settings).unwrap(), (format!("{base}/v1/models"), "anthropic"));
+        }
+        let settings = draft_settings("pi", "gemini", "https://dashscope.aliyuncs.com/compatible-mode/v1");
+        assert_eq!(model_listing_endpoint(&settings).unwrap().1, "gemini");
+        let settings = draft_settings("pi", "chat", "https://llm-fixture.cn-beijing.maas.aliyuncs.com/apps/anthropic");
+        assert_eq!(model_listing_endpoint(&settings).unwrap().1, "chat");
+    }
+    #[tokio::test]
+    async fn bailian_catalog_reads_native_pages_ids_and_capacity_with_bearer_auth() {
+        let mut first: Vec<_> = (0..98).map(|i| json!({"model":format!("fixture-{i:03}")})).collect();
+        first.push(json!({"model":"qwen-fixture","name":"千问测试模型","model_info":{"context_window":1000000}}));
+        first.push(Value::Null);
+        let (base, peer) = model_peer(vec![
+            json!({"success":true,"output":{"total":105,"page_no":1,"page_size":100,"models":first}}),
+            json!({"success":true,"output":{"total":105,"page_no":2,"page_size":100,"models":[
+                {"model":"qwen-fixture"},
+                {"model":"deepseek-fixture","name":"DeepSeek 测试模型","model_info":{"context_window":128000}},
+                {"model":"invalid\nmodel"}, {"id":"wrong-field","name":"Human label"}, {"model":""}
+            ]}}),
+        ]).await;
+        let (models, metadata) = fetch_bailian_models(&client().unwrap(), &format!("{base}/api/v1/models"), Some("fixture-secret"))
+            .await.unwrap();
+        assert_eq!(models.len(), 100);
+        assert!(models.contains(&"deepseek-fixture".into()));
+        assert!(!models.contains(&"Human label".into()));
+        assert_eq!(metadata["qwen-fixture"]["displayName"], "千问测试模型");
+        assert_eq!(metadata["qwen-fixture"]["contextWindow"], 1000000);
+        assert_eq!(metadata["deepseek-fixture"]["contextWindow"], 128000);
+        let requests = peer.await.unwrap();
+        assert_eq!(requests.len(), 2);
+        for (i, request) in requests.iter().enumerate() {
+            assert!(request.starts_with(&format!("GET /api/v1/models?page_no={}&page_size=100&capabilities=TG&capabilities=Reasoning HTTP/1.1", i + 1)));
+            let headers = request.to_ascii_lowercase();
+            assert!(headers.contains("authorization: bearer fixture-secret"));
+            assert!(!headers.contains("x-api-key:"));
+            assert!(!headers.contains("anthropic-version:"));
+            assert!(!request.lines().next().unwrap().contains("fixture-secret"));
+        }
+    }
+    #[tokio::test]
+    async fn bailian_catalog_keeps_http_and_api_failures_visible_without_exposing_key() {
+        for (status, response, expected) in [
+            (401, json!({"message":"invalid fixture-secret"}), "HTTP 401"),
+            (200, json!({"success":false,"message":"denied fixture-secret"}), "denied"),
+            (200, json!({"success":true,"output":{"total":1,"models":[]}}), "分页为空"),
+            (200, json!({"success":true,"output":{"total":0,"models":[]}}), "没有返回模型列表"),
+            (200, json!({"success":true,"output":{"total":1,"models":{}}}), "响应格式无效"),
+            (200, json!({"success":true,"output":{"models":[{"model":"fixture"}]}}), "分页信息无效"),
+        ] {
+            let (base, peer) = model_peer_with_status(vec![(status, response)]).await;
+            let error = fetch_bailian_models(&client().unwrap(), &format!("{base}/api/v1/models"), Some("fixture-secret"))
+                .await.unwrap_err();
+            assert!(error.contains(expected), "{error}");
+            assert!(!error.contains("fixture-secret"), "{error}");
+            assert_eq!(peer.await.unwrap().len(), 1);
+        }
+    }
+    #[tokio::test]
+    async fn bailian_catalog_obeys_the_existing_model_limit() {
+        let responses = (1..=2).map(|page| {
+            let rows: Vec<_> = (0..100).map(|i| json!({"model":format!("fixture-{:03}", (page - 1) * 100 + i)})).collect();
+            json!({"success":true,"output":{"total":300,"page_no":page,"page_size":100,"models":rows}})
+        }).collect();
+        let (base, peer) = model_peer(responses).await;
+        let (models, _) = fetch_bailian_models(&client().unwrap(), &format!("{base}/api/v1/models"), None).await.unwrap();
+        assert_eq!(models.len(), 200);
+        assert_eq!(peer.await.unwrap().len(), 2);
     }
     #[tokio::test]
     async fn unsaved_gemini_lists_use_native_headers_normalize_names_and_follow_pages() {

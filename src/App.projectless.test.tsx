@@ -36,6 +36,7 @@ beforeEach(() => {
   data = { projects:[{id:'existing',name:'已有项目',path:'D:/existing'}],sessions:[],agents:[],profiles:[{id:'api:claude',agent:'claude',name:'Test API',model:'test-model',hasCredential:true,current:true}],officialAgents:[],connectionOrder:{},sidebar:{ projects:{}, sessions:{}, sections:[] },codexPath:null,loadMcp:false } as Bootstrap;
   vi.mocked(call).mockImplementation(async (command, args={}) => {
     if (command==='bootstrap') return structuredClone(data);
+    if (command==='get_linkage_state') return {configuration:null,worker:null,messages:[],active:false};
     if (command==='check_chat_connection') { if (providerMissing) throw PROVIDER_REQUIRED; return null; }
     if (command==='list_provider_accounts') return [];
     if (command==='get_model_source') return { providerId:providerMissing?'unknown':'custom', providerName:providerMissing?'':'Test API', mark:providerMissing?'':'T', available:!providerMissing };
@@ -109,6 +110,65 @@ async function type(text: string) {
 async function send() {
   await act(async()=>{container.querySelector<HTMLFormElement>('.composer')!.dispatchEvent(new Event('submit',{bubbles:true,cancelable:true}));await new Promise(resolve=>setTimeout(resolve,30));});
 }
+function linkageFixture(){
+  data.agents=['claude','codex','opencode','pi','gemini'].map(id=>({id,name:id==='claude'?'Claude Code':id,installed:true,path:null,connected:true}));
+  data.profiles.push({id:'api:codex',agent:'codex',name:'Executor API',model:'worker-model',hasCredential:true,current:true});
+  const base=vi.mocked(call).getMockImplementation()!;
+  vi.mocked(call).mockImplementation(async(command,args={})=>{
+    if(command==='configure_linkage')return {configuration:args.configuration,worker:null,messages:[],active:false};
+    return base(command,args);
+  });
+}
+async function enableLinkage(){
+  await act(async()=>{container.querySelector<HTMLButtonElement>('[aria-label="联动设置"]')!.click();await new Promise(resolve=>setTimeout(resolve,30));});
+  for(let i=0;i<40&&!container.querySelector('[role="switch"]');i++)await act(async()=>{await new Promise(resolve=>setTimeout(resolve,25));});
+  expect(container.querySelector('[role="switch"]')?.getAttribute('aria-checked')).toBe('false');
+  await act(async()=>{container.querySelector<HTMLButtonElement>('[role="switch"]')!.click();await new Promise(resolve=>setTimeout(resolve,30));});
+  const apply=[...container.querySelectorAll<HTMLButtonElement>('.linkage-dialog-footer button')].find(button=>button.textContent==='完成')!;
+  expect(apply.disabled).toBe(false);
+  await act(async()=>{apply.click();await new Promise(resolve=>setTimeout(resolve,30));});
+}
+it('saves the real controller and execution connection before sending the first linked task',async()=>{
+  linkageFixture();await render();await enableLinkage();await type('请完成这项任务');await send();
+  const calls=vi.mocked(call).mock.calls;
+  const saved=calls.findIndex(([command])=>command==='configure_linkage');
+  expect(saved).toBeGreaterThan(-1);
+  expect(calls[saved][1]).toEqual({sessionId:'standalone',configuration:{mode:'linked',controller:{agentId:'claude',connectionId:'api:claude',modelId:'test-model',effort:''},executor:{agentId:'codex',connectionId:'api:codex',modelId:'worker-model',effort:''}}});
+  expect(calls.findIndex(([command])=>command==='send_chat_message')).toBeGreaterThan(saved);
+});
+it('retains the chosen pair after a failed configuration save and does not send a single-agent task',async()=>{
+  linkageFixture();let fail=true;const base=vi.mocked(call).getMockImplementation()!;
+  vi.mocked(call).mockImplementation(async(command,args={})=>{if(command==='configure_linkage'&&fail)throw new Error('执行连接暂不可用');return base(command,args);});
+  await render();await enableLinkage();await type('保留联动设置');await send();
+  expect(call).not.toHaveBeenCalledWith('send_chat_message',expect.anything());
+  expect(container.querySelector<HTMLTextAreaElement>('[aria-label="消息"]')?.value).toBe('保留联动设置');
+  expect(container.querySelector('[aria-label="联动设置"]')?.textContent).toContain('联动中');
+  fail=false;await send();
+  expect(vi.mocked(call).mock.calls.filter(([command])=>command==='configure_linkage')).toHaveLength(2);
+  expect(call).toHaveBeenCalledWith('send_chat_message',expect.objectContaining({sessionId:'standalone',text:'保留联动设置'}));
+});
+it('closes the native agent picker on Escape before closing linkage settings',async()=>{
+  linkageFixture();await render();
+  await act(async()=>{container.querySelector<HTMLButtonElement>('[aria-label="联动设置"]')!.click();await new Promise(resolve=>setTimeout(resolve,30));});
+  await act(async()=>container.querySelector<HTMLButtonElement>('[aria-label="选择主控 Agent"]')!.click());
+  expect(container.querySelector('[aria-label="选择 Agent"]')).not.toBeNull();
+  await act(async()=>document.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',bubbles:true,cancelable:true})));
+  expect(container.querySelector('[aria-label="选择 Agent"]')).toBeNull();
+  expect(container.querySelector('.linkage-config-dialog')).not.toBeNull();
+  await act(async()=>document.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',bubbles:true,cancelable:true})));
+  expect(container.querySelector('.linkage-config-dialog')).toBeNull();
+  expect(call).not.toHaveBeenCalledWith('configure_linkage',expect.anything());
+});
+it('stops a running executor when the controller has already finished its native turn',async()=>{
+  linkageFixture();localStorage.setItem('supercode.session','controller');
+  data.sessions=[{id:'controller',projectId:'existing',title:'联动',agent:'claude',connectionId:'api:claude',model:'test-model',status:'idle',nativeId:'native',turnId:null,updatedAt:1}];
+  const base=vi.mocked(call).getMockImplementation()!;
+  vi.mocked(call).mockImplementation(async(command,args={})=>command==='get_linkage_state'?{configuration:{mode:'linked',controller:{agentId:'claude',connectionId:'api:claude',modelId:'test-model'},executor:{agentId:'codex',connectionId:'api:codex',modelId:'worker-model'}},worker:null,messages:[],active:true}:base(command,args));
+  await render();const stop=container.querySelector<HTMLButtonElement>('[aria-label="停止生成"]')!;expect(stop.disabled).toBe(false);
+  await act(async()=>stop.click());
+  expect(call).toHaveBeenCalledWith('interrupt_turn',{sessionId:'controller'});
+  expect(call).not.toHaveBeenCalledWith('send_chat_message',expect.anything());
+});
 it('keeps the draft and blocks task creation when the selected Magpie gateway is offline', async () => {
   data.profiles = [{ id:'magpie:claude', agent:'claude', name:'Magpie', providerId:'magpie', source:'magpie', model:'saved-model', models:['saved-model'], current:true, hasCredential:true }];
   const base = vi.mocked(call).getMockImplementation()!;
@@ -967,15 +1027,27 @@ it.each(['claude', 'codex', 'opencode', 'pi', 'gemini'] as const)('shows persist
   localStorage.setItem('supercode.session', 'context-chat');
   data.sessions = [{ id: 'context-chat', projectId: 'existing', title: '上下文测试', agent, connectionId: `api:${agent}`, model: 'provider-specific-model', nativeId: 'native-context', status: 'running', turnId: 'turn-context', updatedAt: 1 }];
   let tokens = 12345;
+  const provenance = agent === 'claude' ? { contextSource: 'usage', contextApproximate: true } : {};
+  const prefix = agent === 'claude' ? '~' : '';
   const fallback = vi.mocked(call).getMockImplementation()!;
-  vi.mocked(call).mockImplementation(async (command, args) => command === 'get_usage' ? { records: [{ data: { total: {}, last: {}, contextTokens: tokens, cumulative: false } }] } : fallback(command, args));
+  vi.mocked(call).mockImplementation(async (command, args) => command === 'get_usage' ? { records: [{ agent, model: 'provider-specific-model', data: { total: {}, last: {}, contextTokens: tokens, cumulative: false, ...provenance } }] } : fallback(command, args));
   await render();
-  expect(container.querySelector('.usage-trigger')?.textContent).toBe('上下文 12.3K');
+  expect(container.querySelector('.usage-trigger')?.textContent).toBe(`上下文 ${prefix}12.3K`);
   tokens = 23456;
-  await act(async () => notify({ method: 'thread/tokenUsage/updated', params: { threadId: 'native-context', turnId: 'turn-context', tokenUsage: { total: {}, last: {}, contextTokens: tokens, cumulative: false } } }));
-  expect(container.querySelector('.usage-trigger')?.textContent).toBe('上下文 23.5K');
+  await act(async () => notify({ method: 'thread/tokenUsage/updated', params: { threadId: 'native-context', turnId: 'turn-context', tokenUsage: { total: {}, last: {}, contextTokens: tokens, cumulative: false, ...provenance } } }));
+  expect(container.querySelector('.usage-trigger')?.textContent).toBe(`上下文 ${prefix}23.5K`);
   await act(async () => { notify({ method: 'turn/completed', params: { threadId: 'native-context', turn: { id: 'turn-context', status: 'completed' } } }); await new Promise(resolve => setTimeout(resolve, 30)); });
-  expect(container.querySelector('.usage-trigger')?.textContent).toBe('上下文 23.5K');
+  expect(container.querySelector('.usage-trigger')?.textContent).toBe(`上下文 ${prefix}23.5K`);
+});
+it('does not restore an old model context when reopening a switched chat and accepts its new native snapshot', async () => {
+  localStorage.setItem('supercode.session', 'switched-context');
+  data.sessions = [{ id:'switched-context',projectId:'existing',title:'切换后的聊天',agent:'claude',connectionId:'api:claude',model:'test-model',nativeId:'same-native',status:'idle',turnId:null,updatedAt:1 }];
+  const fallback = vi.mocked(call).getMockImplementation()!;
+  vi.mocked(call).mockImplementation(async (command,args) => command === 'get_usage' ? { records:[{agent:'claude',model:'old-model',data:{total:{},last:{},contextTokens:900000,modelContextWindow:1000000,contextSource:'claude',contextPercent:90,counterEpoch:'same-native'}}] } : fallback(command,args));
+  await render();
+  expect(container.querySelector('.usage-trigger')?.textContent).toBe('上下文 —');
+  await act(async () => notify({ method:'thread/tokenUsage/updated',params:{threadId:'same-native',tokenUsage:{total:{},last:{},contextTokens:70000,modelContextWindow:1000000,contextSource:'claude',contextPercent:8,contextApproximate:false}} }));
+  expect(container.querySelector('.usage-trigger')?.textContent).toBe('上下文 8%');
 });
 it('does not let a delayed usage load overwrite newer live context on a slow device', async () => {
   localStorage.setItem('supercode.session', 'slow-context');
@@ -996,13 +1068,13 @@ it('waits for hosted-route capacity and never substitutes the publisher window w
   let resolve!: (value: unknown) => void;
   const pending = new Promise(done => { resolve = done; });
   const fallback = vi.mocked(call).getMockImplementation()!;
-  vi.mocked(call).mockImplementation(async (command,args) => command==='list_models' ? pending : command==='get_usage' ? {records:[{data:{total:{},last:{},contextTokens:96000,cumulative:false}}]} : fallback(command,args));
+  vi.mocked(call).mockImplementation(async (command,args) => command==='list_models' ? pending : command==='get_usage' ? {records:[{agent:'claude',model:'MiniMax-M3',data:{total:{},last:{},contextTokens:96000,cumulative:false}}]} : fallback(command,args));
   await render();
-  expect(container.querySelector('.usage-trigger')?.textContent).toBe('上下文 96.0K');
+  expect(container.querySelector('.usage-trigger')?.textContent).toBe('上下文 ~96.0K');
   expect(container.querySelector('.usage-trigger')?.getAttribute('aria-label')).not.toContain('1,000,000');
   await act(async () => { resolve({data:[{id:'MiniMax-M3',model:'MiniMax-M3',displayName:'MiniMax-M3',isDefault:true,contextWindow:192000}]}); await pending; });
-  expect(container.querySelector('.usage-trigger')?.textContent).toBe('上下文 50%');
-  await act(async () => notify({method:'thread/tokenUsage/updated',params:{threadId:'native-context',turnId:'turn-context',tokenUsage:{total:{},last:{},contextTokens:96000,modelContextWindow:160000,cumulative:false}}}));
+  expect(container.querySelector('.usage-trigger')?.textContent).toBe('上下文 ~50%');
+  await act(async () => notify({method:'thread/tokenUsage/updated',params:{threadId:'native-context',turnId:'turn-context',tokenUsage:{total:{},last:{},contextTokens:96000,modelContextWindow:160000,contextSource:'claude',contextPercent:60,contextApproximate:false,cumulative:false}}}));
   expect(container.querySelector('.usage-trigger')?.textContent).toBe('上下文 60%');
 });
 it('automatically refreshes a selected Magpie catalog on every opening without changing the chosen model', async () => {

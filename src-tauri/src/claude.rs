@@ -575,7 +575,7 @@ pub async fn send(
         "--settings".into(),
         plugin_settings.to_string(),
         "--append-system-prompt".into(),
-        crate::client_features::instructions(app),
+        crate::client_features::instructions_for_session(app,Some(&session.id))?,
     ];
     args.extend(permission_args);
     args.extend(snapshot_args);
@@ -589,7 +589,7 @@ pub async fn send(
         args.extend(["--effort".into(), effort]);
     }
     args.extend(plugin_args);
-    let mcp = crate::client_features::claude_mcp(app, native_mcp)?;
+    let mcp = crate::client_features::claude_mcp_for_session(app, native_mcp,Some(&session.id))?;
     crate::runtime_diagnostics::register_secrets(app, &mcp);
     if mcp["mcpServers"].as_object().is_some_and(|v| !v.is_empty()) {
         args.extend(["--mcp-config".into(), mcp.to_string()]);
@@ -778,6 +778,25 @@ pub async fn send(
             }
             if message["type"] == "control_response" {
                 if let Some(id) = message["response"]["request_id"].as_str() {
+                    if let Some(expected_turn) = id.strip_prefix("supercode-context:") {
+                        let slot = session_runtime.client.lock().await;
+                        if slot.as_ref().is_some_and(|current| Arc::ptr_eq(current, &turn))
+                            && context_reply_is_current(expected_turn, &turn.id(), turn.active.load(Ordering::Acquire))
+                            && reader_app.state::<AppState>().store.session(&turn.session)
+                                .is_ok_and(|current| context_binding_matches(&current, &turn.native, model.as_deref()))
+                        {
+                            match native_context_usage(&message["response"]) {
+                                Ok(data) => {
+                                    stream.model_context_window = data["modelContextWindow"].as_u64();
+                                    stream.context_window_reported = true;
+                                    stream.native_context = Some(data);
+                                    publish(&reader_app, stream.usage_event(&turn.native, expected_turn));
+                                }
+                                Err(error) => crate::runtime_diagnostics::message(&reader_app, Some(&turn.session), "claude", "warn", "native_context_unavailable", &error),
+                            }
+                        }
+                        continue;
+                    }
                     if let Some(tx) = turn.controls.lock().await.remove(id) {
                         let _ = tx.send(message["response"].clone());
                     }
@@ -921,6 +940,7 @@ pub async fn send(
                 stream = Stream {
                     model: stream.model.clone(),
                     model_context_window: stream.model_context_window,
+                    context_window_reported: stream.context_window_reported,
                     declared_context: stream.declared_context.clone(),
                     last_context: stream.context_usage(),
                     ..Stream::default()
@@ -960,6 +980,14 @@ pub async fn send(
                         json!({"turn":{"id":completed_id,"status":status,"error":failure.take().map(|e|json!({"message":e}))}}),
                     ),
                 );
+                // Ask the same live CLI for its /context snapshot after the task
+                // settles. The reader keeps running; no model generation or task
+                // completion waits for this optional control response.
+                if status == "completed" {
+                    if let Err(error) = turn.write(json!({"type":"control_request","request_id":format!("supercode-context:{completed_id}"),"request":{"subtype":"get_context_usage"}})).await {
+                        crate::runtime_diagnostics::message(&reader_app, Some(&turn.session), "claude", "warn", "native_context_unavailable", &error);
+                    }
+                }
                 turn.finished.notify_one();
                 drop(result_slot);
                 failure = Some("Claude 连接在任务完成前关闭".to_owned());
@@ -1030,6 +1058,27 @@ pub async fn send(
     state.store.session(&session.id)
 }
 
+fn context_reply_is_current(expected: &str, current: &str, active: bool) -> bool {
+    !active && !expected.is_empty() && expected == current
+}
+
+fn context_binding_matches(session: &Session, native: &str, model: Option<&str>) -> bool {
+    session.native_id.as_deref() == Some(native) && session.model.as_deref() == model
+}
+
+fn native_context_usage(response: &Value) -> Result<Value, String> {
+    if response["subtype"] != "success" {
+        return Err(protocol::bounded(response["error"].as_str().unwrap_or("Claude 未返回原生上下文状态"), 300));
+    }
+    let data = &response["response"];
+    let used = crate::usage_tokens::count(&data["totalTokens"]).filter(|n| *n <= 100_000_000).ok_or("原生上下文未返回有效用量")?;
+    let window = crate::model_context::positive(&data["maxTokens"]).ok_or("原生上下文未返回有效上限")?;
+    let percent = data["percentage"].as_f64().filter(|n| n.is_finite() && (0.0..=100.0).contains(n)).ok_or("原生上下文未返回有效百分比")?;
+    let measured = ["input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"].iter()
+        .any(|key| crate::usage_tokens::count(&data["apiUsage"][*key]).is_some_and(|n| n > 0));
+    Ok(json!({"total":{},"last":{},"contextTokens":used,"modelContextWindow":window,"contextPercent":percent,"contextSource":"claude","contextApproximate":!measured,"contextWindowSource":"runtime","cumulative":false}))
+}
+
 #[derive(Default)]
 struct Stream {
     retrying: bool,
@@ -1042,6 +1091,8 @@ struct Stream {
     last_context: Value,
     model: String,
     model_context_window: Option<u64>,
+    context_window_reported: bool,
+    native_context: Option<Value>,
     declared_context: Option<(String,u64)>,
     message_id: String,
     text: String,
@@ -1055,6 +1106,7 @@ impl Stream {
         self.clear_request_usage();
     }
     fn clear_request_usage(&mut self) {
+        self.native_context = None;
         self.context_tokens = None;
         self.uncached_input_tokens = None;
         self.cached_input_tokens = None;
@@ -1070,6 +1122,8 @@ impl Stream {
         if !same_context_model(&self.model,model) {
             self.model_context_window = self.declared_context.as_ref().filter(|(id,_)|same_context_model(id,model)).map(|(_,window)|*window);
             self.last_context = Value::Null;
+            self.native_context = None;
+            self.context_window_reported = false;
         }
         self.model = model.into();
     }
@@ -1134,9 +1188,13 @@ impl Stream {
         crate::usage_tokens::count(&usage["contextWindow"]).filter(|n| *n > 0)
     }
     fn context_usage(&self) -> Value {
-        let known = self
-            .context_tokens
-            .map(|input| input.saturating_add(self.output_tokens));
+        if let Some(native) = &self.native_context {
+            let mut data = native.clone();
+            data["last"] = self.last_usage.clone();
+            return data;
+        }
+        // Claude's native percentage uses input + cache, never output tokens.
+        let known = self.context_tokens;
         let last = if known.is_some() {
             self.last_usage.clone()
         } else {
@@ -1145,10 +1203,18 @@ impl Stream {
                 .map(|_| self.last_context["last"].clone())
                 .unwrap_or_else(|| json!({}))
         };
-        json!({"total":{},"last":last,"contextTokens":known.or_else(||self.last_context["contextTokens"].as_u64()),"modelContextWindow":self.model_context_window,"cumulative":false})
+        if known.is_none() && self.last_context["contextSource"] == "claude" {
+            let mut previous = self.last_context.clone();
+            previous["total"] = json!({});
+            return previous;
+        }
+        json!({"total":{},"last":last,"contextTokens":known.or_else(||self.last_context["contextTokens"].as_u64()),"modelContextWindow":self.model_context_window,"contextPercent":null,"contextSource":"usage","contextApproximate":true,"contextWindowSource":if self.context_window_reported {"runtime"} else {"catalog"},"cumulative":false})
     }
     fn result_usage(&mut self, result: &Value, inputs: &mut InputState) -> Value {
-        self.model_context_window = self.context_window(result).or(self.model_context_window);
+        if let Some(window) = self.context_window(result) {
+            self.model_context_window = Some(window);
+            self.context_window_reported = true;
+        }
         // Result usage sums all calls in the turn. It describes current context
         // only when the native runner confirms there was a single model call.
         if self.context_tokens.is_none() && result["num_turns"] == 1 {
@@ -1819,13 +1885,70 @@ mod tests {
     }
 
     #[test]
-    fn context_updates_include_cache_and_latest_output_not_aggregate_turn_usage() {
+    fn native_context_snapshot_keeps_the_cli_percentage_and_identifies_estimates() {
+        // Captured shape from the real non-interactive get_context_usage control
+        // response, driven by an isolated local Anthropic fixture.
+        let mut response = json!({"subtype":"success","response":{"totalTokens":70000,"maxTokens":1000000,"percentage":7,"model":"claude-sonnet-5-5","apiUsage":{"input_tokens":10000,"cache_read_input_tokens":60000,"output_tokens":2000}}});
+        let data = native_context_usage(&response).unwrap();
+        assert_eq!(data["contextTokens"], 70000);
+        assert_eq!(data["contextPercent"], 7.0);
+        assert_eq!(data["contextSource"], "claude");
+        assert_eq!(data["contextApproximate"], false);
+        response["response"]["percentage"] = json!(8);
+        assert_eq!(native_context_usage(&response).unwrap()["contextPercent"], 8.0);
+        response["response"]["apiUsage"] = Value::Null;
+        assert_eq!(native_context_usage(&response).unwrap()["contextApproximate"], true);
+        for (key, value) in [("maxTokens", json!(0)), ("totalTokens", Value::Null), ("percentage", json!(-1)), ("percentage", json!(101))] {
+            let mut invalid = response.clone();
+            invalid["response"][key] = value;
+            assert!(native_context_usage(&invalid).is_err());
+        }
+        assert!(native_context_usage(&json!({"subtype":"error","error":"unknown control request"})).is_err());
+        assert!(context_reply_is_current("turn", "turn", false));
+        assert!(!context_reply_is_current("old", "new", false));
+        assert!(!context_reply_is_current("turn", "turn", true));
+        assert!(!context_reply_is_current("", "", false));
+        let store = crate::storage::Store::from_connection(rusqlite::Connection::open_in_memory().unwrap()).unwrap();
+        let project = store.add_project(Path::new("D:/context-binding-fixture")).unwrap();
+        let session = store.create_session(&project.id, Some("before-model".into())).unwrap();
+        store.bind_native(&session.id, "native").unwrap();
+        let mut session = store.session(&session.id).unwrap();
+        assert!(context_binding_matches(&session, "native", Some("before-model")));
+        // A same-connection model switch can retain the native thread ID.
+        session.model = Some("after-model".into());
+        assert!(!context_binding_matches(&session, "native", Some("before-model")));
+        session.native_id = None;
+        assert!(!context_binding_matches(&session, "native", Some("after-model")));
+    }
+
+    #[test]
+    fn native_snapshot_is_retained_until_new_input_is_measured_and_cleared_on_compaction() {
+        let native = native_context_usage(&json!({"subtype":"success","response":{"totalTokens":70000,"maxTokens":1000000,"percentage":7,"apiUsage":{"input_tokens":70000}}})).unwrap();
+        let mut stream = Stream { model_context_window: Some(1000000), native_context: Some(native), ..Stream::default() };
+        assert_eq!(stream.context_usage()["contextPercent"], 7.0);
+        stream.begin_message();
+        stream.observe_usage(&json!({"input_tokens":0,"output_tokens":0}));
+        assert_eq!(stream.context_usage()["contextPercent"], 7.0);
+        stream.observe_usage(&json!({"input_tokens":80000,"output_tokens":2000}));
+        let data = stream.context_usage();
+        assert_eq!(data["contextTokens"], 80000);
+        assert!(data["contextPercent"].is_null());
+        assert_eq!(data["contextSource"], "usage");
+        assert_eq!(data["contextApproximate"], true);
+        assert_eq!(data["last"]["totalTokens"], 82000);
+        stream.reset_context();
+        assert!(stream.context_usage()["contextTokens"].is_null());
+        assert!(stream.context_usage()["contextPercent"].is_null());
+    }
+
+    #[test]
+    fn context_updates_match_claude_input_only_formula_not_aggregate_turn_usage() {
         let mut stream = Stream::default();
         let start = |id: &str, usage: Value| json!({"type":"stream_event","event":{"type":"message_start","message":{"id":id,"model":"glm-fixture","usage":usage}}});
         let updates = stream.translate(&start("one", json!({"input_tokens":10,"cache_read_input_tokens":100,"cache_creation_input_tokens":20,"output_tokens":1})), "n", "t");
-        assert_eq!(updates[0]["params"]["tokenUsage"]["contextTokens"], 131);
+        assert_eq!(updates[0]["params"]["tokenUsage"]["contextTokens"], 130);
         let updates = stream.translate(&json!({"type":"stream_event","event":{"type":"message_delta","usage":{"input_tokens":10,"output_tokens":15}}}), "n", "t");
-        assert_eq!(updates[0]["params"]["tokenUsage"]["contextTokens"], 145);
+        assert_eq!(updates[0]["params"]["tokenUsage"]["contextTokens"], 130);
         assert_eq!(
             updates[0]["params"]["tokenUsage"]["last"]["inputTokens"],
             130
@@ -1844,14 +1967,14 @@ mod tests {
         let mut stream = Stream::default();
         let message = json!({"type":"assistant","message":{"id":"one","usage":{"input_tokens":12,"cache_read_input_tokens":8,"output_tokens":5},"content":[]}});
         let events = stream.translate(&message, "n", "t");
-        assert_eq!(events[0]["params"]["tokenUsage"]["contextTokens"], 25);
+        assert_eq!(events[0]["params"]["tokenUsage"]["contextTokens"], 20);
         let mut child = message;
         child["parent_tool_use_id"] = json!("child");
         child["message"]["usage"]["input_tokens"] = json!(999);
         assert!(stream.translate(&child, "n", "t").is_empty());
-        assert_eq!(stream.context_usage()["contextTokens"], 25);
+        assert_eq!(stream.context_usage()["contextTokens"], 20);
         stream.translate(&json!({"type":"assistant","message":{"id":"two","usage":{"input_tokens":12,"output_tokens":1},"content":[]}}), "n", "t");
-        assert_eq!(stream.context_usage()["contextTokens"], 13);
+        assert_eq!(stream.context_usage()["contextTokens"], 12);
         assert_eq!(stream.context_usage()["last"]["cachedInputTokens"], 0);
         stream.reset_context();
         assert!(stream.context_usage()["contextTokens"].is_null());
@@ -1869,7 +1992,7 @@ mod tests {
         assert_eq!(compact[0]["params"]["tokenUsage"]["modelContextWindow"],1_000_000);
         let after=stream.translate(&assistant("after",12000),"native","same-turn");
         assert_eq!(after[0]["params"]["turnId"],"same-turn");
-        assert_eq!(after[0]["params"]["tokenUsage"]["contextTokens"],12001);
+        assert_eq!(after[0]["params"]["tokenUsage"]["contextTokens"],12000);
         assert_eq!(after[0]["params"]["tokenUsage"]["modelContextWindow"],1_000_000);
     }
     #[test]
@@ -1891,18 +2014,18 @@ mod tests {
         assert!(events[0]["params"]["tokenUsage"]["contextTokens"].is_null());
         let delta = json!({"type":"stream_event","event":{"type":"message_delta","usage":{"cache_read_input_tokens":"24000","cache_creation_input_tokens":100,"output_tokens":300}}});
         let events = stream.translate(&delta, "n", "t");
-        assert_eq!(events[0]["params"]["tokenUsage"]["contextTokens"], 24400);
+        assert_eq!(events[0]["params"]["tokenUsage"]["contextTokens"], 24100);
         stream.translate(&json!({"type":"assistant","message":{"id":"one","model":"provider-model","usage":{"input_tokens":0,"output_tokens":0},"content":[]}}), "n", "t");
-        assert_eq!(stream.context_usage()["contextTokens"], 24400);
+        assert_eq!(stream.context_usage()["contextTokens"], 24100);
         stream.observe_usage(&json!({"input_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"output_tokens":1}));
-        assert_eq!(stream.context_usage()["contextTokens"], 24400);
+        assert_eq!(stream.context_usage()["contextTokens"], 24100);
         let events = stream.translate(&start("two"), "n", "t");
-        assert_eq!(events[0]["params"]["tokenUsage"]["contextTokens"], 24400);
+        assert_eq!(events[0]["params"]["tokenUsage"]["contextTokens"], 24100);
         stream.observe_usage(&json!({"input_tokens":12000,"output_tokens":1}));
-        assert_eq!(stream.context_usage()["contextTokens"], 12001);
+        assert_eq!(stream.context_usage()["contextTokens"], 12000);
         stream.observe_usage(&json!({"output_tokens":300}));
         stream.observe_usage(&json!({"input_tokens":12000,"output_tokens":1}));
-        assert_eq!(stream.context_usage()["contextTokens"], 12300);
+        assert_eq!(stream.context_usage()["contextTokens"], 12000);
         stream.begin_message();
         stream.observe_model("different-model");
         assert!(stream.context_usage()["contextTokens"].is_null());
@@ -1913,7 +2036,7 @@ mod tests {
         let mut inputs = InputState::default();
         let mut result = json!({"num_turns":1,"usage":{"input_tokens":647,"cache_read_input_tokens":31232,"output_tokens":348},"modelUsage":{"provider-model":{"contextWindow":128000}}});
         let data = stream.result_usage(&result, &mut inputs);
-        assert_eq!(data["contextTokens"], 32227);
+        assert_eq!(data["contextTokens"], 31879);
         assert_eq!(data["modelContextWindow"], 128000);
         assert_eq!(data["total"]["inputTokens"], 31879);
         stream.reset_context();
@@ -1923,7 +2046,7 @@ mod tests {
         assert_eq!(data["total"]["inputTokens"], 63758);
         stream.observe_usage(&json!({"input_tokens":15000,"output_tokens":12}));
         let data = stream.result_usage(&result, &mut inputs);
-        assert_eq!(data["contextTokens"], 15012);
+        assert_eq!(data["contextTokens"], 15000);
         assert_eq!(data["last"]["inputTokens"], 15000);
     }
     #[test]

@@ -5,7 +5,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::Value;
 use std::collections::BTreeMap;
 
-fn schema(conn: &Connection) -> Result<()> {
+pub(crate) fn schema(conn: &Connection) -> Result<()> {
     conn.execute_batch("CREATE TEMP TABLE IF NOT EXISTS connection_usage(owner TEXT NOT NULL,session_id TEXT,connection_id TEXT NOT NULL,thread_id TEXT NOT NULL,turn_id TEXT,active INTEGER NOT NULL,definitive INTEGER NOT NULL,PRIMARY KEY(owner,thread_id));")
         .map_err(|e| e.to_string())
 }
@@ -36,7 +36,7 @@ pub(crate) fn session_tasks(conn: &Connection, id: &str) -> Result<bool> {
 
 pub(crate) fn ensure_session_idle(conn: &Connection, id: &str) -> Result<()> {
     let primary: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM sessions WHERE id=?1 AND status IN ('starting','running','waiting'))", [id], |row| row.get(0)).map_err(|e| e.to_string())?;
-    if primary || session_tasks(conn, id)? {
+    if primary || session_tasks(conn, id)? || crate::linkage_store::active_children(conn,id)? {
         return Err("此聊天仍有任务或后台子任务运行，请完成或停止后再操作".into());
     }
     Ok(())
@@ -83,7 +83,7 @@ impl Store {
     pub fn active_session_ids(&self) -> Result<Vec<String>> {
         let conn = self.0.lock().map_err(|e| e.to_string())?;
         schema(&conn)?;
-        let mut query = conn.prepare("SELECT id FROM sessions WHERE status IN ('starting','running','waiting') UNION SELECT session_id FROM temp.connection_usage WHERE active=1 AND session_id IS NOT NULL ORDER BY 1").map_err(|e| e.to_string())?;
+        let mut query = conn.prepare("SELECT coalesce((SELECT controller_id FROM linkage_workers WHERE worker_id=sessions.id),id) FROM sessions WHERE status IN ('starting','running','waiting') UNION SELECT coalesce((SELECT controller_id FROM linkage_workers WHERE worker_id=connection_usage.session_id),session_id) FROM temp.connection_usage WHERE active=1 AND session_id IS NOT NULL ORDER BY 1").map_err(|e| e.to_string())?;
         let rows = query
             .query_map([], |row| row.get(0))
             .map_err(|e| e.to_string())?
@@ -234,6 +234,12 @@ impl Store {
         conn.execute("DELETE FROM temp.connection_usage WHERE owner=?1", [owner])
             .map_err(|e| e.to_string())?;
         Ok(active)
+    }
+    pub(crate) fn clear_session_usage(&self,session:&str)->Result<()>{
+        let conn=self.0.lock().map_err(|e|e.to_string())?;
+        schema(&conn)?;
+        conn.execute("DELETE FROM temp.connection_usage WHERE session_id=?1",[session]).map_err(|e|e.to_string())?;
+        Ok(())
     }
 }
 

@@ -258,6 +258,7 @@ impl Store {
         let tx = conn.transaction().map_err(|e| e.to_string())?;
         require_idle(&tx, "session", id)?;
         require_item(&tx, "project", project)?;
+        tx.execute("UPDATE linkage_configs SET worker_id=NULL WHERE controller_id=?1 AND EXISTS(SELECT 1 FROM sessions WHERE id=?1 AND project_id IS NOT ?2)",params![id,project]).map_err(|e|e.to_string())?;
         tx.execute(
             "UPDATE sessions SET native_id=NULL,project_id=?2 WHERE id=?1 AND project_id IS NOT ?2",
             params![id, project],
@@ -296,7 +297,7 @@ impl Store {
     }
     pub fn archived_sessions(&self) -> Result<Vec<ArchivedSession>, String> {
         let conn = self.0.lock().map_err(|e| e.to_string())?;
-        let mut stmt=conn.prepare("SELECT s.id,s.project_id,s.title,s.agent,s.model,s.native_id,s.status,s.updated_at,s.turn_id,s.connection_id,w.path,coalesce(p.name,'无项目聊天'),coalesce(p.path,w.path,'') FROM sessions s LEFT JOIN session_workspaces w ON w.session_id=s.id LEFT JOIN projects p ON p.id=s.project_id WHERE s.archived=1 OR p.id IN (SELECT id FROM sidebar_items WHERE kind='project' AND removed=1) ORDER BY s.updated_at DESC LIMIT 500").map_err(|e|e.to_string())?;
+        let mut stmt=conn.prepare("SELECT s.id,s.project_id,s.title,s.agent,s.model,s.native_id,s.status,s.updated_at,s.turn_id,s.connection_id,w.path,coalesce(p.name,'无项目聊天'),coalesce(p.path,w.path,'') FROM sessions s LEFT JOIN session_workspaces w ON w.session_id=s.id LEFT JOIN projects p ON p.id=s.project_id WHERE s.id NOT IN (SELECT worker_id FROM linkage_workers) AND (s.archived=1 OR p.id IN (SELECT id FROM sidebar_items WHERE kind='project' AND removed=1)) ORDER BY s.updated_at DESC LIMIT 500").map_err(|e|e.to_string())?;
         let rows = stmt
             .query_map([], |r| {
                 Ok(ArchivedSession {
@@ -323,6 +324,7 @@ impl Store {
         let mut conn = self.0.lock().map_err(|e| e.to_string())?;
         let tx = conn.transaction().map_err(|e| e.to_string())?;
         require_idle(&tx, "session", id)?;
+        crate::linkage_store::delete_children(&tx,id).map_err(|e|e.to_string())?;
         for sql in [
             "DELETE FROM followups WHERE session_id=?1",
             "DELETE FROM messages WHERE session_id=?1",

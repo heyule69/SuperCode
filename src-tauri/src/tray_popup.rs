@@ -51,7 +51,7 @@ pub struct Snapshot {
 
 fn recent(store: &crate::storage::Store) -> Result<(Vec<RecentChat>, bool), String> {
     let conn = store.0.lock().map_err(|e| e.to_string())?;
-    let mut query = conn.prepare("SELECT s.id,s.title,coalesce(p.name,''),s.status,coalesce(i.unread,0) FROM sessions s LEFT JOIN projects p ON p.id=s.project_id LEFT JOIN sidebar_items i ON i.kind='session' AND i.id=s.id WHERE s.archived=0 AND coalesce(i.removed,0)=0 AND NOT EXISTS (SELECT 1 FROM sidebar_items x WHERE x.kind='project' AND x.id=p.id AND x.removed=1) ORDER BY s.updated_at DESC,s.rowid DESC LIMIT 31").map_err(|e| e.to_string())?;
+    let mut query = conn.prepare("SELECT s.id,s.title,coalesce(p.name,''),s.status,coalesce(i.unread,0) FROM sessions s LEFT JOIN projects p ON p.id=s.project_id LEFT JOIN sidebar_items i ON i.kind='session' AND i.id=s.id WHERE s.id NOT IN (SELECT worker_id FROM linkage_workers) AND s.archived=0 AND coalesce(i.removed,0)=0 AND NOT EXISTS (SELECT 1 FROM sidebar_items x WHERE x.kind='project' AND x.id=p.id AND x.removed=1) ORDER BY s.updated_at DESC,s.rowid DESC LIMIT 31").map_err(|e| e.to_string())?;
     let mut rows = query
         .query_map([], |row| {
             Ok(RecentChat {
@@ -286,7 +286,7 @@ pub async fn tray_menu_action(
     // Validate a destination before dismissing, so errors remain visible.
     let target = if action == "session" {
         let id = value.as_deref().ok_or("请选择对话")?;
-        let valid: bool = app.state::<AppState>().store.0.lock().map_err(|e| e.to_string())?.query_row("SELECT EXISTS (SELECT 1 FROM sessions s WHERE s.id=?1 AND s.archived=0 AND NOT EXISTS (SELECT 1 FROM sidebar_items i WHERE (i.kind='session' AND i.id=s.id OR i.kind='project' AND i.id=s.project_id) AND i.removed=1))", [id], |row| row.get(0)).map_err(|e| e.to_string())?;
+        let valid: bool = app.state::<AppState>().store.0.lock().map_err(|e| e.to_string())?.query_row("SELECT EXISTS (SELECT 1 FROM sessions s WHERE s.id=?1 AND s.id NOT IN (SELECT worker_id FROM linkage_workers) AND s.archived=0 AND NOT EXISTS (SELECT 1 FROM sidebar_items i WHERE (i.kind='session' AND i.id=s.id OR i.kind='project' AND i.id=s.project_id) AND i.removed=1))", [id], |row| row.get(0)).map_err(|e| e.to_string())?;
         if !valid {
             return Err("对话已归档或移除，请重新打开菜单".into());
         }

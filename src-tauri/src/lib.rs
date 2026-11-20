@@ -52,6 +52,11 @@ mod input_limits;
 mod installation_exit;
 mod installation_exit_protocol;
 mod links;
+mod linkage;
+mod linkage_bridge;
+mod linkage_store;
+#[cfg(debug_assertions)]
+mod linkage_smoke;
 mod log_files;
 mod log_redaction;
 mod maintenance;
@@ -104,6 +109,10 @@ pub struct AppState {
 
 pub fn run() {
     let args: Vec<_> = std::env::args().collect();
+    if args.get(1).is_some_and(|arg|arg=="--linkage-mcp") {
+        if let Err(error)=linkage_bridge::run(&args[2..]) {eprintln!("{error}");std::process::exit(1);}
+        return;
+    }
     let diagnostic_dir = startup_data::directory(&args).unwrap_or_else(|error| {
         eprintln!("{error}");
         std::process::exit(2);
@@ -166,7 +175,7 @@ pub fn run() {
                 | "--agent-updates-test"
                 | "--provider-accounts-test"
         )
-    }) || cfg!(debug_assertions) && args.iter().any(|arg|arg=="--activity-details-test");
+    }) || cfg!(debug_assertions) && args.iter().any(|arg|matches!(arg.as_str(),"--activity-details-test"|"--linkage-smoke-test"));
     let smoke_dir = (smoke_test
         || agents_test
         || desktop_test
@@ -224,6 +233,7 @@ pub fn run() {
     };
     builder
         .manage(outbox::Outbox::default())
+        .manage(linkage::Linkage::default())
         .manage(media::Media::default())
         .manage(reply_translation::Translations::default())
         .manage(managed_services::Services::default())
@@ -305,6 +315,7 @@ pub fn run() {
                 runtime_diagnostics::message(app.handle(),None,"desktop_control","warn","desktop_control_install_error",&error.to_string());
             }
             browser::install(app.handle())?;
+            linkage::install(app.handle())?;
             if !std::env::args().any(|arg| arg == "--legacy-installation-exit-test") {
                 installation_exit::attach(app.handle())?;
             }
@@ -440,6 +451,8 @@ pub fn run() {
             commands::list_messages,
             subagents::get_subagent_messages,
             commands::send_message,
+            linkage::configure_linkage,
+            linkage::get_linkage_state,
             commands::send_chat_message,
             outbox::enqueue_followup,
             outbox::list_followups,

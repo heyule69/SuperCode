@@ -1,7 +1,7 @@
 import { useCallback, useState } from 'react';
 import type { FilePreview } from './WorkspacePanel';
 
-export type RightTabKind = 'workspace' | 'browser' | 'question' | 'subagents' | 'document';
+export type RightTabKind = 'workspace' | 'browser' | 'question' | 'subagents' | 'document' | 'linkage';
 export interface RightTab { id: string; kind: RightTabKind; title: string; preview?: FilePreview }
 export interface RightPaneState { tabs: RightTab[]; active: string | null }
 export const emptyRightPane: RightPaneState = { tabs: [], active: null };

@@ -576,9 +576,9 @@ async fn consume_setup_event(app: &AppHandle, t: &Arc<Turn>, value: Value) -> Re
     }
     Ok(())
 }
-fn mcp(app: &AppHandle, agent: &str) -> Result<Value, String> {
+fn mcp_for_session(app:&AppHandle,agent:&str,id:Option<&str>)->Result<Value,String>{
     let acp = is_acp(agent);
-    let servers = client_features::servers(app)?;
+    let servers = client_features::servers_for_session(app,id)?;
     let mut rows = vec![];
     let mut object = serde_json::Map::new();
     for s in servers.into_iter().filter(|s| s.enabled) {
@@ -636,7 +636,10 @@ fn opencode_config(config: &Value, permission: &str) -> Value {
                     .filter(|v| v.is_object())
                     .cloned()
                     .unwrap_or_else(|| json!({"name":m}));
-                if !definition["limit"]["context"].is_number() {
+                // OpenCode's optional limit object requires BOTH context and
+                // output. Do not create a partial declaration from context-only
+                // metadata: that prevents the CLI from starting at all.
+                if !definition["limit"]["context"].is_number() && crate::model_context::positive(&definition["limit"]["output"]).is_some() {
                     if let Some(capacity) = crate::model_context::for_model(config, &m) {
                         if !definition["limit"].is_object() {
                             definition["limit"] = json!({});
@@ -933,7 +936,7 @@ async fn start_configured(
             "--extension".into(),
             extension.to_string_lossy().into(),
             "--append-system-prompt".into(),
-            client_features::instructions(app),
+            client_features::instructions_for_session(app,session.map(|s|s.id.as_str()))?,
         ]);
         if permission == "summary" {
             args.extend([
@@ -956,7 +959,7 @@ async fn start_configured(
         } else {
             args.push("--no-session".into());
         }
-        let mut settings = json!({"permission":permission,"mcp":if permission=="summary"{json!({})}else{mcp(app,"pi")?}});
+        let mut settings = json!({"permission":permission,"mcp":if permission=="summary"{json!({})}else{mcp_for_session(app,"pi",session.map(|s|s.id.as_str()))?}});
         if let Some(provider) = pi_provider_config(&config) {
             settings["provider"] = provider;
         }
@@ -1416,7 +1419,7 @@ pub async fn send(
                         .request("authenticate", gemini::authentication(&config), 60)
                         .await?;
                 }
-                let mut p = json!({"cwd":cwd,"mcpServers":mcp(app,&s.agent)?});
+                let mut p = json!({"cwd":cwd,"mcpServers":mcp_for_session(app,&s.agent,Some(&s.id))?});
                 let method = if let Some(native) = &s.native_id {
                     if init["agentCapabilities"]["loadSession"] != true {
                         return Err(format!(
@@ -1570,7 +1573,7 @@ pub async fn send(
             .rename(&s.id, &text.chars().take(24).collect::<String>())?;
     }
     let turn = Arc::new(boot.after_setup(native));
-    let instructions = client_features::instructions(app);
+    let instructions = client_features::instructions_for_session(app,Some(&s.id))?;
     let prompt = prompt_content(&s.agent, &content, &instructions);
     let params = if turn.agent == "pi" {
         prompt
@@ -3163,7 +3166,7 @@ write(v.type?{type:'response',command:method,id:v.id,success:true,data:{session:
         );
     }
     #[test]
-    fn generated_provider_limits_are_model_specific_and_native_limits_win() {
+    fn pi_limits_are_model_specific_and_opencode_never_gets_incomplete_limits() {
         let config = json!({"baseUrl":"https://api.example","protocol":"anthropic","model":"glm-5.3","models":["glm-5.3","kimi-for-coding","kimi-for-coding-highspeed","MiniMax-M2.7"]});
         let provider = pi_provider_config(&config).unwrap();
         for (id, capacity) in [
@@ -3179,17 +3182,15 @@ write(v.type?{type:'response',command:method,id:v.id,success:true,data:{session:
                 .find(|row| row["id"] == id)
                 .unwrap();
             assert_eq!(row["contextWindow"], capacity);
-            assert_eq!(
-                opencode_config(&config, "read")["provider"]["supercode"]["models"][id]["limit"]
-                    ["context"],
-                capacity
-            );
+            assert!(opencode_config(&config, "read")["provider"]["supercode"]["models"][id]["limit"].is_null());
         }
         let declared = json!({"baseUrl":"https://api.example","protocol":"anthropic","model":"glm-5.3","piProvider":{"models":[{"id":"glm-5.3","contextWindow":32768}]}});
         assert_eq!(
             pi_provider_config(&declared).unwrap()["models"][0]["contextWindow"],
             32768
         );
+        let output_declared=json!({"baseUrl":"https://api.example","protocol":"anthropic","model":"glm-5.3","opencodeProvider":{"models":{"glm-5.3":{"limit":{"output":8192}}}}});
+        assert_eq!(opencode_config(&output_declared,"read")["provider"]["supercode"]["models"]["glm-5.3"]["limit"],json!({"context":1000000,"output":8192}));
     }
     #[test]
     fn native_tool_paths_and_interrupted_items_survive_normalization() {

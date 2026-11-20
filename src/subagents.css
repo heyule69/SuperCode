@@ -8,7 +8,13 @@
 .subagent-row:disabled { opacity:1; cursor:default; }
 .subagent-row.failed { color:var(--danger); }
 .subagent-avatar { width:19px; height:19px; flex:none; }
-.subagent-avatar.color-0 { color:#a480cc; }.subagent-avatar.color-1 { color:#699ed2; }.subagent-avatar.color-2 { color:#53aa99; }.subagent-avatar.color-3 { color:#c39355; }.subagent-avatar.color-4 { color:#ca819d; }.subagent-avatar.color-5 { color:#859f58; }
+.subagent-avatar.color-0 { color:#6086ad; }.subagent-avatar.color-1 { color:#78947c; }.subagent-avatar.color-2 { color:#ac895b; }.subagent-avatar.color-3 { color:#b67e91; }.subagent-avatar.color-4 { color:#8580b0; }.subagent-avatar.color-5 { color:#56969a; }
+:root:is([data-theme=dark],[data-theme=graphite],[data-theme=contrast]) .subagent-avatar.color-0 { color:#8caed2; }
+:root:is([data-theme=dark],[data-theme=graphite],[data-theme=contrast]) .subagent-avatar.color-1 { color:#99b5a0; }
+:root:is([data-theme=dark],[data-theme=graphite],[data-theme=contrast]) .subagent-avatar.color-2 { color:#c3a377; }
+:root:is([data-theme=dark],[data-theme=graphite],[data-theme=contrast]) .subagent-avatar.color-3 { color:#ce9aad; }
+:root:is([data-theme=dark],[data-theme=graphite],[data-theme=contrast]) .subagent-avatar.color-4 { color:#aaa4ce; }
+:root:is([data-theme=dark],[data-theme=graphite],[data-theme=contrast]) .subagent-avatar.color-5 { color:#81b8bb; }
 .subagent-panel { min-width:0; min-height:0; display:flex; flex-direction:column; background:var(--bg); border-left:1px solid var(--line); position:relative; }
 .desktop-workarea .subagent-panel { grid-column:3; grid-row:1; z-index:2; }
 .desktop-workarea .app.has-subagent-panel > .side-chat { display:none; }

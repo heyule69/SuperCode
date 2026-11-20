@@ -28,6 +28,7 @@ impl Store {
             "SELECT COUNT(*) FROM sessions s
              JOIN sidebar_items i ON i.kind='session' AND i.id=s.id
              WHERE i.unread=1 AND i.removed=0 AND s.archived=0
+             AND NOT EXISTS (SELECT 1 FROM linkage_workers w WHERE w.worker_id=s.id)
              AND s.status NOT IN ('starting','running','waiting')
              AND NOT EXISTS (SELECT 1 FROM sidebar_items p WHERE p.kind='project' AND p.id=s.project_id AND p.removed=1)",
             [], |row| row.get(0),
