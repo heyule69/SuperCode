@@ -188,7 +188,7 @@ fn checked_copy(path: &Path) -> Result<CheckedDatabase> {
     let original = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
         .map_err(|e| e.to_string())?;
     original
-        .backup(MAIN_DB, &checked.0, None)
+        .backup(MAIN_DB, &checked.0, None::<fn(rusqlite::backup::Progress)>)
         .map_err(|e| e.to_string())?;
     preflight_database(&checked.0)?;
     Ok(checked)
@@ -292,7 +292,7 @@ fn snapshot(conn: &Connection, directory: &Path, reason: &str) -> Result<PathBuf
         crate::storage::now(),
         uuid::Uuid::new_v4()
     ));
-    if let Err(error) = read.backup(MAIN_DB, &path, None) {
+    if let Err(error) = read.backup(MAIN_DB, &path, None::<fn(rusqlite::backup::Progress)>) {
         let _ = fs::remove_file(&path);
         return Err(error.to_string());
     }
