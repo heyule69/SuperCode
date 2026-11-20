@@ -613,6 +613,9 @@ pub async fn send(
     crate::managed_services::configure(&mut command, app, Some(&session.id));
     command.env("CLAUDE_CODE_SDK_READS_SESSION_STATE", "1");
     command.env("CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST", "1");
+    if app.state::<AppState>().store.linkage_configuration(&session.id)?.is_some_and(|(config, _)| config.enabled()) {
+        command.env("CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS", "0");
+    }
     let mut child = command
         .current_dir(cwd)
         .stdin(std::process::Stdio::piped())

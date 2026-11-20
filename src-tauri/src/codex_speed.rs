@@ -33,10 +33,9 @@ pub(crate) fn supports(model: &Value, tier: &str) -> bool {
         tiers
             .iter()
             .any(|option| option["id"] == tier || tier == "fast" && option["id"] == "priority")
-    }) || tier == "fast"
-        && model["additionalSpeedTiers"]
+    }) || model["additionalSpeedTiers"]
             .as_array()
-            .is_some_and(|tiers| tiers.iter().any(|tier| tier == "fast"))
+            .is_some_and(|tiers| tiers.iter().any(|option| option == tier))
 }
 
 pub(crate) fn find_model<'a>(catalog: &'a Value, model: &str) -> Option<&'a Value> {
@@ -46,7 +45,7 @@ pub(crate) fn find_model<'a>(catalog: &'a Value, model: &str) -> Option<&'a Valu
         .find(|row| row["model"] == model || row["id"] == model)
 }
 
-// Capability reads happen only when the user opens an official model picker.
+// Capability reads are scoped to the selected official connection and model.
 // They start no thread, generation, tools or approval flow.
 #[tauri::command]
 pub async fn get_codex_model_speeds(
@@ -68,28 +67,39 @@ pub async fn get_codex_model_speeds(
     if !official {
         return Err("速度能力仅适用于 Codex 官方账号".into());
     }
+    let catalog = read_catalog(&app, route.config["accountId"].as_str()).await?;
+    Ok(speed_capabilities(&catalog, &model))
+}
+
+fn speed_capabilities(catalog: &Value, model: &str) -> Value {
+    match find_model(catalog, model) {
+        Some(row) => {
+            let tiers: Vec<_> = ["default", "fast", "ultrafast"]
+                .into_iter().filter(|tier| supports(row, tier)).collect();
+            json!({"tiers":tiers})
+        }
+        None => json!({"modelUnavailable":true}),
+    }
+}
+
+pub(crate) async fn read_catalog(app: &AppHandle, account_id: Option<&str>) -> Result<Value, String> {
     let mut cursor = Value::Null;
+    let mut rows = Vec::new();
     for _ in 0..10 {
         let catalog = crate::accounts::read_codex_value(
-            &app,
-            route.config["accountId"].as_str(),
+            app,
+            account_id,
             "model/list",
             json!({"cursor":cursor,"limit":100}),
         )
         .await?;
-        if let Some(row) = find_model(&catalog, &model) {
-            let tiers: Vec<_> = ["default", "fast", "ultrafast"]
-                .into_iter()
-                .filter(|tier| supports(row, tier))
-                .collect();
-            return Ok(json!({"tiers":tiers}));
-        }
+        rows.extend(catalog["data"].as_array().ok_or("Codex 未返回模型目录")?.iter().cloned());
         cursor = catalog["nextCursor"].clone();
         if cursor.as_str().is_none_or(str::is_empty) {
-            break;
+            return Ok(json!({"data":rows}));
         }
     }
-    Err(missing_model(&model))
+    Err("Codex 模型目录分页超过限制".into())
 }
 
 pub(crate) fn missing_model(model: &str) -> String {
@@ -140,6 +150,8 @@ mod tests {
             &json!({"serviceTiers":[{"id":"ultrafast"}]})
         ));
         assert!(!supports_fast(&json!({})));
+        assert!(supports(&json!({"additionalSpeedTiers":["ultrafast"]}), "ultrafast"));
+        assert!(!supports(&json!({"additionalSpeedTiers":["ultrafast"]}), "fast"));
         assert!(supports(
             &json!({"serviceTiers":[{"id":"ultrafast"}]}),
             "ultrafast"
@@ -148,6 +160,14 @@ mod tests {
             &json!({"serviceTiers":[{"id":"priority"}]}),
             "ultrafast"
         ));
+    }
+    #[test]
+    fn missing_native_model_requests_update_without_inventing_account_entitlements() {
+        let old = json!({"data":[{"model":"gpt-6.1-sol","additionalSpeedTiers":["fast"]}]});
+        assert_eq!(speed_capabilities(&old, "gpt-6.2-sol"), json!({"modelUnavailable":true}));
+        let current = json!({"data":[{"model":"gpt-6.2-sol","additionalSpeedTiers":["fast","ultrafast"]}]});
+        assert_eq!(speed_capabilities(&current, "gpt-6.2-sol"), json!({"tiers":["default","fast","ultrafast"]}));
+        assert_eq!(speed_capabilities(&json!({"data":[{"model":"standard-only"}]}), "standard-only"), json!({"tiers":["default"]}));
     }
     #[test]
     fn gpt_62_sol_and_astra_can_advertise_different_account_speed_permissions() {

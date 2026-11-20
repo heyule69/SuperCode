@@ -61,7 +61,7 @@ async fn verify(app: &AppHandle) -> Result<Value, String> {
         if let Some(path) = source.codex_path()? {
             state.store.set_setting("codex_path", &path)?;
         }
-        let accounts = crate::accounts::list_provider_accounts(Some(true), app.clone()).await?;
+        let accounts = crate::accounts::list_provider_accounts(Some(true), None, app.clone()).await?;
         if accounts.iter().any(|account| account["error"].is_string()) {
             return Err("真实官方登录检测失败".into());
         }

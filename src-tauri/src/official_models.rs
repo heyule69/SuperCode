@@ -1,14 +1,11 @@
-//! App-owned model catalogs. No agent process or RPC is used for discovery.
+//! Fast local discovery; explicit refresh uses the same native catalog as execution.
 use crate::AppState;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::{io::Read, path::PathBuf, time::Duration};
+use std::{io::Read, path::PathBuf};
 use tauri::{AppHandle, Manager};
 
-// Tokens stay in Rust and are sent only to this documented official endpoint.
-const ENDPOINT: &str = "https://api.openai.com/v1/models";
 struct Login {
-    access_token: String,
     account: String,
     plan: Option<String>,
 }
@@ -84,7 +81,6 @@ fn parse_login(value: &Value) -> Result<Option<Login>, String> {
                 .map(str::to_owned)
         });
     Ok(Some(Login {
-        access_token: access_token.into(),
         account: account.into(),
         plan,
     }))
@@ -111,14 +107,14 @@ pub(crate) fn preset() -> Value {
     json!({"data":models,"origin":"preset","notice":"官方模型目录 · 实际可用范围由账号权限决定"})
 }
 fn parse_catalog(value: &Value) -> Result<Value, String> {
-    let rows = value["models"].as_array().ok_or("官方接口未返回模型目录")?;
+    let rows = value["data"].as_array().ok_or("Codex 未返回模型目录")?;
     if rows.len() > 200 {
         return Err("官方模型目录超过大小限制".into());
     }
     let mut seen = std::collections::HashSet::new();
     let mut models = Vec::new();
-    for row in rows.iter().filter(|row| row["visibility"] == "list") {
-        let id = row["slug"]
+    for row in rows {
+        let id = row["model"]
             .as_str()
             .filter(|id| {
                 !id.is_empty()
@@ -131,40 +127,21 @@ fn parse_catalog(value: &Value) -> Result<Value, String> {
         if !seen.insert(id) {
             continue;
         }
-        let efforts: Vec<_> = row["supported_reasoning_levels"]
+        let efforts: Vec<_> = row["supportedReasoningEfforts"]
             .as_array()
             .into_iter()
             .flatten()
             .filter_map(|level| {
-                level["effort"].as_str().map(
-                    |effort| json!({"reasoningEffort":effort,"description":level["description"]}),
-                )
+                level["reasoningEffort"].as_str().map(|effort| json!({"reasoningEffort":effort}))
             })
             .collect();
         let mut parsed = crate::model_context::metadata(row);
-        let tiers: Vec<_> = row["service_tiers"].as_array().into_iter().flatten()
-            .filter(|tier| matches!(tier["id"].as_str(), Some("fast" | "priority" | "ultrafast")))
-            .map(|tier| if tier["id"] == "ultrafast" { json!({"id":"ultrafast","name":"Ultrafast"}) } else { json!({"id":"fast","name":"Fast"}) }).collect();
-        parsed.as_object_mut().unwrap().extend(json!({"id":id,"model":id,"displayName":row["display_name"].as_str().unwrap_or(id),"isDefault":models.is_empty(),"defaultReasoningEffort":row["default_reasoning_level"],"supportedReasoningEfforts":efforts,"serviceTiers":tiers}).as_object().unwrap().clone());
+        let tiers: Vec<_> = ["fast", "ultrafast"].into_iter().filter(|tier| crate::codex_speed::supports(row, tier))
+            .map(|tier| json!({"id":tier,"name":if tier == "fast" {"Fast"} else {"Ultrafast"}})).collect();
+        parsed.as_object_mut().unwrap().extend(json!({"id":id,"model":id,"displayName":row["displayName"].as_str().unwrap_or(id),"isDefault":row["isDefault"]==true,"defaultReasoningEffort":row["defaultReasoningEffort"],"supportedReasoningEfforts":efforts,"serviceTiers":tiers}).as_object().unwrap().clone());
         models.push(parsed);
     }
-    Ok(json!({"data":models,"origin":"officialApi"}))
-}
-async fn fetch(client: &reqwest::Client, login: &Login, endpoint: &str) -> Result<Value, String> {
-    let response = client
-        .get(endpoint)
-        .bearer_auth(&login.access_token)
-        .header("Accept", "application/json")
-        .send()
-        .await
-        .map_err(|_| "无法连接官方模型接口".to_owned())?;
-    if !response.status().is_success() {
-        return Err(format!(
-            "官方模型接口返回 HTTP {}",
-            response.status().as_u16()
-        ));
-    }
-    parse_catalog(&crate::providers::read_json(response).await?)
+    Ok(json!({"data":models,"origin":"native"}))
 }
 fn saved_or_preset(saved: Option<&str>) -> Value {
     saved
@@ -190,80 +167,18 @@ pub(crate) async fn catalog(
     let state = app.state::<AppState>();
     let store = &state.store;
     let saved = store.setting(&key)?;
-    let mut local = saved_or_preset(saved.as_deref());
     if !refresh {
-        return Ok(local);
+        return Ok(saved_or_preset(saved.as_deref()));
     }
-    let client = reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(5))
-        .timeout(Duration::from_secs(12))
-        .redirect(reqwest::redirect::Policy::none())
-        .user_agent(concat!("SuperCode/", env!("CARGO_PKG_VERSION")))
-        .build()
-        .map_err(|_| "无法初始化官方模型接口")?;
-    match fetch(&client, &login, ENDPOINT).await {
-        Ok(catalog) => {
-            store.set_setting(&key, &catalog.to_string())?;
-            Ok(catalog)
-        }
-        Err(error) => {
-            local["warning"] = format!("{error}，当前显示本地模型目录").into();
-            Ok(local)
-        }
-    }
+    let catalog = parse_catalog(&crate::codex_speed::read_catalog(app, account_id).await?)?;
+    store.set_setting(&key, &catalog.to_string())?;
+    Ok(catalog)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn http_catalog_uses_oauth_and_reports_failures_without_leaking_the_response_or_redirecting(
-    ) {
-        use axum::{
-            http::{HeaderMap, StatusCode},
-            response::IntoResponse,
-            routing::get,
-            Json, Router,
-        };
-        let router = Router::new().route("/models", get(|headers: HeaderMap| async move {
-            assert_eq!(headers["authorization"], "Bearer private-token");
-            Json(json!({"models":[{"slug":"server-model","display_name":"Server Model","visibility":"list"}]}))
-        })).route("/denied", get(|| async { (StatusCode::FORBIDDEN, "private response with private-token").into_response() }))
-        .route("/redirect", get(|| async { axum::response::Redirect::temporary("/models") }));
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            axum::serve(listener, router).await.unwrap();
-        });
-        let client = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .timeout(Duration::from_secs(2))
-            .build()
-            .unwrap();
-        let login = Login {
-            access_token: "private-token".into(),
-            account: "account".into(),
-            plan: None,
-        };
-        let catalog = fetch(&client, &login, &format!("http://{address}/models"))
-            .await
-            .unwrap();
-        assert_eq!(catalog["data"][0]["model"], "server-model");
-        assert_eq!(catalog["origin"], "officialApi");
-        let error = fetch(&client, &login, &format!("http://{address}/denied"))
-            .await
-            .unwrap_err();
-        assert!(error.contains("403"));
-        assert!(!error.contains("private"));
-        assert!(
-            fetch(&client, &login, &format!("http://{address}/redirect"))
-                .await
-                .unwrap_err()
-                .contains("307")
-        );
-        server.abort();
-    }
     #[test]
     fn full_official_preset_is_app_owned_and_has_distinct_effort_capabilities() {
         let data = preset();
@@ -293,15 +208,18 @@ mod tests {
         assert!(crate::codex_speed::supports(astra,"ultrafast"));
     }
     #[test]
-    fn direct_catalog_uses_visible_server_order_and_an_empty_catalog_does_not_restore_presets() {
-        let catalog=parse_catalog(&json!({"models":[{"slug":"hidden","visibility":"hide"},{"slug":"new","display_name":"New model","visibility":"list","default_reasoning_level":"high","supported_reasoning_levels":[{"effort":"high"}]},{"slug":"old","visibility":"list"}]})).unwrap();
+    fn native_catalog_preserves_server_order_defaults_and_empty_results() {
+        let catalog=parse_catalog(&json!({"data":[{"model":"new","displayName":"New model","isDefault":false,"defaultReasoningEffort":"high","supportedReasoningEfforts":[{"reasoningEffort":"high"}]},{"model":"old","isDefault":true}]})).unwrap();
         assert_eq!(catalog["data"][0]["model"], "new");
         assert_eq!(catalog["data"][1]["model"], "old");
+        assert_eq!(catalog["data"][0]["isDefault"], false);
+        assert_eq!(catalog["data"][1]["isDefault"], true);
+        assert_eq!(catalog["origin"], "native");
         assert_eq!(
             catalog["data"][0]["supportedReasoningEfforts"][0]["reasoningEffort"],
             "high"
         );
-        let empty = parse_catalog(&json!({"models":[]})).unwrap();
+        let empty = parse_catalog(&json!({"data":[]})).unwrap();
         assert_eq!(saved_or_preset(Some(&empty.to_string()))["data"], json!([]));
         assert!(parse_catalog(&json!({"error":"secret"}))
             .unwrap_err()
@@ -309,18 +227,18 @@ mod tests {
             .is_none());
     }
     #[test]
-    fn official_api_capacity_overrides_presets_without_exposing_extra_fields() {
-        let catalog=parse_catalog(&json!({"models":[{"slug":"gpt-6.1-sol","visibility":"list","context_window":600000,"effective_context_window_percent":95,"private":"secret"}]})).unwrap();
+    fn native_capacity_is_preserved_without_exposing_extra_fields() {
+        let catalog=parse_catalog(&json!({"data":[{"model":"gpt-6.1-sol","contextWindow":600000,"effectiveContextWindowPercent":95,"private":"secret"}]})).unwrap();
         assert_eq!(catalog["data"][0]["contextWindow"],600000);
         assert_eq!(catalog["data"][0]["effectiveContextWindowPercent"],95);
         assert!(!catalog.to_string().contains("secret"));
     }
     #[test]
     fn speed_capabilities_are_preserved_without_inventing_unsupported_tiers() {
-        let catalog = parse_catalog(&json!({"models":[{"slug":"model","visibility":"list","service_tiers":[{"id":"priority","name":"Fast","private":"secret"},{"id":"ultrafast","name":"Ultrafast"}]}]})).unwrap();
+        let catalog = parse_catalog(&json!({"data":[{"model":"model","serviceTiers":[{"id":"priority","name":"Fast","private":"secret"},{"id":"ultrafast","name":"Ultrafast"}]}]})).unwrap();
         assert_eq!(catalog["data"][0]["serviceTiers"], json!([{"id":"fast","name":"Fast"},{"id":"ultrafast","name":"Ultrafast"}]));
         assert!(!catalog.to_string().contains("secret"));
-        assert_eq!(parse_catalog(&json!({"models":[{"slug":"model","visibility":"list"}]})).unwrap()["data"][0]["serviceTiers"],json!([]));
+        assert_eq!(parse_catalog(&json!({"data":[{"model":"model"}]})).unwrap()["data"][0]["serviceTiers"],json!([]));
         assert!(preset()["data"].as_array().unwrap().iter().all(crate::codex_speed::supports_fast));
     }
     #[test]
@@ -335,7 +253,6 @@ mod tests {
             .is_none());
         let a=parse_login(&json!({"auth_mode":"chatgpt","tokens":{"access_token":"private-token","account_id":"a"}})).unwrap().unwrap();
         let b = Login {
-            access_token: "different-token".into(),
             account: "b".into(),
             plan: None,
         };

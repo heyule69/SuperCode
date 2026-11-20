@@ -32,7 +32,7 @@ export function useMagpieCatalogs(enabled: boolean, agent: string, currentId: st
       results.forEach((result, index) => {
         if (result.status === 'fulfilled') {
           catalogs[ids[index]] = result.value;
-          const warning = result.value.warning || result.value.notice;
+          const warning = result.value.warning;
           if (warning) warnings.push(warning);
         } else warnings.push(`无法刷新 Magpie 模型：${result.reason instanceof Error ? result.reason.message : String(result.reason)}`);
       });

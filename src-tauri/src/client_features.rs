@@ -506,6 +506,9 @@ pub fn codex_mcp_overrides_for_session(app:&AppHandle,id:Option<&str>)->Result<V
         let prefix = format!("mcp_servers.supercode_{}", s.id.replace('-', "_"));
         out.push(format!("{prefix}.enabled=true"));
         out.push(format!("{prefix}.startup_timeout_sec=120"));
+        if s.id == "linkage" {
+            out.push(format!("{prefix}.tool_timeout_sec={}", crate::linkage_bridge::WAIT_SECONDS));
+        }
         if let Some(url) = s.url {
             out.push(format!("{prefix}.url={}", toml::Value::String(url)));
         } else {
@@ -531,14 +534,15 @@ pub fn claude_mcp_for_session(app:&AppHandle,native:Value,id:Option<&str>)->Resu
         .unwrap_or_default();
     for s in servers_for_session(app,id)?.into_iter().filter(|s| s.enabled) {
         let s = crate::desktop_control::wrap(app, s, "claude")?;
-        map.insert(
-            format!("supercode_{}", s.id),
-            if let Some(url) = s.url {
+        let mut entry = if let Some(url) = s.url {
                 json!({"type":"http","url":url})
             } else {
                 json!({"type":"stdio","command":s.command,"args":s.args})
-            },
-        );
+            };
+        if s.id == "linkage" {
+            entry["timeout"] = json!(crate::linkage_bridge::WAIT_SECONDS * 1000);
+        }
+        map.insert(format!("supercode_{}", s.id), entry);
     }
     Ok(json!({"mcpServers":map}))
 }

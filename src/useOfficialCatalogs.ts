@@ -22,7 +22,7 @@ export function useOfficialCatalogs(enabled: boolean, agent: string, currentId: 
     let disposed = false;
     const forceRefresh = revision !== refreshed.current;
     refreshed.current = revision;
-    setResult({ key, catalogs: empty, loading: true, warning: '' });
+    setResult(previous => ({ key, catalogs: previous.key === key ? previous.catalogs : empty, loading: true, warning: '' }));
     void Promise.allSettled(connections.map(connectionId => call<ModelCatalog>('list_models', { agent, connectionId, forceRefresh }))).then(results => {
       if (disposed) return;
       const catalogs: Record<string, ModelCatalog> = {}, warnings: string[] = [];

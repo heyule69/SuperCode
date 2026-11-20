@@ -57,6 +57,7 @@ impl Accounts {
 #[tauri::command]
 pub async fn list_provider_accounts(
     force: Option<bool>,
+    agent: Option<String>,
     app: AppHandle,
 ) -> Result<Vec<Value>, String> {
     async fn one(agent: &str, force: bool, app: &AppHandle) -> Value {
@@ -71,18 +72,26 @@ pub async fn list_provider_accounts(
             Err(error) => json!({"agent":agent,"loggedIn":false,"error":error}),
         }
     }
-    let (codex, claude, gemini) = tokio::join!(
-        one("codex", force.unwrap_or(false), &app),
-        one("claude", force.unwrap_or(false), &app),
-        one("gemini", force.unwrap_or(false), &app)
-    );
-    let mut rows = vec![codex, claude, gemini];
+    let mut rows = if let Some(agent) = agent.as_deref() {
+        if !matches!(agent, "codex" | "claude" | "gemini") {
+            return Err("不支持此 Agent 的官方账号".into());
+        }
+        vec![one(agent, force.unwrap_or(false), &app).await]
+    } else {
+        let (codex, claude, gemini) = tokio::join!(
+            one("codex", force.unwrap_or(false), &app),
+            one("claude", force.unwrap_or(false), &app),
+            one("gemini", force.unwrap_or(false), &app)
+        );
+        vec![codex, claude, gemini]
+    };
     for profile in app
         .state::<AppState>()
         .store
         .profiles()?
         .into_iter()
-        .filter(|p| p.is_official() && p.account_id().is_some())
+        .filter(|p| p.is_official() && p.account_id().is_some()
+            && agent.as_deref().is_none_or(|agent| p.agent == agent))
     {
         let mut status = app
             .state::<Accounts>()

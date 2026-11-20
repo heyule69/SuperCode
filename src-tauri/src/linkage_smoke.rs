@@ -18,22 +18,19 @@ async fn settled(app: &AppHandle, id: &str, progress_dir: Option<&std::path::Pat
         let root = state.store.session(id)?;
         let children = state.store.linkage_children(id)?;
         let task = state.store.linkage_task(id)?;
+        if progress_dir.is_some() && root.status == "idle" && task.as_ref().is_some_and(|task| task.live()) {
+            return Err("主控在整项任务验收前结束了当前轮次".into());
+        }
         if let Some(dir)=progress_dir.filter(|_|progress_reply.is_none()) {
-            if root.status=="idle" && children.iter().any(|child|child.status=="running") && dir.join("stage-1.txt").is_file() && task.as_ref().is_some_and(|task|task.state=="working") {
+            if root.status=="running" && children.iter().any(|child|child.status=="running") && dir.join("stage-1.txt").is_file() && task.as_ref().is_some_and(|task|task.state=="working") {
                 let messages=state.store.messages(id,None)?;
-                let (_,updates)=state.store.linkage_updates(id)?;
-                let stage_cursor=updates.iter().find(|update|update.text.as_ref().is_some_and(|text|text.contains("WORKER_PROGRESS_1"))).map(|update|update.cursor);
-                if let Some(wake)=messages.iter().rposition(|message|message.kind=="linkageProgress") {
-                    // A preparatory worker message can also be complete. The
-                    // host must wait for the actual stage checkpoint, not just
-                    // for an earlier "execution started" acknowledgement.
-                    let checkpoint_seen=stage_cursor.is_some_and(|cursor|messages[wake].data["linkageProgress"]["cursor"].as_i64().is_some_and(|seen|seen>=cursor))
-                        || messages[wake..].iter().filter(|message|message.role=="tool").any(|message|serde_json::from_str::<Value>(&message.text).ok().is_some_and(|report|report["updates"].as_array().is_some_and(|updates|updates.iter().any(|update|update["text"].as_str().is_some_and(|text|text.contains("WORKER_PROGRESS_1"))))));
-                    let reply=messages[wake..].iter().filter(|message|message.role=="assistant").map(|message|message.text.as_str()).collect::<Vec<_>>().join("\n");
-                    if checkpoint_seen && !reply.trim().is_empty() {
+                let checkpoint=messages.iter().rposition(|message|message.role!="assistant" && (message.text.contains("WORKER_PROGRESS_1") || message.data.to_string().contains("WORKER_PROGRESS_1")));
+                if let Some(checkpoint)=checkpoint {
+                    let reply=messages[checkpoint+1..].iter().filter(|message|message.role=="assistant").map(|message|message.text.as_str()).collect::<Vec<_>>().join("\n");
+                    if !reply.trim().is_empty() {
                         if reply.contains("WORKER_PROGRESS") {return Err("主控直接复述了执行方的原始进展标记".into());}
-                        std::fs::write(dir.join("continue.flag"),"host verified controller progress").map_err(|e|e.to_string())?;
-                        progress_reply=Some(json!({"reply":reply,"stageCheckpointSeen":true,"workerStillRunning":true,"taskStillWorking":true,"controllerRested":true}));
+                        std::fs::write(dir.join("continue.flag"),"host verified continuous controller progress").map_err(|e|e.to_string())?;
+                        progress_reply=Some(json!({"reply":reply,"stageCheckpointSeen":true,"workerStillRunning":true,"taskStillWorking":true,"controllerStillRunning":true}));
                     }
                 }
             }
@@ -170,13 +167,16 @@ async fn pair(app: &AppHandle, controller: &Profile, executor: &Profile) -> Resu
         std::fs::write(dir.join(format!("input-{round}.txt")), &token)
             .map_err(|e| e.to_string())?;
         let text=if progress_test {
-            format!("这是阶段进展的真实联动验证。完整计划两项：1. 执行方读取 input-{round}.txt 原样复制为 stage-{round}.txt 并核对；2. 执行方把 stage-{round}.txt 原样复制为 {filename} 并回读核对。请 task_plan 登记两项，再一次 delegate_task 派发两项完整工作。委派时明确要求：第一项用一条 Python 命令完成；第一项完成后先发一段完整简短的进展说明，包含私有标记 WORKER_PROGRESS_{round}，接着执行第二条 Python 命令，等待当前目录 continue.flag 存在（每 0.25 秒检查，最多 240 秒），然后复制并核对第二项文件。continue.flag 由测试程序自动创建，是为了验证主控先向用户表达进展、执行方仍继续运行；不要要求用户创建它。执行方最终报告包含 WORKER_ONLY_{round} 和真实文件内容。你在首次派发后调用 executor_wait 交给软件监听并结束本轮；之后收到阶段进展时，必须用一句自然中文说明第一项已完成、第二项还在继续，并调用 executor_wait 交接后结束本轮；你不能复制私有标记或文件内容。等执行方实际结束，再逐项 task_review，全部验证后才 completed。你不要自己运行命令或读写文件。任务只允许访问当前隔离测试目录。")
+            format!("这是阶段进展的真实联动验证。完整计划两项：1. 执行方读取 input-{round}.txt 原样复制为 stage-{round}.txt 并核对；2. 执行方把 stage-{round}.txt 原样复制为 {filename} 并回读核对。请 task_plan 登记两项，再一次 delegate_task 派发两项完整工作。委派时明确要求：第一项用一条 Python 命令完成；第一项完成后先发一段完整简短的进展说明，包含私有标记 WORKER_PROGRESS_{round}，接着执行第二条 Python 命令，等待当前目录 continue.flag 存在（每 0.25 秒检查，最多 240 秒），然后复制并核对第二项文件。continue.flag 由测试程序自动创建，是为了验证主控先向用户表达进展、执行方仍继续运行；不要要求用户创建它。执行方最终报告包含 WORKER_ONLY_{round} 和真实文件内容。你在首次派发后调用 executor_wait 在同一轮中等待；收到阶段进展时，必须用一句自然中文说明第一项已完成、第二项还在继续，然后调用 executor_wait 继续等待，不结束当前主控轮次；你不能复制私有标记或文件内容。等执行方实际结束，再逐项 task_review，全部验证后才 completed。你不要自己运行命令或读写文件。任务只允许访问当前隔离测试目录。")
         } else if supervision {
-            format!("这是主控自动续派集成验证，完整计划恰有两项：1. 执行方读取 input-{round}.txt，等待 3 秒后原样写入 stage-{round}.txt；2. 执行方读取 stage-{round}.txt，原样写入 {filename} 并重新读取核对。请先用 task_plan 登记两项完整清单，再 delegate_task 仅派发第一项，明确让执行方第一项完成就停、不要提前执行第二项。这是一次特意模拟提前结束的测试：第一项派发成功后，请直接用一句中文回复已开始并结束你这一轮，不调用 wait，不标记完成；软件随后会在执行方结束时安排你验收并续派第二项。进入后续验收阶段时，你必须读取真实状态并通过 task_review 的 continue 实际派发第二项，全部完成再逐项验收为 completed。执行方最终报告必须包含 WORKER_ONLY_{round} 和实际文件内容，你不能自己运行命令或读取文件，也不要向用户复述原始标记或文件内容。只允许访问当前测试目录。")
+            format!("这是主控连续监督和续派集成验证，完整计划恰有两项：1. 执行方读取 input-{round}.txt，等待 3 秒后原样写入 stage-{round}.txt；2. 执行方读取 stage-{round}.txt，原样写入 {filename} 并重新读取核对。请先用 task_plan 登记两项完整清单，再 delegate_task 仅派发第一项，明确让执行方第一项完成就停、不要提前执行第二项。这是一次特意模拟提前结束的测试：第一项派发成功后，请调用 executor_wait 在当前主控轮次中持续等待，不提前结束回复或标记完成；执行方结束后，你必须读取真实状态并通过 task_review 的 continue 实际派发第二项，全部完成再逐项验收为 completed。执行方最终报告必须包含 WORKER_ONLY_{round} 和实际文件内容，你不能自己运行命令或读取文件，也不要向用户复述原始标记或文件内容。只允许访问当前测试目录。")
         } else {
             format!("这是联动集成验证第 {round} 轮。先通过 task_plan 登记文件生成和验证清单，再调用 supercode_linkage 的 delegate_task，让配置的执行 Agent 读取当前目录 input-{round}.txt，并把完全相同的内容写入 {filename}，再读取验证；执行方最终报告必须包含 WORKER_ONLY_{round} 和实际文件内容。你不要自己读取文件或运行命令。必须调用 executor_wait 跟进，执行方结束后调用 task_review 对全部清单逐项验收，全部通过才标记 completed。最后只用一句自然中文告诉我文件已生成，不复述执行方的原始标记。可用工具可能需要先发现。任务只允许访问当前测试目录。")
         };
-        let text = if supervision {format!("{text}\n为减少测试开销，请在派发时要求执行方每个阶段使用一条 Python 命令完成复制、字节核对和输出，随后简短报告即可。")} else if progress_test {format!("{text}\n整个测试最终也只回复一句自然中文说明两项验收完成，不展开内部测试流程。")} else {text};
+        let text = if supervision {format!("{text}\n为减少测试开销，请在派发时要求执行方每个阶段使用一条 Python 命令完成复制、字节核对和输出，随后简短报告即可。")} else if progress_test {
+            let silence = std::env::var("SUPERCODE_LINKAGE_TEST_SILENCE_SECONDS").ok().map(|value| value.parse::<u64>().map_err(|_| "测试静默时长无效")).transpose()?.unwrap_or(0);
+            format!("{text}\n派发时要求第一条 Python 命令先 time.sleep({silence}) 秒再复制文件，保持这段工具执行期间静默，模拟没有新消息的长任务。若命令工具有超时参数，需设为至少 300 秒；执行方可以等待工具，但这段静默期间不要另外发送阶段消息。整个测试最终也只回复一句自然中文说明两项验收完成，不展开内部测试流程。")
+        } else {text};
         let result=async {
             crate::commands::send_chat_message_inner(root.id.clone(),text,Some(main.model_id.clone()),false,Some("full".into()),None,main.effort.clone(),None,None,main.service_tier.clone(),None,app.clone()).await?;
             let progress_delivery=settled(app,&root.id,progress_test.then_some(dir.as_path())).await?;
@@ -193,7 +193,7 @@ async fn pair(app: &AppHandle, controller: &Profile, executor: &Profile) -> Resu
             let last_user=root_messages.iter().rposition(|m|m.role=="user").ok_or("缺少主控输入")?;
             let review_turns=root_messages[last_user..].iter().filter(|m|m.kind=="linkageReview").count();
             let progress_turns=root_messages[last_user..].iter().filter(|m|m.kind=="linkageProgress").count();
-            if supervision && review_turns==0 {return Err("主控提前结束后没有自动安排验收".into());}
+            if (supervision || progress_test) && (review_turns>0 || progress_turns>0) {return Err("连续跟进期间主控提前结束并被重新启动".into());}
             let reply=root_messages[last_user..].iter().filter(|m|m.role=="assistant").map(|m|m.text.as_str()).collect::<Vec<_>>().join("\n");
             if reply.is_empty()||reply.contains(&format!("WORKER_ONLY_{round}"))||reply.contains("WORKER_PROGRESS")||reply.contains(&token) {return Err("主控未独立表达结果，或原始执行输出泄漏到主回复".into());}
             let child_session=state.store.session(child)?;

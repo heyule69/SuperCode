@@ -24,7 +24,10 @@ async function render(profiles = [api]) {
 async function open() { await act(async () => node.querySelector<HTMLButtonElement>('[aria-label="选择模型"]')!.click()); }
 
 it('loads the signed-in native official catalog while an API is selected, without changing the route', async () => {
-  await render(); expect(call).not.toHaveBeenCalled(); await open();
+  await render();
+  expect(call).toHaveBeenCalledWith('list_provider_accounts', { force: false, agent: 'codex' });
+  expect(call).toHaveBeenCalledWith('list_models', { agent: 'codex', connectionId: '@official', forceRefresh: false });
+  await open();
   expect(call).toHaveBeenCalledWith('list_models', { agent: 'codex', connectionId: '@official', forceRefresh: false });
   const chip = [...node.querySelectorAll<HTMLButtonElement>('.model-provider-filters button')].find(button => button.textContent === 'ChatGPT 官方账号')!;
   expect(chip).toBeDefined(); await act(async () => chip.click());
@@ -50,8 +53,9 @@ it('reports official catalog failures and allows an explicit refresh', async () 
   await act(async () => node.querySelector<HTMLButtonElement>('[aria-label="刷新模型"]')!.click());
   expect(node.querySelector('.model-menu-scroll')?.textContent).toContain('Official Model');
   expect(call).toHaveBeenCalledWith('list_models', { agent: 'codex', connectionId: '@official', forceRefresh: true });
+  const calls = vi.mocked(call).mock.calls.length;
   await open(); await open();
-  expect(vi.mocked(call).mock.calls.filter(([command]) => command === 'list_models').at(-1)?.[1]).toEqual({ agent: 'codex', connectionId: '@official', forceRefresh: false });
+  expect(vi.mocked(call).mock.calls.length).toBe(calls);
 });
 
 it('queries a managed official account by its connection id and never uses a signed-out managed account', async () => {
@@ -88,7 +92,7 @@ it('keeps Ultra reasoning while selecting Fast, then explicitly returns to Stand
   await act(async () => [...node.querySelectorAll<HTMLButtonElement>('[role="menuitemradio"]')].find(button => button.textContent === 'Fast')!.click());
   expect(speed.textContent).toContain('Fast');
   expect(node.querySelector('.model-chip-effort')?.textContent).toBe('超高');
-  expect(node.querySelector('.model-menu-footer')?.textContent).toContain('消耗更多额度');
+  expect(node.querySelector('.model-menu-footer')?.textContent).not.toContain('消耗更多额度');
   await act(async () => speed.click());
   await act(async () => [...node.querySelectorAll<HTMLButtonElement>('[role="menuitemradio"]')].find(button => button.textContent === '标准')!.click());
   expect(speed.textContent).toContain('标准');
@@ -117,7 +121,7 @@ it('selects Ultrafast independently of Ultra reasoning and returns to Standard',
 it('disables Ultrafast when the account or installed CLI does not advertise it', async () => {
   vi.mocked(call).mockImplementation(async command => command === 'list_provider_accounts' ? [{ agent: 'codex', loggedIn: true }] : { tiers: ['default','fast'] });
   await act(async () => root.render(<SpeedPicker/>)); await open();
-  expect(node.querySelector('.model-menu-footer')?.textContent).toContain('当前账号或本机 Codex 未提供超快');
+  expect(node.querySelector('.model-menu-footer')?.textContent).not.toContain('当前账号或本机 Codex 未提供超快');
   await act(async () => node.querySelector<HTMLButtonElement>('[aria-label="选择速度"]')!.click());
   expect([...node.querySelectorAll<HTMLButtonElement>('.model-setting-menu button')].find(button => button.textContent === '超快')?.disabled).toBe(true);
   expect([...node.querySelectorAll<HTMLButtonElement>('.model-setting-menu button')].find(button => button.textContent === 'Fast')?.disabled).toBe(false);
@@ -129,4 +133,62 @@ it('shows capability failures and does not enable a paid speed before capability
   expect(node.querySelector('.model-menu-footer')?.textContent).toContain('速度能力读取失败');
   await act(async () => node.querySelector<HTMLButtonElement>('[aria-label="选择速度"]')!.click());
   expect([...node.querySelectorAll<HTMLButtonElement>('.model-setting-menu button')].filter(button => button.textContent !== '标准').every(button => button.disabled)).toBe(true);
+});
+
+it('keeps preloaded official options through close, reopen and unrelated profile updates', async () => {
+  await render();
+  const initial = vi.mocked(call).mock.calls.filter(([command]) => command === 'list_models').length;
+  await open(); await open(); await render([{ ...api, name: 'Renamed API' }]); await open();
+  expect(node.querySelector('.model-menu-scroll')?.textContent).toContain('Official Model');
+  expect(vi.mocked(call).mock.calls.filter(([command]) => command === 'list_models')).toHaveLength(initial);
+  expect(reload).not.toHaveBeenCalled();
+});
+
+it('repairs an old SDK through the existing updater and rechecks actual native speeds', async () => {
+  let updated = false, complete!: () => void;
+  vi.mocked(call).mockImplementation(async command => {
+    if (command === 'list_provider_accounts') return [{ agent: 'codex', loggedIn: true }];
+    if (command === 'get_codex_model_speeds') return updated ? { tiers: ['default','fast','ultrafast'] } : { modelUnavailable: true };
+    if (command === 'update_agent') { await new Promise<void>(resolve => { complete = resolve; }); updated = true; return; }
+    return official;
+  });
+  await act(async () => root.render(<SpeedPicker/>));
+  expect(call).toHaveBeenCalledWith('get_codex_model_speeds', { connectionId: '@official', model: 'official-model' });
+  await open();
+  const update = node.querySelector<HTMLButtonElement>('.model-menu-status button')!;
+  expect(update.textContent).toBe('更新 Codex');
+  await act(async () => update.click());
+  expect(call).toHaveBeenCalledWith('update_agent', { id: 'codex' });
+  expect(update.disabled).toBe(true);
+  await act(async () => complete());
+  expect(reload).toHaveBeenCalledWith(true);
+  expect(node.querySelector('.model-menu-status')).toBeNull();
+  await act(async () => node.querySelector<HTMLButtonElement>('[aria-label="选择速度"]')!.click());
+  expect([...node.querySelectorAll<HTMLButtonElement>('.model-setting-menu button')].find(button => button.textContent === '超快')?.disabled).toBe(false);
+  expect(choose).not.toHaveBeenCalled();
+});
+
+it('shows update errors without enabling unsupported speeds and keeps an explicit retry action', async () => {
+  vi.mocked(call).mockImplementation(async command => {
+    if (command === 'list_provider_accounts') return [{ agent: 'codex', loggedIn: true }];
+    if (command === 'get_codex_model_speeds') return { modelUnavailable: true };
+    if (command === 'update_agent') throw new Error('请先等待其他任务结束');
+    return official;
+  });
+  await act(async () => root.render(<SpeedPicker/>)); await open();
+  await act(async () => node.querySelector<HTMLButtonElement>('.model-menu-status button')!.click());
+  expect(node.querySelector('.model-menu-error summary')?.textContent).toContain('更新失败');
+  expect(node.querySelector('.model-menu-error p')?.textContent).toContain('请先等待其他任务结束');
+  expect([...node.querySelectorAll('button')].some(button => button.textContent === '重试更新')).toBe(true);
+  expect(reload).not.toHaveBeenCalled();
+});
+
+it('shows only relevant failures and keeps healthy account selection free of explanatory paragraphs', async () => {
+  const magpie = { ...api, id: 'magpie:codex', name: 'Magpie', providerId: 'magpie', current: false, models: ['saved-model'] };
+  await act(async () => root.render(<ModelMenu value="proxy-model" models={[{ id: 'proxy-model', model: 'proxy-model', displayName: 'Proxy Model', isDefault: true }]}
+    catalogLoaded catalogWarning="上次使用的模型已不在 Magpie 目录" profiles={[api, magpie]} activeProfile={api} connectionId={api.id} agent="codex" busy={false} loading={false} choose={choose} reload={reload} manage={() => {}} effort="" setEffort={() => {}} hasConversation/>));
+  await open();
+  await act(async () => [...node.querySelectorAll<HTMLButtonElement>('.model-provider-filters button')].find(button => button.textContent === 'ChatGPT 官方账号')!.click());
+  expect(node.querySelector('.model-menu-footer')?.textContent).toBe('模型设置');
+  expect(node.querySelector('.model-menu-footer p')).toBeNull();
 });

@@ -52,8 +52,9 @@ it('keeps cached model IDs selectable with an explicit offline notice and a fres
   const trigger = node.querySelector<HTMLButtonElement>('[aria-label="选择模型"]')!;
   await act(async () => trigger.click());
   expect(node.querySelector('.model-option')?.textContent).toContain('vendor/saved');
-  expect(node.querySelector('.magpie-gateway-status')?.textContent).toContain('网关未连接');
-  expect(node.textContent).toContain('已保存目录');
+  expect(node.querySelector('.model-menu-error')?.textContent).toContain('网关未连接');
+  expect(node.querySelector('.model-menu-error')?.hasAttribute('open')).toBe(false);
+  expect(node.textContent).not.toContain('已保存目录');
   expect(vi.mocked(call).mock.calls.every(([command]) => !['open_magpie', 'use_magpie', 'list_models', 'send_chat_message'].includes(command))).toBe(true);
   await act(async () => trigger.click()); await act(async () => trigger.click());
   expect(vi.mocked(call).mock.calls.filter(([command]) => command === 'get_magpie_status')).toHaveLength(2);

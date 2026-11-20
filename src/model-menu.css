@@ -43,6 +43,13 @@
 .model-popover .model-menu-empty { padding:32px 16px; text-align:center; color:var(--muted); font-size:var(--ui-size); }
 .model-popover .model-menu-footer { display:block; border-top:1px solid var(--line); padding:6px 13px 8px; }
 .model-catalog-warning { margin:4px 0 7px; color:var(--muted); font-size:calc(var(--ui-size) - 2px); line-height:1.5; }
+.model-menu-status, .model-menu-error { margin:4px 0; color:var(--muted); font-size:var(--model-menu-size); }
+.model-menu-status, .model-menu-error summary { display:flex; align-items:center; justify-content:space-between; gap:8px; min-height:28px; }
+.model-menu-error summary { cursor:pointer; list-style:none; }
+.model-menu-error summary::-webkit-details-marker { display:none; }
+.model-menu-error summary span { font-size:calc(var(--model-menu-size) - 1px); }
+.model-menu-error p { margin:4px 0 8px; line-height:1.5; overflow-wrap:anywhere; font-size:calc(var(--model-menu-size) - 1px); }
+.model-popover .model-menu-status button { padding:4px 6px; font-size:var(--model-menu-size); }
 .model-setting-row { display:flex; align-items:center; justify-content:space-between; gap:10px; min-height:28px; font-size:var(--model-menu-size); }
 .model-setting-row > span { color:var(--muted); }
 .model-setting-control { position:relative; }
