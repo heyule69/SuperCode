@@ -55,7 +55,9 @@ pub fn has_update(event: &Value) -> bool {
 pub struct Update {
     pub cursor: i64,
     pub kind: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    // The transport exposes statements only inside executorEvidence, never twice
+    // as a top-level progress reply as well.
+    #[serde(skip_serializing)]
     pub text: Option<String>,
 }
 
@@ -126,17 +128,45 @@ impl Store {
         updates.reverse();
         Ok((cursor, updates))
     }
-    pub fn acknowledge_linkage_updates(&self, parent: &str, cursor: i64) -> Result<(), String> {
+    pub fn acknowledge_linkage_updates(&self, parent: &str, cursor: i64, no_user_update_reason: Option<&str>) -> Result<(), String> {
         let Some(task) = self.linkage_task(parent)? else {
             return Ok(());
         };
-        let conn = self.0.lock().map_err(|e| e.to_string())?;
-        let latest: i64 = conn.query_row("SELECT COALESCE(MAX(seq),0) FROM linkage_updates WHERE controller_id=?1 AND input_seq=?2 AND round=?3",params![parent,task.input_seq,task.round],|row|row.get(0)).map_err(|e|e.to_string())?;
+        if no_user_update_reason.is_some_and(|reason| reason.trim().is_empty() || reason.len() > 1024 || reason.contains('\0')) {
+            return Err("略过进展时必须具体说明仅为准备动作或已向用户说明过的重复信息".into());
+        }
+        let mut conn = self.0.lock().map_err(|e| e.to_string())?;
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        let latest: i64 = tx.query_row("SELECT COALESCE(MAX(seq),0) FROM linkage_updates WHERE controller_id=?1 AND input_seq=?2 AND round=?3",params![parent,task.input_seq,task.round],|row|row.get(0)).map_err(|e|e.to_string())?;
         if cursor < 0 || cursor > latest {
             return Err("进展游标无效，请先读取 executor_status".into());
         }
-        conn.execute("UPDATE linkage_updates SET delivered=1 WHERE controller_id=?1 AND input_seq=?2 AND round=?3 AND seq<=?4",params![parent,task.input_seq,task.round,cursor]).map_err(|e|e.to_string())?;
-        Ok(())
+        let acknowledged: i64 = tx.query_row(
+            "SELECT cursor FROM linkage_communications WHERE controller_id=?1 AND input_seq=?2 AND round=?3",
+            params![parent,task.input_seq,task.round], |row| row.get(0),
+        ).optional().map_err(|e|e.to_string())?.unwrap_or(0);
+        // A delivered tool response is not proof that the user heard progress.
+        // Sequence numbers are global, so an old controller reply cannot satisfy
+        // an acknowledgement of a newer worker statement (even on fallback turns).
+        let statement: Option<(i64,String)> = tx.query_row(
+            "SELECT m.seq,m.text FROM linkage_updates u JOIN messages m ON m.session_id=u.worker_id AND m.id=u.message_id WHERE u.controller_id=?1 AND u.input_seq=?2 AND u.round=?3 AND u.seq<=?4 AND u.seq>?5 AND u.kind='progress' ORDER BY m.seq DESC LIMIT 1",
+            params![parent,task.input_seq,task.round,cursor,acknowledged], |row| Ok((row.get(0)?,row.get(1)?)),
+        ).optional().map_err(|e|e.to_string())?;
+        if let Some((seq,worker_text)) = statement {
+            let reply: Option<String> = tx.query_row(
+                "SELECT text FROM messages WHERE session_id=?1 AND seq>?2 AND role='assistant' AND length(trim(text))>0 AND COALESCE(json_extract(data,'$.status'),'completed')='completed' ORDER BY seq DESC LIMIT 1",
+                params![parent,seq], |row| row.get(0),
+            ).optional().map_err(|e|e.to_string())?;
+            if reply.as_ref().is_some_and(|reply| reply.trim() == worker_text.trim()) {
+                return Err("主控不能直接复用执行方原文。请先对照用户目标独立判断，用你自己的表达说明变化与影响，再继续等待".into());
+            }
+            if reply.is_none() && no_user_update_reason.is_none() {
+                return Err("这批执行进展尚未向用户说明。请先独立判断并回复新增成果、验证结果或阻碍，再继续等待；仅为准备或已说明过的重复信息时，提供具体 noUserUpdateReason".into());
+            }
+        }
+        tx.execute("UPDATE linkage_updates SET delivered=1 WHERE controller_id=?1 AND input_seq=?2 AND round=?3 AND seq<=?4",params![parent,task.input_seq,task.round,cursor]).map_err(|e|e.to_string())?;
+        tx.execute("INSERT INTO linkage_communications(controller_id,input_seq,round,cursor) VALUES(?1,?2,?3,?4) ON CONFLICT(controller_id) DO UPDATE SET input_seq=excluded.input_seq,round=excluded.round,cursor=excluded.cursor",params![parent,task.input_seq,task.round,cursor.max(acknowledged)]).map_err(|e|e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())
     }
     pub fn claim_linkage_update(&self, parent: &str) -> Result<Option<(u64, i64)>, String> {
         let Some(task) = self.linkage_task(parent)?.filter(|task| {
@@ -311,18 +341,56 @@ mod tests {
         let (store, root, worker) = fixture();
         let first = progress(&store, &root, &worker, "first");
         let next = progress(&store, &root, &worker, "next");
-        store.acknowledge_linkage_updates(&root.id, first).unwrap();
+        store.acknowledge_linkage_updates(&root.id, first, Some("该条仅为准备动作，尚无新增结果")).unwrap();
         assert_eq!(
             store.claim_linkage_update(&root.id).unwrap(),
             Some((1, next))
         );
         assert!(store
-            .acknowledge_linkage_updates(&root.id, next + 100)
+            .acknowledge_linkage_updates(&root.id, next + 100, None)
             .is_err());
-        assert!(store.acknowledge_linkage_updates(&root.id, -1).is_err());
+        assert!(store.acknowledge_linkage_updates(&root.id, -1, None).is_err());
         for _ in 0..50 {
             assert_eq!(store.claim_linkage_update(&root.id).unwrap(), None);
         }
+    }
+    #[test]
+    fn progress_requires_a_new_controller_explanation_not_just_receipt_or_old_text() {
+        let (store, root, worker) = fixture();
+        store.save_message("old",&root.id,"assistant","检查已经开始。","agentMessage",&json!({"status":"completed"})).unwrap();
+        let cursor = progress(&store,&root,&worker,"result");
+        assert!(store.acknowledge_linkage_updates(&root.id,cursor,None).unwrap_err().contains("尚未向用户说明"));
+        // A fallback dispatch has claimed the notification, but has not explained it.
+        assert!(store.claim_linkage_update(&root.id).unwrap().is_some());
+        assert!(store.acknowledge_linkage_updates(&root.id,cursor,None).is_err());
+        store.save_message("new",&root.id,"assistant","文件已保存，剩下的校验还在继续。","agentMessage",&json!({"status":"inProgress"})).unwrap();
+        assert!(store.acknowledge_linkage_updates(&root.id,cursor,None).is_err());
+        store.save_message("new",&root.id,"assistant","文件已保存，剩下的校验还在继续。","agentMessage",&json!({"status":"completed"})).unwrap();
+        store.acknowledge_linkage_updates(&root.id,cursor,None).unwrap();
+        assert_eq!(store.claim_linkage_update(&root.id).unwrap(),None);
+    }
+    #[test]
+    fn copying_a_worker_reply_does_not_satisfy_controller_communication() {
+        let (store, root, worker) = fixture();
+        let cursor = progress(&store,&root,&worker,"copy");
+        let raw = store.messages(&worker.id,None).unwrap().last().unwrap().text.clone();
+        store.save_message("copied",&root.id,"assistant",&raw,"agentMessage",&json!({"status":"completed"})).unwrap();
+        assert!(store.acknowledge_linkage_updates(&root.id,cursor,None).unwrap_err().contains("原文"));
+        let pending:i64=store.0.lock().unwrap().query_row("SELECT COUNT(*) FROM linkage_updates WHERE delivered=0",[],|row|row.get(0)).unwrap();
+        assert_eq!(pending,1);
+    }
+    #[test]
+    fn preparation_can_be_skipped_only_with_an_explicit_nonempty_reason() {
+        let (store, root, worker) = fixture();
+        let cursor = progress(&store,&root,&worker,"preparation");
+        assert!(store.acknowledge_linkage_updates(&root.id,cursor,Some(" ")).is_err());
+        assert!(store.acknowledge_linkage_updates(&root.id,cursor,Some(&"x".repeat(1025))).is_err());
+        store.acknowledge_linkage_updates(&root.id,cursor,Some("仅确认开始检查，尚无新增成果；开始执行已向用户说明")).unwrap();
+        // An explicit decision is durable and need not be repeated on each wait.
+        store.acknowledge_linkage_updates(&root.id,cursor,None).unwrap();
+        assert_eq!(store.claim_linkage_update(&root.id).unwrap(),None);
+        let next = progress(&store,&root,&worker,"real-result");
+        assert!(store.acknowledge_linkage_updates(&root.id,next,None).is_err());
     }
     #[test]
     fn execution_end_takes_priority_over_progress_and_requires_whole_task_acceptance() {
@@ -472,6 +540,31 @@ mod tests {
         assert!(!store
             .record_linkage_update(&root.id, &worker.id, &approval)
             .unwrap());
+    }
+    #[test]
+    fn communication_receipts_survive_reopen_without_hiding_a_new_progress_message() {
+        let (store, root, worker) = fixture();
+        let cursor = progress(&store,&root,&worker,"first");
+        store.acknowledge_linkage_updates(&root.id,cursor,Some("已说明过的准备状态")).unwrap();
+        let restored = Store::from_connection(store.0.into_inner().unwrap()).unwrap();
+        restored.acknowledge_linkage_updates(&root.id,cursor,None).unwrap();
+        let next = progress(&restored,&root,&worker,"next");
+        assert!(restored.acknowledge_linkage_updates(&root.id,next,None).is_err());
+        assert_eq!(restored.claim_linkage_update(&root.id).unwrap(),Some((1,next)));
+    }
+    #[test]
+    fn adding_communication_receipts_preserves_the_existing_notification_queue() {
+        let (store, root, worker) = fixture();
+        let cursor = progress(&store,&root,&worker,"legacy");
+        {
+            let conn = store.0.lock().unwrap();
+            conn.execute("DROP TABLE linkage_communications",[]).unwrap();
+            crate::linkage_store::schema(&conn).unwrap();
+            crate::linkage_store::schema(&conn).unwrap();
+        }
+        assert_eq!(store.linkage_updates(&root.id).unwrap().0,cursor);
+        assert!(store.acknowledge_linkage_updates(&root.id,cursor,None).is_err());
+        assert_eq!(store.claim_linkage_update(&root.id).unwrap(),Some((1,cursor)));
     }
     #[test]
     fn notifications_survive_storage_reopen_and_only_a_superseding_input_can_defer_delivery() {

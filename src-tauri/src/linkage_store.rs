@@ -11,6 +11,7 @@ pub fn schema(conn: &Connection) -> rusqlite::Result<()> {
         CREATE INDEX IF NOT EXISTS linkage_owner ON linkage_workers(controller_id);
         CREATE TABLE IF NOT EXISTS linkage_tasks(controller_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,task TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS linkage_updates(seq INTEGER PRIMARY KEY AUTOINCREMENT,controller_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,worker_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,input_seq INTEGER NOT NULL,round INTEGER NOT NULL,kind TEXT NOT NULL,event_key TEXT NOT NULL,message_id TEXT,delivered INTEGER NOT NULL DEFAULT 0,UNIQUE(controller_id,input_seq,round,kind,event_key));
+        CREATE TABLE IF NOT EXISTS linkage_communications(controller_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,input_seq INTEGER NOT NULL,round INTEGER NOT NULL,cursor INTEGER NOT NULL);
         CREATE INDEX IF NOT EXISTS linkage_pending_updates ON linkage_updates(controller_id,input_seq,round,delivered,seq);")
 }
 pub fn active_children(conn: &Connection, id: &str) -> Result<bool, String> {
