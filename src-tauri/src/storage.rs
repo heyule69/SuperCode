@@ -35,6 +35,8 @@ pub struct HistoryRun {
     pub id: String,
     pub turn_key: String,
     pub data: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<u64>,
 }
 
 #[derive(Clone, Serialize)]
@@ -1000,12 +1002,21 @@ impl Store {
                     // Match the same UI turn key used when its user message is
                     // eventually loaded, preserving manually expanded details.
                     let boundary = conn.query_row(
-                        "SELECT id,role,data FROM messages WHERE session_id=?1 AND seq<?2 AND (role='user' OR kind IN ('runMarker','modelSwitch')) AND kind<>'runMarker' ORDER BY seq DESC LIMIT 1",
+                        "SELECT seq,id,role,data FROM messages WHERE session_id=?1 AND seq<?2 AND (role='user' OR kind IN ('runMarker','modelSwitch')) AND kind<>'runMarker' ORDER BY seq DESC LIMIT 1",
                         params![id, seq],
-                        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)),
+                        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?)),
                     ).optional().map_err(|e| e.to_string())?;
+                    // A logical reply can span several native runs, including
+                    // idle gaps while its configured executor keeps working.
+                    // Carry the original start even when every earlier run is
+                    // outside this page, without rewriting native durations.
+                    let started_at = conn.query_row(
+                        "SELECT MIN(json_extract(data,'$.startedAt')) FROM messages WHERE session_id=?1 AND seq>?2 AND seq<=?3 AND (role='user' OR kind IN ('runMarker','modelSwitch')) AND kind='runMarker' AND json_valid(data) AND json_type(data,'$.startedAt')='integer' AND json_extract(data,'$.startedAt')>=0",
+                        params![id, boundary.as_ref().map(|row| row.0).unwrap_or(0), seq],
+                        |row| row.get::<_, Option<u64>>(0),
+                    ).map_err(|e|e.to_string())?;
                     let turn_key = boundary
-                        .map(|(id, role, raw)| {
+                        .map(|(_, id, role, raw)| {
                             let metadata: Value = serde_json::from_str(&raw).unwrap_or(Value::Null);
                             if role == "user" {
                                 metadata["clientMessageId"]
@@ -1021,6 +1032,7 @@ impl Store {
                         id: marker_id,
                         turn_key,
                         data,
+                        started_at,
                     });
                 }
             }
@@ -2170,6 +2182,37 @@ mod tests {
         store.delete_profile("api:test").unwrap();
         assert!(store.active_profile("claude").unwrap().is_none());
         assert!(store.profiles().unwrap().is_empty());
+    }
+    #[test]
+    fn paginated_linked_history_carries_the_first_start_across_execution_and_review() {
+        let store = Store::from_connection(Connection::open_in_memory().unwrap()).unwrap();
+        let project = store.add_project(Path::new("D:/历史/联动计时")).unwrap();
+        let session = store.create_session(&project.id, None).unwrap();
+        store.save_message("user", &session.id, "user", "完成完整任务", "userMessage", &serde_json::json!({"clientMessageId":"logical-task"})).unwrap();
+        let timings = [(1795225791381_u64,333938_u64),(1795226126100,302727),(1795226569002,13971),(1795226656941,56223)];
+        for (index,(started_at,duration)) in timings.iter().enumerate() {
+            store.save_message(&format!("run-{index}"), &session.id, "activity", "", "runMarker", &serde_json::json!({"turnId":format!("native-{index}"),"startedAt":started_at,"durationMs":duration,"status":"completed"})).unwrap();
+            for item in 0..101 {
+                store.save_message(&format!("output-{index}-{item}"), &session.id, "assistant", "执行进展", "agentMessage", &serde_json::json!({"turnId":format!("native-{index}")})).unwrap();
+            }
+        }
+        let page=store.messages(&session.id,None).unwrap();
+        assert_eq!(page.len(),100);
+        let context=page[0].history_run.as_ref().unwrap();
+        assert_eq!(context.turn_key,"logical-task");
+        assert_eq!(context.started_at,Some(timings[0].0));
+        assert_eq!(context.data["startedAt"],timings[3].0);
+        assert_eq!(context.data["durationMs"],timings[3].1);
+        assert_eq!(context.data["startedAt"].as_u64().unwrap()+context.data["durationMs"].as_u64().unwrap()-context.started_at.unwrap(),921783);
+        // A new request or model boundary starts a separate logical clock.
+        for (role,kind) in [("user","userMessage"),("system","modelSwitch")] {
+            store.save_message(&format!("boundary-{kind}"),&session.id,role,"下一项",kind,&Value::Null).unwrap();
+            store.save_message(&format!("next-run-{kind}"),&session.id,"activity","","runMarker",&serde_json::json!({"turnId":kind,"startedAt":1795228000000_u64,"durationMs":1000,"status":"completed"})).unwrap();
+            for item in 0..101 {
+                store.save_message(&format!("next-{kind}-{item}"),&session.id,"assistant","新任务输出","agentMessage",&serde_json::json!({"turnId":kind})).unwrap();
+            }
+            assert_eq!(store.messages(&session.id,None).unwrap()[0].history_run.as_ref().unwrap().started_at,Some(1795228000000));
+        }
     }
     #[test]
     fn long_history_pages_carry_lifecycle_without_changing_rows_or_cursor() {

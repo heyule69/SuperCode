@@ -16,7 +16,7 @@ import { ConversationIndex } from './ConversationIndex';
 import { AttachmentImage } from './AttachmentImage';
 import { MediaContext, MediaList, ProcessMedia } from './Media';
 import { messageMedia } from './mediaSources';
-import { presentTurn, type TurnLifecycle } from './turnPresentation';
+import { presentTurn, turnElapsedMs, type TurnLifecycle } from './turnPresentation';
 import { QuestionHistory } from './QuestionHistory';
 import { planText, type PlanDecision } from './planPresentation';
 import { collectSubagents, isSubagent } from './subagents';
@@ -210,7 +210,8 @@ const TurnView = memo(function TurnView({ turn, lifecycle, pendingLabel, agentNa
   const artifactLinksKey = useMemo(()=>JSON.stringify(turnArtifactLinks(presentation.final)),[turn.items,presentation.completed]);
   const artifactKnownKey = useMemo(()=>JSON.stringify(turnKnownArtifacts(turn.items)),[turn.items]);
   const artifactError = turn.items.filter(message=>message.kind==='turnArtifacts').map(message=>message.data?.error).find(error=>typeof error==='string') as string|undefined;
-  const summary = <>{marker?.data?.durationMs != null ? <span>用时 {duration(Number(marker.data.durationMs))}</span> : <span>{resultText || '执行过程'}</span>}{resultText && marker?.data?.durationMs != null ? <span>· {resultText}</span> : null}</>;
+  const elapsedMs = turnElapsedMs(turn);
+  const summary = <>{elapsedMs != null ? <span>用时 {duration(elapsedMs)}</span> : <span>{resultText || '执行过程'}</span>}{resultText && elapsedMs != null ? <span>· {resultText}</span> : null}</>;
   if (!turn.user && turn.items.length === 1 && turn.items[0].kind === 'modelSwitch') return <MessageView message={turn.items[0]} openFile={openFile} />;
   function renderItems(items: Message[], live = false) {
     const blocks: (Message | Message[])[] = [];

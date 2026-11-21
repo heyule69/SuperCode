@@ -20,3 +20,14 @@ it('invalidates a previously shared turn when its historical output changes', ()
   const second = shareConversationTurns(first, conversationTurns(messages.map(message => message.id === 'a1' ? { ...message, text: 'corrected history' } : message)));
   expect(second[0]).not.toBe(first[0]); expect(second[1]).toBe(first[1]);
 });
+it('refreshes the elapsed heading when an older native start is loaded without changing visible items',()=>{
+  const user=message('u','user','完成整个任务');
+  const last:Message={...message('last','activity',''),kind:'runMarker',data:{startedAt:10000,durationMs:2000,status:'completed'}};
+  const reply=message('reply','assistant','完成');
+  const first=shareConversationTurns([],conversationTurns([user,last,reply]));
+  const original:Message={...last,id:'original',data:{startedAt:1000,durationMs:1000,status:'completed'}};
+  const next=shareConversationTurns(first,conversationTurns([user,original,last,reply]));
+  expect(next[0]).not.toBe(first[0]);
+  expect(next[0].startedAt).toBe(1000);
+  expect(next[0].run).toBe(last);
+});

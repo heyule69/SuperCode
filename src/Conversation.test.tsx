@@ -17,6 +17,19 @@ function render(items = messages, autoExpand = false) {
 }
 
 describe('task replies and execution history', () => {
+  it('shows total elapsed time across linked progress and final review without adding overlapping run times', () => {
+    const timings = [[1795225791381,333938],[1795226126100,302727],[1795226569002,13971],[1795226656941,56223]];
+    const runs = timings.map(([startedAt,durationMs],index)=>message(`run-${index}`,'activity','','runMarker',{turnId:`native-${index}`,startedAt,durationMs,status:'completed'}));
+    const html=render([messages[0],...runs,message('final','assistant','整项任务验收完成')]);
+    expect(html).toContain('用时 15 分钟 22 秒');
+    expect(html).not.toContain('用时 56 秒');
+    expect(runs.at(-1)?.data?.durationMs).toBe(56223);
+  });
+  it('keeps the complete elapsed time when pagination has only the final native run',()=>{
+    const last=message('final','assistant','整项任务验收完成');
+    last.historyRun={id:'run-last',turnKey:'logical-task',startedAt:1795225791381,data:{turnId:'last',status:'completed',startedAt:1795226656941,durationMs:56223}};
+    expect(render([last])).toContain('用时 15 分钟 22 秒');
+  });
   it('keeps process screenshots behind a disclosure and allows a media-only final reply', () => {
     const media = [{ kind: 'image', path: 'D:/cache/截图.png', name: '截图' }];
     const html = render([messages[0], message('shot', 'tool', '', 'mcpToolCall', { tool: 'screenshot', status: 'completed', media })]);

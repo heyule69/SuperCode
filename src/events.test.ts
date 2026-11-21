@@ -1,6 +1,19 @@
 import { describe, expect, it } from 'vitest';
 import { conversationTurns, mergeEvent, reconcileMessages } from './events';
 import type { Message, RpcEvent } from './types';
+import { turnElapsedMs } from './turnPresentation';
+it('starts the elapsed clock anew for the next user request or model boundary',()=>{
+  const row=(id:string,role:string,kind:string,data:Message['data']):Message=>({id,seq:0,sessionId:'s',role,kind,data,text:''});
+  const rows=[row('u','user','userMessage',{}),row('r1','activity','runMarker',{startedAt:1000,durationMs:1000,status:'completed'}),row('r2','activity','runMarker',{startedAt:10000,durationMs:2000,status:'completed'}),row('u2','user','userMessage',{}),row('r3','activity','runMarker',{startedAt:30000,durationMs:3000,status:'completed'}),row('switch','system','modelSwitch',{}),row('r4','activity','runMarker',{startedAt:50000,durationMs:4000,status:'completed'})];
+  expect(conversationTurns(rows).map(turnElapsedMs)).toEqual([11000,3000,4000]);
+});
+it('preserves the logical start from paginated history when longer live output wins reconciliation',()=>{
+  const live:Message={id:'output',seq:12,sessionId:'s',role:'assistant',kind:'agentMessage',text:'完整实时输出',data:{turnId:'last',status:'inProgress'}};
+  const saved:Message={...live,text:'完整',historyRun:{id:'run-last',turnKey:'u',startedAt:1000,data:{turnId:'last',startedAt:10000,status:'completed',durationMs:2000}}};
+  const merged=reconcileMessages([live],[saved],new Set());
+  expect(merged[0].text).toBe(live.text);
+  expect(turnElapsedMs(conversationTurns(merged)[0])).toBe(11000);
+});
 it('retains patch output separately from paths and reserves exact statistics when details are large',()=>{
   let rows=mergeEvent([],{method:'item/started',params:{turnId:'t',item:{id:'edit',type:'fileChange',status:'inProgress',changes:[{path:'a.ts'}]}}},'s');
   rows=mergeEvent(rows,{method:'item/fileChange/outputDelta',params:{turnId:'t',itemId:'edit',delta:'PATCH_OUTPUT'}},'s');

@@ -18,6 +18,10 @@ pub fn active_children(conn: &Connection, id: &str) -> Result<bool, String> {
     conn.query_row("SELECT EXISTS(SELECT 1 FROM linkage_workers w JOIN sessions s ON s.id=w.worker_id WHERE w.controller_id=?1 AND (s.status IN ('starting','running','waiting') OR EXISTS(SELECT 1 FROM temp.connection_usage u WHERE u.session_id=s.id AND u.active=1)))", [id], |r| r.get(0)).map_err(|e|e.to_string())
 }
 impl Store {
+    pub fn linkage_controller(&self, id: &str) -> Result<bool, String> {
+        Ok(self.linkage_parent(id)?.is_none()
+            && self.linkage_configuration(id)?.is_some_and(|(config, _)| config.enabled()))
+    }
     pub fn linkage_active(&self, id: &str) -> Result<bool, String> {
         active_children(&*self.0.lock().map_err(|e| e.to_string())?, id)
     }
@@ -283,5 +287,17 @@ mod tests {
         let archived = store.archived_sessions().unwrap();
         assert_eq!(archived.len(), 1);
         assert_eq!(archived[0].session.id, root.id);
+    }
+    #[test]
+    fn tool_restrictions_apply_only_to_the_enabled_controller() {
+        let (store, root, mut config) = fixture();
+        assert!(!store.linkage_controller(&root.id).unwrap());
+        store.save_linkage(&root.id, &config).unwrap();
+        let worker = store.linkage_worker(&root.id).unwrap();
+        assert!(store.linkage_controller(&root.id).unwrap());
+        assert!(!store.linkage_controller(&worker.id).unwrap());
+        config.mode = "single".into();
+        store.save_linkage(&root.id, &config).unwrap();
+        assert!(!store.linkage_controller(&root.id).unwrap());
     }
 }

@@ -343,16 +343,26 @@ impl Client {
         let executable = crate::agents::resolve(&app, "codex")?.program;
         let global_config = process::read_codex_config()?;
         let project_config = process::read_codex_project_config(project)?;
+        let controller = crate::linkage::is_controller(&app, session_id.as_deref())?;
         let mut overrides =
-            process::codex_config_overrides_for(&global_config, app.state::<AppState>().store.load_mcp()?)?;
+            process::codex_config_overrides_for(&global_config, !controller && app.state::<AppState>().store.load_mcp()?)?;
+        if controller {
+            // Empty TOML tables merge with lower layers; disable each project
+            // server explicitly before adding the controller's linkage server.
+            overrides.extend(process::codex_config_overrides_for(&project_config, false)?);
+            overrides.extend(crate::linkage::controller_codex_tools().iter().map(|value| value.to_string()));
+        }
         overrides.extend(crate::client_features::codex_mcp_overrides_for_session(&app,session_id.as_deref())?);
-        overrides.extend(crate::extensions::codex_overrides(&app, project)?);
+        if !controller { overrides.extend(crate::extensions::codex_overrides(&app, project)?); }
         if route.config["official"] == true {
             overrides.push("model_provider=\"openai\"".into());
         }
         let profile = &route.profile;
         if let Some(profile) = profile {
             overrides.extend(crate::ccswitch::codex_overrides(&profile.config)?);
+        }
+        if crate::linkage::is_worker(&app, session_id.as_deref())? {
+            overrides.extend(crate::linkage::worker_codex_tools().iter().map(|value| value.to_string()));
         }
         context_configuration.apply(&mut overrides,&app.state::<AppState>().data_dir)?;
         let mcp = process::codex_mcp_configuration(&global_config, &project_config, &overrides)?;

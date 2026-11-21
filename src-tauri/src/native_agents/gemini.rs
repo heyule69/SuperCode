@@ -127,6 +127,17 @@ pub(super) fn policy(permission: &str) -> Value {
     json!({"rule":rules})
 }
 
+fn role_policy(permission: &str, controller: bool) -> Value {
+    if !controller { return policy(permission); }
+    // The controller's MCP allowlist contains only supercode_linkage. Matching
+    // the MCP category avoids parsing underscores in that server's identity.
+    json!({"rule":[
+        {"toolName":"*","decision":"deny","priority":900},
+        {"mcpName":"*","decision":"allow","priority":950},
+        {"toolName":["ask_user","write_todos"],"decision":"allow","priority":950}
+    ]})
+}
+
 pub(super) async fn configure(
     home: &Path,
     config: &Value,
@@ -171,7 +182,7 @@ pub(super) async fn configure(
     .await
     .map_err(|error| format!("无法保存 Gemini 会话的工作目录信任：{error}"))?;
     let auth = authentication(config);
-    let settings = json!({
+    let mut settings = json!({
         "security":{"auth":{"selectedType":auth["methodId"]},"disableAlwaysAllow":true},
         "general":{"enableAutoUpdate":false,"plan":{"enabled":true}},
         "telemetry":{"enabled":false},
@@ -180,6 +191,15 @@ pub(super) async fn configure(
         "advanced":{"ignoreLocalEnv":true},
         "admin":{"extensions":{"enabled":false},"skills":{"enabled":permission!="summary"},"mcp":{"enabled":permission!="summary"}}
     });
+    let controller = config["_supercodeController"] == true;
+    if controller || config["_supercodeSingleWorker"] == true {
+        settings["experimental"] = json!({"enableAgents":false});
+    }
+    if controller {
+        settings["tools"] = json!({"core":["ask_user","write_todos"]});
+        settings["mcp"] = json!({"allowed":["supercode_linkage"]});
+        settings["admin"]["skills"]["enabled"] = json!(false);
+    }
     tokio::fs::write(
         &settings_file,
         serde_json::to_vec(&settings).map_err(|e| e.to_string())?,
@@ -189,7 +209,7 @@ pub(super) async fn configure(
     tokio::fs::write(&defaults_file, b"{}")
         .await
         .map_err(|e| e.to_string())?;
-    let policy = toml::to_string(&policy(permission)).map_err(|e| e.to_string())?;
+    let policy = toml::to_string(&role_policy(permission, controller)).map_err(|e| e.to_string())?;
     tokio::fs::write(&policy_file, policy.as_bytes())
         .await
         .map_err(|e| e.to_string())?;
@@ -272,6 +292,32 @@ pub(super) fn clear_environment(command: &mut tokio::process::Command) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn linked_worker_disables_native_agents_but_keeps_regular_tools_and_permissions() {
+        let root = std::env::temp_dir().join(format!("supercode-gemini-single-worker-{}", uuid::Uuid::new_v4()));
+        let workspace = root.join("workspace");
+        let home = root.join("home");
+        tokio::fs::create_dir_all(&workspace).await.unwrap();
+        for worker in [true, false] {
+            configure(&home, &json!({"_supercodeSingleWorker":worker}), "full", &workspace).await.unwrap();
+            let settings: Value = serde_json::from_slice(&tokio::fs::read(home.join(".gemini/supercode-settings.json")).await.unwrap()).unwrap();
+            assert_eq!(settings.pointer("/experimental/enableAgents"), worker.then_some(&json!(false)));
+            assert!(settings.get("tools").is_none());
+            let policy: toml::Value = toml::from_str(&tokio::fs::read_to_string(home.join(".gemini/supercode-policy.toml")).await.unwrap()).unwrap();
+            assert!(policy["rule"].as_array().unwrap().is_empty());
+        }
+        tokio::fs::remove_dir_all(&root).await.unwrap();
+    }
+    #[test]
+    fn controller_policy_excludes_project_tools_without_restricting_the_worker() {
+        let restricted=role_policy("full",true);
+        assert_eq!(restricted["rule"][0]["toolName"],"*");
+        assert_eq!(restricted["rule"][0]["decision"],"deny");
+        assert_eq!(restricted["rule"][1]["mcpName"],"*");
+        assert_eq!(restricted["rule"][1]["decision"],"allow");
+        assert!(role_policy("full",false)["rule"].as_array().unwrap().is_empty());
+        assert_eq!(role_policy("read",false),policy("read"));
+    }
 
     #[test]
     fn session_working_directories_use_the_trusted_path_spelling_without_changing_other_fields() {

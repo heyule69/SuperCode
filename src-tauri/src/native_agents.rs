@@ -620,6 +620,14 @@ fn opencode_config(config: &Value, permission: &str) -> Value {
     if permission == "summary" {
         value["permission"] = json!({"*":"deny"});
     }
+    if config["_supercodeController"] == true {
+        let role = json!({"*":"deny","supercode_linkage_*":"allow","question":"allow","todoread":"allow","todowrite":"allow"});
+        value["permission"] = role.clone();
+        value["agent"] = json!({"build":{"permission":role},"plan":{"permission":role}});
+    } else if config["_supercodeSingleWorker"] == true {
+        value["permission"]["task"] = json!("deny");
+        value["agent"] = json!({"build":{"permission":{"task":"deny"}},"plan":{"permission":{"task":"deny"}}});
+    }
     if config["baseUrl"].is_string() {
         let npm = match config["protocol"].as_str() {
             Some("anthropic") => "@ai-sdk/anthropic",
@@ -831,6 +839,13 @@ export default function(pi) {
   if (config.provider) pi.registerProvider('supercode', config.provider);
   pi.on('tool_call', async (event, ctx) => {
     if (config.permission === 'summary') return {block:true,reason:'Summary does not allow tools'};
+    if (config.controller) {
+      if (!/^(?:mcp(?:__|[_.:/]))?supercode_linkage(?:__|[_.:/])/.test(event.toolName)) return {block:true,reason:'Project search, reading, design and execution belong to the configured executor. Use the linkage tools.'};
+      // The dispatcher preserves the user's permission on the worker. Its
+      // coordination calls must remain available while designing in read mode.
+      return;
+    }
+    if (config.singleWorker && event.toolName === 'subagent') return {block:true,reason:'This chat uses one executor. Complete the task in this session without creating subagents.'};
     const desktopRead = event.toolName.includes('supercode_computer') && /(?:__|[./:])desktop_(?:list_windows|snapshot)$/.test(event.toolName);
     const read = ['read', 'grep', 'find', 'ls', 'glob'].includes(event.toolName) || desktopRead;
     if (config.permission === 'read' && !read) return {block:true,reason:'Read-only mode'};
@@ -889,10 +904,13 @@ async fn start_configured(
     cwd: &Path,
     session: Option<&Session>,
     permission: &str,
-    config: Value,
+    mut config: Value,
     launch: &Launch,
     connection_test: bool,
 ) -> Result<(Arc<Client>, mpsc::Receiver<Value>, Value), String> {
+    let controller = crate::linkage::is_controller(app, session.map(|s| s.id.as_str()))?;
+    config["_supercodeController"] = json!(controller);
+    config["_supercodeSingleWorker"] = json!(crate::linkage::is_worker(app, session.map(|s| s.id.as_str()))?);
     let mut env = vec![];
     let mut probe_launch = None;
     if let Some(session) = session {
@@ -959,7 +977,7 @@ async fn start_configured(
         } else {
             args.push("--no-session".into());
         }
-        let mut settings = json!({"permission":permission,"mcp":if permission=="summary"{json!({})}else{mcp_for_session(app,"pi",session.map(|s|s.id.as_str()))?}});
+        let mut settings = json!({"permission":permission,"controller":controller,"singleWorker":config["_supercodeSingleWorker"],"mcp":if permission=="summary"{json!({})}else{mcp_for_session(app,"pi",session.map(|s|s.id.as_str()))?}});
         if let Some(provider) = pi_provider_config(&config) {
             settings["provider"] = provider;
         }
@@ -1324,6 +1342,8 @@ pub async fn send(
         s.id,
         cwd,
         model.as_ref().or(s.model.as_ref()),
+        crate::linkage::is_controller(app, Some(&s.id))?,
+        crate::linkage::is_worker(app, Some(&s.id))?,
         permission,
         effort
     ])
@@ -3250,6 +3270,73 @@ write(v.type?{type:'response',command:method,id:v.id,success:true,data:{session:
         assert_eq!(c["permission"]["*"], "deny");
         assert_eq!(c["permission"]["read"], "allow");
         assert!(PI_EXTENSION.contains("User declined"));
+    }
+    #[test]
+    fn opencode_controller_denies_project_tools_in_both_native_modes() {
+        let config=opencode_config(&json!({"_supercodeController":true}),"full");
+        for permissions in [&config["permission"],&config["agent"]["build"]["permission"],&config["agent"]["plan"]["permission"]] {
+            assert_eq!(permissions["*"],"deny");
+            assert_eq!(permissions["supercode_linkage_*"],"allow");
+            assert_eq!(permissions["question"],"allow");
+            assert!(permissions.get("read").is_none());
+        }
+        assert_eq!(opencode_config(&json!({}),"full")["permission"]["*"],"allow");
+    }
+    #[test]
+    fn opencode_linked_worker_cannot_delegate_but_keeps_project_permissions() {
+        for mode in ["read", "ask", "strict", "full"] {
+            let config = opencode_config(&json!({"_supercodeSingleWorker":true}), mode);
+            let mut permissions = config["permission"].clone();
+            assert_eq!(permissions.as_object_mut().unwrap().remove("task"), Some(json!("deny")));
+            assert_eq!(permissions, opencode_config(&json!({}), mode)["permission"]);
+            for agent in ["build", "plan"] {
+                assert_eq!(config["agent"][agent]["permission"], json!({"task":"deny"}));
+            }
+        }
+    }
+    #[tokio::test]
+    async fn pi_linked_worker_blocks_subagents_without_blocking_regular_tools() {
+        let script = format!(r#"
+const extension = await import('data:text/javascript;base64,' + Buffer.from({}).toString('base64'));
+for (const singleWorker of [true, false]) {{
+ process.env.SUPERCODE_PI_CONFIG = JSON.stringify({{singleWorker,permission:'full'}});
+ const callbacks = {{}};
+ extension.default({{registerMcpServer(){{}},registerProvider(){{}},on(name,cb){{callbacks[name]=cb}}}});
+ const context = {{cwd:process.cwd(),ui:{{confirm:async()=>{{throw Error('Unexpected approval')}}}}}};
+ const result = await callbacks.tool_call({{toolName:'subagent',input:{{}},toolCallId:'delegate'}},context);
+ if ((result?.block === true) !== singleWorker) throw Error('Wrong delegation policy');
+ for (const toolName of ['read','grep','bash','write','edit']) {{
+  const result = await callbacks.tool_call({{toolName,input:{{}},toolCallId:'regular'}},context);
+  if (result?.block) throw Error('Project tool blocked: ' + toolName);
+ }}
+}}
+"#, serde_json::to_string(PI_EXTENSION).unwrap());
+        let node = crate::process::find_program("node").expect("Node is required for the native extension check");
+        let result = crate::process::command(&node, &["--input-type=module", "-e", &script]).output().await.unwrap();
+        assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
+    }
+    #[tokio::test]
+    async fn pi_controller_blocks_project_reads_but_preserves_read_only_delegation() {
+        let script=format!(r#"
+const callbacks={{}};let confirmations=0;
+process.env.SUPERCODE_PI_CONFIG=JSON.stringify({{controller:true,permission:'read'}});
+const extension=await import('data:text/javascript;base64,'+Buffer.from({}).toString('base64'));
+extension.default({{registerMcpServer(){{}},registerProvider(){{}},on(name,callback){{callbacks[name]=callback}}}});
+const context={{ui:{{confirm:async()=>{{confirmations++;return true}}}}}};
+for(const toolName of ['read','grep','find','ls','bash','write','edit']){{
+ const result=await callbacks.tool_call({{toolName,input:{{}},toolCallId:'test'}},context);
+ if(result?.block!==true)throw Error('Controller project tool was allowed: '+toolName);
+}}
+for(const toolName of ['supercode_linkage_delegate_task','mcp__supercode_linkage__task_plan','mcp_supercode_linkage_executor_wait']){{
+ if((await callbacks.tool_call({{toolName,input:{{}},toolCallId:'test'}},context))?.block)throw Error('Coordination blocked');
+}}
+if(confirmations!==0)throw Error('Internal coordination requested an execution approval');
+console.log('controller-role-ok');
+"#,serde_json::to_string(PI_EXTENSION).unwrap());
+        let node=crate::process::find_program("node").expect("Node is required for the native extension check");
+        let result=crate::process::command(&node,&["--input-type=module","-e",&script]).output().await.unwrap();
+        assert!(result.status.success(),"{}",String::from_utf8_lossy(&result.stderr));
+        assert!(String::from_utf8_lossy(&result.stdout).contains("controller-role-ok"));
     }
     #[test]
     fn opencode_execution_permissions_do_not_keep_the_readonly_policy() {

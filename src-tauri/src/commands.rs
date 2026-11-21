@@ -601,10 +601,13 @@ async fn send_inner(
     } else {
         already_loaded
     };
+    let controller = crate::linkage::is_controller(app, Some(session_id))?;
+    let mut thread_options = json!({"cwd":project.path,"approvalPolicy":approval,"approvalsReviewer":reviewer,"sandbox":sandbox,"model":model,"modelProvider":route.provider(),"developerInstructions":crate::client_features::instructions_for_session(app,Some(session_id))?,"serviceName":"supercode"});
+    if controller { crate::linkage::restrict_codex_controller(&mut thread_options, false); }
     let request = codex_thread_request(
         session.native_id.as_deref(),
         already_loaded,
-        json!({"cwd":project.path,"approvalPolicy":approval,"approvalsReviewer":reviewer,"sandbox":sandbox,"model":model,"modelProvider":route.provider(),"developerInstructions":crate::client_features::instructions_for_session(app,Some(session_id))?,"serviceName":"supercode"}),
+        thread_options,
     );
     let result = if let Some((method, parameters)) = request {
         client.request(method, parameters).await?
@@ -659,6 +662,7 @@ async fn send_inner(
         None
     };
     let mut turn = json!({"threadId":native,"input":inputs,"cwd":project.path,"model":model,"effort":effort,"summary":"auto","approvalPolicy":approval,"approvalsReviewer":reviewer,"sandboxPolicy":policy});
+    if controller { crate::linkage::restrict_codex_controller(&mut turn, true); }
     if let Some(collaboration) = collaboration {
         turn["collaborationMode"] = collaboration;
     }

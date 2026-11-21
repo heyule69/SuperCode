@@ -69,6 +69,50 @@ beforeEach(() => {
 });
 afterEach(async () => { await act(async()=>root.unmount()); container.remove(); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
 async function render() { await act(async()=>{root.render(<App/>); await new Promise(resolve=>setTimeout(resolve,30));}); }
+function gitRefreshFixture(open: boolean) {
+  localStorage.setItem('supercode.context',String(open));
+  localStorage.setItem('supercode.session','git-chat');
+  data.sessions=[{id:'git-chat',projectId:'existing',title:'Git 查询',agent:'claude',connectionId:'api:claude',model:'test-model',status:'running',nativeId:'git-native',turnId:'git-turn',updatedAt:1}];
+  messages=[{id:'git-user',seq:1,sessionId:'git-chat',role:'user',kind:'userMessage',text:'继续处理任务',data:null}];
+}
+it('does not scan Git after each turn while the workspace is closed',async()=>{
+  gitRefreshFixture(false);
+  await render();vi.mocked(call).mockClear();
+  await act(async()=>{notify({method:'turn/completed',params:{threadId:'git-native',turn:{id:'git-turn',status:'completed'}}});await new Promise(resolve=>setTimeout(resolve,40));});
+  expect(call).not.toHaveBeenCalledWith('workspace_changes',expect.anything());
+  await act(async()=>{container.querySelector<HTMLButtonElement>('[aria-label="打开工作空间"]')!.click();});
+  expect(call).toHaveBeenCalledWith('workspace_changes',{projectId:'existing',sessionId:'git-chat'});
+});
+it('does not show a late Git timeout after the workspace has been closed',async()=>{
+  gitRefreshFixture(true);
+  let reject!: (reason:unknown)=>void;
+  const base=vi.mocked(call).getMockImplementation()!;
+  vi.mocked(call).mockImplementation((command,args)=>command==='workspace_changes'?new Promise((_,no)=>{reject=no;}):base(command,args));
+  await render();
+  expect(reject).toBeTypeOf('function');
+  await act(async()=>{container.querySelector<HTMLButtonElement>('[aria-label="收起工作空间"]')!.click();});
+  await act(async()=>{reject('Git 请求超时');});
+  expect(container.querySelector('.composer-area .error-banner')).toBeNull();
+});
+it('still reports a current Git query failure when the workspace is open',async()=>{
+  gitRefreshFixture(true);
+  const base=vi.mocked(call).getMockImplementation()!;
+  vi.mocked(call).mockImplementation(async(command,args)=>{if(command==='workspace_changes')throw 'Git 请求超时';return base(command,args);});
+  await render();
+  expect(container.querySelector('.composer-area .error-banner')?.textContent).toContain('Git 请求超时');
+});
+it('does not show a late Git timeout from the previous conversation',async()=>{
+  gitRefreshFixture(true);
+  data.sessions.push({...data.sessions[0],id:'next-chat',title:'另一个聊天',nativeId:'next-native',turnId:null,status:'idle'});
+  let reject!: (reason:unknown)=>void;
+  const base=vi.mocked(call).getMockImplementation()!;
+  vi.mocked(call).mockImplementation((command,args={})=>command==='workspace_changes'&&args.sessionId==='git-chat'?new Promise((_,no)=>{reject=no;}):base(command,args));
+  await render();
+  expect(reject).toBeTypeOf('function');
+  await act(async()=>{container.querySelector<HTMLButtonElement>('.session-row[title="另一个聊天"]')!.click();});
+  await act(async()=>{reject('Git 请求超时');});
+  expect(container.querySelector('.composer-area .error-banner')).toBeNull();
+});
 it.each(['accept','decline'])('requires an explicit %s response for an application-owned service approval', async decision => {
   localStorage.setItem('supercode.session','service-chat');
   data.sessions = [{id:'service-chat',projectId:'existing',title:'网站服务',agent:'claude',connectionId:'api:claude',model:'test-model',status:'running',nativeId:'service-native',turnId:'service-turn',updatedAt:1}];

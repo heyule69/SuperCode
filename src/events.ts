@@ -89,7 +89,7 @@ export function reconcileMessages(live: Message[], saved: Message[], pendingUser
       && previous.data?.turnId === message.data?.turnId
       && ['completed', 'failed', 'interrupted'].includes(String(previous.data?.status))
       && ['inProgress', 'running', 'preparing'].includes(String(message.data?.status))) {
-      result.push({ ...previous, seq: message.seq });
+      result.push({ ...previous, seq: message.seq, ...(message.historyRun ? { historyRun: message.historyRun } : {}) });
       return;
     }
     if (previous?.kind === 'runMarker' && message.kind === 'runMarker' && previous.data?.turnId === message.data?.turnId
@@ -100,7 +100,7 @@ export function reconcileMessages(live: Message[], saved: Message[], pendingUser
     }
     result.push(previous && previous.text.length > message.text.length
       && ['inProgress', 'preparing'].includes(String(previous.data?.status))
-      && ['inProgress', 'preparing'].includes(String(message.data?.status)) ? { ...previous, seq: message.seq } : message);
+      && ['inProgress', 'preparing'].includes(String(message.data?.status)) ? { ...previous, seq: message.seq, ...(message.historyRun ? { historyRun: message.historyRun } : {}) } : message);
   });
   result.push(...(slots.get(saved.length) ?? []));
   return result;
@@ -203,7 +203,7 @@ export function initialAnswers(event: RpcEvent): Record<string, string> {
   return Object.fromEntries((event.params.questions ?? []).map((q: { id: string }) => [q.id, '']));
 }
 
-export interface ConversationTurn { id: string; user?: Message; items: Message[]; run?: Message }
+export interface ConversationTurn { id: string; user?: Message; items: Message[]; run?: Message; startedAt?: number }
 export function conversationTurns(messages: Message[]): ConversationTurn[] {
   const turns: ConversationTurn[] = [];
   for (const m of messages) {
@@ -213,6 +213,9 @@ export function conversationTurns(messages: Message[]): ConversationTurn[] {
     if (m.historyRun) {
       if (!turn.user) turn.id = m.historyRun.turnKey;
       if (!turn.run) turn.run = { seq: 0, id: m.historyRun.id, sessionId: m.sessionId, role: 'activity', text: '', kind: 'runMarker', data: m.historyRun.data };
+    }
+    for (const start of [m.historyRun?.startedAt, m.historyRun?.data?.startedAt, m.kind === 'runMarker' ? m.data?.startedAt : undefined]) {
+      if (typeof start === 'number' && Number.isFinite(start) && start >= 0) turn.startedAt = turn.startedAt == null ? start : Math.min(turn.startedAt, start);
     }
     if (m.kind === 'runMarker') turn.run = m;
     else if (m.role !== 'user') turn.items.push(m);

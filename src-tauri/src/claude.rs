@@ -164,12 +164,20 @@ impl RunCompletion {
     fn finished(&mut self) { self.result_received = false; }
 }
 
-fn permission_args(read_only: bool, permission: &str) -> Result<Vec<String>, String> {
+fn permission_args(read_only: bool, permission: &str, controller: bool) -> Result<Vec<String>, String> {
     let mode = crate::client_features::claude_native_permission(if read_only { "read" } else { permission })?;
     // Native plan mode protects the workspace while allowing its designated
     // plan file, questions, subagents and ExitPlanMode. A Read/Glob/Grep tool
     // whitelist removes the planning workflow itself.
-    Ok(vec!["--permission-mode".into(), mode.into(), "--tools".into(), "default".into()])
+    Ok(vec!["--permission-mode".into(), mode.into(), "--tools".into(), role_tool_args(controller)[1].into()])
+}
+
+fn role_tool_args(controller: bool) -> [&'static str; 2] {
+    ["--tools", if controller { "AskUserQuestion,EnterPlanMode,ExitPlanMode,ToolSearch,TodoWrite" } else { "default" }]
+}
+
+fn worker_tool_args(worker: bool) -> Vec<String> {
+    if worker { vec!["--disallowedTools".into(), "Agent,Task".into()] } else { vec![] }
 }
 
 fn prompt_snapshot_args(version: Option<&str>) -> Vec<String> {
@@ -475,12 +483,16 @@ pub async fn send(
     crate::runtime_diagnostics::register_secrets(app, &config);
     let model = crate::providers::real_claude_model(&config, model.as_deref());
     crate::claude_models::apply(&mut config, model.as_deref())?;
+    let controller = crate::linkage::is_controller(app, Some(&session.id))?;
+    let worker = crate::linkage::is_worker(app, Some(&session.id))?;
     let signature = json!([
         fingerprint,
         crate::client_features::tool_configuration(app)?,
         session.id,
         cwd,
         model,
+        controller,
+        worker,
         read_only,
         permission,
         effort
@@ -549,9 +561,12 @@ pub async fn send(
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     // Validate IDs before passing flags. Prompts and permission replies always travel via stdin.
     uuid::Uuid::parse_str(&native).map_err(|_| "Claude 原生会话 ID 无效")?;
-    let permission_args = permission_args(read_only, permission)?;
-    let (native_mcp, mut plugin_settings, plugin_args) =
-        crate::extensions::claude_config(app, Path::new(cwd))?;
+    let permission_args = permission_args(read_only, permission, controller)?;
+    let (native_mcp, mut plugin_settings, plugin_args) = if controller {
+        (json!({"mcpServers":{}}), json!({"disableAllHooks":true,"enabledPlugins":{}}), vec![])
+    } else {
+        crate::extensions::claude_config(app, Path::new(cwd))?
+    };
     plugin_settings["autoCompactEnabled"] = json!(true);
     let mut args = vec![
         "--print".to_owned(),
@@ -570,6 +585,8 @@ pub async fn send(
         "--append-system-prompt".into(),
         crate::client_features::instructions_for_session(app,Some(&session.id))?,
     ];
+    // The role limits available tools independently of the user's permission
+    // mode. The same permission still authorizes the configured executor.
     args.extend(permission_args);
     args.extend(snapshot_args);
     // This flag permits a later explicit plan confirmation to restore full
@@ -582,6 +599,7 @@ pub async fn send(
         args.extend(["--effort".into(), effort]);
     }
     args.extend(plugin_args);
+    args.extend(worker_tool_args(worker));
     let mcp = crate::client_features::claude_mcp_for_session(app, native_mcp,Some(&session.id))?;
     crate::runtime_diagnostics::register_secrets(app, &mcp);
     if mcp["mcpServers"].as_object().is_some_and(|v| !v.is_empty()) {
@@ -1753,9 +1771,9 @@ mod tests {
     #[test]
     fn planning_keeps_native_workflow_tools_without_widening_permissions() {
         for (read_only, permission, native) in [(true,"full","plan"),(false,"read","plan"),(false,"ask","manual")] {
-            assert_eq!(permission_args(read_only,permission).unwrap(), vec!["--permission-mode",native,"--tools","default"]);
+            assert_eq!(permission_args(read_only,permission,false).unwrap(), vec!["--permission-mode",native,"--tools","default"]);
         }
-        assert!(permission_args(false,"invalid").is_err());
+        assert!(permission_args(false,"invalid",false).is_err());
     }
     #[test]
     fn only_main_agent_results_can_end_the_turn() {
@@ -1835,6 +1853,32 @@ mod tests {
         assert!(crate::client_features::validate_steering_settings(&after,"full",Some("high")).is_ok());
         assert!(crate::client_features::validate_steering_settings(&after,"read",Some("high")).is_err());
         assert!(execution_signature("{}", "edit").is_err());
+        let controller = json!(["route",{},"session","D:/project","model",true,true,"read","high"]).to_string();
+        let after = execution_signature(&controller,"full").unwrap();
+        assert_eq!(serde_json::from_str::<Value>(&after).unwrap()[5], true);
+        assert!(crate::client_features::validate_steering_settings(&after,"full",Some("high")).is_ok());
+    }
+    #[test]
+    fn controller_has_communication_and_coordination_tools_even_with_full_access() {
+        for permission in ["read","ask","full"] {
+            let args=permission_args(false,permission,true).unwrap();
+            assert_eq!(args.iter().filter(|arg|arg.as_str()=="--tools").count(),1);
+            let tools=args.last().unwrap().split(',').collect::<Vec<_>>();
+            assert!(tools.contains(&"ToolSearch") && tools.contains(&"AskUserQuestion"));
+            for project_tool in ["Read","Grep","Glob","Bash","Write","Edit","Agent","Task","Skill"] { assert!(!tools.contains(&project_tool)); }
+            assert_eq!(permission_args(false,permission,false).unwrap().last().unwrap(),"default");
+        }
+    }
+    #[test]
+    fn linked_worker_disables_subagents_without_removing_project_tools() {
+        assert_eq!(worker_tool_args(true), ["--disallowedTools", "Agent,Task"]);
+        assert!(worker_tool_args(false).is_empty());
+        for permission in ["read", "ask", "full"] {
+            let args = permission_args(false, permission, false).unwrap();
+            assert_eq!(args.last().unwrap(), "default");
+            let mode = crate::client_features::claude_native_permission(permission).unwrap();
+            assert_eq!(args[1], mode);
+        }
     }
 
     #[test]

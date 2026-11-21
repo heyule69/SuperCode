@@ -185,6 +185,7 @@ export default function App() {
   const [settingsTab, setSettingsTab] = useState<SettingsTab>('general');
   const [settingsOpen, setSettingsOpen] = useState(false);
   const settingsOpenRef = useRef(false); settingsOpenRef.current = settingsOpen;
+  const workspaceVisible = useRef(false); workspaceVisible.current = showContext && !settingsOpen;
   const settingsScroll = useRef(0);
   const [navigation, setNavigation] = useState(emptyNavigation);
   const navigating = useRef(false);
@@ -431,12 +432,13 @@ export default function App() {
     if(current.current.sessionId===id && revision===usageRevision.current)setUsage(latestChatUsage(result.records, sessionsRef.current.find(session => session.id === id)));
   }, [setUsage]);
   const refreshChanges = useCallback(async (id: string) => {
-    if (!id && !current.current.sessionId) return;
+    if (!workspaceVisible.current || !id && !current.current.sessionId) return;
     const selectedSession = current.current.sessionId;
     const revision = ++changesRevision.current;
     setChangesLoading(true);
-    try { const data = await call<Changes>('workspace_changes', { projectId: id, sessionId: selectedSession || null }); if (current.current.projectId === id && current.current.sessionId === selectedSession && revision === changesRevision.current) setChanges(data); }
-    catch (e) { report(e); }
+    const currentQuery = () => workspaceVisible.current && current.current.projectId === id && current.current.sessionId === selectedSession && revision === changesRevision.current;
+    try { const data = await call<Changes>('workspace_changes', { projectId: id, sessionId: selectedSession || null }); if (currentQuery()) setChanges(data); }
+    catch (e) { if (currentQuery()) report(e); }
     finally { if (revision === changesRevision.current) setChangesLoading(false); }
   }, []);
   useEffect(() => {
@@ -522,7 +524,11 @@ export default function App() {
     return () => { disposed = true; off?.(); if (changeTimer) clearTimeout(changeTimer); discardDisplayEvents(); };
   }, [refresh, loadMessages, refreshChanges, refreshUsage, flush, requestEvent, clearRequestTurn, recoverRequests, enqueueDisplayEvent, discardDisplayEvents]);
 
-  useEffect(() => { if ((projectId || sessionId) && showContext) void refreshChanges(projectId); }, [projectId, sessionId, showContext, refreshChanges]);
+  useEffect(() => {
+    if ((projectId || sessionId) && showContext && !settingsOpen) void refreshChanges(projectId);
+    else setChangesLoading(false);
+    return () => { changesRevision.current++; };
+  }, [projectId, sessionId, showContext, settingsOpen, refreshChanges]);
   useLayoutEffect(() => { applyPreferences(prefs); const query = window.matchMedia('(prefers-color-scheme: dark)'); const update = () => applyPreferences(prefs); query.addEventListener('change', update); return () => query.removeEventListener('change', update); }, [prefs]);
   useEffect(() => {
     if (desktop) void call('update_notification_preferences', { preferences: notificationPreferences(prefs) }).catch(report);

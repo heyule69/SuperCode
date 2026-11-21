@@ -37,6 +37,16 @@ export function finalReply(items: Message[]): Message[] {
 
 export interface TurnLifecycle { sessionStatus?: string; activeTurnId?: string | null; latest?: boolean }
 
+export function turnElapsedMs(turn: ConversationTurn): number | undefined {
+  const duration = turn.run?.data?.durationMs;
+  if (duration == null) return undefined;
+  const start = turn.run?.data?.startedAt;
+  // Preserve the recorded duration for legacy markers without timestamps.
+  // Only complete timing evidence can extend it across earlier native runs.
+  return typeof start === 'number' && turn.startedAt != null
+    ? start + Number(duration) - turn.startedAt : Number(duration);
+}
+
 export function presentTurn(turn: ConversationTurn, lifecycle: TurnLifecycle = {}) {
   const status = turn.run?.data?.status;
   const turnId = turn.run?.data?.turnId ?? turn.items.find(message => message.data?.turnId)?.data?.turnId;
