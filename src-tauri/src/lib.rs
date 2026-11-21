@@ -54,6 +54,7 @@ mod installation_exit_protocol;
 mod links;
 mod linkage;
 mod linkage_bridge;
+mod linkage_evidence;
 mod linkage_store;
 mod linkage_task;
 mod linkage_updates;
