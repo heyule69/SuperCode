@@ -168,7 +168,7 @@ async fn pair(app: &AppHandle, controller: &Profile, executor: &Profile) -> Resu
     let progress_test = std::env::var_os("SUPERCODE_LINKAGE_TEST_PROGRESS").is_some();
     for round in 1..=if supervision || progress_test {1} else {2} {
         let token = uuid::Uuid::new_v4().simple().to_string();
-        let filename = format!("result-{round}.txt");
+        let filename = format!("outputs/result-{round}.txt");
         std::fs::write(dir.join(format!("input-{round}.txt")), &token)
             .map_err(|e| e.to_string())?;
         let text=if progress_test {
