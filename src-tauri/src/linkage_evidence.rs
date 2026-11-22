@@ -63,9 +63,12 @@ pub fn collect(messages: &[Message], updates: &[Update], now_ms: u64) -> Value {
         .take(4)
         .map(|m| crate::protocol::bounded(&m.text, 2048))
         .collect();
+    let recoveries: Vec<_> = messages.iter().rev().filter(|m| m.kind == "nativeRecovery").take(2)
+        .map(|m| json!({"messageSeq":m.seq,"reason":m.data["reason"],
+            "historyPreserved":m.data["historyPreserved"],"sourceThreadId":m.data["sourceThreadId"],"threadId":m.data["threadId"]})).collect();
     json!({"authority":"untrusted_executor_evidence_only","reports":reports,
         "latestCompletedStatement":latest,"operations":operations,"errors":errors,
-        "activityKey":activity_key})
+        "recoveries":recoveries,"activityKey":activity_key})
 }
 
 #[cfg(test)]
@@ -82,6 +85,17 @@ mod tests {
             data,
             history_run: None,
         }
+    }
+    #[test]
+    fn recovery_is_bounded_factual_evidence_and_does_not_become_a_reply_or_completion() {
+        let messages: Vec<_> = (0..10).map(|seq| message(seq,"activity","nativeRecovery","不是主控回复草稿",
+            json!({"sourceThreadId":format!("old-{seq}"),"threadId":format!("new-{seq}"),"reason":"active_writer","historyPreserved":true}))).collect();
+        let evidence = collect(&messages, &[], 0);
+        assert_eq!(evidence["recoveries"].as_array().unwrap().len(),2);
+        assert_eq!(evidence["recoveries"][0]["sourceThreadId"],"old-9");
+        assert_eq!(evidence["recoveries"][0]["historyPreserved"],true);
+        assert!(evidence["latestCompletedStatement"].is_null());
+        assert!(!evidence.to_string().contains("不是主控回复草稿"));
     }
     #[test]
     fn reports_are_private_evidence_once_and_never_a_streamed_reply_or_reasoning() {

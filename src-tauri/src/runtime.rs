@@ -175,7 +175,7 @@ impl Runtime {
         let client = self.client.lock().await.take();
         if let Some(client) = client {
             client.alive.store(false, Ordering::Relaxed);
-            let _ = client._child.lock().await.start_kill();
+            stop_child(&client._child).await;
         }
     }
     /// A quota read must also work before the first turn, without replacing the chat client.
@@ -275,7 +275,9 @@ impl Runtime {
         let generation = self.epoch.fetch_add(1, Ordering::Relaxed) + 1;
         if let Some(previous)=slot.take() {
             previous.alive.store(false,Ordering::Relaxed);
-            let _=previous._child.lock().await.start_kill();
+            // Wait for our own writer to exit before another process resumes
+            // the same native thread. Never terminate a foreign Codex client.
+            stop_child(&previous._child).await;
         }
         let client = Arc::new(
             Client::start(
@@ -655,6 +657,10 @@ impl Client {
     }
 }
 
+async fn stop_child(child: &Mutex<Child>) {
+    let _ = child.lock().await.kill().await;
+}
+
 fn connection_closed_error(protocol_error: Option<&str>, exit_code: Option<i32>) -> String {
     if let Some(error) = protocol_error {
         format!("Codex 协议数据读取失败：{}。本轮连接已停止，原会话已保留。", protocol::bounded(error,4096))
@@ -911,6 +917,20 @@ pub async fn idle_watch(app: AppHandle) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn owned_process_stop_waits_for_exit_and_leaves_other_clients_running() {
+        let spawn = || crate::process::command(std::path::Path::new("node"), &["-e", "setInterval(()=>{},1000)"])
+            .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null()).spawn().unwrap();
+        let owned = Mutex::new(spawn());
+        let mut other = spawn();
+        stop_child(&owned).await;
+        assert!(owned.lock().await.try_wait().unwrap().is_some());
+        assert!(other.try_wait().unwrap().is_none());
+        // Repeated Stop remains harmless when the owned process has exited.
+        stop_child(&owned).await;
+        other.kill().await.unwrap();
+    }
     #[test]
     fn closed_connections_preserve_protocol_causes_and_local_exit_details() {
         let protocol = connection_closed_error(Some("Agent 单条事件超过 4 MB，连接已关闭以保护内存"),None);

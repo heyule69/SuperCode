@@ -604,16 +604,14 @@ async fn send_inner(
     let controller = crate::linkage::is_controller(app, Some(session_id))?;
     let mut thread_options = json!({"cwd":project.path,"approvalPolicy":approval,"approvalsReviewer":reviewer,"sandbox":sandbox,"model":model,"modelProvider":route.provider(),"developerInstructions":crate::client_features::instructions_for_session(app,Some(session_id))?,"serviceName":"supercode"});
     if controller { crate::linkage::restrict_codex_controller(&mut thread_options, false); }
-    let request = codex_thread_request(
+    let opened = crate::codex_recovery::open(
         session.native_id.as_deref(),
         already_loaded,
+        crate::linkage::is_worker(app, Some(session_id))?,
         thread_options,
-    );
-    let result = if let Some((method, parameters)) = request {
-        client.request(method, parameters).await?
-    } else {
-        json!({"thread":{"id":session.native_id}})
-    };
+        |method, parameters| client.request(method, parameters),
+    ).await?;
+    let result = opened.result;
     let native = result["thread"]["id"]
         .as_str()
         .ok_or("Codex 未返回会话 ID")?;
@@ -630,6 +628,12 @@ async fn send_inner(
     state.store.set_model(session_id, model.as_deref())?;
     let user_id = crate::client_features::user_message_id(&prepared.metadata);
     state.store.save_chat_input(&user_id,session_id,text,&prepared.metadata)?;
+    if let Some(source) = opened.recovered_from {
+        let data = json!({"sourceThreadId":source,"threadId":native,"reason":"active_writer","historyPreserved":true,"status":"completed"});
+        state.store.save_message(&format!("native-recovery-{}",uuid::Uuid::new_v4()),session_id,"activity",
+            "原 Codex 会话被另一客户端占用，已保留历史并在独立延续会话中继续。","nativeRecovery",&data)?;
+        crate::runtime_diagnostics::record(app,Some(session_id),"codex_writer_recovered",data);
+    }
     if session.title == "新会话" {
         state
             .store
@@ -707,7 +711,7 @@ pub(crate) fn codex_thread_request(
 pub async fn interrupt_turn(session_id: String, app: AppHandle) -> Result<(), String> {
     let children=crate::linkage::stop_scope(&app,&session_id)?;
     let mut errors=Vec::new();
-    for child in children { if matches!(child.status.as_str(),"starting"|"running"|"waiting")||app.state::<AppState>().store.session_has_native_tasks(&child.id)? { if let Err(error)=crate::linkage::stop_worker(&app,&child).await { errors.push(error); } } }
+    for child in children { if crate::linkage::worker_needs_stop(&child,app.state::<AppState>().store.session_has_native_tasks(&child.id)?) { if let Err(error)=crate::linkage::stop_worker(&app,&child).await { errors.push(error); } } }
     let current=app.state::<AppState>().store.session(&session_id)?;
     if matches!(current.status.as_str(),"starting"|"running"|"waiting") { if let Err(error)=interrupt_one(session_id,app).await { errors.push(error); } }
     if errors.is_empty(){Ok(())}else{Err(errors.join("；"))}

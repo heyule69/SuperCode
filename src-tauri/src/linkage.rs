@@ -383,6 +383,11 @@ pub fn stop_scope(app: &AppHandle, parent: &str) -> Result<Vec<Session>, String>
     }
     Ok(children)
 }
+pub(crate) fn worker_needs_stop(worker: &Session, native_tasks: bool) -> bool {
+    // A failed resume can leave an idle private app-server holding writers.
+    // Stopping only running turns would leave that process behind indefinitely.
+    worker.agent == "codex" || active(worker) || native_tasks
+}
 pub async fn stop_worker(app: &AppHandle, worker: &Session) -> Result<(), String> {
     let state = app.state::<AppState>();
     if worker.agent == "codex" {
@@ -849,7 +854,7 @@ async fn execute(app: &AppHandle, actor: &Arc<Actor>, request: &Call) -> Result<
             if let Some((_, Some(worker))) = store.linkage_configuration(&request.session)? {
                 store.pause_followups(&worker);
                 let worker = store.session(&worker)?;
-                if active(&worker) || store.session_has_native_tasks(&worker.id)? {
+                if worker_needs_stop(&worker, store.session_has_native_tasks(&worker.id)?) {
                     stop_worker(app, &worker).await?;
                 }
             }
@@ -885,6 +890,23 @@ pub fn install(app: &AppHandle) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn stop_cleans_failed_or_idle_private_codex_processes_too() {
+        let store = crate::storage::Store::from_connection(rusqlite::Connection::open_in_memory().unwrap()).unwrap();
+        let project = store.add_project(std::path::Path::new(env!("CARGO_MANIFEST_DIR"))).unwrap();
+        let mut worker = store.create_session(&project.id, None).unwrap();
+        worker.agent = "codex".into();
+        for status in ["failed","idle","interrupted","starting","running","waiting"] {
+            worker.status = status.into();
+            assert!(worker_needs_stop(&worker, false));
+        }
+        worker.agent = "claude".into();
+        worker.status = "failed".into();
+        assert!(!worker_needs_stop(&worker, false));
+        assert!(worker_needs_stop(&worker, true));
+        worker.status = "running".into();
+        assert!(worker_needs_stop(&worker, false));
+    }
     fn waiting_actor() -> Arc<Actor> {
         let actor = Arc::new(Actor::default());
         *actor.lease.lock().unwrap() = Some(Lease { nonce: "current".into(), permission: "ask".into(), revoked: false });
