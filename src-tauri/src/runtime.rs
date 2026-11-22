@@ -120,6 +120,7 @@ pub struct Client {
     pub requests: Arc<Mutex<HashMap<String, Value>>>,
     next: AtomicU64,
     pub alive: Arc<AtomicBool>,
+    connection_failure: Arc<Mutex<Option<String>>>,
     pub last_used: Arc<AtomicU64>,
     active_connection_tasks: Arc<AtomicU64>,
     pub pid: u32,
@@ -410,6 +411,8 @@ impl Client {
         let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
         let requests = Arc::new(Mutex::new(HashMap::new()));
         let alive = Arc::new(AtomicBool::new(true));
+        let connection_failure = Arc::new(Mutex::new(None::<String>));
+        let reader_failure = connection_failure.clone();
         let (reader_pending, reader_requests, reader_alive) =
             (pending.clone(), requests.clone(), alive.clone());
         let last_used = Arc::new(AtomicU64::new(storage::now() as u64));
@@ -425,12 +428,14 @@ impl Client {
         let log_session = session_id.clone();
         tauri::async_runtime::spawn(async move {
             let mut reader = BufReader::new(output);
+            let mut protocol_failure = None;
             loop {
                 let frame = match read_frame(&mut reader).await {
                     Ok(Some(frame)) => frame,
                     Ok(None) => break,
                     Err(error) => {
                         crate::runtime_diagnostics::message(&reader_app, session_id.as_deref(), "codex", "error", "protocol_read_error", &error);
+                        protocol_failure = Some(error);
                         break;
                     }
                 };
@@ -489,16 +494,18 @@ impl Client {
                     if connection_usage_changed { let _ = reader_app.emit("workspace-updated", ()); }
                 }
             }
-            reader_alive.store(false, Ordering::Relaxed);
+            let exit_code = reader_child.lock().await.try_wait().ok().flatten().and_then(|s|s.code());
+            let failure = connection_closed_error(protocol_failure.as_deref(), exit_code);
+            *reader_failure.lock().await = Some(failure.clone());
+            reader_alive.store(false, Ordering::Release);
             reader_active_connection_tasks.store(0, Ordering::Release);
             if reader_app.state::<AppState>().store.clear_connection_usage(&reader_namespace).unwrap_or(false) {
                 let _ = reader_app.emit("workspace-updated", ());
             }
-            let exit_code = reader_child.lock().await.try_wait().ok().flatten().and_then(|s|s.code());
-            crate::runtime_diagnostics::record(&reader_app, session_id.as_deref(), "agent_process_output_closed", json!({"source":"codex","pid":pid,"exitCode":exit_code}));
+            crate::runtime_diagnostics::record(&reader_app, session_id.as_deref(), "agent_process_output_closed", json!({"source":"codex","pid":pid,"exitCode":exit_code,"error":failure}));
             let _ = reader_child.lock().await.kill().await;
             for (_, sender) in reader_pending.lock().await.drain() {
-                let _ = sender.send(Err("Codex 连接已关闭，请重新发送消息".into()));
+                let _ = sender.send(Err(failure.clone()));
             }
             reader_requests.lock().await.clear();
             if epoch.load(Ordering::Relaxed) == generation {
@@ -506,13 +513,16 @@ impl Client {
                     let state = reader_app.state::<AppState>();
                     let active = state.store.session(&id).ok().is_some_and(|s| matches!(s.status.as_str(), "running" | "starting" | "waiting"));
                     crate::runtime_diagnostics::record(&reader_app, Some(&id), "agent_connection_closed",
-                        json!({"active":active,"pid":pid,"exitCode":exit_code,"errorType":active.then_some("connection")}));
+                        json!({"active":active,"pid":pid,"exitCode":exit_code,"error":failure,"errorType":active.then(||crate::runtime_diagnostics::error_type(&failure))}));
                     if active {
                         if let Ok(session) = state.store.session(&id) {
                             if let (Some(native), Some(turn)) = (session.native_id.as_deref(), session.turn_id.as_deref()) {
-                                publish_event(&reader_app, json!({"method":"turn/connection/updated","params":{"threadId":native,"turnId":turn,"appSessionId":id,"connection":{"status":"disconnected","kind":"network","at":chrono::Utc::now().timestamp_millis()}}}));
-                            } else {
-                                let _ = state.store.save_message(&format!("connection-closed-{}", uuid::Uuid::new_v4()), &id, "system", "与 Codex 的连接已断开，本轮已停止。请检查连接后重新发送消息。", "error", &Value::Null);
+                                // Local stdout/protocol failures are not proof of
+                                // a network or account failure.
+                                publish_event(&reader_app, json!({"method":"turn/connection/updated","params":{"threadId":native,"turnId":turn,"appSessionId":id,"connection":{"status":"disconnected","kind":"unknown","at":chrono::Utc::now().timestamp_millis()}}}));
+                            }
+                            if protocol_failure.is_some() || session.turn_id.is_none() {
+                                let _ = state.store.save_message(&format!("connection-closed-{}", uuid::Uuid::new_v4()), &id, "system", &failure, "error", &Value::Null);
                             }
                         }
                     }
@@ -527,6 +537,9 @@ impl Client {
                         state.activity.remove_idle(&id, &buffer);
                     }
                     state.store.fail_session(&id);
+                    if active {
+                        crate::linkage::worker_connection_closed(&reader_app, &id, &failure);
+                    }
                     crate::outbox::kick(&reader_app);
                     crate::desktop_lifecycle::refresh(&reader_app);
                 }
@@ -546,6 +559,7 @@ impl Client {
             request_namespace,
             next: AtomicU64::new(1),
             alive,
+            connection_failure,
             last_used,
             active_connection_tasks,
             loaded_threads: Mutex::new(Vec::new()),
@@ -574,6 +588,9 @@ impl Client {
     }
 
     pub async fn request(&self, method: &str, params: Value) -> Result<Value, String> {
+        if !self.alive.load(Ordering::Acquire) {
+            return Err(self.connection_failure.lock().await.clone().unwrap_or_else(|| connection_closed_error(None,None)));
+        }
         let id = self.next.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         self.pending.lock().await.insert(id, tx);
@@ -582,13 +599,13 @@ impl Client {
             .await
         {
             self.pending.lock().await.remove(&id);
-            return Err(error);
+            return Err(self.connection_failure.lock().await.clone().unwrap_or(error));
         }
         let result = timeout(Duration::from_secs(45), rx).await;
         self.pending.lock().await.remove(&id);
         match result {
             Ok(Ok(value)) => value,
-            Ok(Err(_)) => Err("Codex 连接已关闭".into()),
+            Ok(Err(_)) => Err(self.connection_failure.lock().await.clone().unwrap_or_else(|| connection_closed_error(None,None))),
             Err(_) => Err(format!("Codex 请求超时：{method}")),
         }
     }
@@ -635,6 +652,16 @@ impl Client {
         }
         self.requests.lock().await.remove(&key);
         Ok(())
+    }
+}
+
+fn connection_closed_error(protocol_error: Option<&str>, exit_code: Option<i32>) -> String {
+    if let Some(error) = protocol_error {
+        format!("Codex 协议数据读取失败：{}。本轮连接已停止，原会话已保留。", protocol::bounded(error,4096))
+    } else if let Some(code) = exit_code {
+        format!("Codex 进程已退出（退出码 {code}），本地连接已关闭。请重新发送消息以恢复原会话。")
+    } else {
+        "Codex 本地通信流已关闭。请重新发送消息以恢复原会话。".into()
     }
 }
 
@@ -884,6 +911,18 @@ pub async fn idle_watch(app: AppHandle) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn closed_connections_preserve_protocol_causes_and_local_exit_details() {
+        let protocol = connection_closed_error(Some("Agent 单条事件超过 4 MB，连接已关闭以保护内存"),None);
+        assert!(protocol.contains("4 MB"));
+        assert!(protocol.contains("原会话已保留"));
+        assert_eq!(crate::runtime_diagnostics::error_type(&protocol),"protocol");
+        assert!(!protocol.contains("网络"));
+        let exited = connection_closed_error(None,Some(23));
+        assert!(exited.contains("退出码 23"));
+        assert!(exited.contains("恢复原会话"));
+        assert!(!connection_closed_error(None,None).contains("网络"));
+    }
     fn turn_event(method: &str, id: &str) -> Value {
         json!({"method":method,"params":{"threadId":"thread","turn":{"id":id}}})
     }

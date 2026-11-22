@@ -325,6 +325,33 @@ mod tests {
             .is_ok());
     }
     #[test]
+    fn a_disconnected_worker_retains_its_thread_and_verified_steps_for_continuation() {
+        let (store,root,worker) = fixture();
+        store.plan_linkage_task(&root.id,plan()).unwrap();
+        store.begin_linkage_work(&root.id,"实现第一步").unwrap();
+        ended(&store,&root,"first-turn");
+        let partial = store.review_linkage_task(&root.id,review(1,"continue",1)).unwrap();
+        store.begin_linkage_work(&root.id,partial.next_task.as_deref().unwrap()).unwrap();
+        store.bind_native(&worker.id,"retained-native-history").unwrap();
+        store.set_status(&worker.id,"running",Some("second-turn")).unwrap();
+        store.fail_session(&worker.id);
+        store.fail_linkage_work(&root.id,2,"Codex 协议数据读取失败：单条事件超过 4 MB").unwrap();
+        let failed = store.linkage_task(&root.id).unwrap().unwrap();
+        assert_eq!(failed.state,"needs_review");
+        assert!(failed.execution_error.as_deref().unwrap().contains("4 MB"));
+        assert!(failed.steps[0].done);
+        assert_eq!(store.session(&worker.id).unwrap().native_id.as_deref(),Some("retained-native-history"));
+        let continuation = store.review_linkage_task(&root.id,review(2,"continue",1)).unwrap();
+        let resumed = store.begin_linkage_work(&root.id,continuation.next_task.as_deref().unwrap()).unwrap();
+        assert_eq!(resumed.round,3);
+        assert!(resumed.steps[0].done);
+        assert!(resumed.execution_error.is_none());
+        // A late transport failure cannot undo a user's explicit Stop.
+        store.cancel_linkage_task(&root.id).unwrap();
+        store.fail_linkage_work(&root.id,3,"late disconnect").unwrap();
+        assert_eq!(store.linkage_task(&root.id).unwrap().unwrap().state,"cancelled");
+    }
+    #[test]
     fn startup_errors_preserve_the_goal_for_controller_judgment_and_restart_keeps_progress() {
         let (store, root, _) = fixture();
         store.plan_linkage_task(&root.id, plan()).unwrap();

@@ -689,6 +689,10 @@ pub(crate) fn codex_thread_request(
             return None;
         }
         parameters["threadId"] = json!(native);
+        // Codex keeps the execution history on its side. The UI already reads
+        // its bounded SQLite history; replaying thread.turns here can exceed
+        // the JSONL frame limit and make this same thread impossible to resume.
+        parameters["excludeTurns"] = json!(true);
         if let Some(object) = parameters.as_object_mut() {
             object.remove("developerInstructions");
             object.remove("serviceName");

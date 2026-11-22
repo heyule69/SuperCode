@@ -568,6 +568,23 @@ pub fn observe(app: &AppHandle, event: &Value) {
     // worker and is never copied into the user-facing assistant conversation.
     let _=app.emit("agent-event",json!({"method":"linkage/updated","params":{"appSessionId":parent,"workerSessionId":event["params"]["appSessionId"],"statusEvent":event["method"]}}));
 }
+pub(crate) fn worker_connection_closed(app: &AppHandle, worker: &str, error: &str) {
+    let store = &app.state::<AppState>().store;
+    let result = (|| -> Result<(),String> {
+        let Some(parent) = store.linkage_parent(worker)? else { return Ok(()); };
+        let Some(task) = store.linkage_task(&parent)?.filter(|task| task.round > 0 && !task.closed()) else { return Ok(()); };
+        store.fail_linkage_work(&parent,task.round,error)?;
+        // Notify a waiting controller immediately; it must review the real
+        // failure before deciding whether to continue, never silently replay work.
+        task_changed(app,&parent);
+        schedule_review(app,&parent);
+        Ok(())
+    })();
+    if let Err(error) = result {
+        crate::runtime_diagnostics::message(app,Some(worker),"linkage","error","connection_failure_state_error",&error);
+    }
+}
+
 async fn report(app: &AppHandle, parent: &str) -> Result<Value, String> {
     let store = &app.state::<AppState>().store;
     let Some((config, worker)) = store.linkage_configuration(parent)? else {

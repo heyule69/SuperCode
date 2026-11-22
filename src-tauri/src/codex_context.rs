@@ -390,9 +390,9 @@ mod tests {
         std::fs::remove_dir(data_dir).unwrap();
     }
     #[tokio::test]
-    async fn controlled_cli_peer_reads_real_model_catalog_and_keeps_native_history_across_model_changes(
+    async fn controlled_cli_peer_resumes_large_native_history_with_bounded_frames_across_model_changes(
     ) {
-        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::io::{AsyncWriteExt, BufReader};
         let data_dir = std::env::temp_dir().join(format!(
             "supercode-codex-context-peer-{}",
             uuid::Uuid::new_v4()
@@ -414,6 +414,7 @@ mod tests {
             let fixture_path = fixture.to_string_lossy();
             let mut child =
                 crate::process::command(Path::new("node"), &[fixture_path.as_ref(), &expected])
+                    .kill_on_drop(true)
                     .stdin(std::process::Stdio::piped())
                     .stdout(std::process::Stdio::piped())
                     .stderr(std::process::Stdio::inherit())
@@ -437,19 +438,20 @@ mod tests {
                     + "\n";
                 input.write_all(request.as_bytes()).await.unwrap();
                 input.flush().await.unwrap();
-                let mut line = String::new();
-                tokio::time::timeout(
+                let frame = tokio::time::timeout(
                     std::time::Duration::from_secs(5),
-                    output.read_line(&mut line),
+                    crate::runtime::read_frame(&mut output),
                 )
                 .await
                 .unwrap()
+                .unwrap()
                 .unwrap();
-                let reply: Value = serde_json::from_str(&line).unwrap();
+                let reply: Value = serde_json::from_slice(&frame).unwrap();
                 assert_eq!(reply["id"], id);
                 assert!(reply.get("error").is_none());
                 if id == 2 {
                     assert_eq!(reply["result"]["thread"]["id"], "existing-history-thread");
+                    assert_eq!(reply["result"]["thread"]["turns"],json!([]));
                 }
             }
             drop(input);

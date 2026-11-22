@@ -38,7 +38,15 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
     assert.equal(request.params.threadId, expected.native);
     assert.equal(request.params.model, expected.model);
     assert.equal(request.params.developerInstructions, undefined);
-    resumed = true; result = { thread: { id: expected.native } };
+    assert.equal(request.params.history, undefined);
+    assert.equal(request.params.path, undefined);
+    resumed = true;
+    // The server retains its history either way. Only the optional UI replay
+    // changes size, as on a long real thread resumed in a new process.
+    const turns = request.params.excludeTurns === true ? [] : [{
+      id: 'previous-turn', items: [{ type: 'commandExecution', aggregatedOutput: 'x'.repeat(5 * 1024 * 1024) }],
+    }];
+    result = { thread: { id: expected.native, turns } };
   } else if (request.method === 'turn/start') {
     assert.ok(resumed);
     assert.equal(request.params.threadId, expected.native);
