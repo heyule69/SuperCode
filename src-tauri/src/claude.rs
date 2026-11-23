@@ -132,15 +132,65 @@ fn is_main_result(message: &Value) -> bool {
     message["type"] == "result" && message["parent_tool_use_id"].is_null()
 }
 
-/// A native model result can precede the parent's background-task follow-up.
-/// New CLIs report run idleness separately; older CLIs still use task lifecycles.
+/// Native idle includes intervals while a Monitor waits for its next event or
+/// a foreground command continues after being yielded into the background.
+enum BackgroundTool { Monitor, ForegroundShell }
+
 #[derive(Default)]
 struct RunCompletion {
     state: Option<String>,
     result_received: bool,
+    background_tools: HashMap<String, BackgroundTool>,
+    background_tasks: HashMap<String, bool>,
 }
 impl RunCompletion {
+    fn observe_background(&mut self, message: &Value) {
+        if !message["parent_tool_use_id"].is_null() { return; }
+        match message["type"].as_str() {
+            Some("assistant") => {
+                if let Some(content) = message["message"]["content"].as_array() {
+                    for block in content.iter().filter(|block| block["type"] == "tool_use") {
+                        // An explicitly detached server is not a command the
+                        // current run is waiting to finish. Monitor is a watch.
+                        let kind = match block["name"].as_str() {
+                            Some("Monitor") => BackgroundTool::Monitor,
+                            Some("Bash") if block["input"]["run_in_background"] != true => BackgroundTool::ForegroundShell,
+                            _ => continue,
+                        };
+                        if let Some(id) = block["id"].as_str() { self.background_tools.insert(id.to_owned(), kind); }
+                    }
+                }
+            }
+            Some("user") => {
+                if let Some(content) = message["message"]["content"].as_array() {
+                    for block in content.iter().filter(|block| block["type"] == "tool_result") {
+                        if !block["tool_use_id"].as_str().is_some_and(|id| self.background_tools.remove(id).is_some())
+                            || block["is_error"] == true { continue; }
+                        let metadata = &message["tool_use_result"];
+                        if let Some(id) = metadata["backgroundTaskId"].as_str().or_else(|| metadata["taskId"].as_str()) {
+                            // A terminal notification can precede the launch
+                            // acknowledgement; never revive that task.
+                            self.background_tasks.entry(id.to_owned()).or_insert(true);
+                        }
+                    }
+                }
+            }
+            Some("system") if matches!(message["subtype"].as_str(), Some("task_started" | "task_progress" | "task_updated" | "task_notification")) => {
+                let Some(id) = message["task_id"].as_str() else { return; };
+                let status = message["patch"]["status"].as_str().or_else(|| message["status"].as_str());
+                if matches!(status, Some("completed" | "failed" | "stopped" | "killed")) {
+                    self.background_tasks.insert(id.to_owned(), false);
+                // Shell task_started also occurs during synchronous commands.
+                // Its launch alone is not evidence that a command was yielded.
+                } else if message["tool_use_id"].as_str().is_some_and(|id| matches!(self.background_tools.get(id), Some(BackgroundTool::Monitor))) {
+                    self.background_tasks.entry(id.to_owned()).or_insert(true);
+                }
+            }
+            _ => {}
+        }
+    }
     fn observe(&mut self, message: &Value) -> bool {
+        self.observe_background(message);
         if message["type"] == "system" && message["subtype"] == "session_state_changed" {
             if let Some(state @ ("running" | "requires_action" | "idle")) = message["state"].as_str() {
                 self.state = Some(state.to_owned());
@@ -158,10 +208,15 @@ impl RunCompletion {
     }
     fn result(&mut self) { self.result_received = true; }
     fn ready(&self, children_pending: bool) -> bool {
-        self.result_received && !children_pending
+        self.result_received && !children_pending && !self.background_tasks.values().any(|pending| *pending)
             && matches!(self.state.as_deref(), None | Some("idle"))
     }
-    fn finished(&mut self) { self.result_received = false; }
+    fn can_finish(&self, children_pending: bool, stopped: bool) -> bool { stopped || self.ready(children_pending) }
+    fn finished(&mut self) {
+        self.result_received = false;
+        self.background_tools.clear();
+        self.background_tasks.clear();
+    }
 }
 
 fn permission_args(read_only: bool, permission: &str, controller: bool) -> Result<Vec<String>, String> {
@@ -773,7 +828,7 @@ pub async fn send(
             let session_state_event = completion.observe(&message);
             if session_state_event {
                 crate::runtime_diagnostics::record(&reader_app, Some(&turn.session), "agent_session_state", json!({"turnId":turn.id(),"state":message["state"]}));
-                if !completion.ready(stream.tasks.pending()) {
+                if !completion.can_finish(stream.tasks.pending(), turn.stopped.load(Ordering::Acquire)) {
                     continue;
                 }
             }
@@ -925,11 +980,11 @@ pub async fn send(
                         publish(&reader_app, notification);
                     }
                 }
-                // A result ends one model turn. Native session state remains
-                // running while child notifications owe another parent reply.
-                // Preserve the task, stream and approvals until the run is idle.
-                if !turn.stopped.load(Ordering::Acquire) && failure.is_none() && !completion.ready(stream.tasks.pending()) {
-                    crate::runtime_diagnostics::record(&reader_app, Some(&turn.session), "background_agents_pending", json!({"turnId":turn.id(),"sessionState":completion.state,"childrenPending":stream.tasks.pending()}));
+                // A result ends one model response. Idle can be an interval
+                // between watch events, not completion of the monitored work.
+                // Keep the same run, stream and approvals until that work ends.
+                if failure.is_none() && !completion.can_finish(stream.tasks.pending(), turn.stopped.load(Ordering::Acquire)) {
+                    crate::runtime_diagnostics::record(&reader_app, Some(&turn.session), "background_agents_pending", json!({"turnId":turn.id(),"sessionState":completion.state,"childrenPending":stream.tasks.pending(),"nativeBackgroundPending":completion.background_tasks.values().filter(|pending| **pending).count()}));
                     drop(result_slot);
                     continue;
                 }
@@ -1747,6 +1802,94 @@ mod tests {
         assert!(!run.ready(false));
         run.observe(&json!({"type":"system","subtype":"session_state_changed","state":"running"}));
         assert!(!run.ready(false));
+    }
+
+    #[test]
+    fn native_monitor_keeps_progress_in_the_same_run_during_idle_intervals() {
+        let mut completion = RunCompletion::default();
+        completion.observe(&json!({"type":"assistant","message":{"content":[{"type":"tool_use","id":"watch-tool","name":"Monitor","input":{"command":"watch-fixture","timeout_ms":1800000}}]}}));
+        completion.observe(&json!({"type":"system","subtype":"task_started","task_id":"watch-task","tool_use_id":"watch-tool"}));
+        completion.observe(&json!({"type":"user","tool_use_result":{"taskId":"watch-task","timeoutMs":1800000,"persistent":false},"message":{"content":[{"type":"tool_result","tool_use_id":"watch-tool","content":"Monitor started"}]}}));
+        completion.result();
+        completion.observe(&json!({"type":"system","subtype":"session_state_changed","state":"idle"}));
+        assert!(!completion.ready(false), "native idle while Monitor is alive is only a waiting interval");
+        completion.observe(&json!({"type":"system","subtype":"session_state_changed","state":"running"}));
+        completion.observe(&json!({"type":"assistant","message":{"content":[{"type":"text","text":"第一部分已完成，继续处理第二部分。"}]}}));
+        completion.result();
+        completion.observe(&json!({"type":"system","subtype":"session_state_changed","state":"idle"}));
+        assert!(!completion.ready(false), "a second progress reply must not finish the task either");
+        completion.observe(&json!({"type":"system","subtype":"task_notification","task_id":"watch-task","status":"completed"}));
+        completion.observe(&json!({"type":"system","subtype":"session_state_changed","state":"running"}));
+        completion.observe(&json!({"type":"assistant","message":{"content":[{"type":"text","text":"两部分均已完成并核对。"}]}}));
+        completion.result();
+        completion.observe(&json!({"type":"system","subtype":"session_state_changed","state":"idle"}));
+        assert!(completion.ready(false));
+    }
+
+    #[test]
+    fn foreground_shell_yielded_to_background_waits_for_its_terminal_event() {
+        let mut completion = RunCompletion::default();
+        completion.observe(&json!({"type":"assistant","message":{"content":[{"type":"tool_use","id":"shell","name":"Bash","input":{"command":"finite-fixture","timeout":300000}}]}}));
+        completion.observe(&json!({"type":"system","subtype":"task_started","task_id":"shell-task","tool_use_id":"shell"}));
+        completion.observe(&json!({"type":"user","tool_use_result":{"backgroundTaskId":"shell-task","timedOutAfterMs":300000,"interrupted":false},"message":{"content":[{"type":"tool_result","tool_use_id":"shell","content":"Command continues in background"}]}}));
+        completion.result();
+        completion.observe(&json!({"type":"system","subtype":"session_state_changed","state":"idle"}));
+        assert!(!completion.ready(false));
+        completion.observe(&json!({"type":"system","subtype":"task_updated","task_id":"shell-task","patch":{"status":"completed"}}));
+        completion.observe(&json!({"type":"system","subtype":"session_state_changed","state":"running"}));
+        completion.observe(&json!({"type":"assistant","message":{"content":[{"type":"text","text":"命令执行完毕，结果核对通过。"}]}}));
+        completion.result();
+        assert!(!completion.ready(false), "wait for the parent's idle after its final response");
+        completion.observe(&json!({"type":"system","subtype":"session_state_changed","state":"idle"}));
+        assert!(completion.ready(false));
+    }
+
+    #[test]
+    fn normal_commands_and_explicitly_detached_servers_do_not_hold_a_finished_run() {
+        for detached in [false, true] {
+            let mut completion = RunCompletion::default();
+            completion.observe(&json!({"type":"assistant","message":{"content":[{"type":"tool_use","id":"shell","name":"Bash","input":{"command":"fixture","run_in_background":detached}}]}}));
+            completion.observe(&json!({"type":"system","subtype":"task_started","task_id":"server","tool_use_id":"shell"}));
+            completion.observe(&json!({"type":"user","tool_use_result":if detached {json!({"backgroundTaskId":"server"})} else {json!({"stdout":"done"})},"message":{"content":[{"type":"tool_result","tool_use_id":"shell","content":"done"}]}}));
+            completion.result();
+            completion.observe(&json!({"type":"system","subtype":"session_state_changed","state":"idle"}));
+            assert!(completion.ready(false));
+        }
+    }
+
+    #[test]
+    fn monitor_terminal_events_before_launch_ack_are_not_revived_by_late_progress() {
+        for status in ["completed", "failed", "stopped", "killed"] {
+            let mut completion = RunCompletion::default();
+            completion.observe(&json!({"type":"assistant","message":{"content":[{"type":"tool_use","id":"watch","name":"Monitor","input":{}}]}}));
+            completion.observe(&json!({"type":"system","subtype":"task_started","task_id":"watch-task","tool_use_id":"watch"}));
+            completion.observe(&json!({"type":"system","subtype":"task_updated","task_id":"watch-task","patch":{"status":status}}));
+            completion.observe(&json!({"type":"system","subtype":"task_progress","task_id":"watch-task","tool_use_id":"watch"}));
+            completion.observe(&json!({"type":"user","tool_use_result":{"taskId":"watch-task"},"message":{"content":[{"type":"tool_result","tool_use_id":"watch","content":"Watch launched"}]}}));
+            completion.result();
+            completion.observe(&json!({"type":"system","subtype":"session_state_changed","state":"idle"}));
+            assert!(completion.ready(false), "{status} must remain terminal");
+        }
+    }
+
+    #[test]
+    fn all_monitors_must_finish_and_user_stop_can_end_a_waiting_run() {
+        let mut completion = RunCompletion::default();
+        for id in ["first", "second"] {
+            completion.observe(&json!({"type":"assistant","message":{"content":[{"type":"tool_use","id":id,"name":"Monitor","input":{}}]}}));
+            // Older launches can be identified by their structured result
+            // without a separate task_started event.
+            completion.observe(&json!({"type":"user","tool_use_result":{"taskId":id},"message":{"content":[{"type":"tool_result","tool_use_id":id,"content":"Watch started"}]}}));
+        }
+        completion.result();
+        completion.observe(&json!({"type":"system","subtype":"session_state_changed","state":"idle"}));
+        completion.observe(&json!({"type":"system","subtype":"task_notification","task_id":"first","status":"completed"}));
+        assert!(!completion.can_finish(false, false));
+        assert!(completion.can_finish(false, true), "Stop must not wait for a monitor timeout");
+        completion.finished();
+        completion.observe(&json!({"type":"system","subtype":"task_progress","task_id":"second","tool_use_id":"second"}));
+        completion.result();
+        assert!(completion.ready(false), "a later turn must not inherit a stopped watch");
     }
     #[test]
     fn native_async_agent_report_updates_the_original_tool_without_main_context_pollution() {
