@@ -12,6 +12,7 @@ import { ProviderIcon } from './AgentIcon';
 import type { ConnectionOrder } from './providerOrder';
 import { MODEL_PAGE_SIZE, ModelPagination, pageModels } from './ModelPagination';
 import { effortLabels, modelReasoningEfforts, modelReasoningKnown } from './modelReasoning';
+import { CodexReasoningSlider } from './CodexReasoningSlider';
 
 function ModelSetting({ label, value, options, choose }: { label: string; value: string; options: { value: string; label: string; disabled?: boolean; title?: string }[]; choose: (value: string) => void }) {
   const [open, setOpen] = useState(false);
@@ -253,7 +254,8 @@ export function ModelMenu({ value, models, catalogLoaded, catalogWarning, profil
       <ModelPagination count={options.length} page={currentPage.page} change={setPage} disabled={busy}/>
       <div className="model-menu-footer">
         {selected && contextVariants.length > 1 ? <ModelSetting label="上下文" value={selected.model} options={contextVariants.map(id => ({ value: id, label: /\[1m\]$/i.test(id) ? '1M' : '默认' }))} choose={model => void choose({ ...selected, model, defaultReasoningEffort: effort })}/> : null}
-        {efforts.length ? <ModelSetting label="推理强度" value={chosenEffort} options={[{ value: '', label: '默认' }, ...efforts.map(value => ({ value, label: effortLabels[value] ?? value, title: value }))]} choose={setEffort}/> : null}
+        {efforts.length ? agent === 'codex' ? <CodexReasoningSlider modelName={selectedName} efforts={efforts} value={chosenEffort} defaultEffort={selected?.defaultReasoningEffort} choose={setEffort} showModels={() => searchInput.current?.focus({ preventScroll: true })} disabled={busy}/>
+          : <ModelSetting label="推理强度" value={chosenEffort} options={[{ value: '', label: '默认' }, ...efforts.map(value => ({ value, label: effortLabels[value] ?? value, title: value }))]} choose={setEffort}/> : null}
         {showSpeeds && setServiceTier ? <ModelSetting label="速度" value={serviceTier || 'default'} options={['default', ...offeredSpeeds].map(value => ({ value, label: speedLabels[value], disabled: updatingCodex || value !== 'default' && !speeds.tiers?.includes(value), title: value === 'default' ? undefined : speeds.tiers?.includes(value) ? '使用更多额度' : speeds.loading ? '正在读取速度' : '当前 Codex 或账号未提供此速度' }))} choose={setServiceTier}/> : null}
         {browsingCurrent && officialCodex && !visibleUpdateWarning && (updatingCodex || speeds.modelUnavailable) ? <div className="model-menu-status" role="status"><span>{updatingCodex ? '正在更新 Codex…' : 'Codex 未提供此模型'}</span><button type="button" disabled={busy || updatingCodex} onClick={() => void updateCodex()}>更新 Codex</button></div>
           : relevantWarning ? <details className="model-menu-error"><summary>{visibleUpdateWarning ? '更新失败' : '读取失败'}<span>详情</span></summary><p>{relevantWarning}</p></details> : null}

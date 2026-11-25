@@ -1,9 +1,16 @@
 import { expect, it } from 'vitest';
-import { modelReasoningEfforts } from './modelReasoning';
+import { modelReasoningEfforts, visibleCodexEfforts } from './modelReasoning';
 import type { Model } from './types';
 
 const model = (id: string, levels?: string[]): Model => ({ id, model: id, displayName: id, isDefault: true,
   ...(levels === undefined ? {} : { supportedReasoningEfforts: levels.map(reasoningEffort => ({ reasoningEffort })) }) });
+
+it('separates the official desktop enabled list from the model capability list', () => {
+  const capabilities = modelReasoningEfforts('codex', model('gpt-6.2-sol', ['low', 'medium', 'high', 'xhigh', 'max', 'ultra']));
+  expect(capabilities).toContain('max');
+  expect(visibleCodexEfforts(capabilities)).toEqual(['low', 'medium', 'high', 'xhigh', 'ultra']);
+  expect(visibleCodexEfforts(capabilities, 'max')).toContain('max');
+});
 
 it('keeps advertised Codex levels: Ultra is available on Sol but not Luna', () => {
   expect(modelReasoningEfforts('codex', model('gpt-6.2-sol', ['low', 'medium', 'high', 'xhigh', 'max', 'ultra']))).toEqual(['low', 'medium', 'high', 'xhigh', 'max', 'ultra']);

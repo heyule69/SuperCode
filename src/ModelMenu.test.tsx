@@ -13,7 +13,7 @@ it.each(['claude', 'codex', 'opencode', 'pi', 'gemini'])('shows Magpie names and
   expect(html).toContain('fixture/test-reasoner');
 });
 
-it.each([['high', '高'], ['max', 'Max'], ['xhigh', '极高'], ['', '中']])('shows reasoning effort %s beside the selected model', (effort, label) => {
+it.each([['high', '高'], ['max', '最大'], ['xhigh', '极高'], ['', '中']])('shows reasoning effort %s beside the selected model', (effort, label) => {
   const profile = { id:'api', agent:'claude', name:'API', model:'claude-opus-5-5', current:true, hasCredential:true };
   const html = renderToStaticMarkup(<ModelMenu value={profile.model} models={[{id:profile.model,model:profile.model,displayName:profile.model,isDefault:true,defaultReasoningEffort:'medium'}]} profiles={[profile]} activeProfile={profile} connectionId="api" agent="claude" busy={false} loading={false} choose={async()=>{}} reload={()=>{}} manage={()=>{}} effort={effort} setEffort={()=>{}} hasConversation/>);
   expect(html).toContain(`class="model-chip-effort" title="推理强度：${label}">${label}</span>`);

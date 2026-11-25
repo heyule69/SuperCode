@@ -2,7 +2,7 @@ import type { Model, ModelSource } from './types';
 
 export const effortLabels: Record<string, string> = {
   none: '关闭', off: '关闭', minimal: '最低', low: '低', medium: '中', high: '高',
-  xhigh: '极高', max: 'Max', ultra: 'Ultra',
+  xhigh: '极高', max: '最大', ultra: 'Ultra',
 };
 
 // Verified 2026-11-24 against Claude Code's per-model effort table:
@@ -30,4 +30,13 @@ export function modelReasoningEfforts(agent: string, model?: Model, source?: Mod
 export function modelReasoningKnown(agent: string, model: Model, source?: ModelSource): boolean {
   return ['opencode', 'gemini'].includes(agent) || model.supportedReasoningEfforts !== undefined
     || agent === 'claude' && claudeEfforts(model, source) !== undefined;
+}
+
+// The official desktop picker filters model capabilities through its enabled
+// efforts (enabled-reasoning-efforts in desktop 26.1117.4957.0, checked 2026-11-25).
+// Max is supported by some models but is not enabled by default.
+// Preserve an existing advanced selection until the user changes or resets it.
+export function visibleCodexEfforts(supported: string[], current = ''): string[] {
+  const enabled = ['low', 'medium', 'high', 'xhigh', 'ultra'];
+  return supported.filter(level => enabled.includes(level) || level === current);
 }

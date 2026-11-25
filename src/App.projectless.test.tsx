@@ -173,10 +173,16 @@ async function selectOfficialFast() {
   await act(async()=>container.querySelector<HTMLButtonElement>('[aria-label="选择速度"]')!.click());
   await act(async()=>[...container.querySelectorAll<HTMLButtonElement>('.model-setting-menu button')].find(button=>button.textContent==='Fast')!.click());
 }
+async function selectOfficialUltra() {
+  await act(async()=>{
+    const slider=container.querySelector<HTMLInputElement>('input[aria-label="推理强度"]')!;
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value')!.set!.call(slider,slider.max);
+    slider.dispatchEvent(new Event('input',{bubbles:true}));
+  });
+}
 it('sends official Fast with Ultra and retains both settings in its saved draft',async()=>{
   officialSpeedFixture();await render();await selectOfficialFast();
-  await act(async()=>container.querySelector<HTMLButtonElement>('[aria-label="选择推理强度"]')!.click());
-  await act(async()=>[...container.querySelectorAll<HTMLButtonElement>('.model-setting-menu button')].find(button=>button.textContent==='Ultra')!.click());
+  await selectOfficialUltra();
   await act(async()=>container.querySelector<HTMLButtonElement>('[aria-label="关闭模型选择"]')!.click());
   await type('核对官方速度');window.dispatchEvent(new Event('beforeunload'));
   expect(loadModelSelection('codex',data.profiles,['codex'])).toEqual({connectionId:'@official',model:'official-model',effort:'ultra',serviceTier:'fast'});
@@ -194,8 +200,7 @@ it('clears official Fast when switching the main draft to an API supplier',async
 it('snapshots Ultrafast separately from Ultra reasoning in main chat requests and saved drafts',async()=>{
   officialSpeedFixture('gpt-6.2-sol');await render();
   await act(async()=>container.querySelector<HTMLButtonElement>('.model-chip')!.click());
-  await act(async()=>container.querySelector<HTMLButtonElement>('[aria-label="选择推理强度"]')!.click());
-  await act(async()=>[...container.querySelectorAll<HTMLButtonElement>('.model-setting-menu button')].find(button=>button.textContent==='Ultra')!.click());
+  await selectOfficialUltra();
   await act(async()=>container.querySelector<HTMLButtonElement>('[aria-label="选择速度"]')!.click());
   await act(async()=>[...container.querySelectorAll<HTMLButtonElement>('.model-setting-menu button')].find(button=>button.textContent==='超快')!.click());
   await act(async()=>container.querySelector<HTMLButtonElement>('[aria-label="关闭模型选择"]')!.click());
