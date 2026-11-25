@@ -176,7 +176,7 @@ async function selectOfficialFast() {
 it('sends official Fast with Ultra and retains both settings in its saved draft',async()=>{
   officialSpeedFixture();await render();await selectOfficialFast();
   await act(async()=>container.querySelector<HTMLButtonElement>('[aria-label="选择推理强度"]')!.click());
-  await act(async()=>[...container.querySelectorAll<HTMLButtonElement>('.model-setting-menu button')].find(button=>button.textContent==='超高')!.click());
+  await act(async()=>[...container.querySelectorAll<HTMLButtonElement>('.model-setting-menu button')].find(button=>button.textContent==='Ultra')!.click());
   await act(async()=>container.querySelector<HTMLButtonElement>('[aria-label="关闭模型选择"]')!.click());
   await type('核对官方速度');window.dispatchEvent(new Event('beforeunload'));
   expect(loadModelSelection('codex',data.profiles,['codex'])).toEqual({connectionId:'@official',model:'official-model',effort:'ultra',serviceTier:'fast'});
@@ -195,7 +195,7 @@ it('snapshots Ultrafast separately from Ultra reasoning in main chat requests an
   officialSpeedFixture('gpt-6.2-sol');await render();
   await act(async()=>container.querySelector<HTMLButtonElement>('.model-chip')!.click());
   await act(async()=>container.querySelector<HTMLButtonElement>('[aria-label="选择推理强度"]')!.click());
-  await act(async()=>[...container.querySelectorAll<HTMLButtonElement>('.model-setting-menu button')].find(button=>button.textContent==='超高')!.click());
+  await act(async()=>[...container.querySelectorAll<HTMLButtonElement>('.model-setting-menu button')].find(button=>button.textContent==='Ultra')!.click());
   await act(async()=>container.querySelector<HTMLButtonElement>('[aria-label="选择速度"]')!.click());
   await act(async()=>[...container.querySelectorAll<HTMLButtonElement>('.model-setting-menu button')].find(button=>button.textContent==='超快')!.click());
   await act(async()=>container.querySelector<HTMLButtonElement>('[aria-label="关闭模型选择"]')!.click());
@@ -482,7 +482,7 @@ it('restores the reasoning level of an existing chat without replacing it with t
   saveModelSelection('claude',{connectionId:'api:claude',model:'another-model',effort:'low'});
   await render();
   expect(container.querySelector('.model-chip-name')?.textContent).toBe('test-model');
-  expect(container.querySelector('.model-chip-effort')?.textContent).toBe('最高');
+  expect(container.querySelector('.model-chip-effort')).toBeNull(); // No advertised capability for this custom ID.
   await type('继续当前聊天'); await send();
   expect(call).toHaveBeenCalledWith('send_chat_message',expect.objectContaining({model:'test-model',effort:'max'}));
 });

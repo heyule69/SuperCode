@@ -78,14 +78,14 @@ function optionsFor(models: Model[], source: ModelSource, connectionId: string, 
   });
 }
 
-export function modelGroups({ models, catalogLoaded = false, catalogs = {}, profiles, activeProfile, source, agent, value, connectionId, order, loggedInAgents = [] }: { models: Model[]; catalogLoaded?: boolean; catalogs?: Record<string, ModelCatalog>; profiles: AgentProfile[]; activeProfile?: AgentProfile; source?: ModelSource; agent: string; value: string; connectionId?: string; order?: ConnectionOrder; loggedInAgents?: string[] }): ModelGroup[] {
+export function modelGroups({ models, catalogLoaded = false, catalogs = {}, profiles, activeProfile, source, agent, value, connectionId, order, loggedInAgents = [], accountsLoaded = false }: { models: Model[]; catalogLoaded?: boolean; catalogs?: Record<string, ModelCatalog>; profiles: AgentProfile[]; activeProfile?: AgentProfile; source?: ModelSource; agent: string; value: string; connectionId?: string; order?: ConnectionOrder; loggedInAgents?: string[]; accountsLoaded?: boolean }): ModelGroup[] {
   const currentId = connectionId ?? activeProfile?.id ?? '';
   const currentProfile = profiles.find(p => p.agent === agent && p.id === currentId);
   const legacyOfficial = agent === 'codex' && currentId === '@local' && source?.available === true && source.connectionName === 'ChatGPT 官方账号';
   const officialRoute = ['claude', 'codex', 'gemini'].includes(agent) && (currentId === '@official' || !!currentProfile?.officialAccount || legacyOfficial);
   const officialCurrent = agent === 'codex' && officialRoute && !currentProfile?.accountId;
   const accountKey = currentProfile?.accountId ? currentId : agent;
-  const verifiedAgents = officialRoute && source?.available === false ? loggedInAgents.filter(id => id !== accountKey) : officialRoute && source?.available === true ? [...new Set([...loggedInAgents, accountKey])] : loggedInAgents;
+  const verifiedAgents = officialRoute && source?.available === false ? loggedInAgents.filter(id => id !== accountKey) : officialRoute && source?.available === true && !accountsLoaded ? [...new Set([...loggedInAgents, accountKey])] : loggedInAgents;
   const currentAvailable = source?.available !== false && (officialRoute ? verifiedAgents.includes(accountKey) : !!currentProfile && !currentProfile.officialAccount);
   const currentSource = officialCurrent ? { ...nativeConnectionSource(agent, '@official'), available: source?.available } : source ?? (currentProfile ? sourceForProfile(currentProfile) : nativeConnectionSource(agent, currentId));
   const currentGroupId = officialCurrent ? '@official' : currentId;
@@ -103,10 +103,10 @@ export function modelGroups({ models, catalogLoaded = false, catalogs = {}, prof
     const groupSource = catalogs[id]?.source ?? (profile ? sourceForProfile(profile) : nativeConnectionSource(agent, id));
     const groupModels = catalogs[id]?.data ?? (profile ? profileModels(profile) : id === '@official' && agent === 'codex' ? officialModels : officialProfile ? profileModels(officialProfile) : []);
     return { id, source: groupSource, options: optionsFor(groupModels, groupSource, id, false, '') };
-  }).filter(g => g.id === currentGroupId || g.options.length > 0);
+  });
 }
 
 export function filterModelGroups(groups: ModelGroup[], search: string, connectionId: string | null): ModelGroup[] {
   const query = search.trim().toLowerCase();
-  return groups.filter(g => connectionId === null || g.id === connectionId).map(g => ({ ...g, options: g.options.filter(m => `${m.displayName} ${m.rawIds.join(' ')} ${sourceLabel(m.source)} ${m.context ?? ''}`.toLowerCase().includes(query)) })).filter(g => g.options.length > 0);
+  return groups.filter(g => connectionId === null || g.id === connectionId).map(g => ({ ...g, options: g.options.filter(m => `${m.displayName} ${m.rawIds.join(' ')} ${sourceLabel(m.source)} ${m.context ?? ''}`.toLowerCase().includes(query)) })).filter(g => g.options.length > 0 || !query);
 }

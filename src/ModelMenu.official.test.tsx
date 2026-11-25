@@ -45,6 +45,52 @@ it('does not request an official catalog for a signed-out account', async () => 
   expect((node.querySelector('.model-provider-filters')?.textContent ?? '')).not.toContain('ChatGPT 官方账号');
 });
 
+it('keeps the verified official account visible while its first catalog is pending', async () => {
+  let finish!: (value: ModelCatalog) => void;
+  vi.mocked(call).mockImplementation(async command => command === 'list_provider_accounts'
+    ? [{ agent: 'codex', loggedIn: true }]
+    : new Promise(resolve => { finish = resolve; }));
+  await render(); await open();
+  const chip = [...node.querySelectorAll<HTMLButtonElement>('.model-provider-filters button')].find(button => button.textContent === 'ChatGPT 官方账号');
+  expect(chip).toBeDefined();
+  await act(async () => chip!.click());
+  expect(node.querySelector('.model-menu-scroll')?.textContent).toContain('正在加载模型');
+  await act(async () => finish(official));
+  expect(node.querySelector('.model-menu-scroll')?.textContent).toContain('Official Model');
+});
+
+it('preserves the official catalog when switching to it and back to an API connection', async () => {
+  await render(); await open();
+  const officialProps = { models: official.data, source: official.source, catalogLoaded: true, profiles: [api], connectionId: '@official', agent: 'codex', busy: false, loading: false, choose, reload, manage: () => {}, effort: '', setEffort: () => {}, hasConversation: true };
+  await act(async () => root.render(<ModelMenu {...officialProps} value="official-model"/>));
+  vi.mocked(call).mockImplementation(async command => command === 'list_provider_accounts'
+    ? [{ agent: 'codex', loggedIn: true }]
+    : new Promise(() => {}));
+  await render();
+  expect(node.querySelector('.model-menu-scroll')?.textContent).toContain('Official Model');
+  expect(node.querySelector('.model-provider-filters')?.textContent).toContain('ChatGPT 官方账号');
+});
+
+it('retains a catalog first loaded as the active official connection when moving to an API', async () => {
+  await act(async () => root.render(<ModelMenu value="official-model" models={official.data} source={official.source} catalogLoaded profiles={[api]}
+    connectionId="@official" agent="codex" busy={false} loading={false} choose={choose} reload={reload} manage={() => {}} effort="" setEffort={() => {}} hasConversation/>));
+  vi.mocked(call).mockImplementation(async command => command === 'list_provider_accounts' ? [{ agent: 'codex', loggedIn: true }] : new Promise(() => {}));
+  await render(); await open();
+  expect(node.querySelector('.model-menu-scroll')?.textContent).toContain('Official Model');
+});
+
+it('removes an active account on confirmed logout even when its previous catalog says available', async () => {
+  const renderOfficial = async (profiles: AgentProfile[]) => act(async () => root.render(<ModelMenu value="official-model" models={official.data} source={official.source} catalogLoaded profiles={profiles}
+    connectionId="@official" agent="codex" busy={false} loading={false} choose={choose} reload={reload} manage={() => {}} effort="" setEffort={() => {}} setServiceTier={() => {}} hasConversation/>));
+  await renderOfficial([api]); await open();
+  expect(node.querySelector('.model-menu-scroll')?.textContent).toContain('Official Model');
+  vi.mocked(call).mockImplementation(async command => command === 'list_provider_accounts' ? [{ agent: 'codex', loggedIn: false }] : official);
+  await renderOfficial([{ ...api }]);
+  expect(node.querySelector('.model-menu-scroll')?.textContent).not.toContain('Official Model');
+  expect(node.querySelector('.model-provider-filters')?.textContent ?? '').not.toContain('ChatGPT 官方账号');
+  expect(node.querySelector('[aria-label="选择速度"]')).toBeNull();
+});
+
 it('reports official catalog failures and allows an explicit refresh', async () => {
   vi.mocked(call).mockImplementation(async command => { if (command === 'list_provider_accounts') return [{ agent: 'codex', loggedIn: true }]; throw new Error('官方目录读取失败'); });
   await render(); await open();
@@ -91,12 +137,12 @@ it('keeps Ultra reasoning while selecting Fast, then explicitly returns to Stand
   await act(async () => speed.click());
   await act(async () => [...node.querySelectorAll<HTMLButtonElement>('[role="menuitemradio"]')].find(button => button.textContent === 'Fast')!.click());
   expect(speed.textContent).toContain('Fast');
-  expect(node.querySelector('.model-chip-effort')?.textContent).toBe('超高');
+  expect(node.querySelector('.model-chip-effort')?.textContent).toBe('Ultra');
   expect(node.querySelector('.model-menu-footer')?.textContent).not.toContain('消耗更多额度');
   await act(async () => speed.click());
   await act(async () => [...node.querySelectorAll<HTMLButtonElement>('[role="menuitemradio"]')].find(button => button.textContent === '标准')!.click());
   expect(speed.textContent).toContain('标准');
-  expect(node.querySelector('.model-chip-effort')?.textContent).toBe('超高');
+  expect(node.querySelector('.model-chip-effort')?.textContent).toBe('Ultra');
 });
 
 it('does not offer Fast without model capability metadata', async () => {
@@ -112,7 +158,7 @@ it('selects Ultrafast independently of Ultra reasoning and returns to Standard',
   expect(ultrafast.disabled).toBe(false);
   await act(async () => ultrafast.click());
   expect(node.querySelector('[aria-label="选择速度"]')?.textContent).toContain('超快');
-  expect(node.querySelector('.model-chip-effort')?.textContent).toBe('超高');
+  expect(node.querySelector('.model-chip-effort')?.textContent).toBe('Ultra');
   await act(async () => node.querySelector<HTMLButtonElement>('[aria-label="选择速度"]')!.click());
   await act(async () => [...node.querySelectorAll<HTMLButtonElement>('.model-setting-menu button')].find(button => button.textContent === '标准')!.click());
   expect(node.querySelector('[aria-label="选择速度"]')?.textContent).toContain('标准');

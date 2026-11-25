@@ -20,11 +20,12 @@ it('keeps managed official accounts separate even when their model IDs match', (
   const accounts: AgentProfile[] = ['personal', 'work'].map(accountId => ({ id: `account:${accountId}`, accountId, agent: 'codex', name: accountId, model: 'same-model', officialAccount: true, current: false, hasCredential: false }));
   const options = { models: [model('same-model')], profiles: accounts, source: { providerId: 'openai', providerName: 'OpenAI', mark: 'O', connectionName: 'personal', available: true }, agent: 'codex', value: 'same-model', connectionId: 'account:personal', loggedInAgents: ['codex', 'account:personal', 'account:work'] };
   const groups = modelGroups(options);
-  expect(groups.map(group => group.id)).toEqual(['account:personal', 'account:work']);
-  expect(groups[0].options[0].connectionId).toBe('account:personal'); expect(groups[1].options[0].connectionId).toBe('account:work');
-  expect(groups[0].source.connectionName).toBe('personal'); expect(groups[1].source.connectionName).toBe('work');
-  expect(modelGroups({ ...options, source: { ...options.source, available: false } }).map(group => group.id)).toEqual(['account:work']);
-  expect(modelGroups({ ...options, source: { ...options.source, available: false }, loggedInAgents: ['codex'] })).toEqual([]);
+  expect(groups.map(group => group.id)).toEqual(['account:personal', '@official', 'account:work']);
+  expect(groups[0].options[0].connectionId).toBe('account:personal'); expect(groups[2].options[0].connectionId).toBe('account:work');
+  expect(groups[0].source.connectionName).toBe('personal'); expect(groups[2].source.connectionName).toBe('work');
+  expect(groups[1].options).toEqual([]); // Native login is verified; its catalog is still loading.
+  expect(modelGroups({ ...options, source: { ...options.source, available: false } }).map(group => group.id)).toEqual(['@official', 'account:work']);
+  expect(modelGroups({ ...options, source: { ...options.source, available: false }, loggedInAgents: [] })).toEqual([]);
 });
 
 it('does not invent official Claude models or restore a catalog marked unavailable from saved models', () => {

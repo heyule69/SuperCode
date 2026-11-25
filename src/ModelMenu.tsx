@@ -11,8 +11,7 @@ import { useFloatingLayer } from './useFloatingLayer';
 import { ProviderIcon } from './AgentIcon';
 import type { ConnectionOrder } from './providerOrder';
 import { MODEL_PAGE_SIZE, ModelPagination, pageModels } from './ModelPagination';
-
-const effortLabels: Record<string, string> = { low: '低', medium: '中', high: '高', xhigh: '极高', max: '最高', ultra: '超高', minimal: '最低', none: '关闭', off: '关闭' };
+import { effortLabels, modelReasoningEfforts, modelReasoningKnown } from './modelReasoning';
 
 function ModelSetting({ label, value, options, choose }: { label: string; value: string; options: { value: string; label: string; disabled?: boolean; title?: string }[]; choose: (value: string) => void }) {
   const [open, setOpen] = useState(false);
@@ -78,6 +77,7 @@ export function ModelMenu({ value, models, catalogLoaded, catalogWarning, profil
   const [listHeight, setListHeight] = useState<number>();
   const [accounts, setAccounts] = useState<{ agent: string; ids: string[] }>({ agent: '', ids: [] });
   const loggedInAgents = accounts.agent === agent ? accounts.ids : [];
+  const checkingAccounts = desktop && ['claude', 'codex', 'gemini'].includes(agent) && accounts.agent !== agent;
   const [accountWarning, setAccountWarning] = useState('');
   const [accountRevision, setAccountRevision] = useState(0);
   const refreshedAccount = useRef(0);
@@ -91,24 +91,28 @@ export function ModelMenu({ value, models, catalogLoaded, catalogWarning, profil
   const [updateWarning, setUpdateWarning] = useState('');
   const currentId = connectionId ?? activeProfile?.id ?? '';
   const { catalogs: magpieCatalogs, loading: loadingMagpie, warning: magpieWarning, refresh: refreshMagpie } = useMagpieCatalogs(open, agent, currentId, profiles);
-  const official = useOfficialCatalogs(true, agent, currentId, profiles, loggedInAgents);
+  const currentCatalog = useMemo(() => catalogLoaded && source?.available === true ? { data: models, source } : undefined, [catalogLoaded, models, source]);
+  const official = useOfficialCatalogs(true, agent, currentId, profiles, loggedInAgents, currentCatalog);
   const catalogs = useMemo(() => ({ ...magpieCatalogs, ...official.catalogs }), [magpieCatalogs, official.catalogs]);
-  const groups = useMemo(() => modelGroups({ value, models, catalogLoaded, catalogs, profiles, activeProfile, source, agent, connectionId, order, loggedInAgents }), [value, models, catalogLoaded, catalogs, profiles, activeProfile, source, agent, connectionId, order, loggedInAgents]);
+  const accountsLoaded = accounts.agent === agent;
+  const groups = useMemo(() => modelGroups({ value, models, catalogLoaded, catalogs, profiles, activeProfile, source, agent, connectionId, order, loggedInAgents, accountsLoaded }), [value, models, catalogLoaded, catalogs, profiles, activeProfile, source, agent, connectionId, order, loggedInAgents, accountsLoaded]);
   const magpieCurrent = profiles.find(profile => profile.agent === agent && profile.id === currentId && (profile.providerId === 'magpie' || profile.modelSource?.providerId === 'magpie' || source?.providerId === 'magpie'));
   const magpieGateway = useMagpieGateway(open && !!magpieCurrent, agent, magpieCurrent?.id);
   const currentGroup = groups.find(g => g.id === currentId || g.options.some(option => option.connectionId === currentId));
-  const officialCodex = agent === 'codex' && (activeProfile?.officialAccount || currentId === '@official' || currentGroup?.id === '@official');
+  const officialCodex = agent === 'codex' && !!currentGroup && (activeProfile?.officialAccount || currentId === '@official' || currentGroup.id === '@official');
   const selected = currentGroup?.options.find(m => m.selected);
   const selectedSource = selected?.source;
-  const needsProvider = !groups.length && !loading;
-  const selectedName = selected?.displayName ?? (needsProvider ? '添加模型供应商' : loading && !currentGroup ? '正在检查连接…' : '选择模型');
+  const needsProvider = !groups.length && !loading && !checkingAccounts;
+  const selectedName = selected?.displayName ?? (needsProvider ? '添加模型供应商' : (loading || checkingAccounts) && !currentGroup ? '正在检查连接…' : '选择模型');
   const visible = useMemo(() => filterModelGroups(groups, search, filter), [groups, search, filter]);
   const options = useMemo(() => visible.flatMap(group => group.options), [visible]);
   const currentPage = pageModels(options, page);
   const pageKeys = new Set(currentPage.items.map(option => option.key));
-  const available = groups.filter(g => g.options.length > 0);
-  const efforts = selected?.supportedReasoningEfforts?.map(e => e.reasoningEffort) ?? (selected && agent === 'claude' ? ['low', 'medium', 'high', 'max'] : []);
-  const effectiveEffort = effort || selected?.defaultReasoningEffort;
+  // Verified connections remain browsable while their model catalogs load.
+  const available = groups;
+  const efforts = modelReasoningEfforts(agent, selected, selectedSource);
+  const chosenEffort = efforts.includes(effort) ? effort : '';
+  const effectiveEffort = chosenEffort || (efforts.includes(selected?.defaultReasoningEffort ?? '') ? selected?.defaultReasoningEffort : undefined);
   const effortName = selected && (efforts.length || effectiveEffort) ? effectiveEffort ? effortLabels[effectiveEffort] ?? effectiveEffort : '默认' : '';
   const speeds = useCodexSpeeds(!!officialCodex && desktop, currentGroup?.id ?? currentId, value || selected?.model || '', codexRevision);
   const declaredSpeeds = selected?.serviceTiers?.map(tier => tier.id === 'priority' ? 'fast' : tier.id) ?? [];
@@ -126,6 +130,11 @@ export function ModelMenu({ value, models, catalogLoaded, catalogWarning, profil
     || (browsingCurrent ? catalogWarning : '')
     || (visible.some(group => group.source.providerId === 'magpie') ? magpieWarning : '')
     || (browsingCurrent && magpieCurrent && ['offline', 'unknown', 'unconfigured'].includes(magpieGateway ?? '') ? magpieGatewayText(magpieGateway) : '');
+
+  useEffect(() => {
+    // A temporary profile placeholder is not the route's actual model catalog.
+    if (!busy && !loading && selected && models.some(model => model.model === selected.model) && modelReasoningKnown(agent, selected, selectedSource) && effort && !efforts.includes(effort)) setEffort('');
+  }, [agent, busy, loading, selected?.model, models, effort, efforts.join(','), setEffort]);
 
   async function updateCodex() {
     setUpdatingCodex(true); setUpdateWarning('');
@@ -229,8 +238,9 @@ export function ModelMenu({ value, models, catalogLoaded, catalogWarning, profil
         {available.map(g => <button type="button" key={g.id} aria-pressed={filter === g.id} title={sourceLabel(g.source)} onClick={() => { setFilter(g.id); setPage(0); }}><ProviderIcon provider={g.source.providerId} name={connectionLabel(g.source)} mark={g.source.mark}/><span>{connectionLabel(g.source)}</span></button>)}
       </div> : null}
       <div ref={list} className="model-menu-scroll" style={{ maxHeight: listHeight }} role="menu" aria-label="可用模型">
-        {visible.filter(group => group.options.some(option => pageKeys.has(option.key))).map(group => <div className="model-source-group" key={group.id}>
+        {visible.filter(group => !group.options.length || group.options.some(option => pageKeys.has(option.key))).map(group => <div className="model-source-group" key={group.id}>
           <div className="model-group-heading" title={sourceLabel(group.source)}><span><span className="model-group-mark" aria-hidden="true"><ProviderIcon provider={group.source.providerId} name={connectionLabel(group.source)} mark={group.source.mark}/></span><span>{connectionLabel(group.source)}</span></span></div>
+          {!group.options.length ? <div className="model-menu-empty">{loading || official.loading || loadingMagpie ? '正在加载模型…' : relevantWarning ? '暂时无法读取模型' : '暂无模型'}</div> : null}
           {group.options.filter(option => pageKeys.has(option.key)).map(option => <button type="button" key={option.key} data-model-key={option.key} className={`model-option ${option.selected ? 'selected' : ''}`} role="menuitemradio" aria-checked={option.selected} disabled={busy}
             title={`模型 ID：${option.rawIds.join(' / ')}${option.context === '1M' ? '\n已配置 Claude Code 1M 上下文参数' : ''}`}
             onClick={() => void select(option)}>
@@ -238,12 +248,12 @@ export function ModelMenu({ value, models, catalogLoaded, catalogWarning, profil
             <span className="model-option-check">{option.selected ? <Check size={15} /> : null}</span>
           </button>)}
         </div>)}
-        {!visible.length ? <div className="model-menu-empty">{loading ? '正在加载模型…' : search || filter !== null ? '没有匹配的模型' : '尚未配置模型'}</div> : null}
+        {!visible.length ? <div className="model-menu-empty">{checkingAccounts ? '正在检查账号…' : loading || official.loading || loadingMagpie ? '正在加载模型…' : relevantWarning ? '暂时无法读取模型' : search || filter !== null ? '没有匹配的模型' : '尚未配置模型'}</div> : null}
       </div>
       <ModelPagination count={options.length} page={currentPage.page} change={setPage} disabled={busy}/>
       <div className="model-menu-footer">
         {selected && contextVariants.length > 1 ? <ModelSetting label="上下文" value={selected.model} options={contextVariants.map(id => ({ value: id, label: /\[1m\]$/i.test(id) ? '1M' : '默认' }))} choose={model => void choose({ ...selected, model, defaultReasoningEffort: effort })}/> : null}
-        {efforts.length ? <ModelSetting label="推理强度" value={effort} options={[{ value: '', label: '默认' }, ...efforts.map(value => ({ value, label: effortLabels[value] ?? value }))]} choose={setEffort}/> : null}
+        {efforts.length ? <ModelSetting label="推理强度" value={chosenEffort} options={[{ value: '', label: '默认' }, ...efforts.map(value => ({ value, label: effortLabels[value] ?? value, title: value }))]} choose={setEffort}/> : null}
         {showSpeeds && setServiceTier ? <ModelSetting label="速度" value={serviceTier || 'default'} options={['default', ...offeredSpeeds].map(value => ({ value, label: speedLabels[value], disabled: updatingCodex || value !== 'default' && !speeds.tiers?.includes(value), title: value === 'default' ? undefined : speeds.tiers?.includes(value) ? '使用更多额度' : speeds.loading ? '正在读取速度' : '当前 Codex 或账号未提供此速度' }))} choose={setServiceTier}/> : null}
         {browsingCurrent && officialCodex && !visibleUpdateWarning && (updatingCodex || speeds.modelUnavailable) ? <div className="model-menu-status" role="status"><span>{updatingCodex ? '正在更新 Codex…' : 'Codex 未提供此模型'}</span><button type="button" disabled={busy || updatingCodex} onClick={() => void updateCodex()}>更新 Codex</button></div>
           : relevantWarning ? <details className="model-menu-error"><summary>{visibleUpdateWarning ? '更新失败' : '读取失败'}<span>详情</span></summary><p>{relevantWarning}</p></details> : null}

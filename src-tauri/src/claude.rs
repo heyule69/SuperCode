@@ -235,6 +235,12 @@ fn worker_tool_args(worker: bool) -> Vec<String> {
     if worker { vec!["--disallowedTools".into(), "Agent,Task".into()] } else { vec![] }
 }
 
+fn effort_args(effort: Option<String>) -> Vec<String> {
+    match effort.filter(|value| matches!(value.as_str(), "low" | "medium" | "high" | "xhigh" | "max")) {
+        Some(value) => vec!["--effort".into(), value],
+        None => Vec::new(),
+    }
+}
 fn prompt_snapshot_args(version: Option<&str>) -> Vec<String> {
     if version
         .and_then(crate::agent_versions::installed_version)
@@ -649,10 +655,7 @@ pub async fn send(
     if permission == "full" || read_only || permission == "read" {
         args.push("--allow-dangerously-skip-permissions".into());
     }
-    if let Some(effort) = effort.filter(|v| matches!(v.as_str(), "low" | "medium" | "high" | "max"))
-    {
-        args.extend(["--effort".into(), effort]);
-    }
+    args.extend(effort_args(effort));
     args.extend(plugin_args);
     args.extend(worker_tool_args(worker));
     let mcp = crate::client_features::claude_mcp_for_session(app, native_mcp,Some(&session.id))?;
@@ -1561,6 +1564,16 @@ fn same_context_model(left: &str, right: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn supported_claude_efforts_are_passed_to_the_cli_including_xhigh() {
+        for level in ["low", "medium", "high", "xhigh", "max"] {
+            assert_eq!(super::effort_args(Some(level.into())), vec!["--effort", level]);
+        }
+        for level in ["ultra", "minimal", "none", "off"] {
+            assert!(super::effort_args(Some(level.into())).is_empty());
+        }
+        assert!(super::effort_args(None).is_empty());
+    }
     #[test]
     fn main_api_retry_is_forwarded_but_a_subagent_retry_cannot_replace_primary_status() {
         let mut stream = super::Stream::default();
