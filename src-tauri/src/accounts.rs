@@ -88,7 +88,7 @@ pub async fn list_provider_accounts(
     for profile in app
         .state::<AppState>()
         .store
-        .profiles()?
+        .profiles_for_display()?
         .into_iter()
         .filter(|p| p.is_official() && p.account_id().is_some()
             && agent.as_deref().is_none_or(|agent| p.agent == agent))

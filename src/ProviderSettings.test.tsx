@@ -22,6 +22,22 @@ beforeEach(()=>{
 });
 afterEach(async()=>{await act(async()=>root.unmount());node.remove();});
 async function render(runningConnections: Record<string, string[]> = {}, updated = async () => {}){await act(async()=>root.render(<ProviderSettings profiles={profiles} officialAgents={['codex','claude']} order={order} runningConnections={runningConnections} updated={updated}/>));}
+it('opens unreadable connections in the existing editor and explicitly saves the same connection after reconfiguration',async()=>{
+  const reason='此连接配置无法解密或读取。原聊天和加密配置已保留，请重新填写连接地址、模型和 API Key 后保存。';
+  const broken:AgentProfile={...profiles[0],hasCredential:false,credentialError:reason,models:[],model:null};
+  const original=mocks.call.getMockImplementation()!;
+  const settings:Config={id:broken.id,name:broken.name,agent:'claude',providerId:'custom',plan:'standard',protocol:'anthropic',baseUrl:'',model:'',models:[],hasCredential:false,credentialError:reason};
+  mocks.call.mockImplementation(async(command:string,args:any)=>command==='get_provider_profile'?settings:command==='save_provider_profile'?{...broken,hasCredential:true,credentialError:undefined}:original(command,args));
+  await act(async()=>root.render(<ProviderSettings profiles={[broken]} officialAgents={[]} order={{claude:[broken.id]}} updated={async()=>{}}/>));
+  expect(node.textContent).toContain('配置无法读取，请点击重新配置');
+  await act(async()=>node.querySelector<HTMLButtonElement>('.saved-provider')!.click());
+  expect(node.querySelector('[role="alert"]')?.textContent).toContain(reason);
+  expect(node.querySelector<HTMLInputElement>('#provider-key')?.readOnly).toBe(false);
+  await inputValue('provider-url','https://fixture.example/v1');await inputValue('provider-default-model','fixture-model');await inputValue('provider-key','replacement-fixture-key');
+  await act(async()=>button('保存').click());
+  expect(mocks.call).toHaveBeenCalledWith('save_provider_profile',expect.objectContaining({settings:expect.objectContaining({id:broken.id,apiKey:'replacement-fixture-key'})}));
+  expect(node.querySelector('[role="alert"]')).toBeNull();
+});
 it('counts only configured suppliers and confirmed official logins, with no CLI placeholder',async()=>{
   await render();expect(tab('claude').textContent).toContain('2');expect(tab('codex').textContent).toContain('1');expect(tab('opencode').textContent).toContain('0');expect(tab('pi').textContent).toContain('0');
   expect(node.textContent).not.toContain('本机 CLI 配置');expect(node.textContent).not.toContain('Claude 官方账号');

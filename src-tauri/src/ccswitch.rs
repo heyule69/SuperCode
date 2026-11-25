@@ -33,12 +33,15 @@ pub struct Summary {
     pub source: String,
     pub models: Vec<String>,
     pub model_source: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credential_error: Option<String>,
 }
 impl Profile {
     pub fn account_id(&self) -> Option<&str> {
         self.config["accountId"].as_str()
     }
     pub fn is_official(&self) -> bool {
+        if crate::connection_recovery::reason(&self.config).is_some() { return false; }
         if crate::providers::key(&self.config).is_some() {
             return false;
         }
@@ -60,6 +63,7 @@ impl Profile {
     }
     pub fn summary(&self, current: bool) -> Summary {
         Summary {
+            credential_error: crate::connection_recovery::reason(&self.config).map(str::to_owned),
             official_account: self.is_official(),
             account_id: self.account_id().map(str::to_owned),
             id: self.id.clone(),

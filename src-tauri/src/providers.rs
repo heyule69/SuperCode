@@ -587,18 +587,20 @@ pub fn settings(profile: &Profile) -> Settings {
     }
 }
 fn find(app: &AppHandle, id: &str) -> Result<Profile, String> {
-    app.state::<AppState>()
-        .store
-        .profiles()?
-        .into_iter()
-        .find(|p| p.id == id)
-        .ok_or("连接配置已不存在".into())
+    let profile = app.state::<AppState>().store.profile_for_editing(id)?;
+    if let Some(error) = crate::connection_recovery::reason(&profile.config) { return Err(error.into()); }
+    Ok(profile)
 }
 #[tauri::command]
-pub fn get_provider_profile(id: String, app: AppHandle) -> Result<Settings, String> {
-    let profile = find(&app, &id)?;
+pub fn get_provider_profile(id: String, app: AppHandle) -> Result<Value, String> {
+    let profile = app.state::<AppState>().store.profile_for_editing(&id)?;
     ensure_editable(&profile)?;
-    Ok(settings(&profile))
+    let mut value = serde_json::to_value(settings(&profile)).map_err(|e|e.to_string())?;
+    if let Some(error) = crate::connection_recovery::reason(&profile.config) {
+        value["credentialError"] = json!(error);
+        if profile.agent == "gemini" { value["protocol"] = json!("gemini"); }
+    }
+    Ok(value)
 }
 
 pub(crate) fn ensure_editable(profile: &Profile) -> Result<(), String> {
@@ -804,7 +806,7 @@ pub async fn save_provider_profile(
     let previous = settings
         .id
         .as_deref()
-        .map(|id| find(&app, id))
+        .map(|id| app.state::<AppState>().store.profile_for_editing(id))
         .transpose()?;
     if settings.provider_id == "magpie" {
         return Err("请使用顶部 Magpie 菜单直接添加，无需填写 API 配置。".into());
@@ -818,10 +820,7 @@ pub async fn save_provider_profile(
     let state = app.state::<AppState>();
     // Existing chats keep their connection; each runtime rechecks its route
     // before the next turn. Unrelated changes need no process shutdown.
-    let was_active = state
-        .store
-        .active_profile(&profile.agent)?
-        .is_some_and(|p| p.id == profile.id);
+    let was_active = state.store.default_connection(&profile.agent)? == profile.id;
     state.store.save_profile(&profile, previous.as_ref())?;
     if activate {
         state
@@ -834,7 +833,7 @@ pub async fn save_provider_profile(
 #[tauri::command]
 pub async fn delete_provider_profile(id: String, app: AppHandle) -> Result<(), String> {
     let state = app.state::<AppState>();
-    let profile = find(&app, &id)?;
+    let profile = state.store.profile_for_editing(&id)?;
     state.store.delete_profiles(&profile.agent, &[id])?;
     let _ = app.emit("workspace-updated", ());
     Ok(())
@@ -891,7 +890,7 @@ pub async fn fetch_provider_models_for_settings(
     let previous = settings
         .id
         .as_deref()
-        .map(|id| find(&app, id))
+        .map(|id| app.state::<AppState>().store.profile_for_editing(id))
         .transpose()?;
     let secret = listing_secret(&settings, previous.as_ref())?;
     // Unsaved settings are a preview. Never mutate a saved route or persist its

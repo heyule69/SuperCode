@@ -164,8 +164,15 @@ fn previous_route(store: &Store, session: &Session) -> Result<Route, String> {
 
 impl Store {
     pub fn default_connection(&self, agent: &str) -> Result<String, String> {
-        Ok(if let Some(p) = self.active_profile(agent)? {
-            p.id
+        // Choosing an ID must not decrypt its credentials. A locked connection
+        // stays selected, and only an actual execution request is rejected.
+        let selected: Option<String> = {
+            let conn = self.0.lock().map_err(|e|e.to_string())?;
+            conn.query_row("SELECT p.id FROM settings s JOIN agent_profiles p ON p.id=s.value WHERE s.key=?1 AND p.agent=?2",
+                params![format!("profile_{agent}"),agent],|r|r.get(0)).optional().map_err(|e|e.to_string())?
+        };
+        Ok(if let Some(id) = selected {
+            id
         } else if self.official(agent)? {
             OFFICIAL.into()
         } else {
@@ -190,8 +197,14 @@ impl Store {
             rows.collect::<rusqlite::Result<Vec<_>>>()
                 .map_err(|e| e.to_string())?
         };
-        let profiles = self.profiles()?;
+        let profiles = self.profiles_for_display()?;
+        // Unknown legacy bindings cannot be inferred from unreadable secrets.
+        // Keep them pending instead of silently choosing a different account.
+        let unavailable: std::collections::HashSet<_> = profiles.iter()
+            .filter(|p|crate::connection_recovery::reason(&p.config).is_some())
+            .map(|p|p.agent.as_str()).collect();
         for (id, agent, model) in rows {
+            if unavailable.contains(agent.as_str()) { continue; }
             let matches: Vec<_> = profiles
                 .iter()
                 .filter(|p| {

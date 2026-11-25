@@ -517,9 +517,10 @@ pub async fn get_quota_connections(app: AppHandle) -> Result<Vec<QuotaConnection
     Ok(visible)
 }
 fn quota_connections(store: &crate::storage::Store) -> Result<Vec<QuotaConnection>, String> {
-    let profiles = store.profiles()?;
+    let profiles = store.profiles_for_display()?;
     let mut connections = Vec::new();
     for profile in &profiles {
+        if crate::connection_recovery::reason(&profile.config).is_some() { continue; }
         if profile.agent == "codex" && profile.is_official() && profile.account_id().is_none() {
             continue;
         }

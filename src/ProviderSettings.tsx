@@ -170,7 +170,7 @@ export default function ProviderSettings({ profiles, officialAgents, order, runn
     if (!config) return;
     if (connectionBusy) throw new Error('此连接正被任务使用，请等待任务完成或停止后再修改。');
     const saved = await call<AgentProfile>('save_provider_profile', { settings: { ...config, apiKey: config.apiKey?.trim() || null }, activate });
-    setConfig(c => c ? { ...c, id: saved.id, apiKey: '', hasCredential: saved.hasCredential } : null);
+    setConfig(c => c ? { ...c, id: saved.id, apiKey: '', hasCredential: saved.hasCredential, credentialError: undefined } : null);
     setCredentialRevision(revision => revision + 1);
     await updated(activate || saved.current ? saved.agent : undefined); setMessage(activate ? '已保存并启用' : '已保存');
     return saved.id;
@@ -260,9 +260,9 @@ export default function ProviderSettings({ profiles, officialAgents, order, runn
               onPointerDown={e => { if (sortingDisabled || e.button !== 0) return; e.currentTarget.setPointerCapture(e.pointerId); pointerDrag.current = { id, y: e.clientY, pointerId: e.pointerId, active: false }; }}
               onPointerMove={dragMove} onPointerUp={dragEnd} onPointerCancel={clearDrag} onLostPointerCapture={clearDrag}
               onKeyDown={e => { if (e.altKey && ['ArrowUp', 'ArrowDown'].includes(e.key)) { e.preventDefault(); move(id, e.key === 'ArrowUp' ? -1 : 1); } }}><GripVertical size={16}/></button>
-            <button type="button" className="saved-provider" disabled={working || !desktop} onClick={() => void run(async () => { setDeleteIds([]); if (id === '@official' || p?.officialAccount) setManagingAccounts(true); else if (p) setConfig(await call<Config>('get_provider_profile', { id })); else setNativeId(id); setMessage(''); })}>
+            <button type="button" className="saved-provider" disabled={working || !desktop} onClick={() => void run(async () => { setDeleteIds([]); if (id === '@official' || p?.officialAccount) setManagingAccounts(true); else if (p) { const value = await call<Config>('get_provider_profile', { id }); setConfig(value); if (value.credentialError) setError(value.credentialError); } else setNativeId(id); setMessage(''); })}>
               <span className={`provider-mark mark-${p?.providerId ?? native.providerId}`}>{id === '@local' ? <AgentIcon agent={agentTab}/> : <ProviderIcon provider={p?.officialAccount ? (agentTab === 'claude' ? 'anthropic' : 'openai') : p?.modelSource?.providerId ?? p?.providerId ?? native.providerId} name={name} mark={p?.modelSource?.mark ?? p?.name.slice(0, 1).toUpperCase() ?? native.mark}/>}</span>
-              <span><strong>{name}</strong><small>{subtitle}</small></span><span className={`connection-state ${isDefault ? 'enabled' : ''}`}>{isDefault ? '新聊天默认' : p ? p.officialAccount ? '官方登录' : p.hasCredential ? '已配置' : '未保存密钥' : '本机登录'}</span>{runningConnections[agentTab]?.includes(id) ? <span className="connection-state">任务使用中</span> : null}<ChevronRight size={16}/>
+              <span><strong>{name}</strong><small>{p?.credentialError ? '配置无法读取，请点击重新配置' : subtitle}</small></span><span className={`connection-state ${isDefault ? 'enabled' : ''}`}>{isDefault ? '新聊天默认' : p ? p.officialAccount ? '官方登录' : p.hasCredential ? '已配置' : '未保存密钥' : '本机登录'}</span>{runningConnections[agentTab]?.includes(id) ? <span className="connection-state">任务使用中</span> : null}<ChevronRight size={16}/>
             </button>
             {p && p.agent === 'claude' && !p.officialAccount ? <button type="button" className="quiet-button provider-mapping-button" disabled={!desktop || working} aria-label={`配置 ${name} 的 Claude 模型映射`} onClick={() => setMappingProfile(p)}>模型映射</button> : null}
             <div className="provider-order-actions"><button type="button" className="icon-button" aria-label={`上移 ${name}`} title="上移" disabled={sortingDisabled || index === 0} onClick={() => move(id, -1)}><ArrowUp size={14}/></button><button type="button" className="icon-button" aria-label={`下移 ${name}`} title="下移" disabled={sortingDisabled || index === ids.length - 1} onClick={() => move(id, 1)}><ArrowDown size={14}/></button></div>

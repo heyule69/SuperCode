@@ -136,7 +136,7 @@ pub async fn list_official_accounts(
 ) -> Result<Vec<Value>, String> {
     account_directory(Path::new("."), &agent, &uuid::Uuid::nil().to_string())?;
     let state = app.state::<AppState>();
-    let profiles = state.store.profiles()?;
+    let profiles = state.store.profiles_for_display()?;
     let default = state.store.default_connection(&agent)?;
     let mut rows = Vec::new();
     let candidates = std::iter::once((

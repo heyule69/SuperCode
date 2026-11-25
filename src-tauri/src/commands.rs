@@ -49,7 +49,7 @@ pub fn bootstrap(state: State<'_, AppState>, app: AppHandle) -> Result<Bootstrap
     let connection_order = state.store.connection_orders()?;
     let profiles = state
         .store
-        .profiles()?
+        .profiles_for_display()?
         .iter()
         .map(|p| {
             p.summary(connection_order.get(&p.agent).and_then(|ids| ids.first()) == Some(&p.id))

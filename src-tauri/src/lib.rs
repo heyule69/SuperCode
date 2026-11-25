@@ -67,6 +67,7 @@ mod media;
 mod model_context;
 mod codex_context;
 mod codex_recovery;
+mod connection_recovery;
 mod codex_speed;
 mod native_agents;
 mod notifications;

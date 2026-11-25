@@ -106,6 +106,7 @@ impl Store {
              CREATE INDEX IF NOT EXISTS usage_session_recent ON usage_records(session_id,updated_at);
              CREATE TABLE IF NOT EXISTS session_context(session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,summary TEXT NOT NULL,through_seq INTEGER NOT NULL);
              CREATE TABLE IF NOT EXISTS agent_profiles(id TEXT PRIMARY KEY,agent TEXT NOT NULL,name TEXT NOT NULL,config TEXT NOT NULL);
+             CREATE TABLE IF NOT EXISTS credential_recovery(profile_id TEXT NOT NULL,config_hash TEXT NOT NULL,agent TEXT NOT NULL,name TEXT NOT NULL,config TEXT NOT NULL,PRIMARY KEY(profile_id,config_hash));
              UPDATE messages SET data=json_set(data,'$.status','interrupted') WHERE json_valid(data) AND json_extract(data,'$.status') IN ('inProgress','running','preparing') AND session_id IN (SELECT id FROM sessions WHERE status IN ('starting','running','waiting'));
              UPDATE sessions SET status='interrupted',turn_id=NULL WHERE status IN ('starting','running','waiting');",
         )?;
@@ -192,6 +193,12 @@ impl Store {
     }
 
     pub fn profiles(&self) -> Result<Vec<crate::ccswitch::Profile>> {
+        self.read_profiles(false)
+    }
+    pub(crate) fn profiles_for_display(&self) -> Result<Vec<crate::ccswitch::Profile>> {
+        self.read_profiles(true)
+    }
+    fn read_profiles(&self, display: bool) -> Result<Vec<crate::ccswitch::Profile>> {
         let conn = self.0.lock().map_err(|e| e.to_string())?;
         let mut stmt = conn
             .prepare("SELECT id,agent,name,config FROM agent_profiles ORDER BY agent,name")
@@ -213,8 +220,7 @@ impl Store {
                 id,
                 agent,
                 name,
-                config: serde_json::from_str(&crate::credentials::open(&raw)?)
-                    .map_err(|_| "本地配置 JSON 无效")?,
+                config: if display { crate::connection_recovery::display(&raw) } else { crate::connection_recovery::read(&raw)? },
             });
         }
         let orders: std::collections::HashMap<_, _> =
@@ -241,6 +247,15 @@ impl Store {
         });
         Ok(profiles)
     }
+    pub(crate) fn profile_for_editing(&self, id: &str) -> Result<crate::ccswitch::Profile> {
+        use rusqlite::OptionalExtension;
+        let conn = self.0.lock().map_err(|e|e.to_string())?;
+        let row: Option<(String,String,String)> = conn.query_row(
+            "SELECT agent,name,config FROM agent_profiles WHERE id=?1",[id],
+            |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional().map_err(|e|e.to_string())?;
+        let (agent,name,raw) = row.ok_or("连接配置已不存在")?;
+        Ok(crate::ccswitch::Profile {id:id.into(),agent,name,config:crate::connection_recovery::display(&raw)})
+    }
     pub fn profile(&self, agent: &str, id: &str) -> Result<Option<crate::ccswitch::Profile>> {
         use rusqlite::OptionalExtension;
         let row: Option<(String, String)> = self
@@ -259,8 +274,7 @@ impl Store {
                 id: id.into(),
                 agent: agent.into(),
                 name,
-                config: serde_json::from_str(&crate::credentials::open(&raw)?)
-                    .map_err(|_| "本地配置 JSON 无效")?,
+                config: crate::connection_recovery::read(&raw)?,
             })
         })
         .transpose()
@@ -333,6 +347,10 @@ impl Store {
         let mut conn = self.0.lock().map_err(|e| e.to_string())?;
         let tx = conn.transaction().map_err(|e| e.to_string())?;
         for profile in profiles {
+            if let Some(error) = crate::connection_recovery::reason(&profile.config) { return Err(error.into()); }
+            let stored: Option<(String,String,String)> = tx.query_row(
+                "SELECT agent,name,config FROM agent_profiles WHERE id=?1",[&profile.id],
+                |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional().map_err(|e|e.to_string())?;
             if compare {
                 let row: Option<(String, String, String)> = tx
                     .query_row(
@@ -349,8 +367,7 @@ impl Store {
                             && expected.agent == agent
                             && expected.name == name
                             && expected.config
-                                == serde_json::from_str::<Value>(&crate::credentials::open(&raw)?)
-                                    .map_err(|_| "本地配置 JSON 无效")?
+                                == crate::connection_recovery::display(&raw)
                     }
                     _ => false,
                 };
@@ -391,10 +408,9 @@ impl Store {
                         id: profile.id.clone(),
                         agent,
                         name: String::new(),
-                        config: serde_json::from_str(&crate::credentials::open(&raw)?)
-                            .map_err(|_| "已保存连接格式无效")?,
+                        config: crate::connection_recovery::display(&raw),
                     };
-                    crate::session_config::routing_identity(&old)
+                    crate::connection_recovery::reason(&old.config).is_some() || crate::session_config::routing_identity(&old)
                         != crate::session_config::routing_identity(profile)
                 } else {
                     true
@@ -409,6 +425,13 @@ impl Store {
                     )
                     .map_err(|e| e.to_string())?;
                 }
+            }
+            if let Some((agent,name,raw)) = stored.filter(|(_,_,raw)|crate::connection_recovery::read(raw).is_err()) {
+                // Explicit repair retains the exact old ciphertext in SQLite.
+                // Listing or opening a connection never performs this write.
+                use sha2::{Digest,Sha256};
+                tx.execute("INSERT OR IGNORE INTO credential_recovery(profile_id,config_hash,agent,name,config) VALUES(?1,?2,?3,?4,?5)",
+                    params![profile.id,format!("{:x}",Sha256::digest(raw.as_bytes())),agent,name,raw]).map_err(|e|e.to_string())?;
             }
             let config = crate::credentials::seal(&profile.config.to_string())?;
             tx.execute("INSERT INTO agent_profiles(id,agent,name,config) VALUES(?1,?2,?3,?4) ON CONFLICT(id) DO UPDATE SET name=excluded.name,agent=excluded.agent,config=excluded.config",params![profile.id,profile.agent,profile.name,config]).map_err(|e|e.to_string())?;
@@ -495,8 +518,7 @@ impl Store {
                 id: id.clone(),
                 agent: owner,
                 name,
-                config: serde_json::from_str(&crate::credentials::open(&raw)?)
-                    .map_err(|_| "本地配置 JSON 无效")?,
+                config: crate::connection_recovery::display(&raw),
             };
             if profile.is_official() {
                 return Err("官方账号请通过账号管理移除，不能批量删除供应商连接".into());

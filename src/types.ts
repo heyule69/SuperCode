@@ -4,7 +4,7 @@ export interface Message { seq: number; id: string; sessionId: string; role: str
 export interface Agent { id: string; name: string; installed: boolean; path: string | null; connected: boolean }
 export interface ModelSource { providerId: string; providerName: string; mark: string; planName?: string | null; connectionName?: string | null; modelFamily?: string | null; available?: boolean }
 export interface ModelCatalog { data: Model[]; source?: ModelSource; origin?: 'preset' | 'saved' | 'officialApi' | 'native'; warning?: string; notice?: string }
-export interface AgentProfile { id: string; agent: string; name: string; model: string | null; hasCredential: boolean; current: boolean; officialAccount?: boolean; accountId?: string | null; providerId?: string | null; protocol?: string; plan?: string | null; source?: string; models?: string[]; modelSource?: ModelSource }
+export interface AgentProfile { id: string; agent: string; name: string; model: string | null; hasCredential: boolean; current: boolean; officialAccount?: boolean; accountId?: string | null; providerId?: string | null; protocol?: string; plan?: string | null; source?: string; models?: string[]; modelSource?: ModelSource; credentialError?: string }
 export interface SidebarItem { pinned: boolean; unread: boolean; sectionId: string | null }
 export interface SidebarSection { id: string; name: string }
 export interface SidebarState { projects: Record<string, SidebarItem>; sessions: Record<string, SidebarItem>; sections: SidebarSection[] }
@@ -12,7 +12,7 @@ export interface ArchivedSession { session: Session; projectName: string; projec
 export interface Bootstrap { projects: Project[]; sessions: Session[]; agents: Agent[]; codexPath: string | null; loadMcp: boolean; profiles: AgentProfile[]; officialAgents: string[]; connectionOrder?: Record<string, string[]>; runningConnections?: Record<string, string[]>; activeSessionIds?: string[]; sidebar?: SidebarState }
 export interface ProviderPreset { id: string; name: string; protocol: string; baseUrl: string; models: string[]; docsUrl?: string; note?: string }
 export interface Provider { id: string; name: string; mark: string; category: string; presets: ProviderPreset[] }
-export interface ProviderSettings { id: string | null; name: string; agent: string; providerId: string; plan: string; protocol: string; baseUrl: string; model: string; models: string[]; apiKey?: string | null; hasCredential: boolean; official?: boolean }
+export interface ProviderSettings { id: string | null; name: string; agent: string; providerId: string; plan: string; protocol: string; baseUrl: string; model: string; models: string[]; apiKey?: string | null; hasCredential: boolean; official?: boolean; credentialError?: string }
 export type PermissionMode = 'read' | 'ask' | 'strict' | 'auto' | 'edit' | 'deny' | 'full';
 export interface Model { id: string; model: string; displayName: string; isDefault: boolean; contextWindow?: number | null; effectiveContextWindowPercent?: number | null; defaultReasoningEffort?: string; supportedReasoningEfforts?: { reasoningEffort: string; description?: string }[]; serviceTiers?: { id: string; name: string }[] }
 export interface Changes { isGit: boolean; branch: string; files: { path: string; status: string }[]; diff: string }
